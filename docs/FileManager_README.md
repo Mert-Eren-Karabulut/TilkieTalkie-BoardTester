@@ -35,7 +35,12 @@ SD_CS   = IO15  // Chip Select
 SD_MISO = IO12  // Master In Slave Out
 SD_MOSI = IO13  // Master Out Slave In  
 SD_CLK  = IO14  // Clock
+
+// CRITICAL: Peripheral Power Control
+IO17    = HIGH  // Must be HIGH to power SD card and peripherals
 ```
+
+**⚠️ IMPORTANT:** GPIO17 controls power to peripherals including the SD card. This pin MUST be set HIGH before initializing any peripherals, or they will not function.
 
 ## Quick Start
 
@@ -52,6 +57,11 @@ FileManager& fileManager = FileManager::getInstance();
 ```cpp
 void setup() {
     // Initialize other components first (WiFi, Battery)
+    
+    // CRITICAL: Enable peripheral power first!
+    pinMode(17, OUTPUT);
+    digitalWrite(17, HIGH);  // Enable power to peripherals
+    delay(100);  // Give peripherals time to power up
     
     if (!fileManager.begin()) {
         Serial.println("FileManager initialization failed!");
@@ -219,6 +229,9 @@ dlqueue    - Show download queue
 required   - Show required files
 checkfiles - Check and download missing files
 cleanup    - Clean up temporary files
+power      - Show peripheral power status
+poweron    - Enable peripheral power (IO17)
+poweroff   - Disable peripheral power (IO17)
 
 download <url> <path>  - Schedule download
 addfile <path> <url>   - Add required file
@@ -227,7 +240,6 @@ Example:
 > download https://example.com/test.wav /audio/test.wav
 > addfile /audio/welcome.wav https://server.com/welcome.wav
 ```
-
 ## SD Card Information
 
 ```cpp
@@ -298,11 +310,16 @@ void setup() {
     // 1. Initialize serial communication
     Serial.begin(115200);
     
-    // 2. Initialize WiFi and Battery first
+    // 2. CRITICAL: Enable peripheral power FIRST!
+    pinMode(17, OUTPUT);
+    digitalWrite(17, HIGH);  // Enable power to peripherals
+    delay(100);  // Give peripherals time to power up
+    
+    // 3. Initialize WiFi and Battery
     wifiProv.begin();
     battery.begin();
     
-    // 3. Then initialize FileManager
+    // 4. Then initialize FileManager
     fileManager.begin();
 }
 ```
@@ -335,6 +352,99 @@ fileManager.setDownloadCompleteCallback(onDownloadComplete);
 ```
 
 ## Troubleshooting
+
+### SD Card Initialization Failures
+
+If you see errors like:
+```
+[E][sd_diskio.cpp:126] sdSelectCard(): Select Failed
+[E][sd_diskio.cpp:199] sdCommand(): Card Failed! cmd: 0x29
+[E][sd_diskio.cpp:806] sdcard_mount(): f_mount failed: (3) The physical drive cannot work
+```
+
+**Step 1: Run Diagnostics**
+```cpp
+// In serial console, type:
+sddiag
+```
+
+This will test:
+- **Peripheral power status (IO17)** - MOST IMPORTANT
+- System voltage levels
+- Pin connectivity
+- SPI communication at different frequencies
+- Basic file operations
+
+**Step 2: Check Peripheral Power**
+
+The most common cause of SD card initialization failure is missing peripheral power:
+
+1. **Check Power Status:**
+   ```cpp
+   // In serial console, type:
+   power
+   ```
+
+2. **Enable Power if Disabled:**
+   ```cpp
+   // In serial console, type:
+   poweron
+   ```
+
+3. **Restart Device:**
+   After enabling power, restart the device for clean initialization.
+
+**Step 3: Check Hardware**
+
+1. **Wiring Verification:**
+   ```
+   ESP32 Pin → SD Card Pin
+   GPIO15    → CS (Chip Select)
+   GPIO12    → DO (Data Out / MISO)
+   GPIO13    → DI (Data In / MOSI)
+   GPIO14    → CLK (Clock)
+   3.3V      → VCC
+   GND       → GND
+   
+   CRITICAL: GPIO17 → HIGH (Peripheral Power Control)
+   ```
+
+2. **Peripheral Power (CRITICAL):**
+   - GPIO17 must be HIGH to power SD card
+   - Check with `power` command
+   - Enable with `poweron` command if disabled
+   - This is the #1 cause of SD card failures
+
+3. **Power Supply:**
+   - Check battery voltage with `battery` command
+   - Voltage should be ≥ 3.2V for reliable SD operation
+   - Connect external power if battery is low
+
+4. **SD Card:**
+   - Format as FAT32 (not exFAT or NTFS)
+   - Use SD cards ≤ 32GB (SDHC)
+   - Try a different SD card
+   - Check SD card is not write-protected
+
+**Step 4: Test Different Configurations**
+
+```cpp
+// Try different SPI frequencies in FileManager.cpp:
+SPI.setFrequency(400000);   // Very slow (most compatible)
+SPI.setFrequency(1000000);  // Slow
+SPI.setFrequency(4000000);  // Medium
+```
+
+**Step 5: Alternative Pin Configuration**
+
+If the current pins don't work, try VSPI pins:
+```cpp
+// In FileManager.h, change to:
+static const int SD_CS_PIN = 5;
+static const int SD_MISO_PIN = 19;
+static const int SD_MOSI_PIN = 23;
+static const int SD_CLK_PIN = 18;
+```
 
 ### SD Card Issues
 - Check wiring connections

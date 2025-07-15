@@ -14,8 +14,10 @@ struct DownloadTask {
     String url;
     String localPath;
     int retryCount;
+    int retryBatch; // Track which batch of retries we're on
     bool completed;
     unsigned long lastAttempt;
+    unsigned long lastBatchAttempt; // Track when the last retry batch was attempted
     String checksum; // Optional for file integrity verification
 };
 
@@ -37,9 +39,14 @@ private:
     static const int SD_MOSI_PIN = 13;
     static const int SD_CLK_PIN = 14;
     
+    // SD Card speed configuration (optimized for high-speed cards)
+    // Default initialization tries 25MHz first, falls back to slower speeds if needed
+    
     // Download configuration
     static const int MAX_RETRY_COUNT = 5;
-    static const unsigned long RETRY_DELAY_MS = 30000; // 30 seconds between retries
+    static const int MAX_RETRY_BATCHES = 10; // Maximum number of retry batches
+    static const unsigned long RETRY_DELAY_MS = 10000; // 10 seconds between individual retries
+    static const unsigned long RETRY_BATCH_DELAY_MS = 60000; // 1 minute between retry batches
     static const unsigned long CONNECTIVITY_TIMEOUT_MS = 10000; // 10 seconds
     static const size_t DOWNLOAD_BUFFER_SIZE = 8192; // 8KB buffer for downloads
     static const unsigned long DOWNLOAD_TIMEOUT_MS = 300000; // 5 minutes per download
@@ -92,10 +99,9 @@ private:
     // File operations
     bool createDirectoryStructure(const String& path);
     String getDirectoryFromPath(const String& path);
-    bool fileExists(const String& path);
     size_t getFileSize(const String& path);
     
-public:
+    public:
     // Singleton access
     static FileManager& getInstance();
     
@@ -112,11 +118,13 @@ public:
     String readFile(const String& path);
     bool readFile(const String& path, uint8_t* buffer, size_t& length);
     bool deleteFile(const String& path);
+    bool deleteFileAndRemoveFromRequired(const String& path); // Smart delete that removes from required list
     bool renameFile(const String& oldPath, const String& newPath);
     bool createDirectory(const String& path);
     bool removeDirectory(const String& path);
     std::vector<String> listFiles(const String& directory = "/");
     bool copyFile(const String& sourcePath, const String& destPath);
+    bool fileExists(const String& path);
     
     // Download management methods
     bool scheduleDownload(const String& url, const String& localPath, const String& checksum = "");
@@ -150,6 +158,11 @@ public:
     void printDownloadQueue();
     void printRequiredFiles();
     String formatBytes(size_t bytes);
+    
+    // Diagnostic methods
+    bool testFileOperations();
+    void runSDCardStressTest();
+    void optimizeSDCardSpeed();
     
     // File integrity
     String calculateFileChecksum(const String& filePath);

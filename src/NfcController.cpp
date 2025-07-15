@@ -1,0 +1,210 @@
+#include "NfcController.h"
+
+// Debounce delay for the reed switch
+#define DEBOUNCE_DELAY 50
+
+// Constructor: Initialize nfc object using the correct I2C constructor from the working example
+NfcController::NfcController() : nfc(NFC_IRQ_PIN, NFC_RESET_PIN, &Wire),
+                                 nfcReady(false),
+                                 reedActive(false),
+                                 cardPresent(false),
+                                 cardReadInSession(false),
+                                 lastDebounceTime(0),
+                                 lastReedState(false)
+{
+}
+
+bool NfcController::begin()
+{
+    // Configure the reed switch pin as an input
+    pinMode(REED_SWITCH_PIN, INPUT);
+    lastReedState = digitalRead(REED_SWITCH_PIN);
+
+    // Initialize I2C with custom pins before initializing the NFC board
+    Wire.begin(NFC_SDA_PIN, NFC_SCL_PIN);
+    delay(100);
+
+    nfc.begin();
+
+    uint32_t versiondata = nfc.getFirmwareVersion();
+    if (!versiondata)
+    {
+        Serial.println("ERROR: PN532 not found! Check wiring on SDA=22, SCL=21, RST=17.");
+        nfcReady = false;
+        return false;
+    }
+
+    // Print firmware version
+    Serial.print("Found chip PN5");
+    Serial.print((versiondata >> 16) & 0xFF, HEX);
+    Serial.print(".");
+    Serial.println((versiondata >> 8) & 0xFF, HEX);
+
+    // Configure board to read RFID tags
+    nfc.SAMConfig();
+
+    nfcReady = true;
+    return true;
+}
+
+void NfcController::update()
+{
+    if (!nfcReady)
+    {
+        return;
+    }
+    handleReedSwitch();
+    if (reedActive)
+    {
+        handleNFCReading();
+    }
+}
+
+void NfcController::handleReedSwitch()
+{
+    bool currentReedState = digitalRead(REED_SWITCH_PIN);
+
+    // Check if the state has changed
+    if (currentReedState != lastReedState)
+    {
+        lastDebounceTime = millis();
+    }
+
+    // If the state has been stable for longer than the debounce delay
+    if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY)
+    {
+        // If the state has truly changed
+        if (currentReedState != reedActive)
+        {
+            reedActive = currentReedState;
+            if (reedActive)
+            {
+                // New session starts
+                Serial.println("Reed switch activated. NFC session started.");
+                cardReadInSession = false; // Reset session flag
+                lastReadUID = "";          // Clear last read UID for the new session
+            }
+            else
+            {
+                // Session ends
+                Serial.println("Reed switch deactivated. NFC session ended.");
+                if (cardReadInSession && afterDetachNFCCallback)
+                {
+                    // Only call the detach hook if a card was actually read
+                    afterDetachNFCCallback();
+                }
+                cardPresent = false;            // Card is no longer considered present
+                dockedCardData.isValid = false; // Invalidate the docked card data
+            }
+        }
+    }
+
+    lastReedState = currentReedState;
+}
+
+void NfcController::handleNFCReading()
+{
+    uint8_t success;
+    uint8_t uid[] = {0, 0, 0, 0, 0, 0, 0}; // Buffer to store the returned UID
+    uint8_t uidLength;                     // Length of the UID (4 or 7 bytes)
+
+    // Wait for an ISO14443A type card
+    success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50); // 50ms timeout
+
+    if (success)
+    {
+        cardPresent = true;
+        String currentUID = "";
+        for (uint8_t i = 0; i < uidLength; i++)
+        {
+            if (i > 0)
+                currentUID += "-";
+            if (uid[i] < 0x10)
+                currentUID += "0";
+            currentUID += String(uid[i], HEX);
+        }
+        currentUID.toUpperCase();
+
+        // Check if this is a new card in this session
+        if (currentUID != lastReadUID)
+        {
+            Serial.println("Found new card!");
+            lastReadUID = currentUID; // Update the last read UID
+            cardReadInSession = true; // Mark that a card has been read in this session
+
+            // Populate the data structure
+            memcpy(dockedCardData.uid, uid, uidLength);
+            dockedCardData.uidLength = uidLength;
+            dockedCardData.uidString = currentUID;
+            dockedCardData.timestamp = millis();
+            dockedCardData.isValid = true;
+
+            // Trigger the callback
+            if (afterNFCReadCallback)
+            {
+                afterNFCReadCallback(dockedCardData);
+            }
+        }
+    }
+}
+
+void NfcController::setAfterNFCReadCallback(std::function<void(const NFCData &)> cb)
+{
+    afterNFCReadCallback = cb;
+}
+
+void NfcController::setAfterDetachNFCCallback(std::function<void()> cb)
+{
+    afterDetachNFCCallback = cb;
+}
+
+bool NfcController::isNFCReady() const
+{
+    return nfcReady;
+}
+
+bool NfcController::isReedSwitchActive() const
+{
+    return reedActive;
+}
+
+bool NfcController::isCardPresent() const
+{
+    return cardPresent && reedActive;
+}
+
+NFCData NfcController::currentNFCData() const
+{
+    return dockedCardData;
+}
+
+void NfcController::diagnostics()
+{
+    Serial.println("\n--- NFC Controller Diagnostics ---");
+    if (!nfcReady)
+    {
+        Serial.println("NFC board not found. Check wiring and I2C address.");
+        return;
+    }
+
+    uint32_t versiondata = nfc.getFirmwareVersion();
+    Serial.print("Firmware version: ");
+    Serial.print((versiondata >> 16) & 0xFF, DEC);
+    Serial.print('.');
+    Serial.println((versiondata >> 8) & 0xFF, DEC);
+
+    Serial.println("Place a card on the reader to test communication...");
+    uint8_t uid[] = {0, 0, 0, 0, 0, 0, 0};
+    uint8_t uidLength;
+    uint8_t success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 1000);
+
+    if (success)
+    {
+        Serial.println("Diagnostics PASSED: Successfully read a card.");
+    }
+    else
+    {
+        Serial.println("Diagnostics FAILED: Could not read a card within 1 second.");
+    }
+    Serial.println("--------------------------------\n");
+}

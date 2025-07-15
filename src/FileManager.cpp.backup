@@ -93,8 +93,8 @@ bool FileManager::initializeSDCard() {
     // Initialize SPI with explicit parameters
     SPI.begin(SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     
-    // Start with high-speed SPI for optimized performance
-    SPI.setFrequency(25000000);  // 25MHz - will fallback if needed during SD.begin()
+    // Set SPI frequency to be more conservative (400kHz for initialization)
+    SPI.setFrequency(400000);
     
     Serial.printf("FileManager: Using pins - CS:%d, CLK:%d, MISO:%d, MOSI:%d\n", 
                   SD_CS_PIN, SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN);
@@ -105,35 +105,21 @@ bool FileManager::initializeSDCard() {
     digitalWrite(SD_CS_PIN, HIGH);
     delay(100);
     
-    // Try multiple initialization attempts with optimized speeds
+    // Try multiple initialization attempts
     bool sdInitialized = false;
-    uint32_t initSpeeds[] = {25000000, 20000000, 10000000, 4000000, 1000000, 400000}; // 25MHz down to 400kHz
-    const char* speedNames[] = {"25MHz", "20MHz", "10MHz", "4MHz", "1MHz", "400kHz"};
-    int numSpeeds = sizeof(initSpeeds) / sizeof(initSpeeds[0]);
-    
-    for (int attempt = 1; attempt <= 3 && !sdInitialized; attempt++) {
+    for (int attempt = 1; attempt <= 3; attempt++) {
         Serial.printf("FileManager: SD card initialization attempt %d/3\n", attempt);
         
-        // Try different speeds, starting with fastest
-        for (int i = 0; i < numSpeeds && !sdInitialized; i++) {
-            Serial.printf("FileManager: Trying %s... ", speedNames[i]);
-            
-            if (SD.begin(SD_CS_PIN, SPI, initSpeeds[i])) {
-                sdInitialized = true;
-                Serial.printf("SUCCESS\n");
-                Serial.printf("FileManager: SD card initialized at %s (≈%.1f KB/s)\n", 
-                             speedNames[i], (initSpeeds[i] * 0.1) / 1024.0);
-                break;
-            } else {
-                Serial.printf("failed, ");
-            }
+        // Start with very conservative settings
+        if (SD.begin(SD_CS_PIN, SPI, 400000)) {  // Start with 400kHz
+            sdInitialized = true;
+            Serial.println("FileManager: SD card initialized successfully");
+            break;
         }
         
-        if (!sdInitialized) {
-            Serial.printf("Attempt %d failed at all speeds, retrying...\n", attempt);
-            SD.end();  // Clean up before retry
-            delay(1000);
-        }
+        Serial.printf("FileManager: Attempt %d failed, retrying...\n", attempt);
+        SD.end();  // Clean up before retry
+        delay(1000);
     }
     
     if (!sdInitialized) {
@@ -143,6 +129,32 @@ bool FileManager::initializeSDCard() {
         Serial.println("  2. Wiring connections are correct");
         Serial.println("  3. SD card is formatted as FAT32");
         Serial.println("  4. Power supply is adequate");
+        return false;
+    }
+    
+    // After successful initialization, we can increase speed for better performance
+    // Try progressively higher speeds to find optimal operating frequency
+    SD.end();
+    delay(100);
+    
+    // Test speeds: 4MHz, 2MHz, 1MHz, 400kHz
+    uint32_t testSpeeds[] = {4000000, 2000000, 1000000, 400000};
+    const char* speedNames[] = {"4MHz", "2MHz", "1MHz", "400kHz"};
+    bool speedFound = false;
+    
+    for (int i = 0; i < 4; i++) {
+        if (SD.begin(SD_CS_PIN, SPI, testSpeeds[i])) {
+            Serial.printf("FileManager: Operating at %s (%.1fkB/s theoretical max)\n", 
+                         speedNames[i], testSpeeds[i] / 8000.0);
+            speedFound = true;
+            break;
+        }
+        SD.end();
+        delay(50);
+    }
+    
+    if (!speedFound) {
+        Serial.println("FileManager: Failed to reinitialize SD card at any speed");
         return false;
     }
     
@@ -179,7 +191,6 @@ bool FileManager::initializeSDCard() {
     createDirectory("/audio");
     createDirectory("/temp");
     createDirectory("/logs");
-    createDirectory("/images");
     
     return true;
 }
@@ -242,7 +253,8 @@ void FileManager::update() {
     // Process download queue if conditions are met
     if (!downloadInProgress && 
         downloadQueue.size() > 0 && 
-        isChargingRequired()) {
+        isChargingRequired() && 
+        checkConnectivity()) {
         processDownloadQueue();
     }
     
@@ -356,91 +368,6 @@ bool FileManager::deleteFile(const String& path) {
     return success;
 }
 
-bool FileManager::deleteFileAndRemoveFromRequired(const String& path) {
-    if (!sdCardInitialized) {
-        Serial.println("FileManager: SD card not initialized");
-        return false;
-    }
-    
-    // Validate that this is a file path, not a directory
-    if (path.endsWith("/") || path.isEmpty()) {
-        Serial.printf("FileManager: Invalid file path (directories not allowed): %s\n", path.c_str());
-        return false;
-    }
-    
-    // Check if path points to a directory
-    File fileOrDir = SD.open(path);
-    if (fileOrDir) {
-        if (fileOrDir.isDirectory()) {
-            fileOrDir.close();
-            Serial.printf("FileManager: Cannot delete directory with deleteFileAndRemoveFromRequired: %s\n", path.c_str());
-            Serial.println("FileManager: Use removeDirectory() for directories");
-            return false;
-        }
-        fileOrDir.close();
-    }
-    
-    // Check if this file is in the required files list
-    bool wasRequired = false;
-    auto it = std::find_if(requiredFiles.begin(), requiredFiles.end(),
-                          [&path](const FileEntry& entry) {
-                              return entry.path == path;
-                          });
-    
-    if (it != requiredFiles.end()) {
-        wasRequired = true;
-        Serial.printf("FileManager: File is marked as required, removing from required list: %s\n", path.c_str());
-        requiredFiles.erase(it);
-        saveRequiredFiles();
-    }
-    
-    // Remove from download queue if it's currently queued
-    bool wasInQueue = false;
-    auto queueIt = downloadQueue.begin();
-    while (queueIt != downloadQueue.end()) {
-        if (queueIt->localPath == path) {
-            Serial.printf("FileManager: Removing from download queue: %s\n", path.c_str());
-            queueIt = downloadQueue.erase(queueIt);
-            wasInQueue = true;
-        } else {
-            ++queueIt;
-        }
-    }
-    
-    if (wasInQueue) {
-        saveDownloadQueue();
-    }
-    
-    // Attempt to delete the file
-    bool success = SD.remove(path);
-    
-    if (fileSystemEventCallback) {
-        fileSystemEventCallback("delete_smart", path, success);
-    }
-    
-    if (success) {
-        Serial.printf("FileManager: File deleted successfully: %s\n", path.c_str());
-        if (wasRequired) {
-            Serial.printf("FileManager: File removed from required list to prevent re-download\n");
-        }
-        if (wasInQueue) {
-            Serial.printf("FileManager: File removed from download queue\n");
-        }
-    } else {
-        Serial.printf("FileManager: Failed to delete file: %s\n", path.c_str());
-        
-        // If deletion failed but we removed it from required list, add it back
-        if (wasRequired) {
-            // We need to reconstruct the FileEntry, but we don't have the URL
-            // Log a warning that manual re-addition might be needed
-            Serial.println("FileManager: WARNING - File was removed from required list but deletion failed");
-            Serial.println("FileManager: You may need to manually re-add it with addfile command if needed");
-        }
-    }
-    
-    return success;
-}
-
 bool FileManager::createDirectory(const String& path) {
     if (!sdCardInitialized) {
         return false;
@@ -544,10 +471,8 @@ void FileManager::addToDownloadQueue(const String& url, const String& localPath,
     task.localPath = localPath;
     task.checksum = checksum;
     task.retryCount = 0;
-    task.retryBatch = 0;
     task.completed = false;
     task.lastAttempt = 0;
-    task.lastBatchAttempt = 0;
     
     downloadQueue.push_back(task);
 }
@@ -572,40 +497,15 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         return false;
     }
     
-    if (!sdCardInitialized) {
-        errorMsg = "SD card not initialized";
-        return false;
-    }
-    
     downloadInProgress = true;
     
     Serial.printf("FileManager: Starting download: %s -> %s\n", url.c_str(), localPath.c_str());
     
-    // Create directory structure with verification
-    if (!createDirectoryStructure(localPath)) {
-        errorMsg = "Failed to create directory structure";
-        downloadInProgress = false;
-        return false;
-    }
-    
-    // Verify directory exists before proceeding
-    String dir = getDirectoryFromPath(localPath);
-    File dirFile = SD.open(dir);
-    if (!dirFile || !dirFile.isDirectory()) {
-        errorMsg = "Directory creation failed or not accessible: " + dir;
-        if (dirFile) dirFile.close();
-        downloadInProgress = false;
-        return false;
-    }
-    dirFile.close();
+    // Create directory structure
+    createDirectoryStructure(localPath);
     
     // Create temporary file
     String tempPath = localPath + ".tmp";
-    
-    // Remove any existing temp file
-    if (SD.exists(tempPath)) {
-        SD.remove(tempPath);
-    }
     
     HTTPClient http;
     http.begin(url);
@@ -623,93 +523,51 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     int contentLength = http.getSize();
     WiFiClient* stream = http.getStreamPtr();
     
-    // Check available space
-    size_t freeSpace = getSDCardFreeSpace();
-    if (contentLength > 0 && (size_t)contentLength > freeSpace) {
-        errorMsg = "Insufficient SD card space";
-        http.end();
-        downloadInProgress = false;
-        return false;
-    }
-    
     File file = SD.open(tempPath, FILE_WRITE);
     if (!file) {
-        errorMsg = "Failed to create temporary file: " + tempPath;
+        errorMsg = "Failed to create temporary file";
         http.end();
         downloadInProgress = false;
         return false;
     }
     
-    uint8_t* buffer = (uint8_t*)malloc(DOWNLOAD_BUFFER_SIZE);
-    if (!buffer) {
-        errorMsg = "Failed to allocate download buffer";
-        file.close();
-        http.end();
-        downloadInProgress = false;
-        return false;
-    }
-    
+    uint8_t buffer[DOWNLOAD_BUFFER_SIZE];
     int totalDownloaded = 0;
     unsigned long lastProgress = 0;
-    bool downloadSuccess = true;
     
-    while (http.connected() && downloadSuccess && (contentLength > 0 || contentLength == -1)) {
+    while (http.connected() && (contentLength > 0 || contentLength == -1)) {
         size_t availableData = stream->available();
         
         if (availableData > 0) {
-            size_t bytesToRead = min(availableData, (size_t)DOWNLOAD_BUFFER_SIZE);
-            int readBytes = stream->readBytes(buffer, bytesToRead);
+            int readBytes = stream->readBytes(buffer, min(availableData, sizeof(buffer)));
+            file.write(buffer, readBytes);
+            totalDownloaded += readBytes;
             
-            if (readBytes > 0) {
-                size_t written = file.write(buffer, readBytes);
-                if (written != readBytes) {
-                    errorMsg = "Failed to write to file";
-                    downloadSuccess = false;
-                    break;
-                }
-                totalDownloaded += readBytes;
+            if (contentLength > 0) {
+                int progress = (totalDownloaded * 100) / contentLength;
                 
-                if (contentLength > 0) {
-                    int progress = (totalDownloaded * 100) / contentLength;
+                // Report progress every 5%
+                if (progress >= lastProgress + 5) {
+                    lastProgress = progress;
+                    Serial.printf("FileManager: Download progress: %d%% (%d/%d bytes)\n", 
+                                progress, totalDownloaded, contentLength);
                     
-                    // Report progress every 5%
-                    if (progress >= lastProgress + 5) {
-                        lastProgress = progress;
-                        Serial.printf("FileManager: Download progress: %d%% (%d/%d bytes)\n", 
-                                    progress, totalDownloaded, contentLength);
-                        
-                        if (downloadProgressCallback) {
-                            downloadProgressCallback(url, localPath, progress, totalDownloaded, contentLength);
-                        }
+                    if (downloadProgressCallback) {
+                        downloadProgressCallback(url, localPath, progress, totalDownloaded, contentLength);
                     }
                 }
-                
-                if (contentLength > 0 && totalDownloaded >= contentLength) {
-                    break;
-                }
+            }
+            
+            if (contentLength > 0 && totalDownloaded >= contentLength) {
+                break;
             }
         }
         
         delay(1); // Yield to other tasks
     }
     
-    free(buffer);
     file.close();
     http.end();
-    
-    if (!downloadSuccess) {
-        SD.remove(tempPath);
-        downloadInProgress = false;
-        return false;
-    }
-    
-    // Verify download size
-    if (contentLength > 0 && totalDownloaded != contentLength) {
-        errorMsg = "Download incomplete: " + String(totalDownloaded) + "/" + String(contentLength) + " bytes";
-        SD.remove(tempPath);
-        downloadInProgress = false;
-        return false;
-    }
     
     // Move temporary file to final location
     if (SD.exists(localPath)) {
@@ -719,23 +577,6 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     if (!SD.rename(tempPath, localPath)) {
         errorMsg = "Failed to move temporary file to final location";
         SD.remove(tempPath);
-        downloadInProgress = false;
-        return false;
-    }
-    
-    // Verify final file exists and has correct size
-    File finalFile = SD.open(localPath);
-    if (!finalFile) {
-        errorMsg = "Final file verification failed";
-        downloadInProgress = false;
-        return false;
-    }
-    size_t finalSize = finalFile.size();
-    finalFile.close();
-    
-    if (contentLength > 0 && finalSize != contentLength) {
-        errorMsg = "Final file size mismatch";
-        SD.remove(localPath);
         downloadInProgress = false;
         return false;
     }
@@ -763,11 +604,6 @@ void FileManager::processDownloadQueue() {
         return;
     }
     
-    // Only proceed if device is charging
-    if (!isChargingRequired()) {
-        return;
-    }
-    
     auto it = downloadQueue.begin();
     while (it != downloadQueue.end()) {
         DownloadTask& task = *it;
@@ -777,56 +613,24 @@ void FileManager::processDownloadQueue() {
             continue;
         }
         
-        // Check if we've exceeded the maximum retry batches
-        if (task.retryBatch >= MAX_RETRY_BATCHES) {
-            Serial.printf("FileManager: Download permanently failed after %d retry batches: %s\n", 
-                         MAX_RETRY_BATCHES, task.url.c_str());
+        if (task.retryCount >= MAX_RETRY_COUNT) {
+            Serial.printf("FileManager: Download failed after %d retries: %s\n", 
+                         MAX_RETRY_COUNT, task.url.c_str());
             
             downloadStats.totalDownloads++;
             downloadStats.failedDownloads++;
             
             if (downloadCompleteCallback) {
-                downloadCompleteCallback(task.url, task.localPath, false, "Max retry batches exceeded");
+                downloadCompleteCallback(task.url, task.localPath, false, "Max retries exceeded");
             }
             
             it = downloadQueue.erase(it);
             continue;
         }
         
-        // Check if we need to wait between retry batches
-        if (task.retryCount >= MAX_RETRY_COUNT) {
-            // We've exhausted this batch of retries, need to wait before starting next batch
-            if (task.lastBatchAttempt == 0) {
-                task.lastBatchAttempt = millis();
-                Serial.printf("FileManager: Retry batch %d failed for %s, waiting %d seconds before next batch\n", 
-                             task.retryBatch + 1, task.url.c_str(), RETRY_BATCH_DELAY_MS / 1000);
-            }
-            
-            if ((millis() - task.lastBatchAttempt) >= RETRY_BATCH_DELAY_MS) {
-                // Start new retry batch
-                task.retryBatch++;
-                task.retryCount = 0;
-                task.lastBatchAttempt = 0;
-                task.lastAttempt = 0;
-                Serial.printf("FileManager: Starting retry batch %d for %s\n", 
-                             task.retryBatch + 1, task.url.c_str());
-            } else {
-                ++it;
-                continue;
-            }
-        }
-        
-        // Check if enough time has passed since last individual retry
+        // Check if enough time has passed since last attempt
         if (task.lastAttempt > 0 && 
             (millis() - task.lastAttempt) < RETRY_DELAY_MS) {
-            ++it;
-            continue;
-        }
-        
-        // Check connectivity before attempting download
-        if (!checkConnectivity()) {
-            // Don't increment retry count for connectivity issues, just wait
-            task.lastAttempt = millis();
             ++it;
             continue;
         }
@@ -846,25 +650,19 @@ void FileManager::processDownloadQueue() {
         
         String errorMsg;
         task.lastAttempt = millis();
-        task.retryCount++;
-        
-        Serial.printf("FileManager: Attempting download (batch %d, attempt %d/%d): %s\n", 
-                     task.retryBatch + 1, task.retryCount, MAX_RETRY_COUNT, task.url.c_str());
         
         if (downloadFileFromURL(task.url, task.localPath, errorMsg)) {
             // Verify integrity if checksum provided
             if (!task.checksum.isEmpty() && !verifyFileIntegrity(task.localPath, task.checksum)) {
                 Serial.printf("FileManager: Downloaded file failed integrity check: %s\n", task.localPath.c_str());
                 deleteFile(task.localPath);
-                Serial.printf("FileManager: Download attempt %d/%d failed (integrity): %s\n", 
-                             task.retryCount, MAX_RETRY_COUNT, errorMsg.c_str());
+                task.retryCount++;
             } else {
                 task.completed = true;
-                Serial.printf("FileManager: Download successful: %s\n", task.localPath.c_str());
             }
         } else {
-            Serial.printf("FileManager: Download attempt %d/%d failed: %s (Error: %s)\n", 
-                         task.retryCount, MAX_RETRY_COUNT, task.url.c_str(), errorMsg.c_str());
+            Serial.printf("FileManager: Download failed: %s (Error: %s)\n", task.url.c_str(), errorMsg.c_str());
+            task.retryCount++;
         }
         
         ++it;
@@ -927,23 +725,7 @@ bool FileManager::createDirectoryStructure(const String& path) {
         return true;
     }
     
-    // Check if directory already exists
-    File dirFile = SD.open(dir);
-    if (dirFile && dirFile.isDirectory()) {
-        dirFile.close();
-        return true;
-    }
-    if (dirFile) {
-        dirFile.close();
-    }
-    
-    // Create directory and verify creation
-    bool success = createDirectory(dir);
-    if (!success) {
-        Serial.printf("FileManager: Failed to create directory structure for: %s\n", path.c_str());
-        Serial.printf("FileManager: Attempted to create directory: %s\n", dir.c_str());
-    }
-    return success;
+    return createDirectory(dir);
 }
 
 String FileManager::getDirectoryFromPath(const String& path) {
@@ -1075,18 +857,9 @@ void FileManager::printDownloadQueue() {
     
     for (size_t i = 0; i < downloadQueue.size(); i++) {
         const auto& task = downloadQueue[i];
-        Serial.printf("  %d. %s -> %s\n", i + 1, task.url.c_str(), task.localPath.c_str());
-        Serial.printf("      Batch: %d/%d, Attempt: %d/%d, Completed: %s\n", 
-                      task.retryBatch + 1, MAX_RETRY_BATCHES,
-                      task.retryCount, MAX_RETRY_COUNT,
-                      task.completed ? "yes" : "no");
-        
-        if (!task.completed && task.retryCount >= MAX_RETRY_COUNT && task.lastBatchAttempt > 0) {
-            unsigned long timeLeft = RETRY_BATCH_DELAY_MS - (millis() - task.lastBatchAttempt);
-            if (timeLeft > 0) {
-                Serial.printf("      Waiting %lu seconds before next batch\n", timeLeft / 1000);
-            }
-        }
+        Serial.printf("  %d. %s -> %s (retries: %d, completed: %s)\n", 
+                      i + 1, task.url.c_str(), task.localPath.c_str(), 
+                      task.retryCount, task.completed ? "yes" : "no");
     }
 }
 
@@ -1128,10 +901,8 @@ bool FileManager::saveDownloadQueue() {
         json += "{\"url\":\"" + task.url + "\",";
         json += "\"path\":\"" + task.localPath + "\",";
         json += "\"retries\":" + String(task.retryCount) + ",";
-        json += "\"retryBatch\":" + String(task.retryBatch) + ",";
         json += "\"completed\":" + String(task.completed ? "true" : "false") + ",";
         json += "\"lastAttempt\":" + String(task.lastAttempt) + ",";
-        json += "\"lastBatchAttempt\":" + String(task.lastBatchAttempt) + ",";
         json += "\"checksum\":\"" + task.checksum + "\"}";
     }
     json += "]";
@@ -1178,123 +949,12 @@ bool FileManager::loadDownloadQueue() {
 }
 
 bool FileManager::saveRequiredFiles() {
-    // Save required files as JSON string, similar to download queue
-    String json = "[";
-    for (size_t i = 0; i < requiredFiles.size(); i++) {
-        if (i > 0) json += ",";
-        const auto& file = requiredFiles[i];
-        json += "{\"path\":\"" + file.path + "\",";
-        json += "\"url\":\"" + file.url + "\",";
-        json += "\"required\":" + String(file.required ? "true" : "false") + ",";
-        json += "\"checksum\":\"" + file.checksum + "\"}";
-    }
-    json += "]";
-    
-    esp_err_t err = nvs_set_str(nvsHandle, NVS_FILE_LIST_KEY, json.c_str());
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to save required files: %s\n", esp_err_to_name(err));
-        return false;
-    }
-    
-    nvs_commit(nvsHandle);
-    Serial.printf("FileManager: Saved %d required files to NVS\n", requiredFiles.size());
+    // Similar implementation to saveDownloadQueue
     return true;
 }
 
 bool FileManager::loadRequiredFiles() {
-    size_t required_size = 0;
-    esp_err_t err = nvs_get_str(nvsHandle, NVS_FILE_LIST_KEY, NULL, &required_size);
-    
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        // No saved required files, start fresh
-        Serial.println("FileManager: No saved required files found");
-        return true;
-    }
-    
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to get required files size: %s\n", esp_err_to_name(err));
-        return false;
-    }
-    
-    char* json_str = (char*)malloc(required_size);
-    if (!json_str) {
-        Serial.println("FileManager: Failed to allocate memory for required files");
-        return false;
-    }
-    
-    err = nvs_get_str(nvsHandle, NVS_FILE_LIST_KEY, json_str, &required_size);
-    
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to load required files: %s\n", esp_err_to_name(err));
-        free(json_str);
-        return false;
-    }
-    
-    // Parse JSON and populate required files
-    // This is a simplified parser - in production, use ArduinoJson
-    requiredFiles.clear();
-    
-    String json(json_str);
-    free(json_str);
-    
-    // Simple JSON parsing for required files
-    int startPos = 0;
-    int braceCount = 0;
-    bool inString = false;
-    char prevChar = 0;
-    
-    for (int i = 0; i < json.length(); i++) {
-        char c = json.charAt(i);
-        
-        if (c == '"' && prevChar != '\\') {
-            inString = !inString;
-        } else if (!inString) {
-            if (c == '{') {
-                if (braceCount == 0) startPos = i;
-                braceCount++;
-            } else if (c == '}') {
-                braceCount--;
-                if (braceCount == 0) {
-                    // Found complete object, parse it
-                    String objStr = json.substring(startPos, i + 1);
-                    
-                    // Extract fields using simple string operations
-                    FileEntry entry;
-                    
-                    // Extract path
-                    int pathStart = objStr.indexOf("\"path\":\"") + 8;
-                    int pathEnd = objStr.indexOf("\"", pathStart);
-                    if (pathStart > 7 && pathEnd > pathStart) {
-                        entry.path = objStr.substring(pathStart, pathEnd);
-                    }
-                    
-                    // Extract url
-                    int urlStart = objStr.indexOf("\"url\":\"") + 7;
-                    int urlEnd = objStr.indexOf("\"", urlStart);
-                    if (urlStart > 6 && urlEnd > urlStart) {
-                        entry.url = objStr.substring(urlStart, urlEnd);
-                    }
-                    
-                    // Extract checksum
-                    int checksumStart = objStr.indexOf("\"checksum\":\"") + 12;
-                    int checksumEnd = objStr.indexOf("\"", checksumStart);
-                    if (checksumStart > 11 && checksumEnd > checksumStart) {
-                        entry.checksum = objStr.substring(checksumStart, checksumEnd);
-                    }
-                    
-                    // Set required to true (we only store required files)
-                    entry.required = true;
-                    
-                    if (!entry.path.isEmpty() && !entry.url.isEmpty()) {
-                        requiredFiles.push_back(entry);
-                    }
-                }
-            }
-        }
-        prevChar = c;
-    }
-    
-    Serial.printf("FileManager: Loaded %d required files from NVS\n", requiredFiles.size());
+    // Similar implementation to loadDownloadQueue
     return true;
 }
 
@@ -1348,15 +1008,13 @@ void FileManager::cancelAllDownloads() {
 
 void FileManager::retryFailedDownloads() {
     for (auto& task : downloadQueue) {
-        if (!task.completed) {
-            task.retryCount = 0; // Reset retry count within current batch
-            task.retryBatch = 0; // Reset to first batch
+        if (!task.completed && task.retryCount < MAX_RETRY_COUNT) {
+            task.retryCount = 0; // Reset retry count
             task.lastAttempt = 0; // Reset last attempt time
-            task.lastBatchAttempt = 0; // Reset batch attempt time
         }
     }
     saveDownloadQueue();
-    Serial.println("FileManager: All failed downloads reset for retry");
+    Serial.println("FileManager: Failed downloads reset for retry");
 }
 
 int FileManager::getPendingDownloadsCount() {
@@ -1491,6 +1149,255 @@ bool FileManager::repairCorruptedFiles() {
     }
     
     return anyRepaired;
+}
+
+void FileManager::runSDCardDiagnostics() {
+    Serial.println("\n=== SD Card Diagnostics ===");
+    
+    // Check peripheral power first (CRITICAL)
+    bool peripheralPower = digitalRead(17);
+    Serial.printf("Peripheral power (IO17): %s", peripheralPower ? "ENABLED" : "DISABLED");
+    if (!peripheralPower) {
+        Serial.println(" ✗ CRITICAL ISSUE!");
+        Serial.println("  SD card and other peripherals have no power!");
+        Serial.println("  Run 'poweron' command or restart device to fix.");
+        Serial.println("=== Diagnostic Aborted ===\n");
+        return;
+    } else {
+        Serial.println(" ✓");
+    }
+    
+    // Check system voltage
+    BatteryManager& battery = BatteryManager::getInstance();
+    float voltage = battery.getBatteryVoltage();
+    Serial.printf("System voltage: %.2fV", voltage);
+    if (voltage < 0.1) {
+        Serial.println(" (USB powered - reading may be inaccurate)");
+    } else if (voltage >= 3.2) {
+        Serial.println(" (OK)");
+    } else {
+        Serial.println(" (LOW - May cause SD issues)");
+    }
+    
+    // Test pin connectivity
+    Serial.println("\nTesting pin connectivity...");
+    testSDCardPins();
+    
+    // Check SPI configuration
+    Serial.println("\nSPI Configuration:");
+    Serial.printf("  CLK:  GPIO%d\n", SD_CLK_PIN);
+    Serial.printf("  MISO: GPIO%d\n", SD_MISO_PIN);
+    Serial.printf("  MOSI: GPIO%d\n", SD_MOSI_PIN);
+    Serial.printf("  CS:   GPIO%d\n", SD_CS_PIN);
+    
+    // Try basic SD card operations
+    Serial.println("\nTesting SD card initialization...");
+    
+    // Configure pins
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);
+    delay(10);
+    
+    SPI.begin(SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+    
+    // Test at different frequencies
+    uint32_t frequencies[] = {400000, 1000000, 4000000};
+    const char* freqNames[] = {"400kHz", "1MHz", "4MHz"};
+    
+    bool anySuccess = false;
+    uint32_t workingFreq = 0;
+    
+    for (int i = 0; i < 3; i++) {
+        Serial.printf("Testing at %s: ", freqNames[i]);
+        SPI.setFrequency(frequencies[i]);
+        
+        if (SD.begin(SD_CS_PIN, SPI, frequencies[i])) {
+            Serial.println("SUCCESS");
+            anySuccess = true;
+            workingFreq = frequencies[i];
+            
+            // If successful, show card info
+            uint8_t cardType = SD.cardType();
+            if (cardType != CARD_NONE) {
+                Serial.printf("  Card type: ");
+                switch (cardType) {
+                    case CARD_MMC: Serial.println("MMC"); break;
+                    case CARD_SD: Serial.println("SDSC"); break;
+                    case CARD_SDHC: Serial.println("SDHC"); break;
+                    default: Serial.println("Unknown"); break;
+                }
+                
+                uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+                Serial.printf("  Card size: %lluMB\n", cardSize);
+                
+                // Test basic file operations only at the first working frequency
+                if (i == 0 || !anySuccess) {
+                    Serial.println("  Testing file operations...");
+                    
+                    // Test root directory access
+                    File root = SD.open("/");
+                    if (root && root.isDirectory()) {
+                        Serial.println("    Root directory: OK");
+                        root.close();
+                        
+                        // Try to create a test file
+                        File testFile = SD.open("/test_diagnostic.txt", FILE_WRITE);
+                        if (testFile) {
+                            testFile.println("SD card diagnostic test");
+                            testFile.close();
+                            Serial.println("    Write test: OK");
+                            
+                            // Try to read it back
+                            testFile = SD.open("/test_diagnostic.txt", FILE_READ);
+                            if (testFile) {
+                                String content = testFile.readString();
+                                testFile.close();
+                                SD.remove("/test_diagnostic.txt");
+                                Serial.println("    Read test: OK");
+                            } else {
+                                Serial.println("    Read test: FAILED");
+                            }
+                        } else {
+                            Serial.println("    Write test: FAILED");
+                        }
+                    } else {
+                        Serial.println("    Root directory: FAILED");
+                    }
+                }
+            }
+        } else {
+            Serial.println("FAILED");
+        }
+        
+        SD.end();
+        delay(100);
+    }
+    
+    if (anySuccess) {
+        Serial.printf("\nRecommendation: Use %s for optimal performance\n", 
+                      workingFreq == 400000 ? "400kHz" : 
+                      workingFreq == 1000000 ? "1MHz" : "4MHz");
+    }
+    
+    Serial.println("\n=== Diagnostic Complete ===\n");
+}
+
+bool FileManager::testSDCardPins() {
+    Serial.println("Testing SD card pin configuration...");
+    
+    // Test CS pin
+    pinMode(SD_CS_PIN, OUTPUT);
+    digitalWrite(SD_CS_PIN, HIGH);
+    delay(10);
+    bool csHigh = digitalRead(SD_CS_PIN);
+    digitalWrite(SD_CS_PIN, LOW);
+    delay(10);
+    bool csLow = digitalRead(SD_CS_PIN);
+    digitalWrite(SD_CS_PIN, HIGH);
+    
+    Serial.printf("CS pin (GPIO%d): %s\n", SD_CS_PIN, 
+                  (csHigh && !csLow) ? "OK" : "FAILED");
+    
+    // Test other pins as inputs (basic connectivity test)
+    pinMode(SD_CLK_PIN, INPUT_PULLUP);
+    pinMode(SD_MISO_PIN, INPUT_PULLUP);
+    pinMode(SD_MOSI_PIN, INPUT_PULLUP);
+    
+    delay(10);
+    
+    bool clkPullup = digitalRead(SD_CLK_PIN);
+    bool misoPullup = digitalRead(SD_MISO_PIN);
+    bool mosiPullup = digitalRead(SD_MOSI_PIN);
+    
+    Serial.printf("CLK pin (GPIO%d): %s\n", SD_CLK_PIN, clkPullup ? "OK" : "Check connection");
+    Serial.printf("MISO pin (GPIO%d): %s", SD_MISO_PIN, misoPullup ? "OK" : "Check connection");
+    
+    // Additional MISO testing since it's critical for SD card communication
+    if (!misoPullup) {
+        Serial.println(" - CRITICAL: MISO pin issue detected!");
+        Serial.println("  This is likely the cause of SD card initialization failure.");
+        Serial.println("  Check:");
+        Serial.println("    - Wire connection from SD card DO pin to GPIO12");
+        Serial.println("    - Continuity with multimeter");
+        Serial.println("    - SD card is properly seated");
+        Serial.println("    - No short circuits");
+    } else {
+        Serial.println("");
+    }
+    
+    Serial.printf("MOSI pin (GPIO%d): %s\n", SD_MOSI_PIN, mosiPullup ? "OK" : "Check connection");
+    
+    // Additional comprehensive pin test
+    Serial.println("\nDetailed pin analysis:");
+    Serial.println("  Note: All pins should read HIGH with pullup enabled");
+    Serial.printf("  CS (GPIO%d):   %s (Expected: HIGH)\n", SD_CS_PIN, csHigh ? "HIGH" : "LOW");
+    Serial.printf("  CLK (GPIO%d):  %s (Expected: HIGH)\n", SD_CLK_PIN, clkPullup ? "HIGH" : "LOW");
+    Serial.printf("  MISO (GPIO%d): %s (Expected: HIGH) %s\n", SD_MISO_PIN, 
+                  misoPullup ? "HIGH" : "LOW", 
+                  misoPullup ? "✓" : "✗ PROBLEM!");
+    Serial.printf("  MOSI (GPIO%d): %s (Expected: HIGH)\n", SD_MOSI_PIN, mosiPullup ? "HIGH" : "LOW");
+    
+    return (csHigh && !csLow && clkPullup && misoPullup && mosiPullup);
+}
+
+void FileManager::printSDCardDiagnostics() {
+    if (!sdCardInitialized) {
+        Serial.println("SD Card: NOT INITIALIZED");
+        return;
+    }
+    
+    Serial.println("SD Card Status: INITIALIZED");
+    Serial.println(getSDCardInfo());
+}
+
+bool FileManager::testAlternatePins() {
+    Serial.println("\n=== Testing Alternative Pin Configuration ===");
+    Serial.println("If current pins don't work, try these alternatives:");
+    Serial.println();
+    
+    // VSPI pins (commonly used alternative)
+    Serial.println("Option 1 - VSPI pins (most common alternative):");
+    Serial.println("  CS:   GPIO5  (instead of GPIO15)");
+    Serial.println("  CLK:  GPIO18 (instead of GPIO14)");
+    Serial.println("  MISO: GPIO19 (instead of GPIO12)");
+    Serial.println("  MOSI: GPIO23 (instead of GPIO13)");
+    
+    // HSPI pins  
+    Serial.println("\nOption 2 - HSPI pins:");
+    Serial.println("  CS:   GPIO15 (same)");
+    Serial.println("  CLK:  GPIO14 (same)"); 
+    Serial.println("  MISO: GPIO2  (instead of GPIO12)");
+    Serial.println("  MOSI: GPIO13 (same)");
+    
+    // Test these alternative MISO pins
+    Serial.println("\nTesting alternative MISO pins:");
+    
+    // Test GPIO19 (VSPI MISO)
+    pinMode(19, INPUT_PULLUP);
+    delay(10);
+    bool gpio19 = digitalRead(19);
+    Serial.printf("  GPIO19: %s %s\n", gpio19 ? "HIGH" : "LOW", gpio19 ? "✓" : "✗");
+    
+    // Test GPIO2 (Alternative MISO)
+    pinMode(2, INPUT_PULLUP);
+    delay(10);
+    bool gpio2 = digitalRead(2);
+    Serial.printf("  GPIO2:  %s %s\n", gpio2 ? "HIGH" : "LOW", gpio2 ? "✓" : "✗");
+    
+    Serial.println("\nRecommendation:");
+    if (!gpio19 && !gpio2) {
+        Serial.println("  All alternative MISO pins also show issues.");
+        Serial.println("  This suggests a broader wiring or SD card problem.");
+    } else if (gpio19) {
+        Serial.println("  Try VSPI configuration (GPIO19 for MISO)");
+        Serial.println("  Change pins in FileManager.h and rewire SD card");
+    } else if (gpio2) {
+        Serial.println("  Try GPIO2 for MISO instead of GPIO12");
+        Serial.println("  Change SD_MISO_PIN to 2 in FileManager.h");
+    }
+    
+    Serial.println("\n=== Alternative Pin Test Complete ===\n");
+    return gpio19 || gpio2;
 }
 
 bool FileManager::testFileOperations() {
@@ -1710,81 +1617,4 @@ void FileManager::runSDCardStressTest() {
     }
     
     Serial.println("=== Stress Test Complete ===\n");
-}
-
-void FileManager::optimizeSDCardSpeed() {
-    Serial.println("=== Optimizing SD Card Speed ===");
-    
-    // Test different frequencies to find the fastest stable one
-    uint32_t frequencies[] = {25000000, 20000000, 16000000, 10000000, 8000000, 4000000, 2000000, 1000000, 400000};
-    const char* freqNames[] = {"25MHz", "20MHz", "16MHz", "10MHz", "8MHz", "4MHz", "2MHz", "1MHz", "400kHz"};
-    int numFreq = sizeof(frequencies) / sizeof(frequencies[0]);
-    
-    uint32_t workingFreq = 400000;  // Start with conservative speed
-    
-    for (int i = 0; i < numFreq; i++) {
-        Serial.printf("Testing %s... ", freqNames[i]);
-        
-        SD.end();
-        delay(100);
-        
-        if (SD.begin(SD_CS_PIN, SPI, frequencies[i])) {
-            // Quick test - create and delete a test file
-            bool testPassed = true;
-            String testFile = "/speedtest.tmp";
-            
-            File file = SD.open(testFile, FILE_WRITE);
-            if (file) {
-                file.println("Speed test");
-                file.close();
-                
-                file = SD.open(testFile);
-                if (file) {
-                    String content = file.readString();
-                    file.close();
-                    SD.remove(testFile);
-                    
-                    if (content.indexOf("Speed test") == -1) {
-                        testPassed = false;
-                    }
-                } else {
-                    testPassed = false;
-                }
-            } else {
-                testPassed = false;
-            }
-            
-            if (testPassed) {
-                workingFreq = frequencies[i];
-                Serial.println("PASS");
-                break;  // Found fastest working frequency
-            } else {
-                Serial.println("FAIL (data corruption)");
-            }
-        } else {
-            Serial.println("FAIL (init)");
-        }
-    }
-    
-    // Final initialization with the fastest working frequency
-    SD.end();
-    delay(100);
-    
-    if (SD.begin(SD_CS_PIN, SPI, workingFreq)) {
-        float dataRateMBps = (workingFreq * 0.8) / (8.0 * 1024.0 * 1024.0);  // Rough estimate with 80% efficiency
-        Serial.printf("✓ Optimized speed: %s (≈%.1f KB/s)\n", 
-                      workingFreq >= 25000000 ? "25MHz" :
-                      workingFreq >= 20000000 ? "20MHz" :
-                      workingFreq >= 16000000 ? "16MHz" :
-                      workingFreq >= 10000000 ? "10MHz" :
-                      workingFreq >= 8000000 ? "8MHz" :
-                      workingFreq >= 4000000 ? "4MHz" :
-                      workingFreq >= 2000000 ? "2MHz" :
-                      workingFreq >= 1000000 ? "1MHz" : "400kHz",
-                      (workingFreq * 0.1) / 1024.0);  // More realistic estimate
-    } else {
-        Serial.println("✗ Speed optimization failed, SD card may have issues");
-    }
-    
-    Serial.println("=== Speed Optimization Complete ===\n");
 }
