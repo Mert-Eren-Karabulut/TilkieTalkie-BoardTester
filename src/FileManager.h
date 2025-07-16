@@ -80,7 +80,7 @@ private:
     bool checkConnectivity();
     bool pingGoogle();
     bool isChargingRequired();
-    
+
     // NVS operations
     bool initializeNVS();
     bool saveDownloadQueue();
@@ -125,7 +125,9 @@ private:
     std::vector<String> listFiles(const String& directory = "/");
     bool copyFile(const String& sourcePath, const String& destPath);
     bool fileExists(const String& path);
-    
+    void printFileTree();
+    void formatSDCard(); // Format SD card as FAT32
+
     // Download management methods
     bool scheduleDownload(const String& url, const String& localPath, const String& checksum = "");
     bool downloadNow(const String& url, const String& localPath, String& errorMsg);

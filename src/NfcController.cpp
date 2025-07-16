@@ -66,8 +66,7 @@ void NfcController::update()
 
 void NfcController::handleReedSwitch()
 {
-    // bool currentReedState = digitalRead(REED_SWITCH_PIN);
-    bool currentReedState = true;
+    bool currentReedState = digitalRead(REED_SWITCH_PIN);
 
     // Check if the state has changed
     if (currentReedState != lastReedState)
@@ -131,11 +130,11 @@ void NfcController::handleNFCReading()
         currentUID.toUpperCase();
 
         // Check if this is a new card in this session
-        if (currentUID != lastReadUID || true)
+        if (currentUID != lastReadUID)
         {
             Serial.println("Found new card!");
             lastReadUID = currentUID; // Update the last read UID
-            // cardReadInSession = true; // Mark that a card has been read in this session
+            cardReadInSession = true; // Mark that a card has been read in this session
 
             // Populate the data structure
             memcpy(dockedCardData.uid, uid, uidLength);

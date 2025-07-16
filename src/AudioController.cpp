@@ -491,8 +491,8 @@ bool AudioController::initializeES8388() {
     // --- Gain and Volume (Fix for distortion) ---
     // **NEW**: Apply -12dB of digital attenuation to the DAC to prevent clipping
     // The digital volume registers attenuate in 0.5dB steps. 24 * -0.5dB = -12dB.
-    writeES8388Register(ES8388_DACCONTROL4, 0x03);  // Left DAC digital volume to -12dB 
-    writeES8388Register(ES8388_DACCONTROL5, 0x03);  // Right DAC digital volume to -12dB [cite: 525]
+    writeES8388Register(ES8388_DACCONTROL4, 0x00);  // Left DAC digital volume to -12dB 
+    writeES8388Register(ES8388_DACCONTROL5, 0x00);  // Right DAC digital volume to -12dB [cite: 525]
 
     // --- Output Mixer Configuration ---
     // Route the DAC signal to the headphone output (LOUT1/ROUT1)

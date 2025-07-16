@@ -148,6 +148,8 @@ void setup()
     Serial.println("  sdtest  - Test file operations");
     Serial.println("  sdstress- Run SD card stress test");
     Serial.println("  sdspeed - Optimize SD card speed");
+    Serial.println("  sdtree  - Check SD card file tree");
+    Serial.println("  sdformat- Format SD card as FAT32");
     Serial.println("  files   - List files on SD card");
     Serial.println("  deletefile <path> - Delete file from SD card");
     Serial.println("  dlstats - Show download statistics");
@@ -181,7 +183,7 @@ void setup()
     Serial.println("  poweron - Enable peripheral power (IO17)");
     Serial.println("  poweroff- Disable peripheral power (IO17)");
     Serial.println("Type any command for help\n");
-    // audioController.play("/sounds/12.mp3"); // Play startup sound
+    audioController.play("/sounds/12.mp3"); // Play startup sound
 }
 
 void loop()
@@ -229,6 +231,8 @@ void loop()
             Serial.println("  sdtest  - Test file operations");
             Serial.println("  sdstress- Run SD card stress test");
             Serial.println("  sdspeed - Optimize SD card speed");
+            Serial.println("  sdtree  - Check SD card file tree");
+            Serial.println("  sdformat- Format SD card as FAT32");
             Serial.println("  files   - List files on SD card");
             Serial.println("  deletefile <path> - Delete file from SD card");
             Serial.println("  dlstats - Show download statistics");
@@ -322,6 +326,14 @@ void loop()
         else if (command == "sdspeed")
         {
             fileManager.optimizeSDCardSpeed();
+        }
+        else if (command == "sdtree")
+        {
+            fileManager.printFileTree();
+        }
+        else if (command == "sdformat")
+        {
+            fileManager.formatSDCard();
         }
         else if (command == "files")
         {

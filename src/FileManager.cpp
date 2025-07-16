@@ -1788,3 +1788,85 @@ void FileManager::optimizeSDCardSpeed() {
     
     Serial.println("=== Speed Optimization Complete ===\n");
 }
+
+void FileManager::printFileTree() {
+    Serial.println("=== SD Card File Tree ===");
+
+    std::function<void(const String&, int)> printTree = [&](const String& dir, int depth) {
+        File dirFile = SD.open(dir);
+        if (!dirFile || !dirFile.isDirectory()) {
+            if (dirFile) dirFile.close();
+            return;
+        }
+
+        while (true) {
+            File entry = dirFile.openNextFile();
+            if (!entry) break;
+
+            for (int i = 0; i < depth; ++i) Serial.print("  ");
+            String name = entry.name();
+            if (entry.isDirectory()) {
+                Serial.printf("%s/\n", name.c_str());
+                String subDir = dir;
+                if (!subDir.endsWith("/")) subDir += "/";
+                subDir += name;
+                entry.close();
+                printTree(subDir, depth + 1);
+            } else {
+                Serial.println(name);
+                entry.close();
+            }
+        }
+        dirFile.close();
+    };
+
+    printTree("/", 0);
+    Serial.println("==========================");
+}
+
+void FileManager::formatSDCard() {
+    Serial.println("=== Formatting SD Card ===");
+    
+    if (!sdCardInitialized) {
+        Serial.println("SD card not initialized - run sddiag first");
+        return;
+    }
+    Serial.println("Formatting...");
+
+    // Remove all files and directories recursively
+    std::function<void(const String&)> removeAll = [&](const String& dir) {
+        File dirFile = SD.open(dir);
+        if (!dirFile) return;
+        File entry = dirFile.openNextFile();
+        while (entry) {
+            String entryName = entry.name();
+            if (entry.isDirectory()) {
+                entry.close();
+                String subDir = dir;
+                if (!subDir.endsWith("/")) subDir += "/";
+                subDir += entryName;
+                removeAll(subDir);
+                SD.rmdir(subDir);
+            } else {
+                entry.close();
+                String filePath = dir;
+                if (!filePath.endsWith("/")) filePath += "/";
+                filePath += entryName;
+                SD.remove(filePath);
+            }
+            entry = dirFile.openNextFile();
+        }
+        dirFile.close();
+    };
+
+    removeAll("/");
+
+    // Optionally recreate standard directories
+    createDirectory("/audio");
+    createDirectory("/temp");
+    createDirectory("/logs");
+    createDirectory("/images");
+
+    Serial.println("Format complete. All files and directories removed.");
+}
+
