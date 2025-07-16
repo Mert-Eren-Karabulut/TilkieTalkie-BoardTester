@@ -60,6 +60,9 @@ private:
     NfcController(const NfcController &) = delete;
     void operator=(const NfcController &) = delete;
 
+    // A dedicated I2C interface for the NFC controller (uses Wire1)
+    TwoWire I2C_NFC;
+
     // PN532 instance
     Adafruit_PN532 nfc;
 

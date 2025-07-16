@@ -3,8 +3,10 @@
 // Debounce delay for the reed switch
 #define DEBOUNCE_DELAY 50
 
-// Constructor: Initialize nfc object using the correct I2C constructor from the working example
-NfcController::NfcController() : nfc(NFC_IRQ_PIN, NFC_RESET_PIN, &Wire),
+// Constructor: Initialize the TwoWire object for I2C bus 1 (Wire1)
+// and pass its address to the Adafruit_PN532 constructor.
+NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
+                                 nfc(NFC_IRQ_PIN, NFC_RESET_PIN, &I2C_NFC),
                                  nfcReady(false),
                                  reedActive(false),
                                  cardPresent(false),
@@ -12,6 +14,7 @@ NfcController::NfcController() : nfc(NFC_IRQ_PIN, NFC_RESET_PIN, &Wire),
                                  lastDebounceTime(0),
                                  lastReedState(false)
 {
+    // The afterNFCReadCallback and afterDetachNFCCallback are initialized to nullptr by default
 }
 
 bool NfcController::begin()
@@ -20,16 +23,17 @@ bool NfcController::begin()
     pinMode(REED_SWITCH_PIN, INPUT);
     lastReedState = digitalRead(REED_SWITCH_PIN);
 
-    // Initialize I2C with custom pins before initializing the NFC board
-    Wire.begin(NFC_SDA_PIN, NFC_SCL_PIN);
+    // Initialize our dedicated I2C bus with custom pins
+    I2C_NFC.begin(NFC_SDA_PIN, NFC_SCL_PIN);
     delay(100);
 
+    // Now, begin the NFC module communication on its own bus
     nfc.begin();
 
     uint32_t versiondata = nfc.getFirmwareVersion();
     if (!versiondata)
     {
-        Serial.println("ERROR: PN532 not found! Check wiring on SDA=22, SCL=21, RST=17.");
+        Serial.println("ERROR: PN532 not found on Wire1! Check wiring on SDA=22, SCL=21, RST=17.");
         nfcReady = false;
         return false;
     }
@@ -62,7 +66,8 @@ void NfcController::update()
 
 void NfcController::handleReedSwitch()
 {
-    bool currentReedState = digitalRead(REED_SWITCH_PIN);
+    // bool currentReedState = digitalRead(REED_SWITCH_PIN);
+    bool currentReedState = true;
 
     // Check if the state has changed
     if (currentReedState != lastReedState)
@@ -126,11 +131,11 @@ void NfcController::handleNFCReading()
         currentUID.toUpperCase();
 
         // Check if this is a new card in this session
-        if (currentUID != lastReadUID)
+        if (currentUID != lastReadUID || true)
         {
             Serial.println("Found new card!");
             lastReadUID = currentUID; // Update the last read UID
-            cardReadInSession = true; // Mark that a card has been read in this session
+            // cardReadInSession = true; // Mark that a card has been read in this session
 
             // Populate the data structure
             memcpy(dockedCardData.uid, uid, uidLength);

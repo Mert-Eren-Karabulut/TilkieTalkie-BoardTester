@@ -33,7 +33,7 @@ void afterNFCRead(const NFCData &nfcData)
 
     // Example: Play a sound and turn the LED green
     // audioController.play("/sounds/nfc_success.mp3");
-    ledController.simpleLed(0x00FF00, 255); // Green color
+    ledController.pulseRapid(0x00FF00, 3); // Green color
 
     Serial.println("==========================");
 }
@@ -47,7 +47,7 @@ void afterDetachNFC()
 
     // Example: Stop audio and turn the LED red
     audioController.stop();
-    ledController.simpleLed(0xFF0000, 255); // Red color
+    ledController.pulseRapid(0xFF0000, 3); // Red color
 
     Serial.println("==========================");
 }
@@ -64,7 +64,7 @@ void setup()
     Serial.println("Enabling peripheral power...");
     pinMode(17, OUTPUT);
     digitalWrite(17, HIGH); // Enable power to peripherals
-    delay(1000);             // Give peripherals time to power up
+    delay(1000);            // Give peripherals time to power up
     Serial.println("Peripheral power enabled on IO17");
 
     // Initialize configuration (this will also initialize NVS)
@@ -122,6 +122,9 @@ void setup()
 
     // Initialize other modules here
     // e.g., sensors, etc.
+
+    // rapid pulse LED to indicate system is ready
+    ledController.pulseRapid(0x00FF00, 3); // Rapid pulse green
 
     Serial.println("System initialization complete!");
     Serial.println("--- Terminal Commands ---");
@@ -200,6 +203,67 @@ void loop()
         if (command.length() == 0)
         {
             return;
+        }
+
+        // help command
+        if (command == "help")
+        {
+            Serial.println("--- Terminal Commands ---");
+            Serial.println("WiFi Commands:");
+            Serial.println("  qr      - Print QR code for provisioning");
+            Serial.println("  reset   - Reset WiFi provisioning");
+            Serial.println("  stats   - Show WiFi connection status");
+            Serial.println("  store   - Store current WiFi credentials");
+            Serial.println("System Commands:");
+            Serial.println("  restart - Restart the device");
+            Serial.println("  config  - Show all configuration");
+            Serial.println("  commit  - Force save configuration to flash");
+            Serial.println("  debug   - Show debug information");
+            Serial.println("  test    - Test NVS storage");
+            Serial.println("  factory - Factory reset (erase all data)");
+            Serial.println("Battery Commands:");
+            Serial.println("  battery - Show battery status");
+            Serial.println("  voltage - Show raw voltage reading");
+            Serial.println("File Manager Commands:");
+            Serial.println("  sdinfo  - Show SD card information");
+            Serial.println("  sdtest  - Test file operations");
+            Serial.println("  sdstress- Run SD card stress test");
+            Serial.println("  sdspeed - Optimize SD card speed");
+            Serial.println("  files   - List files on SD card");
+            Serial.println("  deletefile <path> - Delete file from SD card");
+            Serial.println("  dlstats - Show download statistics");
+            Serial.println("  dlqueue - Show download queue");
+            Serial.println("  required- Show required files");
+            Serial.println("  download <url> <path> - Download file from URL");
+            Serial.println("  addfile <path> <url> - Add required file");
+            Serial.println("  checkfiles - Check and download missing files");
+            Serial.println("  cleanup - Clean up temporary files");
+            Serial.println("Audio Commands:");
+            Serial.println("  play <path> - Play MP3 file");
+            Serial.println("  pause   - Pause current playback");
+            Serial.println("  resume  - Resume paused playback");
+            Serial.println("  stop    - Stop playback");
+            Serial.println("  volup   - Volume up");
+            Serial.println("  voldown - Volume down");
+            Serial.println("  volume  - Show current volume");
+            Serial.println("  track   - Show current track");
+            Serial.println("LED Commands:");
+            Serial.println("  ledon <hex> <intensity> - Turn LED on with hex color and intensity (0-255)");
+            Serial.println("  ledoff  - Turn LED off");
+            Serial.println("  pulse <hex> - Start pulsing LED with hex color");
+            Serial.println("  rapid <hex> <count> - Rapid pulse LED for count times");
+            Serial.println("NFC Commands:");
+            Serial.println("  nfcstatus - Show NFC controller status");
+            Serial.println("  nfcdata   - Show current NFC card data");
+            Serial.println("  nfcreed   - Show reed switch status");
+            Serial.println("  nfcdiag   - Run NFC diagnostics");
+            Serial.println("Power Commands:");
+            Serial.println("  power   - Show peripheral power status");
+            Serial.println("  poweron - Enable peripheral power (IO17)");
+            Serial.println("  poweroff- Disable peripheral power (IO17)");
+            Serial.println("Type any command for help\n");
+            Serial.flush();
+            return; // Skip further processing
         }
 
         // WiFi related commands
