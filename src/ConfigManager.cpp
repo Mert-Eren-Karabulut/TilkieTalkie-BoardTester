@@ -7,6 +7,7 @@ const char* ConfigManager::WIFI_SSID_KEY = "ssid";        // Shortened key
 const char* ConfigManager::WIFI_PASSWORD_KEY = "pass";     // Shortened key
 const char* ConfigManager::DEVICE_NAME_KEY = "device";     // Shortened key
 const char* ConfigManager::PROVISIONING_PIN_KEY = "pin";   // Shortened key
+const char* ConfigManager::JWT_TOKEN_KEY = "jwt";         // Shortened key
 
 ConfigManager::ConfigManager() {
     // Initialize NVS
@@ -165,6 +166,7 @@ void ConfigManager::printAllSettings() {
     Serial.println("WiFi Password: " + String(getWiFiPassword().length() > 0 ? "***" : "Not set"));
     Serial.println(String("Device Name: ") + getDeviceName());
     Serial.println(String("Provisioning PIN: ") + getProvisioningPin());
+    Serial.println("JWT Token: " + String(getJWTToken().length() > 0 ? "Set : " + String(getJWTToken()) : "Not set"));
     Serial.println("Config Valid: " + String(isValid() ? "Yes" : "No"));
     Serial.println("Free NVS Space: " + String(getFreeSpace()) + " bytes");
     
@@ -190,23 +192,13 @@ bool ConfigManager::isValid() {
 void ConfigManager::commit() {
     Serial.println("Committing configuration to flash...");
     
-    // Force commit by closing and reopening preferences
-    preferences.end();
-    delay(100);  // Give some time for flash operations
-    
-    bool success = preferences.begin(NAMESPACE, false);
-    if (success) {
+    // Simple commit without closing/reopening preferences
+    if (preferences.isKey(WIFI_SSID_KEY) || preferences.isKey(WIFI_PASSWORD_KEY) || 
+        preferences.isKey(DEVICE_NAME_KEY) || preferences.isKey(PROVISIONING_PIN_KEY) || 
+        preferences.isKey(JWT_TOKEN_KEY)) {
         Serial.println("SUCCESS: Configuration committed to flash");
     } else {
-        Serial.println("ERROR: Failed to reopen preferences after commit");
-        // Try to recover
-        nvs_flash_erase();
-        nvs_flash_init();
-        if (preferences.begin(NAMESPACE, false)) {
-            Serial.println("RECOVERED: NVS reset and reopened successfully");
-        } else {
-            Serial.println("FATAL: Unable to recover NVS");
-        }
+        Serial.println("WARNING: No configuration data to commit");
     }
 }
 
@@ -250,4 +242,13 @@ void ConfigManager::factoryReset() {
     Serial.println("Device will restart in 3 seconds...");
     delay(3000);
     ESP.restart();
+}
+
+String ConfigManager::getJWTToken() {
+    String token = preferences.getString(JWT_TOKEN_KEY, "");
+    return token;
+}
+
+void ConfigManager::setJWTToken(const String &token) {
+    preferences.putString(JWT_TOKEN_KEY, token);
 }

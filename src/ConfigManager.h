@@ -20,6 +20,7 @@ private:
     static const char *WIFI_PASSWORD_KEY;
     static const char *DEVICE_NAME_KEY;
     static const char *PROVISIONING_PIN_KEY;
+    static const char *JWT_TOKEN_KEY;
 
 public:
     ConfigManager();
@@ -41,6 +42,10 @@ public:
     void setDeviceName(const String &name);
     String getProvisioningPin();
     void setProvisioningPin(const String &pin);
+
+    // JWT Token management
+    String getJWTToken();
+    void setJWTToken(const String &token);
 
     // General methods
     void resetAll();

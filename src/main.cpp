@@ -7,18 +7,35 @@
 #include "AudioController.h"
 #include "LedController.h"
 #include "NfcController.h"
+#include "RequestManager.h"
+#include "ReverbClient.h"
 
 // Use the singleton instance from the header
 NfcController &nfcController = NfcController::getInstance();
 
 // Global instances
 ConfigManager &config = ConfigManager::getInstance();
+RequestManager &requestManager = RequestManager::getInstance("https://portal.tilkietalkie.com/api");
 WiFiProvisioningManager &wifiProv = WiFiProvisioningManager::getInstance();
 BatteryManager &battery = BatteryManager::getInstance();
 FileManager &fileManager = FileManager::getInstance();
 AudioController &audioController = AudioController::getInstance();
 LedController ledController;
-// NfcController is already instantiated above
+ReverbClient &reverb = ReverbClient::getInstance(); // Create an alias for easier access
+
+// +++ Reverb WebSocket Callback Function +++
+void handleChatMessage(const String &message)
+{
+    Serial.printf("\n[REVERB] Message Received: %s\n", message.c_str());
+
+    // Example action: Pulse the LED blue when a message comes in
+    ledController.pulseRapid(0x0000FF, 2); // Blue color
+
+    // You can add more complex logic here, e.g., parsing the message
+    // if (message == "play_sound") {
+    //   audioController.play("/sounds/notification.mp3");
+    // }
+}
 
 // +++ NFC Callback Functions +++
 
@@ -75,12 +92,17 @@ void setup()
     Serial.println("Initializing WiFi...");
     wifiProv.begin();
 
+    // Initialize request manager
+    if (!requestManager.begin())
+    {
+        Serial.println("WARNING: Request Manager initialization failed!");
+        Serial.println("API functionality may be limited.");
+    }
+
     // Initialize battery management
-    Serial.println("Initializing Battery Management...");
     battery.begin();
 
     // Initialize file manager
-    Serial.println("Initializing File Manager...");
     if (!fileManager.begin())
     {
         Serial.println("WARNING: File Manager initialization failed!");
@@ -88,7 +110,6 @@ void setup()
     }
 
     // Initialize audio controller
-    Serial.println("Initializing Audio Controller...");
     if (!audioController.begin())
     {
         Serial.println("WARNING: Audio Controller initialization failed!");
@@ -118,6 +139,44 @@ void setup()
         Serial.println("NFC functionality will not be available.");
         // Handle failure, maybe by pulsing an error color
         ledController.pulseLed(0xFF0000); // Pulse red for error
+    }
+
+    // --- NEW: Initialize Reverb Client ---
+    Serial.println("Initializing Reverb WebSocket Client...");
+
+    // Wait for WiFi to connect before starting Reverb client
+    unsigned long wifi_timeout = millis() + 10000; // 10 second timeout
+    while (!WiFi.isConnected() && millis() < wifi_timeout)
+    {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.isConnected())
+    {
+        Serial.println("WiFi is connected. Starting Reverb client.");
+
+        // Use your production credentials from your Laravel .env file
+        constexpr char HOST[] = "portal.tilkietalkie.com";
+        constexpr uint16_t PORT = 443;
+        constexpr char APP_KEY[] = "erko2001"; // Your REVERB_APP_KEY
+
+        const String token = config.getJWTToken();
+
+        // Generate a unique device ID from the ESP32's MAC address
+        uint64_t chipid = ESP.getEfuseMac();
+        char deviceId[14];
+        snprintf(deviceId, sizeof(deviceId), "%llu", chipid);
+
+        reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId);
+
+        // Register the callback function to handle incoming messages
+        reverb.onChatMessage(handleChatMessage);
+    }
+    else
+    {
+        Serial.println("⚠️ WiFi connection timed out. Reverb client not started.");
     }
 
     // Initialize other modules here
@@ -182,12 +241,16 @@ void setup()
     Serial.println("  power   - Show peripheral power status");
     Serial.println("  poweron - Enable peripheral power (IO17)");
     Serial.println("  poweroff- Disable peripheral power (IO17)");
+    Serial.println("Reverb Commands:");
+    Serial.println("  send <message> - Send message to Reverb API for broadcast");
+    Serial.println("  wsstatus - Show WebSocket connection status");
     Serial.println("Type any command for help\n");
     audioController.play("/sounds/12.mp3"); // Play startup sound
 }
 
 void loop()
 {
+    reverb.update();
     // Update LED controller (handles pulse and pulseRapid animations)
     ledController.update();
 
@@ -265,9 +328,34 @@ void loop()
             Serial.println("  power   - Show peripheral power status");
             Serial.println("  poweron - Enable peripheral power (IO17)");
             Serial.println("  poweroff- Disable peripheral power (IO17)");
+            Serial.println("Reverb Commands:");
+            Serial.println("  send <message> - Send message to Reverb API for broadcast");
+            Serial.println("  wsstatus - Show WebSocket connection status");
             Serial.println("Type any command for help\n");
             Serial.flush();
             return; // Skip further processing
+        }
+        // WebSocket commands
+        if (command.startsWith("send "))
+        {
+            String message = command.substring(5); // Get the text after "send "
+            message.trim();
+            if (message.length() > 0)
+            {
+                Serial.printf("Sending message: '%s'\n", message.c_str());
+                if (reverb.sendMessage(message))
+                {
+                    Serial.println("Message sent to API for broadcast.");
+                }
+                else
+                {
+                    Serial.println("Failed to send message.");
+                }
+            }
+            else
+            {
+                Serial.println("Usage: send <your message>");
+            }
         }
 
         // WiFi related commands
