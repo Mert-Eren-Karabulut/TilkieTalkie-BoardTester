@@ -31,18 +31,32 @@ public:
       return;
     }
 
+    // Check available memory before starting
+    size_t freeHeap = ESP.getFreeHeap();
+    Serial.printf("Free heap before ReverbClient begin: %d bytes\n", freeHeap);
+    
+    if (freeHeap < 50000) {  // Require at least 50KB of free memory
+      Serial.println(F("⚠️ Insufficient memory for WebSocket connection! Try disabling BLE first."));
+      return;
+    }
+
     _host      = host;
     _port      = port;
     _appKey    = appKey;
     _authToken = authToken;
     _deviceId  = deviceId;
 
-    // Initialize the WebSocketsClient pointer
-    _ws = new WebSocketsClient();
+    // Initialize the WebSocketsClient pointer only if we have enough memory
+    if (_ws == nullptr) {
+      _ws = new WebSocketsClient();
+    }
 
     instance = this;
     _ws->onEvent(webSocketEvent);
     _ws->setReconnectInterval(5000);
+    
+    // Add these settings for better connection stability
+    _ws->enableHeartbeat(15000, 3000, 2); // ping interval, pong timeout, disconnect after failures
 
     String path = String("/app/") + _appKey + "?protocol=7&client=esp32-client&version=1.0";
 
@@ -51,10 +65,47 @@ public:
     _ws->beginSSL(_host.c_str(), _port, path.c_str());
     
     Serial.println(F("🔌 ReverbClient: connecting to WebSocket server..."));
+    Serial.printf("Free heap after ReverbClient begin: %d bytes\n", ESP.getFreeHeap());
   }
 
   void update() {
-    _ws->loop();
+    if (!WiFi.isConnected()) {
+      // Don't update WebSocket if WiFi is not connected to prevent crashes
+      return;
+    }
+    
+    if (_ws) {
+      _ws->loop();
+      
+      // Check if we should attempt reconnection
+      if (!_isConnected && WiFi.isConnected() && !_host.isEmpty() && !_authToken.isEmpty()) {
+        // Let the WebSocketsClient handle reconnection automatically
+        // The library will reconnect based on setReconnectInterval()
+      }
+    }
+  }
+
+  bool isConnected() {
+    return WiFi.isConnected() && _isConnected;
+  }
+
+  void disconnect() {
+    if (_ws) {
+      _ws->disconnect();
+      _isConnected = false;
+      Serial.println(F("ReverbClient disconnected"));
+    }
+  }
+
+  void cleanup() {
+    if (_ws) {
+      _ws->disconnect();
+      delete _ws;
+      _ws = nullptr;
+      _isConnected = false;
+      Serial.println(F("ReverbClient cleaned up - memory freed"));
+      Serial.printf("Free heap after cleanup: %d bytes\n", ESP.getFreeHeap());
+    }
   }
 
   bool sendMessage(const String& text) {
@@ -101,11 +152,11 @@ public:
 private:
   ReverbClient() = default;
 
-  WebSocketsClient* _ws;
-  // WiFiClientSecure* _wifiClientSecureForWS; // No longer needed
+  WebSocketsClient* _ws = nullptr;
   String _host, _appKey, _authToken, _deviceId, _socketId;
   uint16_t _port;
   std::function<void(const String&)> _chatCb;
+  bool _isConnected = false;
 
   static ReverbClient* instance;
 
@@ -117,10 +168,14 @@ private:
     switch (type) {
       case WStype_DISCONNECTED:
         Serial.println(F("⚠️ WebSocket Disconnected!"));
+        _isConnected = false;
+        _socketId = ""; // Clear socket ID so we can re-establish connection
         break;
 
       case WStype_CONNECTED:
         Serial.println(F("🔗 WebSocket Connected to server. Waiting for handshake..."));
+        _isConnected = true;
+        // Note: Don't call subscribeToPrivate() here - wait for pusher:connection_established
         break;
 
       case WStype_TEXT: {
@@ -141,8 +196,20 @@ private:
           deserializeJson(socketDoc, socketData);
           _socketId = socketDoc["socket_id"].as<String>();
 
-          Serial.printf("🤝 Handshake complete. Socket ID: %s. Subscribing to presence channel...\n", _socketId.c_str());
-          subscribeToPresence();
+          Serial.printf("🤝 Handshake complete. Socket ID: %s. Subscribing to private channel...\n", _socketId.c_str());
+          subscribeToPrivate();
+        }
+        else if (strcmp(eventName, "pusher:ping") == 0) {
+          // Respond to ping with pong to keep connection alive
+          StaticJsonDocument<64> pongDoc;
+          pongDoc["event"] = "pusher:pong";
+          pongDoc["data"] = JsonObject();
+          
+          String pongMessage;
+          serializeJson(pongDoc, pongMessage);
+          _ws->sendTXT(pongMessage);
+          
+          Serial.println(F("🏓 Responded to ping with pong"));
         }
         else if (strcmp(eventName, "chat-message") == 0 && _chatCb) {
           const char* chatDataStr = doc["data"];
@@ -163,7 +230,7 @@ private:
     }
   }
 
-  bool subscribeToPresence() {
+  bool subscribeToPrivate() {
     if (_socketId.length() == 0) {
       Serial.println(F("⚠️ Cannot subscribe, socket_id is missing."));
       return false;
@@ -179,18 +246,19 @@ private:
     if (http.begin(insecureClient, url)) {
       http.addHeader("Content-Type", "application/json");
       http.addHeader("Authorization", "Bearer " + _authToken);
+      http.addHeader("Accept", "application/json");
       http.addHeader("X-Client-Source", "esp32");
       
       StaticJsonDocument<128> authPayloadDoc;
       authPayloadDoc["socket_id"] = _socketId;
-      authPayloadDoc["channel_name"] = "presence-device." + _deviceId;
+      authPayloadDoc["channel_name"] = "device." + _deviceId;
 
       String authPayload;
       serializeJson(authPayloadDoc, authPayload);
 
       int httpCode = http.POST(authPayload);
       if (httpCode != 200) {
-        Serial.printf("⚠️ Presence channel auth failed! HTTP Code: %d\n", httpCode);
+        Serial.printf("⚠️ Private channel auth failed! HTTP Code: %d\n", httpCode);
         if(httpCode > 0) {
           String response = http.getString();
           Serial.println("Response: " + response);
@@ -211,14 +279,14 @@ private:
       subMsgDoc["event"] = "pusher:subscribe";
       JsonObject data = subMsgDoc.createNestedObject("data");
       data["auth"] = authRespDoc["auth"].as<String>();
-      data["channel"] = "presence-device." + _deviceId;
+      data["channel"] = "device." + _deviceId;
       data["channel_data"] = authRespDoc["channel_data"];
 
       String subFrame;
       serializeJson(subMsgDoc, subFrame);
       _ws->sendTXT(subFrame);
 
-      Serial.println("✅ Successfully subscribed to presence-device." + _deviceId);
+      Serial.println("✅ Successfully subscribed to device." + _deviceId);
       return true;
     } else {
       Serial.println(F("⚠️ Auth HTTP client connection failed!"));

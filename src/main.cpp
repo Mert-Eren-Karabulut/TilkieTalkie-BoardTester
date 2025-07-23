@@ -165,11 +165,9 @@ void setup()
         const String token = config.getJWTToken();
 
         // Generate a unique device ID from the ESP32's MAC address
-        uint64_t chipid = ESP.getEfuseMac();
-        char deviceId[14];
-        snprintf(deviceId, sizeof(deviceId), "%llu", chipid);
+        String deviceId = String(ESP.getEfuseMac());
 
-        reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId);
+        reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId.c_str());
 
         // Register the callback function to handle incoming messages
         reverb.onChatMessage(handleChatMessage);
@@ -192,6 +190,7 @@ void setup()
     Serial.println("  reset   - Reset WiFi provisioning");
     Serial.println("  stats   - Show WiFi connection status");
     Serial.println("  store   - Store current WiFi credentials");
+    Serial.println("Note: BLE is automatically managed based on WiFi state");
     Serial.println("System Commands:");
     Serial.println("  restart - Restart the device");
     Serial.println("  config  - Show all configuration");
@@ -244,13 +243,18 @@ void setup()
     Serial.println("Reverb Commands:");
     Serial.println("  send <message> - Send message to Reverb API for broadcast");
     Serial.println("  wsstatus - Show WebSocket connection status");
+    Serial.println("  testauth - Test stored JWT token authorization with server");
     Serial.println("Type any command for help\n");
-    audioController.play("/sounds/12.mp3"); // Play startup sound
+    // audioController.play("/sounds/12.mp3"); // Play startup sound
 }
 
 void loop()
 {
-    reverb.update();
+    // Update Reverb client only if WiFi is connected
+    if (WiFi.isConnected()) {
+        reverb.update();
+    }
+    
     // Update LED controller (handles pulse and pulseRapid animations)
     ledController.update();
 
@@ -279,6 +283,12 @@ void loop()
             Serial.println("  reset   - Reset WiFi provisioning");
             Serial.println("  stats   - Show WiFi connection status");
             Serial.println("  store   - Store current WiFi credentials");
+            Serial.println("Note: BLE is automatically managed by ESP32 provisioning library");
+            Serial.println("Reverb Commands:");
+            Serial.println("  reverbstatus - Show Reverb connection status");
+            Serial.println("  reverbclean  - Clean up Reverb client to free memory");
+            Serial.println("  reverbstart  - Start Reverb client (needs WiFi)");
+            Serial.println("  testauth     - Test stored JWT token authorization with server");
             Serial.println("System Commands:");
             Serial.println("  restart - Restart the device");
             Serial.println("  config  - Show all configuration");
@@ -331,6 +341,7 @@ void loop()
             Serial.println("Reverb Commands:");
             Serial.println("  send <message> - Send message to Reverb API for broadcast");
             Serial.println("  wsstatus - Show WebSocket connection status");
+            Serial.println("  testauth - Test stored JWT token authorization with server");
             Serial.println("Type any command for help\n");
             Serial.flush();
             return; // Skip further processing
@@ -368,6 +379,91 @@ void loop()
             Serial.println("\nManually storing current WiFi credentials...");
             config.storeCurrentWiFiCredentials();
             config.commit();
+        }
+        // Reverb related commands
+        else if (command == "reverbstatus")
+        {
+            Serial.print("Reverb Status: ");
+            Serial.println(reverb.isConnected() ? "Connected" : "Disconnected");
+            Serial.print("WiFi Status: ");
+            Serial.println(WiFi.isConnected() ? "Connected" : "Disconnected");
+            Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+        }
+        else if (command == "reverbclean")
+        {
+            Serial.println("Cleaning up Reverb client...");
+            reverb.cleanup();
+        }
+        else if (command == "reverbstart")
+        {
+            if (WiFi.isConnected()) {
+                Serial.println("Starting Reverb client...");
+                
+                constexpr char HOST[] = "portal.tilkietalkie.com";
+                constexpr uint16_t PORT = 443;
+                constexpr char APP_KEY[] = "erko2001";
+                
+                const String token = config.getJWTToken();
+                uint64_t chipid = ESP.getEfuseMac();
+                char deviceId[14];
+                snprintf(deviceId, sizeof(deviceId), "%llu", chipid);
+                
+                reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId);
+                reverb.onChatMessage(handleChatMessage);
+            } else {
+                Serial.println("Cannot start Reverb - WiFi not connected");
+            }
+        }
+        else if (command == "testauth")
+        {
+            Serial.println("\n--- Testing Authorization ---");
+            String token = config.getJWTToken();
+            
+            if (token.length() == 0) {
+                Serial.println("❌ No JWT token stored in configuration");
+                return;
+            }
+            
+            if (!WiFi.isConnected()) {
+                Serial.println("❌ WiFi not connected - cannot test authorization");
+                return;
+            }
+            
+            Serial.println("🔑 JWT Token found, testing with server...");
+            Serial.printf("Token length: %d characters\n", token.length());
+            
+            // Use the same method as ReverbClient for consistency
+            WiFiClientSecure client;
+            client.setInsecure(); // For testing only
+            
+            HTTPClient http;
+            String url = "https://portal.tilkietalkie.com/api/user"; // Simple endpoint to test auth
+            
+            if (http.begin(client, url)) {
+                http.addHeader("Authorization", "Bearer " + token);
+                http.addHeader("Accept", "application/json");
+                
+                Serial.println("📡 Sending auth test request...");
+                int httpCode = http.GET();
+                
+                if (httpCode == 200) {
+                    Serial.println("✅ Authorization successful! Token is valid.");
+                    String response = http.getString();
+                    Serial.println("Server response: " + response);
+                } else if (httpCode == 401) {
+                    Serial.println("❌ Authorization failed! Token is invalid or expired.");
+                } else if (httpCode > 0) {
+                    Serial.printf("⚠️ Unexpected response code: %d\n", httpCode);
+                    String response = http.getString();
+                    Serial.println("Response: " + response);
+                } else {
+                    Serial.printf("❌ HTTP request failed with error: %d\n", httpCode);
+                }
+                
+                http.end();
+            } else {
+                Serial.println("❌ Failed to connect to server");
+            }
         }
         else if (command == "test")
         {
@@ -866,6 +962,11 @@ void loop()
             Serial.println("WiFi mode: " + String(WiFi.getMode()));
             Serial.println("WiFi status: " + String(WiFi.status()));
             Serial.println("Battery: " + battery.getBatteryStatusString());
+            Serial.println("WiFi connected: " + String(WiFi.isConnected()));
+            Serial.println("Has WiFi credentials: " + String(config.hasWiFiCredentials()));
+            Serial.println("WiFi SSID length: " + String(config.getWiFiSSID().length()));
+            Serial.println("WiFi Password length: " + String(config.getWiFiPassword().length()));
+            Serial.println("Note: BLE is automatically managed by ESP32 provisioning library");
             config.printAllSettings();
         }
         else
@@ -882,4 +983,7 @@ void loop()
 
     // Update audio controller
     audioController.update();
+    
+    // Handle WiFi background reconnection (only when credentials exist but not connected)
+    wifiProv.handleBackgroundReconnection();
 }

@@ -45,10 +45,16 @@ ConfigManager& ConfigManager::getInstance() {
 }
 
 String ConfigManager::getWiFiSSID() {
+    if (!preferences.isKey(WIFI_SSID_KEY)) {
+        return "";
+    }
     return preferences.getString(WIFI_SSID_KEY, "");
 }
 
 String ConfigManager::getWiFiPassword() {
+    if (!preferences.isKey(WIFI_PASSWORD_KEY)) {
+        return "";
+    }
     return preferences.getString(WIFI_PASSWORD_KEY, "");
 }
 
@@ -95,7 +101,16 @@ void ConfigManager::setWiFiCredentials(const String& ssid, const String& passwor
 }
 
 bool ConfigManager::hasWiFiCredentials() {
-    return getWiFiSSID().length() > 0 && getWiFiPassword().length() > 0;
+    // Check if keys exist before trying to read them to avoid NVS errors
+    if (!preferences.isKey(WIFI_SSID_KEY) || !preferences.isKey(WIFI_PASSWORD_KEY)) {
+        return false;
+    }
+    
+    // Only read if keys exist
+    String ssid = preferences.getString(WIFI_SSID_KEY, "");
+    String password = preferences.getString(WIFI_PASSWORD_KEY, "");
+    
+    return ssid.length() > 0 && password.length() > 0;
 }
 
 void ConfigManager::clearWiFiCredentials() {

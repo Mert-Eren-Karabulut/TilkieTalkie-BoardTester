@@ -58,7 +58,7 @@ void NfcController::update()
         return;
     }
     handleReedSwitch();
-    if (reedActive)
+    if (!reedActive)
     {
         handleNFCReading();
     }
