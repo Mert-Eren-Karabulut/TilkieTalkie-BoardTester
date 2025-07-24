@@ -306,14 +306,12 @@ private:
         case AudioController::PLAYING:
             audioObj["current_track_status"] = "playing";
             audioObj["current_track_id"] = audio.getCurrentTrack();
-            // Note: A method like `getCurrentTrackSeconds()` is required in AudioController
-            // audioObj["current_track_seconds"] = audio.getCurrentTrackSeconds();
+            audioObj["current_track_seconds"] = audio.getCurrentTrackSeconds();
             break;
         case AudioController::PAUSED:
             audioObj["current_track_status"] = "paused";
             audioObj["current_track_id"] = audio.getCurrentTrack();
-            // Note: A method like `getCurrentTrackSeconds()` is required in AudioController
-            // audioObj["current_track_seconds"] = audio.getCurrentTrackSeconds();
+            audioObj["current_track_seconds"] = audio.getCurrentTrackSeconds();
             break;
         case AudioController::STOPPED:
             audioObj["current_track_status"] = "stopped";

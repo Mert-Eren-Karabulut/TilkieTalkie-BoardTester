@@ -66,6 +66,9 @@ AudioController::AudioController() :
     initialized(false),
     pausedPosition(0),
     hasPausedPosition(false),
+    trackStartTime(0),
+    accumulatedPlayTime(0.0f),
+    pauseStartTime(0),
     fileManager(FileManager::getInstance()) {
 }
 
@@ -237,6 +240,11 @@ bool AudioController::play(const String& filePath) {
     currentState = PLAYING;
     currentTrackPath = filePath;
     
+    // Reset timing for new track
+    trackStartTime = millis();
+    accumulatedPlayTime = 0.0f;
+    pauseStartTime = 0;
+    
     Serial.printf("AudioController: Playing: %s\n", filePath.c_str());
     return true;
 }
@@ -252,6 +260,12 @@ bool AudioController::pause() {
             pausedPosition = audioFile->getPos();
             hasPausedPosition = true;
             Serial.printf("AudioController: Saved position %u for pause\n", pausedPosition);
+        }
+        
+        // Accumulate play time before pausing
+        if (trackStartTime > 0) {
+            accumulatedPlayTime += (millis() - trackStartTime) / 1000.0f;
+            pauseStartTime = millis();
         }
         
         // Stop the audio playback
@@ -313,6 +327,10 @@ bool AudioController::resume() {
         }
         
         currentState = PLAYING;
+        
+        // Restart timing for resumed playback
+        trackStartTime = millis();
+        
         Serial.println("AudioController: Resumed");
         return true;
     }
@@ -337,6 +355,11 @@ bool AudioController::stop() {
     // Clear paused position
     pausedPosition = 0;
     hasPausedPosition = false;
+    
+    // Reset timing variables
+    trackStartTime = 0;
+    accumulatedPlayTime = 0.0f;
+    pauseStartTime = 0;
     
     Serial.println("AudioController: Stopped");
     return true;
@@ -635,6 +658,21 @@ bool AudioController::initializeI2S() {
 void AudioController::deinitializeI2S() {
     i2s_driver_uninstall(I2S_NUM_0);
     Serial.println("AudioController: I2S deinitialized");
+}
+
+float AudioController::getCurrentTrackSeconds() const {
+    if (!initialized || currentState == STOPPED || currentTrackPath.isEmpty()) {
+        return 0.0f;
+    }
+    
+    float totalTime = accumulatedPlayTime;
+    
+    // If currently playing, add the time since trackStartTime
+    if (currentState == PLAYING && trackStartTime > 0) {
+        totalTime += (millis() - trackStartTime) / 1000.0f;
+    }
+    
+    return totalTime;
 }
 
 bool AudioController::isValidAudioFile(const String& filePath) {

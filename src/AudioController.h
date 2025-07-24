@@ -66,6 +66,9 @@ public:
     bool isPlaying() const { return currentState == PLAYING; }
     bool isPaused() const { return currentState == PAUSED; }
     bool isStopped() const { return currentState == STOPPED; }
+    
+    // Track timing
+    float getCurrentTrackSeconds() const;
 
     // Update function (call in main loop)
     void update();
@@ -97,6 +100,11 @@ private:
     // Pause/resume position tracking
     uint32_t pausedPosition;
     bool hasPausedPosition;
+    
+    // Track timing variables
+    unsigned long trackStartTime;    // millis() when track started playing
+    float accumulatedPlayTime;       // accumulated play time in seconds
+    unsigned long pauseStartTime;    // millis() when track was paused
 
     // ES8388 control
     bool initializeES8388();
