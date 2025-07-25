@@ -98,6 +98,7 @@ private:
     
     // File operations
     bool createDirectoryStructure(const String& path);
+    bool createDirectoryRecursive(const String& path);
     String getDirectoryFromPath(const String& path);
     size_t getFileSize(const String& path);
     
@@ -142,6 +143,16 @@ private:
     void checkRequiredFiles();
     std::vector<String> getMissingFiles();
     void downloadMissingFiles();
+    
+    // Bulk deletion methods
+    void clearAllRequiredFiles(); // Clear all required files from NVS and storage
+    bool deleteFigureFiles(const String& figureId); // Delete all files for a specific figure
+    
+    // Development/debugging methods
+    void forceProcessDownloads(); // Force download processing regardless of charging status
+    
+    // Development/testing methods
+    void forceDownloads(); // Force process download queue regardless of charging status
     
     // Status and info methods
     bool isSDCardAvailable() const { return sdCardInitialized; }

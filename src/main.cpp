@@ -39,6 +39,45 @@ void handleChatMessage(const String &message)
 
 // +++ NFC Callback Functions +++
 
+// Callback function for when figure download is complete
+void onFigureDownloadComplete(const String &uid, const String &figureName, bool success, const String &error)
+{
+    Serial.println("=== Figure Download Complete ===");
+    Serial.print("UID: ");
+    Serial.println(uid);
+    Serial.print("Figure: ");
+    Serial.println(figureName);
+    Serial.print("Success: ");
+    Serial.println(success ? "YES" : "NO");
+    
+    if (success)
+    {
+        Serial.println("All tracks are ready! Starting automatic playback...");
+        
+        // Pulse LED green to indicate success
+        ledController.pulseRapid(0x00FF00, 5); // Green color, 5 rapid pulses
+        
+        // TODO: Implement automatic track playback here
+        // Example implementation:
+        // String firstTrackPath = "/figures/" + figureId + "/1/1.mp3"; // Adjust path as needed
+        // audioController.play(firstTrackPath);
+        
+        Serial.println("Figure is ready for playback!");
+    }
+    else
+    {
+        Serial.print("Download failed: ");
+        Serial.println(error);
+        
+        // Pulse LED red to indicate failure
+        ledController.pulseRapid(0xFF0000, 5); // Red color, 5 rapid pulses
+        
+        Serial.println("Some tracks may be missing. Check download status.");
+    }
+    
+    Serial.println("================================");
+}
+
 // This function will be called ONLY ONCE when a new card is detected
 void afterNFCRead(const NFCData &nfcData)
 {
@@ -51,6 +90,9 @@ void afterNFCRead(const NFCData &nfcData)
     // Example: Play a sound and turn the LED green
     // audioController.play("/sounds/nfc_success.mp3");
     ledController.pulseRapid(0x00FF00, 3); // Green color
+    //we need to check if the figure tracks are downloaded and they exist
+    //we need to send get request with bearer token to the url :https://portal.tilkietalkie.com/api/units/{nfc_uid}
+    requestManager.getCheckFigureTracks(nfcData.uidString);
 
     Serial.println("==========================");
 }
@@ -98,6 +140,9 @@ void setup()
         Serial.println("WARNING: Request Manager initialization failed!");
         Serial.println("API functionality may be limited.");
     }
+    
+    // Set up figure download complete callback
+    requestManager.setFigureDownloadCompleteCallback(onFigureDownloadComplete);
 
     // Initialize battery management
     battery.begin();
@@ -201,6 +246,7 @@ void setup()
     Serial.println("Battery Commands:");
     Serial.println("  battery - Show battery status");
     Serial.println("  voltage - Show raw voltage reading");
+    Serial.println("  charging- Show charging status for downloads");
     Serial.println("File Manager Commands:");
     Serial.println("  sdinfo  - Show SD card information");
     Serial.println("  sdtest  - Test file operations");
@@ -210,12 +256,15 @@ void setup()
     Serial.println("  sdformat- Format SD card as FAT32");
     Serial.println("  files   - List files on SD card");
     Serial.println("  deletefile <path> - Delete file from SD card");
+    Serial.println("  delete  - Delete ALL required files from NVS and storage");
+    Serial.println("  deletefig <uid> - Delete all files for a specific figure");
     Serial.println("  dlstats - Show download statistics");
     Serial.println("  dlqueue - Show download queue");
     Serial.println("  required- Show required files");
     Serial.println("  download <url> <path> - Download file from URL");
     Serial.println("  addfile <path> <url> - Add required file");
     Serial.println("  checkfiles - Check and download missing files");
+    Serial.println("  forcedownload - Force download processing (ignore charging)");
     Serial.println("  cleanup - Clean up temporary files");
     Serial.println("Audio Commands:");
     Serial.println("  play <path> - Play MP3 file");
@@ -250,17 +299,7 @@ void setup()
 
 void loop()
 {
-    // Update Reverb client only if WiFi is connected
-    if (WiFi.isConnected()) {
-        reverb.update();
-    }
     
-    // Update LED controller (handles pulse and pulseRapid animations)
-    ledController.update();
-
-    // Update NFC controller (handles reed switch monitoring and NFC reading)
-    nfcController.update();
-
     // Handle serial commands
     if (Serial.available())
     {
@@ -299,6 +338,7 @@ void loop()
             Serial.println("Battery Commands:");
             Serial.println("  battery - Show battery status");
             Serial.println("  voltage - Show raw voltage reading");
+            Serial.println("  charging- Show charging status for downloads");
             Serial.println("File Manager Commands:");
             Serial.println("  sdinfo  - Show SD card information");
             Serial.println("  sdtest  - Test file operations");
@@ -308,12 +348,15 @@ void loop()
             Serial.println("  sdformat- Format SD card as FAT32");
             Serial.println("  files   - List files on SD card");
             Serial.println("  deletefile <path> - Delete file from SD card");
+            Serial.println("  delete  - Delete ALL required files from NVS and storage");
+            Serial.println("  deletefig <uid> - Delete all files for a specific figure");
             Serial.println("  dlstats - Show download statistics");
             Serial.println("  dlqueue - Show download queue");
             Serial.println("  required- Show required files");
             Serial.println("  download <url> <path> - Download file from URL");
             Serial.println("  addfile <path> <url> - Add required file");
             Serial.println("  checkfiles - Check and download missing files");
+            Serial.println("  forcedownload - Force download processing (ignore charging)");
             Serial.println("  cleanup - Clean up temporary files");
             Serial.println("Audio Commands:");
             Serial.println("  play <path> - Play MP3 file");
@@ -608,6 +651,12 @@ void loop()
                 Serial.println("All required files are present");
             }
         }
+        else if (command == "forcedownload")
+        {
+            Serial.println("Forcing download processing (ignoring charging requirement)...");
+            Serial.println("Note: This will attempt to download one file at a time for testing purposes.");
+            fileManager.forceProcessDownloads();
+        }
         else if (command == "cleanup")
         {
             Serial.println("Cleaning up temporary files...");
@@ -647,6 +696,148 @@ void loop()
                 Serial.println("Usage: deletefile <file_path>");
                 Serial.println("Example: deletefile /images/image.webp");
                 Serial.println("Note: This will also remove the file from required list to prevent re-download");
+            }
+        }
+        // Delete all required files command
+        else if (command == "delete")
+        {
+            Serial.println("⚠️  WARNING: This will delete ALL required files from NVS and storage!");
+            Serial.println("Are you sure? Type 'yes' to confirm:");
+            
+            // Wait for confirmation
+            unsigned long confirmTimeout = millis() + 10000; // 10 second timeout
+            bool confirmed = false;
+            
+            while (millis() < confirmTimeout && !confirmed)
+            {
+                if (Serial.available())
+                {
+                    String confirmation = Serial.readStringUntil('\n');
+                    confirmation.trim();
+                    confirmation.toLowerCase();
+                    
+                    if (confirmation == "yes")
+                    {
+                        confirmed = true;
+                        Serial.println("Confirmation received. Deleting all required files...");
+                        fileManager.clearAllRequiredFiles();
+                        Serial.println("✅ All required files have been deleted from NVS and storage.");
+                    }
+                    else if (confirmation == "no" || confirmation.length() > 0)
+                    {
+                        Serial.println("❌ Operation cancelled.");
+                        break;
+                    }
+                }
+                delay(100);
+            }
+            
+            if (!confirmed && millis() >= confirmTimeout)
+            {
+                Serial.println("❌ Confirmation timeout. Operation cancelled.");
+            }
+        }
+        // Delete figure-specific files command
+        else if (command.startsWith("deletefig "))
+        {
+            // Parse deletefig command: deletefig <figure_uid>
+            int firstSpace = command.indexOf(' ');
+
+            if (firstSpace != -1)
+            {
+                String figureUid = command.substring(firstSpace + 1);
+                figureUid.trim(); // Remove any extra whitespace
+
+                if (figureUid.isEmpty())
+                {
+                    Serial.println("Usage: deletefig <figure_uid>");
+                    Serial.println("Example: deletefig c538b083-28c1-384b-ae6d-e58e1f38f1f7");
+                    Serial.println("Note: This will delete all files associated with the figure");
+                }
+                else
+                {
+                    Serial.printf("🔍 Looking up figure ID for UID: %s\n", figureUid.c_str());
+                    
+                    // Try to get figure ID from UID mapping
+                    String figureId = requestManager.getFigureIdFromUid(figureUid);
+                    
+                    if (figureId.length() > 0)
+                    {
+                        Serial.printf("Found figure ID: %s for UID: %s\n", figureId.c_str(), figureUid.c_str());
+                        Serial.printf("⚠️  WARNING: This will delete all files for figure (UID: %s, ID: %s)\n", figureUid.c_str(), figureId.c_str());
+                        Serial.println("Type 'yes' to confirm deletion, or 'no' to cancel:");
+                        
+                        // Wait for confirmation
+                        unsigned long confirmTimeout = millis() + 10000; // 10 second timeout
+                        bool confirmed = false;
+                        
+                        while (millis() < confirmTimeout && !confirmed)
+                        {
+                            if (Serial.available())
+                            {
+                                String confirmation = Serial.readStringUntil('\n');
+                                confirmation.trim();
+                                confirmation.toLowerCase();
+                                
+                                if (confirmation == "yes")
+                                {
+                                    confirmed = true;
+                                    Serial.printf("Deleting all files for figure ID: %s\n", figureId.c_str());
+                                    
+                                    if (fileManager.deleteFigureFiles(figureId))
+                                    {
+                                        Serial.printf("✅ Successfully deleted all files for figure (UID: %s, ID: %s)\n", figureUid.c_str(), figureId.c_str());
+                                    }
+                                    else
+                                    {
+                                        Serial.printf("❌ Failed to delete files for figure (UID: %s, ID: %s)\n", figureUid.c_str(), figureId.c_str());
+                                    }
+                                }
+                                else if (confirmation == "no" || confirmation.length() > 0)
+                                {
+                                    Serial.println("❌ Operation cancelled.");
+                                    break;
+                                }
+                            }
+                            delay(100);
+                        }
+                        
+                        if (!confirmed && millis() >= confirmTimeout)
+                        {
+                            Serial.println("❌ Confirmation timeout. Operation cancelled.");
+                        }
+                    }
+                    else
+                    {
+                        Serial.printf("❌ Figure ID not found for UID: %s\n", figureUid.c_str());
+                        Serial.println("This could mean:");
+                        Serial.println("1. The figure was never downloaded/tracked in this session");
+                        Serial.println("2. The UID is incorrect");
+                        Serial.println("3. You can manually delete by figure ID if you know it");
+                        
+                        // List available figure directories as a hint
+                        Serial.println("\nAvailable figure directories:");
+                        std::vector<String> figureDirectories = fileManager.listFiles("/figures");
+                        if (figureDirectories.empty())
+                        {
+                            Serial.println("  (No figure directories found)");
+                        }
+                        else
+                        {
+                            for (const String& figureDir : figureDirectories)
+                            {
+                                Serial.printf("  - Figure ID: %s\n", figureDir.c_str());
+                            }
+                            Serial.println("\nYou can use 'deletefig <figure_id>' if you know the correct figure ID.");
+                        }
+                    }
+                }
+            }
+            else
+            {
+                Serial.println("Usage: deletefig <figure_uid>");
+                Serial.println("Example: deletefig c538b083-28c1-384b-ae6d-e58e1f38f1f7");
+                Serial.println("Note: This will delete all files associated with the figure");
             }
         }
         // Audio commands
@@ -938,6 +1129,26 @@ void loop()
             Serial.println("Charging pin state: " + String(digitalRead(34)));
             Serial.println("------------------------------\n");
         }
+        else if (command == "charging")
+        {
+            Serial.println("\n--- Charging Status for Downloads ---");
+            bool chargingStatus = battery.getChargingStatus();
+            Serial.println("Charging status: " + String(chargingStatus ? "CHARGING" : "NOT CHARGING"));
+            Serial.println("Charging required for downloads: " + String(chargingStatus ? "Met" : "NOT MET"));
+            Serial.println("Download queue size: " + String(fileManager.getPendingDownloadsCount()));
+            Serial.println("Download in progress: " + String(fileManager.isDownloadInProgress() ? "Yes" : "No"));
+            Serial.println("SD Card initialized: " + String(fileManager.isSDCardAvailable() ? "Yes" : "No"));
+            Serial.println("WiFi connected: " + String(WiFi.isConnected() ? "Yes" : "No"));
+            
+            if (!chargingStatus) {
+                Serial.println("\n⚠️  ISSUE: Device is not charging!");
+                Serial.println("Downloads will not start until device is connected to power.");
+                Serial.println("Use 'forcedownload' command to bypass charging requirement for testing.");
+            }
+            
+            Serial.println("Note: Downloads only start when device is charging");
+            Serial.println("---------------------------------------\n");
+        }
         // System commands
         else if (command == "restart")
         {
@@ -986,4 +1197,16 @@ void loop()
     
     // Handle WiFi background reconnection (only when credentials exist but not connected)
     wifiProv.handleBackgroundReconnection();
+
+    // Update Reverb client only if WiFi is connected
+    if (WiFi.isConnected()) {
+        reverb.update();
+    }
+    
+    // Update LED controller (handles pulse and pulseRapid animations)
+    ledController.update();
+
+    // Update NFC controller (handles reed switch monitoring and NFC reading)
+    nfcController.update();
+
 }

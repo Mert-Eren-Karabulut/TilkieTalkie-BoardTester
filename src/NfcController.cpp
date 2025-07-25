@@ -12,7 +12,8 @@ NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
                                  cardPresent(false),
                                  cardReadInSession(false),
                                  lastDebounceTime(0),
-                                 lastReedState(false)
+                                 lastReedState(false),
+                                 lastNFCReadAttempt(0)
 {
     // The afterNFCReadCallback and afterDetachNFCCallback are initialized to nullptr by default
 }
@@ -58,7 +59,9 @@ void NfcController::update()
         return;
     }
     handleReedSwitch();
-    if (!reedActive)
+    
+    // Only attempt NFC reading when reed switch is active AND no card has been read yet
+    if (reedActive && !cardReadInSession)
     {
         handleNFCReading();
     }
@@ -66,7 +69,7 @@ void NfcController::update()
 
 void NfcController::handleReedSwitch()
 {
-    bool currentReedState = digitalRead(REED_SWITCH_PIN);
+    bool currentReedState = !digitalRead(REED_SWITCH_PIN);
 
     // Check if the state has changed
     if (currentReedState != lastReedState)
@@ -98,6 +101,7 @@ void NfcController::handleReedSwitch()
                     afterDetachNFCCallback();
                 }
                 cardPresent = false;            // Card is no longer considered present
+                cardReadInSession = false;      // Reset session flag
                 dockedCardData.isValid = false; // Invalidate the docked card data
             }
         }
@@ -108,11 +112,20 @@ void NfcController::handleReedSwitch()
 
 void NfcController::handleNFCReading()
 {
+    // Only attempt NFC reading at intervals to avoid blocking the main thread
+    unsigned long currentTime = millis();
+    if (currentTime - lastNFCReadAttempt < NFC_READ_INTERVAL)
+    {
+        return; // Too soon for another read attempt
+    }
+    
+    lastNFCReadAttempt = currentTime;
+
     uint8_t success;
     uint8_t uid[] = {0, 0, 0, 0, 0, 0, 0}; // Buffer to store the returned UID
     uint8_t uidLength;                     // Length of the UID (4 or 7 bytes)
 
-    // Wait for an ISO14443A type card
+    // Use a reasonable timeout - 50ms should be enough for most NFC operations
     success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50); // 50ms timeout
 
     if (success)
@@ -150,6 +163,7 @@ void NfcController::handleNFCReading()
             }
         }
     }
+    // Note: No need for card removal detection here since reed switch handles that
 }
 
 void NfcController::setAfterNFCReadCallback(std::function<void(const NFCData &)> cb)

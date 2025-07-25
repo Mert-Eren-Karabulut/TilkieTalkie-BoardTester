@@ -240,10 +240,18 @@ void FileManager::update() {
     }
     
     // Process download queue if conditions are met
-    if (!downloadInProgress && 
-        downloadQueue.size() > 0 && 
-        isChargingRequired()) {
-        processDownloadQueue();
+    if (!downloadInProgress && downloadQueue.size() > 0) {
+        if (isChargingRequired()) {
+            processDownloadQueue();
+        } else {
+            // Add periodic debug message for blocked downloads
+            static unsigned long lastChargingWarning = 0;
+            if (millis() - lastChargingWarning > 30000) { // Every 30 seconds
+                Serial.printf("FileManager: %d downloads pending but device is not charging. Connect power to start downloads.\n", 
+                             downloadQueue.size());
+                lastChargingWarning = millis();
+            }
+        }
     }
     
     // Check for missing required files periodically
@@ -937,12 +945,51 @@ bool FileManager::createDirectoryStructure(const String& path) {
         dirFile.close();
     }
     
-    // Create directory and verify creation
-    bool success = createDirectory(dir);
-    if (!success) {
-        Serial.printf("FileManager: Failed to create directory structure for: %s\n", path.c_str());
-        Serial.printf("FileManager: Attempted to create directory: %s\n", dir.c_str());
+    // Create directories recursively
+    return createDirectoryRecursive(dir);
+}
+
+bool FileManager::createDirectoryRecursive(const String& path) {
+    if (path.isEmpty() || path == "/") {
+        return true;
     }
+    
+    // Check if directory already exists
+    File dirFile = SD.open(path);
+    if (dirFile && dirFile.isDirectory()) {
+        dirFile.close();
+        return true;
+    }
+    if (dirFile) {
+        dirFile.close();
+    }
+    
+    // Find parent directory
+    int lastSlash = path.lastIndexOf('/');
+    if (lastSlash > 0) { // Don't include root directory
+        String parentDir = path.substring(0, lastSlash);
+        // Recursively create parent directory first
+        if (!createDirectoryRecursive(parentDir)) {
+            Serial.printf("FileManager: Failed to create parent directory: %s\n", parentDir.c_str());
+            return false;
+        }
+    }
+    
+    // Now create this directory
+    bool success = SD.mkdir(path);
+    if (success) {
+        Serial.printf("FileManager: Created directory: %s\n", path.c_str());
+    } else {
+        // Check if it exists now (might have been created by another process)
+        File dirFile = SD.open(path);
+        if (dirFile && dirFile.isDirectory()) {
+            dirFile.close();
+            Serial.printf("FileManager: Directory already exists: %s\n", path.c_str());
+            return true;
+        }
+        Serial.printf("FileManager: Failed to create directory: %s\n", path.c_str());
+    }
+    
     return success;
 }
 
@@ -1868,5 +1915,221 @@ void FileManager::formatSDCard() {
     createDirectory("/images");
 
     Serial.println("Format complete. All files and directories removed.");
+}
+
+// Bulk deletion methods implementation
+void FileManager::clearAllRequiredFiles() {
+    Serial.println("FileManager: Clearing all required files from NVS and storage...");
+    
+    int filesDeleted = 0;
+    int filesNotFound = 0;
+    
+    // Delete all files from storage
+    for (const auto& file : requiredFiles) {
+        if (fileExists(file.path)) {
+            if (deleteFile(file.path)) {
+                filesDeleted++;
+                Serial.printf("Deleted: %s\n", file.path.c_str());
+            } else {
+                Serial.printf("Failed to delete: %s\n", file.path.c_str());
+            }
+        } else {
+            filesNotFound++;
+        }
+    }
+    
+    // Clear required files list from memory and NVS
+    requiredFiles.clear();
+    saveRequiredFiles();
+    
+    // Also clear download queue
+    downloadQueue.clear();
+    saveDownloadQueue();
+    
+    Serial.printf("FileManager: Cleared all required files. Deleted %d files, %d were already missing.\n", 
+                 filesDeleted, filesNotFound);
+}
+
+bool FileManager::deleteFigureFiles(const String& figureId) {
+    Serial.printf("FileManager: Deleting all files for figure ID: %s\n", figureId.c_str());
+    
+    String figureDir = "/figures/" + figureId;
+    int filesDeleted = 0;
+    int requiredFilesRemoved = 0;
+    
+    // Remove files from required files list that belong to this figure
+    auto it = requiredFiles.begin();
+    while (it != requiredFiles.end()) {
+        if (it->path.startsWith(figureDir)) {
+            Serial.printf("Removing from required list: %s\n", it->path.c_str());
+            it = requiredFiles.erase(it);
+            requiredFilesRemoved++;
+        } else {
+            ++it;
+        }
+    }
+    
+    // Remove from download queue as well
+    auto queueIt = downloadQueue.begin();
+    while (queueIt != downloadQueue.end()) {
+        if (queueIt->localPath.startsWith(figureDir)) {
+            Serial.printf("Removing from download queue: %s\n", queueIt->localPath.c_str());
+            queueIt = downloadQueue.erase(queueIt);
+        } else {
+            ++queueIt;
+        }
+    }
+    
+    // Delete the entire figure directory from storage
+    if (fileExists(figureDir)) {
+        // List all files in the figure directory recursively and delete them
+        std::vector<String> allFiles = listFiles(figureDir);
+        for (const String& file : allFiles) {
+            String fullPath = figureDir + "/" + file;
+            if (deleteFile(fullPath)) {
+                filesDeleted++;
+                Serial.printf("Deleted file: %s\n", fullPath.c_str());
+            }
+        }
+        
+        // Try to remove the directory structure
+        if (removeDirectory(figureDir)) {
+            Serial.printf("Removed directory: %s\n", figureDir.c_str());
+        }
+    } else {
+        Serial.printf("Figure directory does not exist: %s\n", figureDir.c_str());
+    }
+    
+    // Save updated required files and download queue
+    saveRequiredFiles();
+    saveDownloadQueue();
+    
+    Serial.printf("FileManager: Figure deletion complete. Removed %d required file entries, deleted %d files.\n", 
+                 requiredFilesRemoved, filesDeleted);
+    
+    return true;
+}
+
+// Development/debugging method to force download processing
+void FileManager::forceProcessDownloads() {
+    Serial.println("FileManager: Forcing download processing (ignoring charging requirement)...");
+    
+    if (downloadQueue.empty()) {
+        Serial.println("FileManager: Download queue is empty. Nothing to process.");
+        return;
+    }
+    
+    if (downloadInProgress) {
+        Serial.println("FileManager: Download already in progress.");
+        return;
+    }
+    
+    Serial.printf("FileManager: Processing %d downloads from queue...\n", downloadQueue.size());
+    
+    // Temporarily bypass charging requirement by processing queue directly
+    auto it = downloadQueue.begin();
+    while (it != downloadQueue.end()) {
+        DownloadTask& task = *it;
+        
+        if (task.completed) {
+            it = downloadQueue.erase(it);
+            continue;
+        }
+        
+        // Check if we've exceeded the maximum retry batches
+        if (task.retryBatch >= MAX_RETRY_BATCHES) {
+            Serial.printf("FileManager: Download permanently failed after %d retry batches: %s\n", 
+                         MAX_RETRY_BATCHES, task.url.c_str());
+            
+            downloadStats.totalDownloads++;
+            downloadStats.failedDownloads++;
+            
+            if (downloadCompleteCallback) {
+                downloadCompleteCallback(task.url, task.localPath, false, "Max retry batches exceeded");
+            }
+            
+            it = downloadQueue.erase(it);
+            continue;
+        }
+        
+        // Check if we need to wait between retry batches
+        if (task.retryCount >= MAX_RETRY_COUNT) {
+            // We've exhausted this batch of retries, need to wait before starting next batch
+            if (task.lastBatchAttempt == 0) {
+                task.lastBatchAttempt = millis();
+                Serial.printf("FileManager: Starting retry batch %d for %s\n", task.retryBatch + 1, task.url.c_str());
+            }
+            
+            if (millis() - task.lastBatchAttempt >= RETRY_BATCH_DELAY_MS) {
+                // Start next batch of retries
+                task.retryBatch++;
+                task.retryCount = 0;
+                task.lastBatchAttempt = 0;
+                Serial.printf("FileManager: Beginning retry batch %d for %s\n", task.retryBatch, task.url.c_str());
+            } else {
+                // Still waiting for batch delay
+                ++it;
+                continue;
+            }
+        }
+        
+        // Check if enough time has passed since last retry
+        if (task.retryCount > 0 && (millis() - task.lastAttempt) < RETRY_DELAY_MS) {
+            ++it;
+            continue;
+        }
+        
+        // Skip connectivity check and charging check for force download
+        
+        Serial.printf("FileManager: [FORCED] Starting download %d/%d: %s -> %s\n", 
+                     std::distance(downloadQueue.begin(), it) + 1, 
+                     downloadQueue.size(),
+                     task.url.c_str(), 
+                     task.localPath.c_str());
+        
+        downloadInProgress = true;
+        task.lastAttempt = millis();
+        task.retryCount++;
+        
+        String errorMsg;
+        bool success = downloadFileFromURL(task.url, task.localPath, errorMsg);
+        
+        downloadInProgress = false;
+        
+        if (success) {
+            Serial.printf("FileManager: [FORCED] Download completed successfully: %s\n", task.localPath.c_str());
+            task.completed = true;
+            
+            downloadStats.totalDownloads++;
+            downloadStats.successfulDownloads++;
+            
+            if (downloadCompleteCallback) {
+                downloadCompleteCallback(task.url, task.localPath, true, "");
+            }
+            
+            it = downloadQueue.erase(it);
+            saveDownloadQueue();
+            saveDownloadStats();
+            
+            // Process only one download at a time, then return to let the caller decide
+            Serial.println("FileManager: Force download completed one file. Use command again for next file.");
+            return;
+            
+        } else {
+            Serial.printf("FileManager: [FORCED] Download failed (attempt %d/%d): %s - %s\n", 
+                         task.retryCount, MAX_RETRY_COUNT, task.localPath.c_str(), errorMsg.c_str());
+            
+            if (task.retryCount >= MAX_RETRY_COUNT) {
+                Serial.printf("FileManager: [FORCED] Max retries reached for this batch: %s\n", task.url.c_str());
+            }
+            
+            ++it;
+        }
+        
+        saveDownloadQueue();
+        saveDownloadStats();
+    }
+    
+    Serial.println("FileManager: Force download processing completed.");
 }
 

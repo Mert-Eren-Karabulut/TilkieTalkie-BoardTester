@@ -78,6 +78,10 @@ private:
     unsigned long lastDebounceTime;
     bool lastReedState;
 
+    // NFC reading timing control
+    unsigned long lastNFCReadAttempt;
+    static const unsigned long NFC_READ_INTERVAL = 100; // Read attempt every 100ms
+
     // Callback function pointers
     std::function<void(const NFCData &)> afterNFCReadCallback;
     std::function<void()> afterDetachNFCCallback;

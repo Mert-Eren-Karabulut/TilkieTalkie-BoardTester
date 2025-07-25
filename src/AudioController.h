@@ -22,7 +22,7 @@ public:
     // Volume levels (0-100)
     static const int MIN_VOLUME = 0;
     static const int MAX_VOLUME = 100;
-    static const int DEFAULT_VOLUME = 95;
+    static const int DEFAULT_VOLUME = 75;
     static const int VOLUME_STEP = 5;
 
     // ES8388 I2C address
@@ -120,7 +120,6 @@ private:
     // Helper functions
     bool isValidAudioFile(const String& filePath);
     void cleanupAudioComponents();
-    void statusCallback(void* cbData, int code, const char* string);
 
     // File manager reference
     FileManager& fileManager;

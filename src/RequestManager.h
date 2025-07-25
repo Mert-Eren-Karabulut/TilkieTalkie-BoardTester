@@ -5,6 +5,9 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <FileManager.h>
+#include <vector>
+#include <map>
 
 class RequestManager
 {
@@ -54,9 +57,44 @@ public:
     bool validateToken(String token);
     void initSecureConnection();
 
+    void getCheckFigureTracks(const String &uid); // New method to fetch figure tracks
+
+    // Figure download callback system
+    typedef void (*FigureDownloadCompleteCallback)(const String &uid, const String &figureName, bool success, const String &error);
+    void setFigureDownloadCompleteCallback(FigureDownloadCompleteCallback callback);
+    
+    // Helper method to get figure ID from UID (for deletion purposes)
+    String getFigureIdFromUid(const String &uid);
+
 private:
     String lastError;
     int lastStatusCode;
+    
+    // Figure download tracking
+    FigureDownloadCompleteCallback figureDownloadCompleteCallback;
+    
+    struct FigureDownloadTracker {
+        String uid;
+        String figureName;
+        String figureId;
+        int totalTracks;
+        int tracksReady; // tracks that existed or were successfully downloaded
+        int tracksFailed; // tracks that failed to download
+        std::vector<String> trackPaths;
+        bool completed;
+    };
+    
+    std::vector<FigureDownloadTracker> activeDownloads;
+    
+    // UID to Figure ID mapping for deletion purposes
+    std::map<String, String> uidToFigureIdMap;
+    
+    // Helper methods for tracking
+    void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths);
+    void checkFigureDownloadStatus(const String &uid);
+    void onTrackDownloadComplete(const String &path, bool success);
+    void storeUidToFigureIdMapping(const String &uid, const String &figureId);
+    static void staticFileDownloadCallback(const String& url, const String& path, bool success, const String& error);
 };
 
 #endif // REQUEST_MANAGER_H
