@@ -64,7 +64,32 @@ void RequestManager::setTimeout(int timeoutMs)
 // Private helper methods
 bool RequestManager::isWiFiConnected()
 {
-    return WiFi.status() == WL_CONNECTED;
+    bool connected = WiFi.status() == WL_CONNECTED;
+    if (!connected)
+    {
+        Serial.printf("RequestManager: WiFi not connected (status: %d)\n", WiFi.status());
+    }
+    return connected;
+}
+
+bool RequestManager::checkNetworkConnectivity()
+{
+    if (!isWiFiConnected())
+    {
+        return false;
+    }
+    
+    // Additional network diagnostics
+    IPAddress localIP = WiFi.localIP();
+    if (localIP[0] == 0)
+    {
+        Serial.println("RequestManager: No IP address assigned");
+        return false;
+    }
+    
+    Serial.printf("RequestManager: Network OK - IP: %s, RSSI: %d dBm\n", 
+                 localIP.toString().c_str(), WiFi.RSSI());
+    return true;
 }
 
 void RequestManager::setDefaultHeaders()
@@ -100,9 +125,9 @@ JsonDocument RequestManager::get(const String &endpoint)
 {
     JsonDocument emptyDoc;
 
-    if (!isWiFiConnected())
+    if (!checkNetworkConnectivity())
     {
-        lastError = "WiFi not connected";
+        lastError = "Network connectivity check failed";
         emptyDoc["error"] = true;
         emptyDoc["message"] = lastError;
         return emptyDoc;
@@ -123,8 +148,46 @@ JsonDocument RequestManager::get(const String &endpoint)
     }
 
     String url = baseUrl + endpoint;
-    http.begin(url);
+    
+    // End any previous connection to ensure clean state
+    http.end();
+    
+    // Begin connection with retry logic
+    bool connected = false;
+    for (int retry = 0; retry < 3 && !connected; retry++)
+    {
+        if (retry > 0)
+        {
+            Serial.printf("RequestManager: Retrying connection attempt %d/3\n", retry + 1);
+            delay(1000); // Wait before retry
+        }
+        
+        // For HTTPS URLs, we need to handle SSL
+        if (url.startsWith("https://"))
+        {
+            connected = http.begin(url);
+        }
+        else
+        {
+            connected = http.begin(url);
+        }
+        
+        if (!connected)
+        {
+            Serial.printf("RequestManager: Failed to begin HTTP connection to %s (attempt %d)\n", url.c_str(), retry + 1);
+        }
+    }
+    
+    if (!connected)
+    {
+        lastError = "Failed to establish HTTP connection after 3 attempts";
+        emptyDoc["error"] = true;
+        emptyDoc["message"] = lastError;
+        return emptyDoc;
+    }
+    
     http.setTimeout(timeout);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     setDefaultHeaders();
 
     int httpResponseCode = http.GET();
@@ -138,7 +201,27 @@ JsonDocument RequestManager::get(const String &endpoint)
     }
     else
     {
-        lastError = "HTTP GET failed with code: " + String(httpResponseCode);
+        // More detailed error reporting
+        String errorDetail = "";
+        switch (httpResponseCode)
+        {
+            case -1: errorDetail = "Connection refused"; break;
+            case -2: errorDetail = "Send header failed"; break;
+            case -3: errorDetail = "Send payload failed"; break;
+            case -4: errorDetail = "Not connected"; break;
+            case -5: errorDetail = "Connection lost"; break;
+            case -6: errorDetail = "No stream"; break;
+            case -7: errorDetail = "No HTTP server"; break;
+            case -8: errorDetail = "Too less RAM"; break;
+            case -9: errorDetail = "Encoding error"; break;
+            case -10: errorDetail = "Stream write error"; break;
+            case -11: errorDetail = "Read timeout"; break;
+            default: errorDetail = "Unknown error"; break;
+        }
+        
+        lastError = "HTTP GET failed with code: " + String(httpResponseCode) + " (" + errorDetail + ")";
+        Serial.printf("RequestManager: %s to URL: %s\n", lastError.c_str(), url.c_str());
+        
         http.end();
         emptyDoc["error"] = true;
         emptyDoc["message"] = lastError;
@@ -173,8 +256,37 @@ JsonDocument RequestManager::post(const String &endpoint, const JsonDocument &da
     }
 
     String url = baseUrl + endpoint;
-    http.begin(url);
+    
+    // End any previous connection to ensure clean state
+    http.end();
+    
+    // Begin connection with retry logic
+    bool connected = false;
+    for (int retry = 0; retry < 3 && !connected; retry++)
+    {
+        if (retry > 0)
+        {
+            Serial.printf("RequestManager: POST retrying connection attempt %d/3\n", retry + 1);
+            delay(1000); // Wait before retry
+        }
+        
+        connected = http.begin(url);
+        if (!connected)
+        {
+            Serial.printf("RequestManager: Failed to begin HTTP POST connection to %s (attempt %d)\n", url.c_str(), retry + 1);
+        }
+    }
+    
+    if (!connected)
+    {
+        lastError = "Failed to establish HTTP POST connection after 3 attempts";
+        emptyDoc["error"] = true;
+        emptyDoc["message"] = lastError;
+        return emptyDoc;
+    }
+    
     http.setTimeout(timeout);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     setDefaultHeaders();
 
     String jsonString;
@@ -219,7 +331,33 @@ String RequestManager::getJWTToken()
 {
     // send get request to BASE_URL + "/{ESP.getEfuseMac()}/token"
     String url = baseUrl + "/hubs/" + String(ESP.getEfuseMac()) + "/token";
-    http.begin(url);
+    
+    // End any previous connection to ensure clean state
+    http.end();
+    
+    // Begin connection with retry logic
+    bool connected = false;
+    for (int retry = 0; retry < 3 && !connected; retry++)
+    {
+        if (retry > 0)
+        {
+            Serial.printf("RequestManager: JWT token retrying connection attempt %d/3\n", retry + 1);
+            delay(1000);
+        }
+        
+        connected = http.begin(url);
+        if (!connected)
+        {
+            Serial.printf("RequestManager: Failed to begin JWT token connection to %s (attempt %d)\n", url.c_str(), retry + 1);
+        }
+    }
+    
+    if (!connected)
+    {
+        lastError = "Failed to establish JWT token connection after 3 attempts";
+        return "";
+    }
+    
     http.setTimeout(timeout);
     setDefaultHeaders();
 
@@ -270,7 +408,32 @@ bool RequestManager::validateToken(String token)
     // send get request to BASE_URL + "/validate-token"
     String url = baseUrl + "/hubs/" + String(ESP.getEfuseMac()) + "/validate-token";
     
-    http.begin(url);
+    // End any previous connection to ensure clean state
+    http.end();
+    
+    // Begin connection with retry logic
+    bool connected = false;
+    for (int retry = 0; retry < 3 && !connected; retry++)
+    {
+        if (retry > 0)
+        {
+            Serial.printf("RequestManager: Token validation retrying connection attempt %d/3\n", retry + 1);
+            delay(1000);
+        }
+        
+        connected = http.begin(url);
+        if (!connected)
+        {
+            Serial.printf("RequestManager: Failed to begin token validation connection to %s (attempt %d)\n", url.c_str(), retry + 1);
+        }
+    }
+    
+    if (!connected)
+    {
+        lastError = "Failed to establish token validation connection after 3 attempts";
+        return false;
+    }
+    
     http.setTimeout(timeout);
     setDefaultHeaders();
 
@@ -333,83 +496,46 @@ void RequestManager::initSecureConnection()
 
 void RequestManager::getCheckFigureTracks(const String &uid)
 {
-    //we need to send get request with bearer token to the url :https://portal.tilkietalkie.com/api/units/{nfc_uid}
     Serial.println("Fetching figure tracks for UID: " + uid);
-    // response will be like below
-//     {
-//     "id": 1,
-//     "nfc_id": "c538b083-28c1-384b-ae6d-e58e1f38f1f7",
-//     "created_at": "2025-07-16T17:35:19.000000Z",
-//     "updated_at": "2025-07-16T17:35:19.000000Z",
-//     "figure": {
-//         "id": 1,
-//         "thumbnail": "/testData/placeholder.png",
-//         "name": "autem voluptas cupiditate",
-//         "mass_assign_key": "ID-1983",
-//         "description": "Reprehenderit qui ut natus in et maxime ipsam. Et omnis laboriosam error commodi ut. Ullam eligendi consectetur repudiandae minima dolor dolorem dignissimos.",
-//         "thumbnail_url": "https://portal.tilkietalkie.com/storage//testData/placeholder.png",
-//         "episodes": [
-//             {
-//                 "id": 2,
-//                 "thumbnail": "/testData/placeholder.png",
-//                 "name": "Episode: Dicta voluptatem.",
-//                 "description": "Impedit numquam aut dolor iusto natus et. Doloribus temporibus quis dolorum at nesciunt.",
-//                 "created_at": "2025-07-16T17:35:19.000000Z",
-//                 "thumbnail_url": "https://portal.tilkietalkie.com/storage//testData/placeholder.png",
-//                 "tracks": [
-//                     {
-//                         "id": 6,
-//                         "name": "aut quis ratione est",
-//                         "description": "Qui id qui repellat assumenda voluptas voluptatem.",
-//                         "audio_file": "/testData/track.mp3",
-//                         "duration": 141,
-//                         "created_at": "2025-07-16T17:35:19.000000Z",
-//                         "audio_url": "https://portal.tilkietalkie.com/storage//testData/track.mp3"
-//                     },
-//                     {
-//                         "id": 7,
-//                         "name": "minima esse voluptatem veritatis",
-//                         "description": "Quia ut cupiditate est laborum.",
-//                         "audio_file": "/testData/track.mp3",
-//                         "duration": 135,
-//                         "created_at": "2025-07-16T17:35:19.000000Z",
-//                         "audio_url": "https://portal.tilkietalkie.com/storage//testData/track.mp3"
-//                     },
-//                     {
-//                         "id": 8,
-//                         "name": "harum odit beatae qui",
-//                         "description": "Molestias excepturi sit laudantium voluptas totam ad.",
-//                         "audio_file": "/testData/track.mp3",
-//                         "duration": 462,
-//                         "created_at": "2025-07-16T17:35:19.000000Z",
-//                         "audio_url": "https://portal.tilkietalkie.com/storage//testData/track.mp3"
-//                     },
-//                     {
-//                         "id": 9,
-//                         "name": "et eaque voluptatibus temporibus",
-//                         "description": "Nulla quis consectetur aut voluptatem dolor et.",
-//                         "audio_file": "/testData/track.mp3",
-//                         "duration": 494,
-//                         "created_at": "2025-07-16T17:35:19.000000Z",
-//                         "audio_url": "https://portal.tilkietalkie.com/storage//testData/track.mp3"
-//                     },
-//                     {
-//                         "id": 10,
-//                         "name": "ducimus cupiditate voluptatem ullam",
-//                         "description": "Similique sint et provident.",
-//                         "audio_file": "/testData/track.mp3",
-//                         "duration": 230,
-//                         "created_at": "2025-07-16T17:35:19.000000Z",
-//                         "audio_url": "https://portal.tilkietalkie.com/storage//testData/track.mp3"
-//                     }
-//                 ]
-//             }
-//         ]
-//     }
-// }
+    
+    // Check network connectivity first
+    if (!checkNetworkConnectivity()) {
+        Serial.println("RequestManager: Network connectivity check failed");
+        return;
+    }
+    
     String url = baseUrl + "/units/" + uid;
-    http.begin(url);
+    
+    // End any previous connection and wait a bit to ensure cleanup
+    http.end();
+    delay(100); // Small delay to ensure proper cleanup
+    
+    // Begin connection with retry logic
+    bool connected = false;
+    for (int retry = 0; retry < 3 && !connected; retry++)
+    {
+        if (retry > 0)
+        {
+            Serial.printf("RequestManager: Figure tracks retrying connection attempt %d/3\n", retry + 1);
+            delay(2000); // Longer delay between retries for network stability
+        }
+        
+        connected = http.begin(url);
+        if (!connected)
+        {
+            Serial.printf("RequestManager: Failed to begin figure tracks connection to %s (attempt %d)\n", url.c_str(), retry + 1);
+        }
+    }
+    
+    if (!connected)
+    {
+        lastError = "Failed to establish figure tracks connection after 3 attempts";
+        Serial.println("HTTP Error: " + lastError);
+        return;
+    }
+    
     http.setTimeout(timeout);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     setDefaultHeaders();
 
     int httpResponseCode = http.GET();
@@ -437,37 +563,63 @@ void RequestManager::getCheckFigureTracks(const String &uid)
         String figureName = figure["name"].as<String>();
         JsonArray episodes = figure["episodes"].as<JsonArray>();
         
+        // Parse the complete figure structure for the callback
+        Figure figureData;
+        figureData.id = figureId;
+        figureData.name = figureName;
+        figureData.description = figure["description"].as<String>();
+        
+        // Parse episodes and tracks
+        for (JsonVariant episodeVar : episodes)
+        {
+            JsonObject episodeObj = episodeVar.as<JsonObject>();
+            Episode episode;
+            episode.id = String(episodeObj["id"].as<int>());
+            episode.name = episodeObj["name"].as<String>();
+            episode.description = episodeObj["description"].as<String>();
+            
+            JsonArray tracks = episodeObj["tracks"].as<JsonArray>();
+            for (JsonVariant trackVar : tracks)
+            {
+                JsonObject trackObj = trackVar.as<JsonObject>();
+                Track track;
+                track.id = String(trackObj["id"].as<int>());
+                track.name = trackObj["name"].as<String>();
+                track.description = trackObj["description"].as<String>();
+                track.audioUrl = trackObj["audio_url"].as<String>();
+                track.duration = trackObj["duration"].as<int>();
+                
+                // Generate local path
+                track.localPath = "/figures/" + figureId + "/" + episode.id + "/" + track.id + ".mp3";
+                
+                episode.tracks.push_back(track);
+            }
+            
+            figureData.episodes.push_back(episode);
+        }
+        
         // Collect all track paths for this figure
         std::vector<String> allTrackPaths;
         int totalTracks = 0;
         int tracksAlreadyExist = 0;
         
-        for (JsonVariant episode : episodes)
+        for (const auto& episode : figureData.episodes)
         {
-            String episodeId = String(episode["id"].as<int>());
-            JsonArray tracks = episode["tracks"].as<JsonArray>();
-
-            for (JsonVariant track : tracks)
+            for (const auto& track : episode.tracks)
             {
-                String trackId = String(track["id"].as<int>());
-                String trackName = track["name"].as<String>();
-                String audioUrl = track["audio_url"].as<String>();
-
-                // Check if the file already exists
-                String filePath = "/figures/" + figureId + "/" + episodeId + "/" + trackId + ".mp3";
-                allTrackPaths.push_back(filePath);
+                allTrackPaths.push_back(track.localPath);
                 totalTracks++;
                 
-                if (!fileManager.fileExists(filePath))
+                if (!fileManager.fileExists(track.localPath))
                 {
-                    Serial.println("Downloading track: " + trackName);
-                    fileManager.addRequiredFile(filePath, audioUrl);
+                    Serial.println("Downloading track: " + track.name);
+                    fileManager.addRequiredFile(track.localPath, track.audioUrl);
                     // Immediately schedule the download
-                    fileManager.scheduleDownload(audioUrl, filePath);
+                    fileManager.scheduleDownload(track.audioUrl, track.localPath);
                 }
                 else
                 {
-                    Serial.println("Track already exists: " + trackName);
+                    Serial.println("Track already exists: " + track.name);
                     tracksAlreadyExist++;
                 }
             }
@@ -479,7 +631,7 @@ void RequestManager::getCheckFigureTracks(const String &uid)
             // Store UID to figure ID mapping for future reference
             storeUidToFigureIdMapping(uid, figureId);
             
-            startTrackingFigure(uid, figureName, figureId, allTrackPaths);
+            startTrackingFigure(uid, figureName, figureId, allTrackPaths, figureData);
             
             // If all tracks already exist, immediately call the callback
             if (tracksAlreadyExist == totalTracks)
@@ -487,7 +639,7 @@ void RequestManager::getCheckFigureTracks(const String &uid)
                 Serial.println("All tracks already exist for figure: " + figureName);
                 if (figureDownloadCompleteCallback)
                 {
-                    figureDownloadCompleteCallback(uid, figureName, true, "All tracks already available");
+                    figureDownloadCompleteCallback(uid, figureName, true, "All tracks already available", figureData);
                 }
                 
                 // Remove from tracking since we're done
@@ -515,7 +667,8 @@ void RequestManager::getCheckFigureTracks(const String &uid)
             Serial.println("No tracks found for figure: " + figureName);
             if (figureDownloadCompleteCallback)
             {
-                figureDownloadCompleteCallback(uid, figureName, false, "No tracks found for this figure");
+                Figure emptyFigure; // Create empty figure for error case
+                figureDownloadCompleteCallback(uid, figureName, false, "No tracks found for this figure", emptyFigure);
             }
         }
     }
@@ -533,7 +686,7 @@ void RequestManager::setFigureDownloadCompleteCallback(FigureDownloadCompleteCal
     this->figureDownloadCompleteCallback = callback;
 }
 
-void RequestManager::startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths)
+void RequestManager::startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData)
 {
     // Remove any existing tracker for this UID
     for (auto it = activeDownloads.begin(); it != activeDownloads.end(); ++it)
@@ -555,6 +708,7 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     tracker.tracksFailed = 0;
     tracker.trackPaths = trackPaths;
     tracker.completed = false;
+    tracker.figureData = figureData; // Store the complete figure structure
     
     // Count tracks that already exist
     FileManager &fileManager = FileManager::getInstance();
@@ -608,7 +762,7 @@ void RequestManager::checkFigureDownloadStatus(const String &uid)
                 
                 if (figureDownloadCompleteCallback)
                 {
-                    figureDownloadCompleteCallback(tracker.uid, tracker.figureName, true, "All tracks downloaded successfully");
+                    figureDownloadCompleteCallback(tracker.uid, tracker.figureName, true, "All tracks downloaded successfully", tracker.figureData);
                 }
                 
                 // Remove completed tracker
@@ -676,7 +830,7 @@ void RequestManager::onTrackDownloadComplete(const String &path, bool success)
                     
                     if (figureDownloadCompleteCallback)
                     {
-                        figureDownloadCompleteCallback(tracker.uid, tracker.figureName, true, "All tracks downloaded successfully");
+                        figureDownloadCompleteCallback(tracker.uid, tracker.figureName, true, "All tracks downloaded successfully", tracker.figureData);
                     }
                 }
                 else
@@ -691,7 +845,7 @@ void RequestManager::onTrackDownloadComplete(const String &path, bool success)
                     
                     if (figureDownloadCompleteCallback)
                     {
-                        figureDownloadCompleteCallback(tracker.uid, tracker.figureName, false, errorMsg);
+                        figureDownloadCompleteCallback(tracker.uid, tracker.figureName, false, errorMsg, tracker.figureData);
                     }
                 }
                 

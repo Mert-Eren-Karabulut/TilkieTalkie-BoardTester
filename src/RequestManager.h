@@ -19,6 +19,7 @@ private:
 
     // Private helper methods
     bool isWiFiConnected();
+    bool checkNetworkConnectivity();
     void setDefaultHeaders();
     JsonDocument parseResponse(String response);
 
@@ -59,8 +60,32 @@ public:
 
     void getCheckFigureTracks(const String &uid); // New method to fetch figure tracks
 
+    // Track and Episode structures for playlist
+    struct Track {
+        String id;
+        String name;
+        String description;
+        String audioUrl;
+        String localPath;  // Local file path after download
+        int duration;
+    };
+    
+    struct Episode {
+        String id;
+        String name;
+        String description;
+        std::vector<Track> tracks;
+    };
+    
+    struct Figure {
+        String id;
+        String name;
+        String description;
+        std::vector<Episode> episodes;
+    };
+
     // Figure download callback system
-    typedef void (*FigureDownloadCompleteCallback)(const String &uid, const String &figureName, bool success, const String &error);
+    typedef void (*FigureDownloadCompleteCallback)(const String &uid, const String &figureName, bool success, const String &error, const Figure &figure);
     void setFigureDownloadCompleteCallback(FigureDownloadCompleteCallback callback);
     
     // Helper method to get figure ID from UID (for deletion purposes)
@@ -82,6 +107,7 @@ private:
         int tracksFailed; // tracks that failed to download
         std::vector<String> trackPaths;
         bool completed;
+        Figure figureData; // Store the complete figure structure
     };
     
     std::vector<FigureDownloadTracker> activeDownloads;
@@ -90,7 +116,7 @@ private:
     std::map<String, String> uidToFigureIdMap;
     
     // Helper methods for tracking
-    void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths);
+    void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData);
     void checkFigureDownloadStatus(const String &uid);
     void onTrackDownloadComplete(const String &path, bool success);
     void storeUidToFigureIdMapping(const String &uid, const String &figureId);

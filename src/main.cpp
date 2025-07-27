@@ -23,6 +23,7 @@ AudioController &audioController = AudioController::getInstance();
 LedController ledController;
 ReverbClient &reverb = ReverbClient::getInstance(); // Create an alias for easier access
 
+const bool DEBUG = true; // Set to false to disable debug prints
 // +++ Reverb WebSocket Callback Function +++
 void handleChatMessage(const String &message)
 {
@@ -40,7 +41,7 @@ void handleChatMessage(const String &message)
 // +++ NFC Callback Functions +++
 
 // Callback function for when figure download is complete
-void onFigureDownloadComplete(const String &uid, const String &figureName, bool success, const String &error)
+void onFigureDownloadComplete(const String &uid, const String &figureName, bool success, const String &error, const RequestManager::Figure &figure)
 {
     Serial.println("=== Figure Download Complete ===");
     Serial.print("UID: ");
@@ -49,32 +50,60 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
     Serial.println(figureName);
     Serial.print("Success: ");
     Serial.println(success ? "YES" : "NO");
-    
+
     if (success)
     {
-        Serial.println("All tracks are ready! Starting automatic playback...");
-        
-        // Pulse LED green to indicate success
-        ledController.pulseRapid(0x00FF00, 5); // Green color, 5 rapid pulses
-        
-        // TODO: Implement automatic track playback here
-        // Example implementation:
-        // String firstTrackPath = "/figures/" + figureId + "/1/1.mp3"; // Adjust path as needed
-        // audioController.play(firstTrackPath);
-        
+        Serial.println("All tracks are ready! Checking if figure is still mounted...");
+
+        // Check if the figure is still mounted on the device
+        if (nfcController.isCardPresent() && nfcController.currentNFCData().uidString == uid)
+        {
+            Serial.println("Figure is still mounted! Starting automatic playback...");
+
+            // Pulse LED green to indicate success
+            ledController.pulseRapid(0x00FF00, 5); // Green color, 5 rapid pulses
+
+            // Create playlist from the figure structure
+            std::vector<String> playlist;
+            for (const auto &episode : figure.episodes)
+            {
+                for (const auto &track : episode.tracks)
+                {
+                    playlist.push_back(track.localPath);
+                    Serial.printf("Added to playlist: %s (%s)\n", track.localPath.c_str(), track.name.c_str());
+                }
+            }
+
+            if (!playlist.empty())
+            {
+                // Set the playlist and start playing
+                audioController.setPlaylist(playlist, uid);
+                audioController.play(); // Start playing the first track
+                Serial.printf("Started playing figure '%s' with %d tracks\n", figureName.c_str(), playlist.size());
+            }
+            else
+            {
+                Serial.println("No tracks found in figure structure!");
+            }
+        }
+        else
+        {
+            Serial.println("Figure is no longer mounted. Not starting playback.");
+        }
+
         Serial.println("Figure is ready for playback!");
     }
     else
     {
         Serial.print("Download failed: ");
         Serial.println(error);
-        
+
         // Pulse LED red to indicate failure
         ledController.pulseRapid(0xFF0000, 5); // Red color, 5 rapid pulses
-        
+
         Serial.println("Some tracks may be missing. Check download status.");
     }
-    
+
     Serial.println("================================");
 }
 
@@ -90,8 +119,8 @@ void afterNFCRead(const NFCData &nfcData)
     // Example: Play a sound and turn the LED green
     // audioController.play("/sounds/nfc_success.mp3");
     ledController.pulseRapid(0x00FF00, 3); // Green color
-    //we need to check if the figure tracks are downloaded and they exist
-    //we need to send get request with bearer token to the url :https://portal.tilkietalkie.com/api/units/{nfc_uid}
+    // we need to check if the figure tracks are downloaded and they exist
+    // we need to send get request with bearer token to the url :https://portal.tilkietalkie.com/api/units/{nfc_uid}
     requestManager.getCheckFigureTracks(nfcData.uidString);
 
     Serial.println("==========================");
@@ -104,18 +133,22 @@ void afterDetachNFC()
     Serial.println("=== Hook: afterDetachNFC ===");
     Serial.println("NFC session has ended.");
 
-    // Example: Stop audio and turn the LED red
+    // Stop audio and clear the playlist
     audioController.stop();
+    audioController.clearPlaylist();
     ledController.pulseRapid(0xFF0000, 3); // Red color
 
+    Serial.println("Playlist cleared due to figure removal.");
     Serial.println("==========================");
 }
 
 void setup()
 {
-    Serial.begin(115200);
-    delay(1000); // Give serial time to initialize
-
+    if (DEBUG)
+    {
+        Serial.begin(115200);
+        delay(1000); // Give serial time to initialize
+    }
     Serial.println("=== TilkieTalkie Board Tester ===");
     Serial.println("Initializing system...");
 
@@ -123,8 +156,7 @@ void setup()
     Serial.println("Enabling peripheral power...");
     pinMode(17, OUTPUT);
     digitalWrite(17, HIGH); // Enable power to peripherals
-    delay(1000);            // Give peripherals time to power up
-    Serial.println("Peripheral power enabled on IO17");
+    delay(500);            // Give peripherals time to power up
 
     // Initialize configuration (this will also initialize NVS)
     Serial.println("Loading configuration...");
@@ -140,7 +172,7 @@ void setup()
         Serial.println("WARNING: Request Manager initialization failed!");
         Serial.println("API functionality may be limited.");
     }
-    
+
     // Set up figure download complete callback
     requestManager.setFigureDownloadCompleteCallback(onFigureDownloadComplete);
 
@@ -267,14 +299,18 @@ void setup()
     Serial.println("  forcedownload - Force download processing (ignore charging)");
     Serial.println("  cleanup - Clean up temporary files");
     Serial.println("Audio Commands:");
-    Serial.println("  play <path> - Play MP3 file");
-    Serial.println("  pause   - Pause current playback");
-    Serial.println("  resume  - Resume paused playback");
-    Serial.println("  stop    - Stop playback");
-    Serial.println("  volup   - Volume up");
-    Serial.println("  voldown - Volume down");
-    Serial.println("  volume  - Show current volume");
-    Serial.println("  track   - Show current track");
+    Serial.println("  play <path> - Play specific MP3 file");
+    Serial.println("  play       - Play/resume current playlist or paused track");
+    Serial.println("  pause      - Pause current playback");
+    Serial.println("  resume     - Resume paused playback");
+    Serial.println("  stop       - Stop playback");
+    Serial.println("  next       - Next track in playlist");
+    Serial.println("  prev       - Previous track in playlist");
+    Serial.println("  playlist   - Show current playlist status");
+    Serial.println("  volup      - Volume up");
+    Serial.println("  voldown    - Volume down");
+    Serial.println("  volume     - Show current volume");
+    Serial.println("  track      - Show current track");
     Serial.println("LED Commands:");
     Serial.println("  ledon <hex> <intensity> - Turn LED on with hex color and intensity (0-255)");
     Serial.println("  ledoff  - Turn LED off");
@@ -296,10 +332,11 @@ void setup()
     Serial.println("Type any command for help\n");
     // audioController.play("/sounds/12.mp3"); // Play startup sound
 }
+unsigned long lastHeapPrint = 0;
 
 void loop()
 {
-    
+
     // Handle serial commands
     if (Serial.available())
     {
@@ -439,21 +476,24 @@ void loop()
         }
         else if (command == "reverbstart")
         {
-            if (WiFi.isConnected()) {
+            if (WiFi.isConnected())
+            {
                 Serial.println("Starting Reverb client...");
-                
+
                 constexpr char HOST[] = "portal.tilkietalkie.com";
                 constexpr uint16_t PORT = 443;
                 constexpr char APP_KEY[] = "erko2001";
-                
+
                 const String token = config.getJWTToken();
                 uint64_t chipid = ESP.getEfuseMac();
                 char deviceId[14];
                 snprintf(deviceId, sizeof(deviceId), "%llu", chipid);
-                
+
                 reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId);
                 reverb.onChatMessage(handleChatMessage);
-            } else {
+            }
+            else
+            {
                 Serial.println("Cannot start Reverb - WiFi not connected");
             }
         }
@@ -461,50 +501,62 @@ void loop()
         {
             Serial.println("\n--- Testing Authorization ---");
             String token = config.getJWTToken();
-            
-            if (token.length() == 0) {
+
+            if (token.length() == 0)
+            {
                 Serial.println("❌ No JWT token stored in configuration");
                 return;
             }
-            
-            if (!WiFi.isConnected()) {
+
+            if (!WiFi.isConnected())
+            {
                 Serial.println("❌ WiFi not connected - cannot test authorization");
                 return;
             }
-            
+
             Serial.println("🔑 JWT Token found, testing with server...");
             Serial.printf("Token length: %d characters\n", token.length());
-            
+
             // Use the same method as ReverbClient for consistency
             WiFiClientSecure client;
             client.setInsecure(); // For testing only
-            
+
             HTTPClient http;
             String url = "https://portal.tilkietalkie.com/api/user"; // Simple endpoint to test auth
-            
-            if (http.begin(client, url)) {
+
+            if (http.begin(client, url))
+            {
                 http.addHeader("Authorization", "Bearer " + token);
                 http.addHeader("Accept", "application/json");
-                
+
                 Serial.println("📡 Sending auth test request...");
                 int httpCode = http.GET();
-                
-                if (httpCode == 200) {
+
+                if (httpCode == 200)
+                {
                     Serial.println("✅ Authorization successful! Token is valid.");
                     String response = http.getString();
                     Serial.println("Server response: " + response);
-                } else if (httpCode == 401) {
+                }
+                else if (httpCode == 401)
+                {
                     Serial.println("❌ Authorization failed! Token is invalid or expired.");
-                } else if (httpCode > 0) {
+                }
+                else if (httpCode > 0)
+                {
                     Serial.printf("⚠️ Unexpected response code: %d\n", httpCode);
                     String response = http.getString();
                     Serial.println("Response: " + response);
-                } else {
+                }
+                else
+                {
                     Serial.printf("❌ HTTP request failed with error: %d\n", httpCode);
                 }
-                
+
                 http.end();
-            } else {
+            }
+            else
+            {
                 Serial.println("❌ Failed to connect to server");
             }
         }
@@ -516,7 +568,7 @@ void loop()
             Serial.println("Test credentials stored. Checking storage...");
             config.printAllSettings();
         }
-        else if (command == "factory")
+        else if (command == "factory" && DEBUG)
         {
             Serial.println("\nWARNING: Factory reset will erase ALL stored data!");
             Serial.println("Type 'yes' to confirm or any other key to cancel:");
@@ -699,15 +751,15 @@ void loop()
             }
         }
         // Delete all required files command
-        else if (command == "delete")
+        else if (command == "delete" && DEBUG)
         {
             Serial.println("⚠️  WARNING: This will delete ALL required files from NVS and storage!");
             Serial.println("Are you sure? Type 'yes' to confirm:");
-            
+
             // Wait for confirmation
             unsigned long confirmTimeout = millis() + 10000; // 10 second timeout
             bool confirmed = false;
-            
+
             while (millis() < confirmTimeout && !confirmed)
             {
                 if (Serial.available())
@@ -715,7 +767,7 @@ void loop()
                     String confirmation = Serial.readStringUntil('\n');
                     confirmation.trim();
                     confirmation.toLowerCase();
-                    
+
                     if (confirmation == "yes")
                     {
                         confirmed = true;
@@ -731,14 +783,14 @@ void loop()
                 }
                 delay(100);
             }
-            
+
             if (!confirmed && millis() >= confirmTimeout)
             {
                 Serial.println("❌ Confirmation timeout. Operation cancelled.");
             }
         }
         // Delete figure-specific files command
-        else if (command.startsWith("deletefig "))
+        else if (command.startsWith("deletefig ") && DEBUG)
         {
             // Parse deletefig command: deletefig <figure_uid>
             int firstSpace = command.indexOf(' ');
@@ -757,20 +809,20 @@ void loop()
                 else
                 {
                     Serial.printf("🔍 Looking up figure ID for UID: %s\n", figureUid.c_str());
-                    
+
                     // Try to get figure ID from UID mapping
                     String figureId = requestManager.getFigureIdFromUid(figureUid);
-                    
+
                     if (figureId.length() > 0)
                     {
                         Serial.printf("Found figure ID: %s for UID: %s\n", figureId.c_str(), figureUid.c_str());
                         Serial.printf("⚠️  WARNING: This will delete all files for figure (UID: %s, ID: %s)\n", figureUid.c_str(), figureId.c_str());
                         Serial.println("Type 'yes' to confirm deletion, or 'no' to cancel:");
-                        
+
                         // Wait for confirmation
                         unsigned long confirmTimeout = millis() + 10000; // 10 second timeout
                         bool confirmed = false;
-                        
+
                         while (millis() < confirmTimeout && !confirmed)
                         {
                             if (Serial.available())
@@ -778,12 +830,12 @@ void loop()
                                 String confirmation = Serial.readStringUntil('\n');
                                 confirmation.trim();
                                 confirmation.toLowerCase();
-                                
+
                                 if (confirmation == "yes")
                                 {
                                     confirmed = true;
                                     Serial.printf("Deleting all files for figure ID: %s\n", figureId.c_str());
-                                    
+
                                     if (fileManager.deleteFigureFiles(figureId))
                                     {
                                         Serial.printf("✅ Successfully deleted all files for figure (UID: %s, ID: %s)\n", figureUid.c_str(), figureId.c_str());
@@ -801,7 +853,7 @@ void loop()
                             }
                             delay(100);
                         }
-                        
+
                         if (!confirmed && millis() >= confirmTimeout)
                         {
                             Serial.println("❌ Confirmation timeout. Operation cancelled.");
@@ -814,7 +866,7 @@ void loop()
                         Serial.println("1. The figure was never downloaded/tracked in this session");
                         Serial.println("2. The UID is incorrect");
                         Serial.println("3. You can manually delete by figure ID if you know it");
-                        
+
                         // List available figure directories as a hint
                         Serial.println("\nAvailable figure directories:");
                         std::vector<String> figureDirectories = fileManager.listFiles("/figures");
@@ -824,7 +876,7 @@ void loop()
                         }
                         else
                         {
-                            for (const String& figureDir : figureDirectories)
+                            for (const String &figureDir : figureDirectories)
                             {
                                 Serial.printf("  - Figure ID: %s\n", figureDir.c_str());
                             }
@@ -875,6 +927,27 @@ void loop()
                 Serial.println("Example: play /audio/song.mp3");
             }
         }
+        else if (command == "play")
+        {
+            // Play playlist or resume
+            if (audioController.play())
+            {
+                if (audioController.hasPlaylist())
+                {
+                    Serial.printf("Playing playlist track %d/%d\n",
+                                  audioController.getCurrentTrackIndex() + 1,
+                                  audioController.getPlaylistSize());
+                }
+                else
+                {
+                    Serial.println("Playback resumed");
+                }
+            }
+            else
+            {
+                Serial.println("No playlist available or failed to start playback");
+            }
+        }
         else if (command == "pause")
         {
             if (audioController.pause())
@@ -906,6 +979,61 @@ void loop()
             else
             {
                 Serial.println("Nothing to stop or already stopped");
+            }
+        }
+        else if (command == "next")
+        {
+            if (audioController.nextTrack())
+            {
+                Serial.printf("Playing next track: %d/%d\n",
+                              audioController.getCurrentTrackIndex() + 1,
+                              audioController.getPlaylistSize());
+            }
+            else
+            {
+                Serial.println("No playlist available or reached end of playlist");
+            }
+        }
+        else if (command == "prev")
+        {
+            if (audioController.prevTrack())
+            {
+                Serial.printf("Playing previous track: %d/%d\n",
+                              audioController.getCurrentTrackIndex() + 1,
+                              audioController.getPlaylistSize());
+            }
+            else
+            {
+                Serial.println("No playlist available");
+            }
+        }
+        else if (command == "playlist")
+        {
+            if (audioController.hasPlaylist())
+            {
+                Serial.printf("Current playlist (Figure UID: %s):\n",
+                              audioController.getPlaylistFigureUid().c_str());
+                Serial.printf("Current track: %d/%d\n",
+                              audioController.getCurrentTrackIndex() + 1,
+                              audioController.getPlaylistSize());
+
+                // Print playlist tracks (limit to 10 for readability)
+                int maxTracks = min(10, audioController.getPlaylistSize());
+                for (int i = 0; i < maxTracks; i++)
+                {
+                    String indicator = (i == audioController.getCurrentTrackIndex()) ? " -> " : "    ";
+                    Serial.printf("%s%d. Track %d\n", indicator.c_str(), i + 1, i + 1);
+                }
+
+                if (audioController.getPlaylistSize() > 10)
+                {
+                    Serial.printf("    ... and %d more tracks\n",
+                                  audioController.getPlaylistSize() - 10);
+                }
+            }
+            else
+            {
+                Serial.println("No playlist loaded");
             }
         }
         else if (command == "volup")
@@ -969,7 +1097,7 @@ void loop()
             Serial.println("Peripheral power ENABLED");
             Serial.println("You may need to reinitialize modules (restart recommended)");
         }
-        else if (command == "poweroff")
+        else if (command == "poweroff" && DEBUG)
         {
             Serial.println("WARNING: This will disable power to SD card and other peripherals!");
             Serial.println("Type 'yes' to confirm or any other key to cancel:");
@@ -1139,13 +1267,14 @@ void loop()
             Serial.println("Download in progress: " + String(fileManager.isDownloadInProgress() ? "Yes" : "No"));
             Serial.println("SD Card initialized: " + String(fileManager.isSDCardAvailable() ? "Yes" : "No"));
             Serial.println("WiFi connected: " + String(WiFi.isConnected() ? "Yes" : "No"));
-            
-            if (!chargingStatus) {
+
+            if (!chargingStatus)
+            {
                 Serial.println("\n⚠️  ISSUE: Device is not charging!");
                 Serial.println("Downloads will not start until device is connected to power.");
                 Serial.println("Use 'forcedownload' command to bypass charging requirement for testing.");
             }
-            
+
             Serial.println("Note: Downloads only start when device is charging");
             Serial.println("---------------------------------------\n");
         }
@@ -1194,19 +1323,24 @@ void loop()
 
     // Update audio controller
     audioController.update();
-    
+
     // Handle WiFi background reconnection (only when credentials exist but not connected)
     wifiProv.handleBackgroundReconnection();
 
     // Update Reverb client only if WiFi is connected
-    if (WiFi.isConnected()) {
+    if (WiFi.isConnected())
+    {
         reverb.update();
     }
-    
+
     // Update LED controller (handles pulse and pulseRapid animations)
     ledController.update();
 
     // Update NFC controller (handles reed switch monitoring and NFC reading)
     nfcController.update();
 
+    // if (millis() - lastHeapPrint >= 1000) {
+    //     Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    //     lastHeapPrint = millis();
+    // }
 }

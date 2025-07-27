@@ -1,4 +1,5 @@
 #include "AudioController.h"
+#include "NfcController.h"
 
 // Initialize static members
 AudioController* AudioController::instance = nullptr;
@@ -69,6 +70,9 @@ AudioController::AudioController() :
     trackStartTime(0),
     accumulatedPlayTime(0.0f),
     pauseStartTime(0),
+    currentPlaylistIndex(-1),
+    playlistFigureUid(""),
+    playlistFinished(false),
     fileManager(FileManager::getInstance()) {
 }
 
@@ -185,14 +189,44 @@ void AudioController::end() {
 }
 
 bool AudioController::play(const String& filePath) {
-    if (!initialized) {
-        Serial.println("AudioController: Not initialized");
-        return false;
+    if (filePath.isEmpty()) {
+        // Play from playlist logic
+        if (!hasPlaylist()) {
+            Serial.println("AudioController: No playlist available");
+            return false;
+        }
+        
+        // Check if NFC session is still active for the expected figure
+        if (!isNfcSessionActive(playlistFigureUid)) {
+            Serial.println("AudioController: NFC session not active for playlist figure");
+            clearPlaylist();
+            return false;
+        }
+        
+        // Handle playlist finished state or initial state
+        if (playlistFinished || currentPlaylistIndex == -1) {
+            currentPlaylistIndex = 0; // Start from beginning
+            playlistFinished = false;
+        }
+        
+        if (currentPlaylistIndex < 0 || currentPlaylistIndex >= playlist.size()) {
+            Serial.println("AudioController: Playlist index out of range");
+            return false;
+        }
+        
+        String trackPath = playlist[currentPlaylistIndex];
+        Serial.printf("AudioController: Playing playlist track %d/%d: %s\n", 
+                     currentPlaylistIndex + 1, playlist.size(), trackPath.c_str());
+        
+        return play(trackPath); // Recursive call with specific file
     }
 
+    // Play specific file (original functionality)
+    Serial.printf("AudioController: Attempting to play file: %s\n", filePath.c_str());
+    
     // Check if file exists
     if (!fileManager.fileExists(filePath)) {
-        Serial.printf("AudioController: File not found: %s\n", filePath.c_str());
+        Serial.printf("AudioController: File does not exist: %s\n", filePath.c_str());
         return false;
     }
 
@@ -205,6 +239,7 @@ bool AudioController::play(const String& filePath) {
     // Stop current playback if any
     if (currentState != STOPPED) {
         stop();
+        delay(50); // Small delay for cleanup
     }
 
     // Clear any previous paused position since we're starting a new track
@@ -214,6 +249,28 @@ bool AudioController::play(const String& filePath) {
     // Clean up previous audio components
     cleanupAudioComponents();
 
+    // Recreate audio output only if it doesn't exist
+    if (!audioOutput) {
+        if (!reinitializeAudioOutput()) {
+            Serial.println("AudioController: Failed to initialize audio output");
+            return false;
+        }
+    }
+
+    // Recreate MP3 generator for each new file to ensure clean state
+    if (audioMP3) {
+        Serial.println("AudioController: Deleting existing MP3 generator");
+        delete audioMP3;
+        audioMP3 = nullptr;
+    }
+    
+    audioMP3 = new AudioGeneratorMP3();
+    if (!audioMP3) {
+        Serial.println("AudioController: Failed to create MP3 generator");
+        return false;
+    }
+    Serial.println("AudioController: MP3 generator created successfully");
+
     // Create new audio file source
     audioFile = new AudioFileSourceSD(filePath.c_str());
     if (!audioFile || !audioFile->isOpen()) {
@@ -221,6 +278,7 @@ bool AudioController::play(const String& filePath) {
         cleanupAudioComponents();
         return false;
     }
+    Serial.printf("AudioController: Audio file opened successfully: %s\n", filePath.c_str());
 
     // Create buffer
     audioBuffer = new AudioFileSourceBuffer(audioFile, AUDIO_BUFFER_SIZE);
@@ -229,16 +287,27 @@ bool AudioController::play(const String& filePath) {
         cleanupAudioComponents();
         return false;
     }
+    Serial.println("AudioController: Audio buffer created successfully");
+
+    // Verify audio output is ready
+    if (!audioOutput) {
+        Serial.println("AudioController: Audio output is null");
+        cleanupAudioComponents();
+        return false;
+    }
+    Serial.println("AudioController: Audio output is ready");
 
     // Start playback
+    Serial.println("AudioController: Starting MP3 playback...");
     if (!audioMP3->begin(audioBuffer, audioOutput)) {
         Serial.printf("AudioController: Failed to start MP3 playback\n");
         cleanupAudioComponents();
         return false;
     }
 
-    currentState = PLAYING;
+    // Set current track info
     currentTrackPath = filePath;
+    currentState = PLAYING;
     
     // Reset timing for new track
     trackStartTime = millis();
@@ -286,6 +355,21 @@ bool AudioController::resume() {
     if (!currentTrackPath.isEmpty()) {
         // Clean up current audio components
         cleanupAudioComponents();
+        
+        // Recreate MP3 generator for resume to ensure clean state
+        if (audioMP3) {
+            delete audioMP3;
+            audioMP3 = nullptr;
+        }
+        
+        audioMP3 = new AudioGeneratorMP3();
+        if (!audioMP3) {
+            Serial.println("AudioController: Failed to create MP3 generator for resume");
+            currentState = STOPPED;
+            currentTrackPath = "";
+            hasPausedPosition = false;
+            return false;
+        }
         
         // Create new audio file source
         audioFile = new AudioFileSourceSD(currentTrackPath.c_str());
@@ -424,6 +508,91 @@ bool AudioController::setVolume(int volume, bool initialize /* = false */) {
     return true;
 }
 
+// Playlist management methods
+void AudioController::setPlaylist(const std::vector<String>& trackPaths, const String& figureUid) {
+    playlist = trackPaths;
+    playlistFigureUid = figureUid;
+    currentPlaylistIndex = -1; // Start at -1, first play() will set to 0
+    playlistFinished = false;
+    
+    Serial.printf("AudioController: Playlist set with %d tracks for figure UID: %s\n", 
+                 playlist.size(), figureUid.c_str());
+    
+    // Print playlist for debugging
+    for (int i = 0; i < playlist.size(); i++) {
+        Serial.printf("  Track %d: %s\n", i + 1, playlist[i].c_str());
+    }
+}
+
+void AudioController::clearPlaylist() {
+    playlist.clear();
+    currentPlaylistIndex = -1;
+    playlistFigureUid = "";
+    playlistFinished = false;
+    
+    Serial.println("AudioController: Playlist cleared");
+}
+
+bool AudioController::nextTrack() {
+    if (!hasPlaylist()) {
+        Serial.println("AudioController: No playlist available");
+        return false;
+    }
+    
+    // Check if NFC session is still active for the figure associated with this playlist
+    if (!isNfcSessionActive(playlistFigureUid)) {
+        Serial.println("AudioController: Figure not present or different figure detected, clearing playlist");
+        clearPlaylist();
+        return false;
+    }
+    
+    // If playlist finished, start from beginning
+    if (playlistFinished) {
+        currentPlaylistIndex = 0;
+        playlistFinished = false;
+        return play(); // Call play() without parameters to use playlist
+    }
+    
+    // Move to next track
+    currentPlaylistIndex++;
+    
+    // Check if we've reached the end
+    if (currentPlaylistIndex >= playlist.size()) {
+        Serial.println("AudioController: Reached end of playlist");
+        playlistFinished = true;
+        stop();
+        return false;
+    }
+    
+    // Play the next track
+    return play(); // Call play() without parameters to use playlist
+}
+
+bool AudioController::prevTrack() {
+    if (!hasPlaylist()) {
+        Serial.println("AudioController: No playlist available");
+        return false;
+    }
+    
+    // Check if NFC session is still active for the figure associated with this playlist
+    if (!isNfcSessionActive(playlistFigureUid)) {
+        Serial.println("AudioController: Figure not present or different figure detected, clearing playlist");
+        clearPlaylist();
+        return false;
+    }
+    
+    // If playlist finished or at first track, go to last track
+    if (playlistFinished || currentPlaylistIndex <= 0) {
+        currentPlaylistIndex = playlist.size() - 1;
+        playlistFinished = false;
+        return play(); // Call play() without parameters to use playlist
+    }
+    
+    // Move to previous track
+    currentPlaylistIndex--;
+    return play(); // Call play() without parameters to use playlist
+}
+
 void AudioController::update() {
     if (!initialized) {
         return;
@@ -436,6 +605,11 @@ void AudioController::update() {
                 // Track finished
                 Serial.println("AudioController: Track finished");
                 stop();
+                
+                // If we have a playlist, automatically go to next track
+                if (hasPlaylist() && !playlistFinished) {
+                    nextTrack();
+                }
             }
         } else {
             // Should be playing but isn't - something went wrong
@@ -660,6 +834,34 @@ void AudioController::deinitializeI2S() {
     Serial.println("AudioController: I2S deinitialized");
 }
 
+bool AudioController::reinitializeAudioOutput() {
+    Serial.println("AudioController: Reinitializing audio output...");
+    
+    // Clean up existing audio output
+    if (audioOutput) {
+        Serial.println("AudioController: Deleting existing audio output");
+        delete audioOutput;
+        audioOutput = nullptr;
+        delay(100); // Give time for cleanup
+    }
+    
+    // Create new audio output (this handles I2S internally)
+    audioOutput = new AudioOutputI2S();
+    if (!audioOutput) {
+        Serial.println("AudioController: Failed to create new audio output");
+        return false;
+    }
+    
+    // Set the pin configuration
+    audioOutput->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
+    
+    // Set gain to current volume
+    audioOutput->SetGain(currentVolume / 100.0f);
+    
+    Serial.println("AudioController: Audio output reinitialized successfully");
+    return true;
+}
+
 float AudioController::getCurrentTrackSeconds() const {
     if (!initialized || currentState == STOPPED || currentTrackPath.isEmpty()) {
         return 0.0f;
@@ -695,5 +897,31 @@ void AudioController::cleanupAudioComponents() {
     if (audioFile) {
         delete audioFile;
         audioFile = nullptr;
+    }
+}
+
+bool AudioController::isNfcSessionActive(const String& expectedUid) const {
+    // We need to include NfcController here to check the session
+    extern NfcController &nfcController; // Reference to the global instance from main.cpp
+    
+    // Safety check - make sure we can access the NFC controller
+    try {
+        bool cardPresent = nfcController.isCardPresent();
+        if (!cardPresent) {
+            Serial.println("AudioController: No card present in NFC session check");
+            return false;
+        }
+        
+        String currentUid = nfcController.currentNFCData().uidString;
+        if (currentUid != expectedUid) {
+            Serial.printf("AudioController: UID mismatch - expected: %s, current: %s\n", 
+                         expectedUid.c_str(), currentUid.c_str());
+            return false;
+        }
+        
+        return true;
+    } catch (...) {
+        Serial.println("AudioController: Exception in NFC session check");
+        return false;
     }
 }

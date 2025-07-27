@@ -32,7 +32,7 @@ void BatteryManager::begin() {
     Serial.println("Initializing Battery Manager...");
     
     // Configure pins
-    pinMode(CHARGING_PIN, INPUT_PULLUP);  // Charging indicator pin
+    pinMode(CHARGING_PIN, INPUT);  // Charging indicator pin
     
     // Initialize ADC for battery voltage reading
     analogReadResolution(12);  // Set ADC resolution to 12 bits

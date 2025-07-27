@@ -4,11 +4,15 @@
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <Wire.h>
+#include <vector>
 #include "AudioFileSourceSD.h"
 #include "AudioFileSourceBuffer.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
 #include "FileManager.h"
+
+// Forward declaration to avoid circular includes
+class NfcController;
 
 class AudioController {
 public:
@@ -49,10 +53,22 @@ public:
     void end();
 
     // Playback control
-    bool play(const String& filePath);
+    bool play(const String& filePath = ""); // Play specific file or current playlist track
     bool pause();
     bool resume();
     bool stop();
+    
+    // Playlist control methods
+    bool nextTrack();
+    bool prevTrack();
+    void setPlaylist(const std::vector<String>& trackPaths, const String& figureUid);
+    void clearPlaylist();
+    
+    // Playlist information
+    bool hasPlaylist() const { return !playlist.empty(); }
+    int getCurrentTrackIndex() const { return currentPlaylistIndex; }
+    int getPlaylistSize() const { return playlist.size(); }
+    String getPlaylistFigureUid() const { return playlistFigureUid; }
 
     // Volume control
     bool volumeUp();
@@ -105,6 +121,12 @@ private:
     unsigned long trackStartTime;    // millis() when track started playing
     float accumulatedPlayTime;       // accumulated play time in seconds
     unsigned long pauseStartTime;    // millis() when track was paused
+    
+    // Playlist variables
+    std::vector<String> playlist;
+    int currentPlaylistIndex;
+    String playlistFigureUid; // UID of the figure associated with this playlist
+    bool playlistFinished; // Track if playlist has finished playing
 
     // ES8388 control
     bool initializeES8388();
@@ -116,10 +138,12 @@ private:
     // I2S configuration
     bool initializeI2S();
     void deinitializeI2S();
+    bool reinitializeAudioOutput();
 
     // Helper functions
     bool isValidAudioFile(const String& filePath);
     void cleanupAudioComponents();
+    bool isNfcSessionActive(const String& expectedUid) const;
 
     // File manager reference
     FileManager& fileManager;

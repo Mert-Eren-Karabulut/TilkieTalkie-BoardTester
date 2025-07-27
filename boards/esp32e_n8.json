@@ -1,0 +1,35 @@
+{
+    "build": {
+        "core": "esp32",
+        "variant": "esp32",
+        "f_cpu": "240000000L",
+        "f_flash": "40000000L",
+        "flash_mode": "qio",
+        "mcu": "esp32",
+        "partitions": "partitions_8mb_ota.csv"
+    },
+    "connectivity": [
+        "wifi",
+        "bluetooth",
+        "ethernet",
+        "can"
+    ],
+    "debug": {
+        "openocd_target": "esp32.cfg"
+    },
+    "frameworks": [
+        "arduino",
+        "espidf"
+    ],
+    "name": "ESP32-WROOM-32E (8MB)",
+    "upload": {
+        "flash_size": "8MB",
+        "maximum_ram_size": 327680,
+        "maximum_size": 8388608,
+        "require_upload_port": true,
+        "speed": 460800,
+        "wait_for_upload_port": true
+    },
+    "url": "https://www.espressif.com/sites/default/files/documentation/esp32-wroom-32e_esp32-wroom-32ue_datasheet_en.pdf",
+    "vendor": "Espressif"
+}
