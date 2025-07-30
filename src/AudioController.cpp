@@ -189,6 +189,22 @@ void AudioController::end() {
 }
 
 bool AudioController::play(const String& filePath) {
+    // Add heap check before major operations
+    size_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 15000) {  // Less than 15KB free
+        Serial.printf("AudioController: Insufficient heap memory for playback (%d bytes free)\n", freeHeap);
+        return false;
+    }
+    
+    // Ensure previous cleanup completed
+    if (audioMP3 != nullptr || audioBuffer != nullptr || audioFile != nullptr) {
+        Serial.println("AudioController: Previous components not fully cleaned, forcing cleanup");
+        cleanupAudioComponents();
+        delay(50);  // Give time for cleanup
+    }
+    
+    Serial.printf("AudioController: Starting playback with %d bytes free heap\n", freeHeap);
+    
     if (filePath.isEmpty()) {
         // Play from playlist logic
         if (!hasPlaylist()) {
@@ -889,15 +905,21 @@ bool AudioController::isValidAudioFile(const String& filePath) {
 }
 
 void AudioController::cleanupAudioComponents() {
+    Serial.println("AudioController: Cleaning up audio components");
+    
     if (audioBuffer) {
+        Serial.println("AudioController: Deleting audio buffer");
         delete audioBuffer;
         audioBuffer = nullptr;
     }
     
     if (audioFile) {
+        Serial.println("AudioController: Deleting audio file");
         delete audioFile;
         audioFile = nullptr;
     }
+    
+    Serial.printf("AudioController: Cleanup complete, %d bytes free heap\n", ESP.getFreeHeap());
 }
 
 bool AudioController::isNfcSessionActive(const String& expectedUid) const {

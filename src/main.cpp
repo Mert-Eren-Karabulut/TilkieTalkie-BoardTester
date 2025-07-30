@@ -24,6 +24,11 @@ LedController ledController;
 ReverbClient &reverb = ReverbClient::getInstance(); // Create an alias for easier access
 
 const bool DEBUG = true; // Set to false to disable debug prints
+
+// Heap monitoring constants
+const size_t CRITICAL_HEAP_THRESHOLD = 15000; // 15KB critical threshold
+const size_t WARNING_HEAP_THRESHOLD = 25000;  // 25KB warning threshold
+
 // +++ Reverb WebSocket Callback Function +++
 void handleChatMessage(const String &message)
 {
@@ -59,6 +64,17 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
         if (nfcController.isCardPresent() && nfcController.currentNFCData().uidString == uid)
         {
             Serial.println("Figure is still mounted! Starting automatic playback...");
+            
+            // Add delay and heap check to prevent rapid execution
+            delay(300);  // Give system time to stabilize
+            
+            size_t freeHeap = ESP.getFreeHeap();
+            Serial.printf("Free heap before playback: %d bytes\n", freeHeap);
+            
+            if (freeHeap < 20000) {  // Less than 20KB
+                Serial.println("Warning: Low heap memory, adding extra delay");
+                delay(500);
+            }
 
             // Pulse LED green to indicate success
             ledController.pulseRapid(0x00FF00, 5); // Green color, 5 rapid pulses
@@ -333,9 +349,23 @@ void setup()
     // audioController.play("/sounds/12.mp3"); // Play startup sound
 }
 unsigned long lastHeapPrint = 0;
+unsigned long lastHeapCheck = 0;
 
 void loop()
 {
+    // Add heap monitoring at the beginning of loop
+    if (millis() - lastHeapCheck >= 2000) { // Check every 2 seconds
+        size_t freeHeap = ESP.getFreeHeap();
+        
+        if (freeHeap < CRITICAL_HEAP_THRESHOLD) {
+            Serial.printf("🔴 CRITICAL: Very low heap memory: %d bytes\n", freeHeap);
+            // Could add emergency cleanup here later
+        } else if (freeHeap < WARNING_HEAP_THRESHOLD) {
+            Serial.printf("🟡 WARNING: Low heap memory: %d bytes\n", freeHeap);
+        }
+        
+        lastHeapCheck = millis();
+    }
 
     // Handle serial commands
     if (Serial.available())
@@ -1297,6 +1327,8 @@ void loop()
         {
             Serial.println("\n--- Debug Information ---");
             Serial.println("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+            Serial.println("Largest free block: " + String(ESP.getMaxAllocHeap()) + " bytes");
+            Serial.println("Minimum free heap: " + String(ESP.getMinFreeHeap()) + " bytes");
             Serial.println("Chip revision: " + String(ESP.getChipRevision()));
             Serial.println("SDK version: " + String(ESP.getSdkVersion()));
             Serial.println("WiFi mode: " + String(WiFi.getMode()));
@@ -1308,6 +1340,29 @@ void loop()
             Serial.println("WiFi Password length: " + String(config.getWiFiPassword().length()));
             Serial.println("Note: BLE is automatically managed by ESP32 provisioning library");
             config.printAllSettings();
+        }
+        // Add new heap command
+        else if (command == "heap")
+        {
+            Serial.println("\n--- Detailed Heap Information ---");
+            Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+            Serial.printf("Largest free block: %d bytes\n", ESP.getMaxAllocHeap());
+            Serial.printf("Minimum free heap since boot: %d bytes\n", ESP.getMinFreeHeap());
+            Serial.printf("Heap size: %d bytes\n", ESP.getHeapSize());
+            
+            // Calculate fragmentation
+            float fragmentation = (1.0 - (float)ESP.getMaxAllocHeap() / ESP.getFreeHeap()) * 100;
+            Serial.printf("Heap fragmentation: %.1f%%\n", fragmentation);
+            
+            // Memory status
+            if (ESP.getFreeHeap() < CRITICAL_HEAP_THRESHOLD) {
+                Serial.println("Status: 🔴 CRITICAL - Very low memory");
+            } else if (ESP.getFreeHeap() < WARNING_HEAP_THRESHOLD) {
+                Serial.println("Status: 🟡 WARNING - Low memory");
+            } else {
+                Serial.println("Status: 🟢 OK - Memory levels normal");
+            }
+            Serial.println("----------------------------------\n");
         }
         else
         {
