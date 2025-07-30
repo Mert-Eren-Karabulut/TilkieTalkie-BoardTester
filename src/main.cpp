@@ -671,7 +671,7 @@ void loop()
                 String url = command.substring(firstSpace + 1, secondSpace);
                 String path = command.substring(secondSpace + 1);
 
-                Serial.println("Scheduling download: " + url + " -> " + path);
+                Serial.printf("Scheduling download: %s -> %s\n", url.c_str(), path.c_str());
                 if (fileManager.scheduleDownload(url, path))
                 {
                     Serial.println("Download scheduled successfully");
@@ -698,7 +698,7 @@ void loop()
                 String path = command.substring(firstSpace + 1, secondSpace);
                 String url = command.substring(secondSpace + 1);
 
-                Serial.println("Adding required file: " + path + " <- " + url);
+                Serial.printf("Adding required file: %s <- %s\n", path.c_str(), url.c_str());
                 if (fileManager.addRequiredFile(path, url))
                 {
                     Serial.println("Required file added successfully");

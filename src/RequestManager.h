@@ -13,15 +13,23 @@ class RequestManager
 {
 private:
     HTTPClient http;
+    WiFiClientSecure secureClient; // Pre-allocated secure client for reuse
     String baseUrl;
     String authToken;
     int timeout;
+    static char responseBuffer[4096]; // Static buffer for HTTP responses
+
+    // Connection pooling
+    bool connectionEstablished;
+    String lastUsedHost;
 
     // Private helper methods
     bool isWiFiConnected();
     bool checkNetworkConnectivity();
     void setDefaultHeaders();
     JsonDocument parseResponse(String response);
+    bool ensureConnection(const String& host);
+    void closeConnection();
 
     // Private constructor for singleton
     RequestManager(const String &baseUrl = "https://your-laravel-api.com/api");

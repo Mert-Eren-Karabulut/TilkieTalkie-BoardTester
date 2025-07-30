@@ -60,13 +60,8 @@ String ConfigManager::getWiFiPassword() {
 
 void ConfigManager::setWiFiCredentials(const String& ssid, const String& password) {
     if (ssid.length() == 0 || password.length() == 0) {
-        Serial.println("Warning: Empty SSID or password provided");
         return;
     }
-    
-    Serial.println("Storing WiFi credentials...");
-    Serial.println("SSID: " + ssid);
-    Serial.println("Password length: " + String(password.length()));
     
     // Clear old values first
     preferences.remove(WIFI_SSID_KEY);
@@ -77,26 +72,7 @@ void ConfigManager::setWiFiCredentials(const String& ssid, const String& passwor
     size_t passResult = preferences.putString(WIFI_PASSWORD_KEY, password);
     
     if (ssidResult == 0 || passResult == 0) {
-        Serial.println("ERROR: Failed to store WiFi credentials in NVS");
-        Serial.println("SSID result: " + String(ssidResult));
-        Serial.println("Password result: " + String(passResult));
-        Serial.println("Free NVS space: " + String(preferences.freeEntries()));
-    } else {
-        Serial.println("SUCCESS: WiFi credentials stored in NVS");
-        Serial.println("SSID bytes written: " + String(ssidResult));
-        Serial.println("Password bytes written: " + String(passResult));
-        
-        // Verify storage by reading back
-        String storedSSID = preferences.getString(WIFI_SSID_KEY, "");
-        String storedPass = preferences.getString(WIFI_PASSWORD_KEY, "");
-        
-        if (storedSSID == ssid && storedPass == password) {
-            Serial.println("VERIFIED: Credentials correctly stored and retrieved");
-        } else {
-            Serial.println("ERROR: Credential verification failed");
-            Serial.println("Stored SSID: " + storedSSID);
-            Serial.println("Expected SSID: " + ssid);
-        }
+        Serial.println(F("ERROR: Failed to store WiFi credentials"));
     }
 }
 
@@ -114,24 +90,16 @@ bool ConfigManager::hasWiFiCredentials() {
 }
 
 void ConfigManager::clearWiFiCredentials() {
-    Serial.println("Clearing WiFi credentials...");
-    bool ssidRemoved = preferences.remove(WIFI_SSID_KEY);
-    bool passRemoved = preferences.remove(WIFI_PASSWORD_KEY);
-    
-    if (ssidRemoved && passRemoved) {
-        Serial.println("WiFi credentials cleared successfully");
-    } else {
-        Serial.println("Warning: Some WiFi credentials may not have been cleared");
-    }
+    preferences.remove(WIFI_SSID_KEY);
+    preferences.remove(WIFI_PASSWORD_KEY);
 }
 
 String ConfigManager::getDeviceName() {
     String deviceName = preferences.getString(DEVICE_NAME_KEY, "");
     if (deviceName.length() == 0) {
         // Generate default device name and store it
-        deviceName = "TilkieTalkie_" + String(ESP.getEfuseMac());
+        deviceName = String(F("TilkieTalkie_")) + String(ESP.getEfuseMac());
         preferences.putString(DEVICE_NAME_KEY, deviceName);
-        Serial.println("Generated and stored default device name: " + deviceName);
     }
     return deviceName;
 }
@@ -144,9 +112,8 @@ String ConfigManager::getProvisioningPin() {
     String pin = preferences.getString(PROVISIONING_PIN_KEY, "");
     if (pin.length() == 0) {
         // Use default PIN and store it
-        pin = "abcd1234";
+        pin = F("abcd1234");
         preferences.putString(PROVISIONING_PIN_KEY, pin);
-        Serial.println("Generated and stored default provisioning PIN: " + pin);
     }
     return pin;
 }
@@ -158,16 +125,7 @@ void ConfigManager::setProvisioningPin(const String& pin) {
 
 void ConfigManager::storeCurrentWiFiCredentials() {
     if (WiFi.isConnected()) {
-        String ssid = WiFi.SSID();
-        String password = WiFi.psk();
-        
-        Serial.println("Storing current WiFi connection credentials:");
-        Serial.println("Current SSID: " + ssid);
-        Serial.println("Current password length: " + String(password.length()));
-        
-        setWiFiCredentials(ssid, password);
-    } else {
-        Serial.println("Cannot store WiFi credentials - not connected");
+        setWiFiCredentials(WiFi.SSID(), WiFi.psk());
     }
 }
 
@@ -176,26 +134,26 @@ void ConfigManager::resetAll() {
 }
 
 void ConfigManager::printAllSettings() {
-    Serial.println("=== Configuration Settings ===");
-    Serial.println("WiFi SSID: " + getWiFiSSID());
-    Serial.println("WiFi Password: " + String(getWiFiPassword().length() > 0 ? "***" : "Not set"));
-    Serial.println(String("Device Name: ") + getDeviceName());
-    Serial.println(String("Provisioning PIN: ") + getProvisioningPin());
-    Serial.println("JWT Token: " + String(getJWTToken().length() > 0 ? "Set : " + String(getJWTToken()) : "Not set"));
-    Serial.println("Config Valid: " + String(isValid() ? "Yes" : "No"));
-    Serial.println("Free NVS Space: " + String(getFreeSpace()) + " bytes");
+    Serial.println(F("=== Configuration Settings ==="));
+    Serial.print(F("WiFi SSID: ")); Serial.println(getWiFiSSID());
+    Serial.print(F("WiFi Password: ")); Serial.println(getWiFiPassword().length() > 0 ? F("***") : F("Not set"));
+    Serial.print(F("Device Name: ")); Serial.println(getDeviceName());
+    Serial.print(F("Provisioning PIN: ")); Serial.println(getProvisioningPin());
+    Serial.print(F("JWT Token: ")); Serial.println(getJWTToken().length() > 0 ? F("Set") : F("Not set"));
+    Serial.print(F("Config Valid: ")); Serial.println(isValid() ? F("Yes") : F("No"));
+    Serial.print(F("Free NVS Space: ")); Serial.print(getFreeSpace()); Serial.println(F(" bytes"));
     
-    // Debug: Show NVS statistics
+    // Essential NVS statistics only
     nvs_stats_t nvs_stats;
-    esp_err_t err = nvs_get_stats(NULL, &nvs_stats);
-    if (err == ESP_OK) {
-        Serial.println("NVS Stats:");
-        Serial.println("  Used entries: " + String(nvs_stats.used_entries));
-        Serial.println("  Free entries: " + String(nvs_stats.free_entries));
-        Serial.println("  Total entries: " + String(nvs_stats.total_entries));
+    if (nvs_get_stats(NULL, &nvs_stats) == ESP_OK) {
+        Serial.print(F("NVS Stats: "));
+        Serial.print(nvs_stats.used_entries);
+        Serial.print(F(" used, "));
+        Serial.print(nvs_stats.free_entries);
+        Serial.println(F(" free"));
     }
     
-    Serial.println("==============================");
+    Serial.println(F("=============================="));
 }
 
 bool ConfigManager::isValid() {
@@ -205,16 +163,7 @@ bool ConfigManager::isValid() {
 }
 
 void ConfigManager::commit() {
-    Serial.println("Committing configuration to flash...");
-    
-    // Simple commit without closing/reopening preferences
-    if (preferences.isKey(WIFI_SSID_KEY) || preferences.isKey(WIFI_PASSWORD_KEY) || 
-        preferences.isKey(DEVICE_NAME_KEY) || preferences.isKey(PROVISIONING_PIN_KEY) || 
-        preferences.isKey(JWT_TOKEN_KEY)) {
-        Serial.println("SUCCESS: Configuration committed to flash");
-    } else {
-        Serial.println("WARNING: No configuration data to commit");
-    }
+    // Silent commit - only essential error reporting
 }
 
 size_t ConfigManager::getFreeSpace() {

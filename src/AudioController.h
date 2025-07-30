@@ -106,12 +106,17 @@ private:
     AudioFileSourceBuffer* audioBuffer;
     AudioGeneratorMP3* audioMP3;
     AudioOutputI2S* audioOutput;
+    
+    // Pre-allocated reusable components to reduce fragmentation
+    AudioGeneratorMP3* pooledMP3;        // Keep one MP3 decoder alive for reuse
+    AudioFileSourceBuffer* pooledBuffer; // Keep buffer allocated for reuse
 
     // State variables
     AudioState currentState;
     String currentTrackPath;
     int currentVolume;
     bool initialized;
+    bool i2s_driver_installed;  // Track I2S driver state to prevent double initialization
     
     // Pause/resume position tracking
     uint32_t pausedPosition;
@@ -143,6 +148,8 @@ private:
     // Helper functions
     bool isValidAudioFile(const String& filePath);
     void cleanupAudioComponents();
+    void initializeComponentPool();
+    void cleanupComponentPool();
     bool isNfcSessionActive(const String& expectedUid) const;
 
     // File manager reference
