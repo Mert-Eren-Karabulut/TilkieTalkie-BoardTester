@@ -1,8 +1,5 @@
 #include "RequestManager.h"
 
-// Define static buffer
-char RequestManager::responseBuffer[4096];
-
 // Singleton instance getter
 RequestManager &RequestManager::getInstance(const String &baseUrl)
 {
@@ -13,20 +10,24 @@ RequestManager &RequestManager::getInstance(const String &baseUrl)
 // Constructor
 RequestManager::RequestManager(const String &baseUrl)
 {
-    this->baseUrl = baseUrl;
-    this->timeout = 10000; // Default 10 seconds timeout
+    this->baseUrl = convertToHttp(baseUrl);
+    this->timeout = 15000; // 15 seconds timeout for robustness
     this->lastStatusCode = 0;
     this->lastError = "";
     this->figureDownloadCompleteCallback = nullptr;
-    this->connectionEstablished = false;
-    this->lastUsedHost = "";
+    
+    // Pre-reserve memory for containers to prevent frequent reallocations
+    activeDownloads.reserve(5);
 }
 
 // Destructor
 RequestManager::~RequestManager()
 {
-    closeConnection();
     http.end();
+    
+    // Clean up all tracking data
+    clearDownloadTrackers();
+    uidToFigureIdMap.clear();
 }
 
 // Initialization
@@ -34,15 +35,12 @@ bool RequestManager::begin()
 {
     Serial.println(F("RequestManager: Initializing..."));
     
-    // Pre-configure secure client for reuse
-    secureClient.setInsecure(); // For development - use proper certificates in production
-    
     // Set up FileManager callback to track download completion
     FileManager &fileManager = FileManager::getInstance();
     fileManager.setDownloadCompleteCallback(staticFileDownloadCallback);
 
-    // Try to load stored JWT token and initialize secure connection
-    initSecureConnection();
+    // Try to load stored JWT token and initialize connection
+    initConnection();
 
     if (authToken.length() > 0)
     {
@@ -59,7 +57,7 @@ bool RequestManager::begin()
 // Configuration methods
 void RequestManager::setBaseUrl(const String &url)
 {
-    this->baseUrl = url;
+    this->baseUrl = convertToHttp(url);
 }
 
 void RequestManager::setAuthToken(const String &token)
@@ -100,10 +98,70 @@ bool RequestManager::checkNetworkConnectivity()
     return true;
 }
 
+// Convert HTTPS URLs to HTTP for memory efficiency
+String RequestManager::convertToHttp(const String& url)
+{
+    String convertedUrl = url;
+    if (convertedUrl.startsWith("https://"))
+    {
+        convertedUrl.replace("https://", "http://");
+        Serial.println(F("RequestManager: Converted HTTPS to HTTP for memory efficiency"));
+    }
+    return convertedUrl;
+}
+
+// Memory-efficient string building helper
+String RequestManager::buildUrl(const String& endpoint) const
+{
+    String url;
+    url.reserve(baseUrl.length() + endpoint.length() + 1);
+    url = baseUrl;
+    url += endpoint;
+    return url;
+}
+
+// Memory cleanup methods
+void RequestManager::clearDownloadTrackers()
+{
+    activeDownloads.clear();
+    activeDownloads.shrink_to_fit(); // Free unused capacity
+}
+
+void RequestManager::cleanupOldMappings(size_t maxMappings)
+{
+    if (uidToFigureIdMap.size() > maxMappings)
+    {
+        // Keep only the most recent mappings (simple cleanup strategy)
+        auto it = uidToFigureIdMap.begin();
+        std::advance(it, uidToFigureIdMap.size() - maxMappings);
+        uidToFigureIdMap.erase(uidToFigureIdMap.begin(), it);
+        
+        Serial.printf("RequestManager: Cleaned up old UID mappings, kept %zu entries\n", maxMappings);
+    }
+}
+
+void RequestManager::cleanupCompletedTrackers()
+{
+    auto it = activeDownloads.begin();
+    while (it != activeDownloads.end())
+    {
+        if (it->completed)
+        {
+            Serial.printf("RequestManager: Removing completed tracker for figure: %s\n", it->figureName.c_str());
+            it = activeDownloads.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
 void RequestManager::setDefaultHeaders()
 {
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Accept", "application/json");
+    http.addHeader("User-Agent", "TilkieTalkie/1.0");
 
     if (authToken.length() > 0)
     {
@@ -111,15 +169,33 @@ void RequestManager::setDefaultHeaders()
     }
 }
 
-JsonDocument RequestManager::parseResponse(String response)
+JsonDocument RequestManager::parseResponse(const String& response)
 {
-    JsonDocument doc;
+    // Check response size
+    if (response.length() > MAX_RESPONSE_SIZE)
+    {
+        Serial.printf("RequestManager: Response too large (%d bytes), truncating\n", response.length());
+        // Could truncate here if needed, but for now we'll try to parse as-is
+    }
+    
+    // Calculate JSON document size with more conservative approach
+    size_t jsonSize = min(response.length() * 2, (size_t)MAX_RESPONSE_SIZE);
+    if (jsonSize < 512) jsonSize = 512;    // Minimum size
+    
+    DynamicJsonDocument doc(jsonSize);
     DeserializationError error = deserializeJson(doc, response);
 
     if (error)
     {
-        lastError = "JSON parsing error: " + String(error.c_str());
-        JsonDocument errorDoc;
+        lastError = "JSON parsing error: ";
+        lastError += error.c_str();
+        
+        Serial.println("RequestManager: " + lastError);
+        Serial.printf("Response length: %d bytes\n", response.length());
+        Serial.println("Response preview: " + response.substring(0, min(200, (int)response.length())));
+        
+        // Create minimal error document
+        DynamicJsonDocument errorDoc(256);
         errorDoc["error"] = true;
         errorDoc["message"] = lastError;
         return errorDoc;
@@ -131,7 +207,7 @@ JsonDocument RequestManager::parseResponse(String response)
 // HTTP Methods
 JsonDocument RequestManager::get(const String &endpoint)
 {
-    JsonDocument emptyDoc;
+    DynamicJsonDocument emptyDoc(256);
 
     if (!checkNetworkConnectivity())
     {
@@ -144,8 +220,8 @@ JsonDocument RequestManager::get(const String &endpoint)
     // Check if we have an auth token, if not try to get one
     if (authToken.length() == 0)
     {
-        Serial.println("No auth token available, attempting to authenticate...");
-        initSecureConnection();
+        Serial.println(F("No auth token available, attempting to authenticate..."));
+        initConnection();
         if (authToken.length() == 0)
         {
             lastError = "Authentication failed - no token available";
@@ -155,33 +231,16 @@ JsonDocument RequestManager::get(const String &endpoint)
         }
     }
 
-    String url = baseUrl + endpoint;
+    String url = buildUrl(endpoint);
     
-    // For now, let's revert to the simpler approach to fix the immediate issue
-    // The connection pooling was causing HTTP header failures
-    http.end(); // Clean up any previous connections
+    // Clean up any previous connections
+    http.end();
     
-    // Begin connection with retry logic
-    bool connected = false;
-    for (int retry = 0; retry < 3 && !connected; retry++)
+    // Begin HTTP connection (not HTTPS)
+    if (!http.begin(client, url))
     {
-        if (retry > 0)
-        {
-            Serial.printf("RequestManager: Retrying connection attempt %d/3\n", retry + 1);
-            delay(1000); // Wait before retry
-        }
-        
-        connected = http.begin(secureClient, url);
-        
-        if (!connected)
-        {
-            Serial.printf("RequestManager: Failed to begin HTTP connection to %s (attempt %d)\n", url.c_str(), retry + 1);
-        }
-    }
-    
-    if (!connected)
-    {
-        lastError = "Failed to establish HTTP connection after 3 attempts";
+        lastError = "Failed to establish HTTP connection to " + url;
+        Serial.println("RequestManager: " + lastError);
         emptyDoc["error"] = true;
         emptyDoc["message"] = lastError;
         return emptyDoc;
@@ -191,39 +250,43 @@ JsonDocument RequestManager::get(const String &endpoint)
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     setDefaultHeaders();
 
+    Serial.print(F("RequestManager: Sending GET request to "));
+    Serial.println(url);
     int httpResponseCode = http.GET();
     lastStatusCode = httpResponseCode;
 
     if (httpResponseCode > 0)
     {
         String response = http.getString();
-        http.end(); // Clean up connection after use
+        http.end();
+        
+        Serial.printf("RequestManager: GET response code: %d, size: %d bytes\n", httpResponseCode, response.length());
         return parseResponse(response);
     }
     else
     {
-        // More detailed error reporting
-        String errorDetail = "";
+        // Improved error reporting
+        String errorDetail;
         switch (httpResponseCode)
         {
-            case -1: errorDetail = "Connection refused"; break;
-            case -2: errorDetail = "Send header failed"; break;
-            case -3: errorDetail = "Send payload failed"; break;
-            case -4: errorDetail = "Not connected"; break;
-            case -5: errorDetail = "Connection lost"; break;
-            case -6: errorDetail = "No stream"; break;
-            case -7: errorDetail = "No HTTP server"; break;
-            case -8: errorDetail = "Too less RAM"; break;
-            case -9: errorDetail = "Encoding error"; break;
-            case -10: errorDetail = "Stream write error"; break;
-            case -11: errorDetail = "Read timeout"; break;
+            case HTTPC_ERROR_CONNECTION_REFUSED: errorDetail = "Connection refused"; break;
+            case HTTPC_ERROR_SEND_HEADER_FAILED: errorDetail = "Send header failed"; break;
+            case HTTPC_ERROR_SEND_PAYLOAD_FAILED: errorDetail = "Send payload failed"; break;
+            case HTTPC_ERROR_NOT_CONNECTED: errorDetail = "Not connected"; break;
+            case HTTPC_ERROR_CONNECTION_LOST: errorDetail = "Connection lost"; break;
+            case HTTPC_ERROR_NO_STREAM: errorDetail = "No stream"; break;
+            case HTTPC_ERROR_NO_HTTP_SERVER: errorDetail = "No HTTP server"; break;
+            case HTTPC_ERROR_TOO_LESS_RAM: errorDetail = "Too less RAM"; break;
+            case HTTPC_ERROR_ENCODING: errorDetail = "Encoding error"; break;
+            case HTTPC_ERROR_STREAM_WRITE: errorDetail = "Stream write error"; break;
+            case HTTPC_ERROR_READ_TIMEOUT: errorDetail = "Read timeout"; break;
             default: errorDetail = "Unknown error"; break;
         }
         
         lastError = "HTTP GET failed with code: " + String(httpResponseCode) + " (" + errorDetail + ")";
-        Serial.printf("RequestManager: %s to URL: %s\n", lastError.c_str(), url.c_str());
+        Serial.println("RequestManager: " + lastError + " to URL: " + url);
         
-        http.end(); // Clean up connection on error
+        http.end();
         emptyDoc["error"] = true;
         emptyDoc["message"] = lastError;
         return emptyDoc;
@@ -232,11 +295,11 @@ JsonDocument RequestManager::get(const String &endpoint)
 
 JsonDocument RequestManager::post(const String &endpoint, const JsonDocument &data)
 {
-    JsonDocument emptyDoc;
+    DynamicJsonDocument emptyDoc(256);
 
-    if (!isWiFiConnected())
+    if (!checkNetworkConnectivity())
     {
-        lastError = "WiFi not connected";
+        lastError = "Network connectivity check failed";
         emptyDoc["error"] = true;
         emptyDoc["message"] = lastError;
         return emptyDoc;
@@ -245,8 +308,8 @@ JsonDocument RequestManager::post(const String &endpoint, const JsonDocument &da
     // Check if we have an auth token, if not try to get one
     if (authToken.length() == 0)
     {
-        Serial.println("No auth token available, attempting to authenticate...");
-        initSecureConnection();
+        Serial.println(F("No auth token available, attempting to authenticate..."));
+        initConnection();
         if (authToken.length() == 0)
         {
             lastError = "Authentication failed - no token available";
@@ -256,31 +319,16 @@ JsonDocument RequestManager::post(const String &endpoint, const JsonDocument &da
         }
     }
 
-    String url = baseUrl + endpoint;
+    String url = buildUrl(endpoint);
     
-    // End any previous connection to ensure clean state
+    // Clean up any previous connections
     http.end();
     
-    // Begin connection with retry logic
-    bool connected = false;
-    for (int retry = 0; retry < 3 && !connected; retry++)
+    // Begin HTTP connection
+    if (!http.begin(client, url))
     {
-        if (retry > 0)
-        {
-            Serial.printf("RequestManager: POST retrying connection attempt %d/3\n", retry + 1);
-            delay(1000); // Wait before retry
-        }
-        
-        connected = http.begin(secureClient, url);
-        if (!connected)
-        {
-            Serial.printf("RequestManager: Failed to begin HTTP POST connection to %s (attempt %d)\n", url.c_str(), retry + 1);
-        }
-    }
-    
-    if (!connected)
-    {
-        lastError = "Failed to establish HTTP POST connection after 3 attempts";
+        lastError = "Failed to establish HTTP POST connection to " + url;
+        Serial.println("RequestManager: " + lastError);
         emptyDoc["error"] = true;
         emptyDoc["message"] = lastError;
         return emptyDoc;
@@ -291,8 +339,11 @@ JsonDocument RequestManager::post(const String &endpoint, const JsonDocument &da
     setDefaultHeaders();
 
     String jsonString;
+    jsonString.reserve(512); // Pre-reserve space for JSON serialization
     serializeJson(data, jsonString);
 
+    Serial.print(F("RequestManager: Sending POST request to "));
+    Serial.println(url);
     int httpResponseCode = http.POST(jsonString);
     lastStatusCode = httpResponseCode;
 
@@ -300,11 +351,15 @@ JsonDocument RequestManager::post(const String &endpoint, const JsonDocument &da
     {
         String response = http.getString();
         http.end();
+        
+        Serial.printf("RequestManager: POST response code: %d, size: %d bytes\n", httpResponseCode, response.length());
         return parseResponse(response);
     }
     else
     {
         lastError = "HTTP POST failed with code: " + String(httpResponseCode);
+        Serial.println("RequestManager: " + lastError);
+        
         http.end();
         emptyDoc["error"] = true;
         emptyDoc["message"] = lastError;
@@ -331,47 +386,28 @@ int RequestManager::getLastStatusCode()
 String RequestManager::getJWTToken()
 {
     uint64_t macAddress = ESP.getEfuseMac();
-    String url = baseUrl + "/hubs/" + String(macAddress) + "/token";
     
-    // End any previous connection to ensure clean state
+    // Build endpoint URL
+    String endpoint = "/hubs/" + String(macAddress, 10) + "/token";
+    String url = buildUrl(endpoint);
+    
+    // Clean up any previous connections
     http.end();
     
-    // Begin connection with retry logic
-    bool connected = false;
-    for (int retry = 0; retry < 3 && !connected; retry++)
+    // Begin HTTP connection
+    if (!http.begin(client, url))
     {
-        if (retry > 0)
-        {
-            delay(1000);
-        }
-        
-        connected = http.begin(secureClient, url);
-    }
-    
-    if (!connected)
-    {
-        lastError = F("Failed to establish JWT token connection");
-        return "";
+        lastError = "Failed to establish JWT token connection";
+        Serial.println("RequestManager: " + lastError);
+        return String();
     }
     
     http.setTimeout(timeout);
     setDefaultHeaders();
 
+    Serial.println(F("RequestManager: Requesting JWT token"));
     int httpResponseCode = http.GET();
     lastStatusCode = httpResponseCode;
-
-    // response is formatted as below
-    //  return response()->json([
-    //              'token'   => $token,
-    //              'status'  => 'success',
-    //              'message' => 'Token generated successfully.'
-    //          ]);
-    // or
-    //      return response()->json([
-    //          'token'   => null,
-    //          'status'  => 'error',
-    //          'message' => 'No user is bound to this hub.'], 404);
-    //  }
 
     if (httpResponseCode > 0)
     {
@@ -382,50 +418,43 @@ String RequestManager::getJWTToken()
         // check if status is success
         if (doc["status"] == "success")
         {
-            return doc["token"].as<String>();
+            String token = doc["token"].as<String>();
+            Serial.println(F("RequestManager: JWT token obtained successfully"));
+            return token;
         }
         else
         {
             lastError = doc["message"].as<String>();
-            return "";
+            Serial.println("RequestManager: JWT token request failed: " + lastError);
+            return String();
         }
     }
     else
     {
         lastError = "HTTP GET failed with code: " + String(httpResponseCode);
+        Serial.println("RequestManager: " + lastError);
+        
         http.end();
-        return "";
+        return String();
     }
 }
 
-bool RequestManager::validateToken(String token)
+bool RequestManager::validateToken(const String& token)
 {
-    // send get request to BASE_URL + "/validate-token"
-    String url = baseUrl + "/hubs/" + String(ESP.getEfuseMac()) + "/validate-token";
+    uint64_t macAddress = ESP.getEfuseMac();
     
-    // End any previous connection to ensure clean state
+    // Build endpoint URL
+    String endpoint = "/hubs/" + String(macAddress, 10) + "/validate-token";
+    String url = buildUrl(endpoint);
+    
+    // Clean up any previous connections
     http.end();
     
-    // Begin connection with retry logic
-    bool connected = false;
-    for (int retry = 0; retry < 3 && !connected; retry++)
+    // Begin HTTP connection
+    if (!http.begin(client, url))
     {
-        if (retry > 0)
-        {
-            Serial.printf("RequestManager: Token validation retrying connection attempt %d/3\n", retry + 1);
-            delay(1000);
-        }
-        
-        connected = http.begin(secureClient, url);
-        if (!connected)
-        {
-            Serial.printf("RequestManager: Failed to begin token validation connection to %s (attempt %d)\n", url.c_str(), retry + 1);
-        }
-    }
-    
-    if (!connected)
-    {
-        lastError = "Failed to establish token validation connection after 3 attempts";
+        lastError = "Failed to establish token validation connection";
+        Serial.println("RequestManager: " + lastError);
         return false;
     }
     
@@ -433,25 +462,29 @@ bool RequestManager::validateToken(String token)
     setDefaultHeaders();
 
     // add Authorization header
-    http.addHeader("Authorization", "Bearer " + token);
+    String authHeader = "Bearer " + token;
+    http.addHeader("Authorization", authHeader);
 
+    Serial.println(F("RequestManager: Validating token"));
     int httpResponseCode = http.GET();
     lastStatusCode = httpResponseCode;
 
+    http.end();
+    
     if (httpResponseCode == 200)
     {
-        http.end();
+        Serial.println(F("RequestManager: Token validation successful"));
         return true;
     }
     else
     {
         lastError = "Token validation failed with code: " + String(httpResponseCode);
-        http.end();
+        Serial.println("RequestManager: " + lastError);
         return false;
     }
 }
 
-void RequestManager::initSecureConnection()
+void RequestManager::initConnection()
 {
     ConfigManager &config = ConfigManager::getInstance();
     String storedToken = config.getJWTToken();
@@ -462,12 +495,12 @@ void RequestManager::initSecureConnection()
     {
         if (validateToken(storedToken))
         {
-            Serial.println("Using stored JWT token: " + storedToken);
+            Serial.println(F("RequestManager: Using stored JWT token"));
             needNewToken = false;
         }
         else
         {
-            config.setJWTToken("");
+            config.setJWTToken(String()); // Clear invalid token
         }
     }
 
@@ -476,12 +509,12 @@ void RequestManager::initSecureConnection()
         storedToken = getJWTToken();
         if (storedToken.length() > 0)
         {
-            Serial.println("New JWT token obtained: " + storedToken);
+            Serial.println(F("RequestManager: New JWT token obtained"));
             config.setJWTToken(storedToken);
         }
         else
         {
-            setAuthToken("");
+            setAuthToken(String());
             return;
         }
     }
@@ -493,30 +526,24 @@ void RequestManager::getCheckFigureTracks(const String &uid)
 {
     // Check network connectivity first
     if (!checkNetworkConnectivity()) {
+        Serial.println(F("RequestManager: Network connectivity check failed"));
         return;
     }
     
-    String url = baseUrl + "/units/" + uid;
+    // Cleanup old mappings periodically to prevent memory bloat
+    cleanupOldMappings();
     
-    // End any previous connection and wait a bit to ensure cleanup
+    String endpoint = "/units/" + uid;
+    String url = buildUrl(endpoint);
+    
+    // Clean up any previous connections
     http.end();
-    delay(100); // Small delay to ensure proper cleanup
     
-    // Begin connection with retry logic
-    bool connected = false;
-    for (int retry = 0; retry < 3 && !connected; retry++)
+    // Begin HTTP connection
+    if (!http.begin(client, url))
     {
-        if (retry > 0)
-        {
-            delay(2000); // Longer delay between retries for network stability
-        }
-        
-        connected = http.begin(secureClient, url);
-    }
-    
-    if (!connected)
-    {
-        lastError = F("Failed to establish figure tracks connection");
+        lastError = "Failed to establish figure tracks connection";
+        Serial.println("RequestManager: " + lastError);
         return;
     }
     
@@ -524,6 +551,7 @@ void RequestManager::getCheckFigureTracks(const String &uid)
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     setDefaultHeaders();
 
+    Serial.println(F("RequestManager: Fetching figure tracks"));
     int httpResponseCode = http.GET();
     lastStatusCode = httpResponseCode;
 
@@ -535,13 +563,11 @@ void RequestManager::getCheckFigureTracks(const String &uid)
         JsonDocument doc = parseResponse(response);
         if (doc["error"].as<bool>())
         {
+            Serial.println(F("RequestManager: API returned error"));
             return;
         }
 
-        // now we check if this figures tracks are already downloaded
-        //file structure is /figures/{figure_id}/{episode_id}/{track_id}.mp3
-        //there can be multiple episodes and tracks for each figure
-        //first get instance of file manager
+        // Get file manager instance
         FileManager &fileManager = FileManager::getInstance();
         
         JsonObject figure = doc["figure"].as<JsonObject>();
@@ -558,7 +584,7 @@ void RequestManager::getCheckFigureTracks(const String &uid)
             if (figureDownloadCompleteCallback)
             {
                 Figure emptyFigure;
-                figureDownloadCompleteCallback(uid, F("null"), false, F("No figure data found"), emptyFigure);
+                figureDownloadCompleteCallback(uid, "null", false, "No figure data found", emptyFigure);
             }
             return;
         }
@@ -573,7 +599,16 @@ void RequestManager::getCheckFigureTracks(const String &uid)
         figureData.name = figureName;
         figureData.description = figure["description"].as<String>();
         
+        // Pre-reserve capacity based on episodes count
+        if (episodes.size() > 0) {
+            figureData.episodes.reserve(episodes.size());
+        }
+        
         // Parse episodes and tracks
+        std::vector<String> trackPaths;
+        int tracksToDownload = 0;
+        int tracksAlreadyExist = 0;
+        
         for (JsonVariant episodeVar : episodes)
         {
             JsonObject episodeObj = episodeVar.as<JsonObject>();
@@ -583,6 +618,10 @@ void RequestManager::getCheckFigureTracks(const String &uid)
             episode.description = episodeObj["description"].as<String>();
             
             JsonArray tracks = episodeObj["tracks"].as<JsonArray>();
+            if (tracks.size() > 0) {
+                episode.tracks.reserve(tracks.size());
+            }
+            
             for (JsonVariant trackVar : tracks)
             {
                 JsonObject trackObj = trackVar.as<JsonObject>();
@@ -593,84 +632,60 @@ void RequestManager::getCheckFigureTracks(const String &uid)
                 track.audioUrl = trackObj["audio_url"].as<String>();
                 track.duration = trackObj["duration"].as<int>();
                 
-                // Generate local path
+                // Create local path for the track using the original file structure
                 track.localPath = "/figures/" + figureId + "/" + episode.id + "/" + track.id + ".mp3";
+                trackPaths.push_back(track.localPath);
                 
-                episode.tracks.push_back(track);
-            }
-            
-            figureData.episodes.push_back(episode);
-        }
-        
-        // Collect all track paths for this figure
-        std::vector<String> allTrackPaths;
-        int totalTracks = 0;
-        int tracksAlreadyExist = 0;
-        
-        for (const auto& episode : figureData.episodes)
-        {
-            for (const auto& track : episode.tracks)
-            {
-                allTrackPaths.push_back(track.localPath);
-                totalTracks++;
-                
-                if (!fileManager.fileExists(track.localPath))
+                // Only schedule download if file doesn't already exist
+                if (track.audioUrl.length() > 0)
                 {
-                    fileManager.addRequiredFile(track.localPath, track.audioUrl);
-                    // Immediately schedule the download
-                    fileManager.scheduleDownload(track.audioUrl, track.localPath);
-                }
-                else
-                {
-                    tracksAlreadyExist++;
-                }
-            }
-        }
-        
-        // Start tracking this figure's download progress
-        if (totalTracks > 0)
-        {
-            // Store UID to figure ID mapping for future reference
-            storeUidToFigureIdMapping(uid, figureId);
-            
-            startTrackingFigure(uid, figureName, figureId, allTrackPaths, figureData);
-            
-            // If all tracks already exist, immediately call the callback
-            if (tracksAlreadyExist == totalTracks)
-            {
-                if (figureDownloadCompleteCallback)
-                {
-                    figureDownloadCompleteCallback(uid, figureName, true, F("All tracks available"), figureData);
-                }
-                
-                // Remove from tracking since we're done
-                for (auto it = activeDownloads.begin(); it != activeDownloads.end(); ++it)
-                {
-                    if (it->uid == uid)
+                    if (!fileManager.fileExists(track.localPath))
                     {
-                        activeDownloads.erase(it);
-                        break;
+                        Serial.print(F("RequestManager: Starting download: "));
+                        Serial.println(track.name);
+                        fileManager.scheduleDownload(track.audioUrl, track.localPath);
+                        tracksToDownload++;
+                    }
+                    else
+                    {
+                        Serial.print(F("RequestManager: File already exists, skipping download: "));
+                        Serial.println(track.name);
+                        tracksAlreadyExist++;
                     }
                 }
+                
+                episode.tracks.push_back(std::move(track));
             }
-            else
-            {
-                // Trigger download processing for newly added files
-                fileManager.checkRequiredFiles();
-            }
+            
+            figureData.episodes.push_back(std::move(episode));
         }
-        else
+        
+        // Store UID to Figure ID mapping
+        storeUidToFigureIdMapping(uid, figureId);
+        
+        // Start tracking the download progress
+        startTrackingFigure(uid, figureName, figureId, trackPaths, figureData);
+        
+        // More informative download summary
+        if (tracksToDownload > 0)
         {
-            if (figureDownloadCompleteCallback)
-            {
-                Figure emptyFigure; // Create empty figure for error case
-                figureDownloadCompleteCallback(uid, figureName, false, F("No tracks found"), emptyFigure);
-            }
+            Serial.print(F("RequestManager: Started downloading "));
+            Serial.print(tracksToDownload);
+            Serial.print(F(" new tracks for figure: "));
+            Serial.println(figureName);
+        }
+        if (tracksAlreadyExist > 0)
+        {
+            Serial.print(F("RequestManager: "));
+            Serial.print(tracksAlreadyExist);
+            Serial.print(F(" tracks already exist for figure: "));
+            Serial.println(figureName);
         }
     }
     else
     {
         lastError = "HTTP GET failed with code: " + String(httpResponseCode);
+        Serial.println("RequestManager: " + lastError);
         http.end();
     }
 }
@@ -683,7 +698,10 @@ void RequestManager::setFigureDownloadCompleteCallback(FigureDownloadCompleteCal
 
 void RequestManager::startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData)
 {
-    // Remove any existing tracker for this UID
+    // Clean up completed trackers periodically to prevent memory bloat
+    cleanupCompletedTrackers();
+    
+    // Remove any existing tracker for this UID to prevent duplicates
     for (auto it = activeDownloads.begin(); it != activeDownloads.end(); ++it)
     {
         if (it->uid == uid)
@@ -703,7 +721,7 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     tracker.tracksFailed = 0;
     tracker.trackPaths = trackPaths;
     tracker.completed = false;
-    tracker.figureData = figureData; // Store the complete figure structure
+    tracker.figureData = figureData;
     
     // Count tracks that already exist
     FileManager &fileManager = FileManager::getInstance();
@@ -715,10 +733,31 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
         }
     }
     
-    activeDownloads.push_back(tracker);
+    Serial.print(F("Started tracking figure '"));
+    Serial.print(figureName);
+    Serial.print(F("' (UID: "));
+    Serial.print(uid);
+    Serial.print(F("): "));
+    Serial.print(tracker.totalTracks);
+    Serial.print(F(" total tracks, "));
+    Serial.print(tracker.tracksReady);
+    Serial.println(F(" already ready"));
     
-    Serial.printf("Started tracking figure '%s' (UID: %s): %d total tracks, %d already ready\n", 
-                 figureName.c_str(), uid.c_str(), tracker.totalTracks, tracker.tracksReady);
+    // Check if all tracks are already ready before adding to activeDownloads
+    bool allTracksReady = (tracker.tracksReady >= tracker.totalTracks && tracker.totalTracks > 0);
+    
+    if (allTracksReady)
+    {
+        Serial.println(F("All tracks already exist, triggering immediate callback"));
+        tracker.completed = true;
+        
+        if (figureDownloadCompleteCallback)
+        {
+            figureDownloadCompleteCallback(uid, figureName, true, "", figureData);
+        }
+    }
+    
+    activeDownloads.push_back(std::move(tracker));
 }
 
 void RequestManager::checkFigureDownloadStatus(const String &uid)
@@ -727,54 +766,28 @@ void RequestManager::checkFigureDownloadStatus(const String &uid)
     {
         if (tracker.uid == uid && !tracker.completed)
         {
-            FileManager &fileManager = FileManager::getInstance();
-            int currentReady = 0;
-            int currentFailed = 0;
-            
-            // Recount to get current status
-            for (const String &path : tracker.trackPaths)
-            {
-                if (fileManager.fileExists(path))
-                {
-                    currentReady++;
-                }
-                else
-                {
-                    // Check if this path is still in download queue or has failed permanently
-                    // For simplicity, we'll assume if it doesn't exist and we've been called,
-                    // it might have failed. The FileManager will handle retries.
-                }
-            }
-            
-            tracker.tracksReady = currentReady;
-            
-            // Check if all tracks are ready
-            if (tracker.tracksReady == tracker.totalTracks)
+            if (tracker.tracksReady + tracker.tracksFailed >= tracker.totalTracks)
             {
                 tracker.completed = true;
-                Serial.printf("Figure '%s' download completed successfully! All %d tracks are ready.\n", 
-                             tracker.figureName.c_str(), tracker.totalTracks);
+                bool success = (tracker.tracksReady > 0) && (tracker.tracksFailed == 0);
                 
                 if (figureDownloadCompleteCallback)
                 {
-                    figureDownloadCompleteCallback(tracker.uid, tracker.figureName, true, "All tracks downloaded successfully", tracker.figureData);
+                    String error = success ? "" : "Some tracks failed to download";
+                    figureDownloadCompleteCallback(uid, tracker.figureName, success, error, tracker.figureData);
                 }
                 
-                // Remove completed tracker
-                for (auto it = activeDownloads.begin(); it != activeDownloads.end(); ++it)
-                {
-                    if (it->uid == uid)
-                    {
-                        activeDownloads.erase(it);
-                        break;
-                    }
-                }
-                return;
+                Serial.print(F("Figure download completed for: "));
+                Serial.print(tracker.figureName);
+                Serial.print(F(" - Success: "));
+                Serial.print(success ? "Yes" : "No");
+                Serial.print(F(" ("));
+                Serial.print(tracker.tracksReady);
+                Serial.print(F("/"));
+                Serial.print(tracker.totalTracks);
+                Serial.println(F(" tracks ready)"));
+                break;
             }
-            
-            Serial.printf("Figure '%s' download progress: %d/%d tracks ready\n", 
-                         tracker.figureName.c_str(), tracker.tracksReady, tracker.totalTracks);
-            break;
         }
     }
 }
@@ -784,78 +797,26 @@ void RequestManager::onTrackDownloadComplete(const String &path, bool success)
     // Find which figure this track belongs to
     for (auto &tracker : activeDownloads)
     {
-        if (tracker.completed) continue;
-        
-        // Check if this path belongs to this figure
-        bool pathBelongsToFigure = false;
-        for (const String &trackPath : tracker.trackPaths)
+        if (!tracker.completed)
         {
-            if (trackPath == path)
+            for (const String &trackPath : tracker.trackPaths)
             {
-                pathBelongsToFigure = true;
-                break;
-            }
-        }
-        
-        if (pathBelongsToFigure)
-        {
-            if (success)
-            {
-                tracker.tracksReady++;
-                Serial.printf("Track downloaded successfully for figure '%s': %s (%d/%d ready)\n", 
-                             tracker.figureName.c_str(), path.c_str(), tracker.tracksReady, tracker.totalTracks);
-            }
-            else
-            {
-                tracker.tracksFailed++;
-                Serial.printf("Track download failed for figure '%s': %s (%d failed)\n", 
-                             tracker.figureName.c_str(), path.c_str(), tracker.tracksFailed);
-            }
-            
-            // Check if all tracks are accounted for (ready + failed = total)
-            if (tracker.tracksReady + tracker.tracksFailed >= tracker.totalTracks)
-            {
-                tracker.completed = true;
-                
-                if (tracker.tracksReady == tracker.totalTracks)
+                if (trackPath == path)
                 {
-                    // All tracks successful
-                    Serial.printf("Figure '%s' download completed successfully! All %d tracks are ready.\n", 
-                                 tracker.figureName.c_str(), tracker.totalTracks);
-                    
-                    if (figureDownloadCompleteCallback)
+                    if (success)
                     {
-                        figureDownloadCompleteCallback(tracker.uid, tracker.figureName, true, "All tracks downloaded successfully", tracker.figureData);
+                        tracker.tracksReady++;
                     }
-                }
-                else
-                {
-                    // Some tracks failed
-                    String errorMsg = String("Download completed with errors: ") + 
-                                    String(tracker.tracksReady) + "/" + String(tracker.totalTracks) + " tracks ready, " +
-                                    String(tracker.tracksFailed) + " failed";
-                    
-                    Serial.printf("Figure '%s' download completed with errors: %d/%d tracks ready, %d failed\n", 
-                                 tracker.figureName.c_str(), tracker.tracksReady, tracker.totalTracks, tracker.tracksFailed);
-                    
-                    if (figureDownloadCompleteCallback)
+                    else
                     {
-                        figureDownloadCompleteCallback(tracker.uid, tracker.figureName, false, errorMsg, tracker.figureData);
+                        tracker.tracksFailed++;
                     }
+                    
+                    // Check if this figure is now complete
+                    checkFigureDownloadStatus(tracker.uid);
+                    return;
                 }
-                
-                // Remove completed tracker
-                for (auto it = activeDownloads.begin(); it != activeDownloads.end(); ++it)
-                {
-                    if (it->uid == tracker.uid)
-                    {
-                        activeDownloads.erase(it);
-                        break;
-                    }
-                }
-                return;
             }
-            break;
         }
     }
 }
@@ -864,7 +825,7 @@ void RequestManager::onTrackDownloadComplete(const String &path, bool success)
 void RequestManager::staticFileDownloadCallback(const String& url, const String& path, bool success, const String& error)
 {
     // Get the singleton instance and forward the call
-    RequestManager &instance = RequestManager::getInstance("https://portal.tilkietalkie.com/api");
+    RequestManager &instance = RequestManager::getInstance("http://portal.tilkietalkie.com/api");
     instance.onTrackDownloadComplete(path, success);
 }
 
@@ -872,7 +833,10 @@ void RequestManager::staticFileDownloadCallback(const String& url, const String&
 void RequestManager::storeUidToFigureIdMapping(const String &uid, const String &figureId)
 {
     uidToFigureIdMap[uid] = figureId;
-    Serial.printf("Stored UID->FigureID mapping: %s -> %s\n", uid.c_str(), figureId.c_str());
+    Serial.print(F("Stored UID->FigureID mapping: "));
+    Serial.print(uid);
+    Serial.print(F(" -> "));
+    Serial.println(figureId);
 }
 
 // Get figure ID from UID for deletion purposes
@@ -885,55 +849,7 @@ String RequestManager::getFigureIdFromUid(const String &uid)
     }
     
     // If not found in memory, could potentially query the server or search filesystem
-    Serial.printf("No figure ID found for UID: %s\n", uid.c_str());
-    return "";
-}
-
-bool RequestManager::ensureConnection(const String& host) {
-    // Check if we can reuse existing connection
-    if (connectionEstablished && lastUsedHost == host) {
-        return true;
-    }
-    
-    // Close previous connection if different host
-    if (connectionEstablished && lastUsedHost != host) {
-        closeConnection();
-    }
-    
-    // Establish new connection
-    String url = String("https://") + host;
-    
-    // Begin connection with retry logic
-    bool connected = false;
-    for (int retry = 0; retry < 3 && !connected; retry++) {
-        if (retry > 0) {
-            Serial.printf("RequestManager: Retrying connection attempt %d/3\n", retry + 1);
-            delay(1000);
-        }
-        
-        connected = http.begin(secureClient, url);
-        
-        if (!connected) {
-            Serial.printf("RequestManager: Failed to begin HTTP connection to %s (attempt %d)\n", host.c_str(), retry + 1);
-        }
-    }
-    
-    if (connected) {
-        connectionEstablished = true;
-        lastUsedHost = host;
-        Serial.printf("RequestManager: Connection established to %s (reusable)\n", host.c_str());
-    } else {
-        Serial.printf("RequestManager: Failed to establish connection to %s after 3 attempts\n", host.c_str());
-    }
-    
-    return connected;
-}
-
-void RequestManager::closeConnection() {
-    if (connectionEstablished) {
-        http.end();
-        connectionEstablished = false;
-        lastUsedHost = "";
-        Serial.println("RequestManager: Connection closed");
-    }
+    Serial.print(F("No figure ID found for UID: "));
+    Serial.println(uid);
+    return String();
 }

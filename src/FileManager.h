@@ -4,11 +4,11 @@
 #include <Arduino.h>
 #include <SD.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 #include <vector>
 #include <map>
+
 
 struct DownloadTask {
     String url;
@@ -40,7 +40,7 @@ private:
     static const int SD_CLK_PIN = 14;
     
     // SD Card speed configuration (optimized for high-speed cards)
-    // Default initialization tries 25MHz first, falls back to slower speeds if needed
+    // Default initialization tries 25MHz first, falls back to slower speeds if neededß
     
     // Download configuration
     static const int MAX_RETRY_COUNT = 5;
@@ -183,7 +183,6 @@ private:
     
     // Maintenance operations
     void cleanupTempFiles();
-    void defragmentSDCard(); // Optional: implement if needed
     bool repairCorruptedFiles();
     
     // Event callbacks

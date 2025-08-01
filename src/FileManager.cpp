@@ -180,6 +180,7 @@ bool FileManager::initializeSDCard() {
     createDirectory("/temp");
     createDirectory("/logs");
     createDirectory("/images");
+    createDirectory("/figures");
     
     return true;
 }
@@ -215,15 +216,41 @@ bool FileManager::checkConnectivity() {
 bool FileManager::pingGoogle() {
     Serial.println("FileManager: Checking internet connectivity...");
     
-    // Simple HTTP request to check connectivity (alternative to ping)
-    HTTPClient http;
-    http.begin("http://www.google.com");
-    http.setTimeout(5000); // 5 second timeout
+    // Use WiFiClient for memory efficiency instead of HTTPClient
+    WiFiClient client;
+    client.setTimeout(5000); // 5 second timeout
     
-    int httpCode = http.GET();
-    http.end();
+    if (!client.connect("www.google.com", 80)) {
+        Serial.printf("FileManager: Internet connectivity: FAILED (connection failed)\n");
+        return false;
+    }
     
-    bool connected = (httpCode > 0);
+    // Send simple HTTP HEAD request (lighter than GET)
+    String request = "HEAD / HTTP/1.1\r\n";
+    request += "Host: www.google.com\r\n";
+    request += "Connection: close\r\n";
+    request += "\r\n";
+    
+    client.print(request);
+    
+    // Wait for response with timeout
+    unsigned long startTime = millis();
+    bool responseReceived = false;
+    
+    while (client.connected() && (millis() - startTime < 5000)) {
+        if (client.available()) {
+            String line = client.readStringUntil('\n');
+            if (line.startsWith("HTTP/")) {
+                responseReceived = true;
+                break;
+            }
+        }
+        delay(1);
+    }
+    
+    client.stop();
+    
+    bool connected = responseReceived;
     Serial.printf("FileManager: Internet connectivity: %s\n", connected ? "OK" : "FAILED");
     
     return connected;
@@ -587,7 +614,44 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     
     downloadInProgress = true;
     
-    Serial.printf("FileManager: Starting download: %s -> %s\n", url.c_str(), localPath.c_str());
+    // Convert HTTPS to HTTP to reduce memory usage
+    String httpUrl = url;
+    if (httpUrl.startsWith("https://")) {
+        httpUrl.replace("https://", "http://");
+        Serial.printf("FileManager: Converted HTTPS to HTTP for memory efficiency\n");
+    }
+    
+    Serial.printf("FileManager: Starting download: %s -> %s\n", httpUrl.c_str(), localPath.c_str());
+    
+    // Parse URL to extract hostname and path
+    String hostname, path;
+    int port = 80;
+    
+    if (httpUrl.startsWith("http://")) {
+        int hostStart = 7; // Length of "http://"
+        int pathStart = httpUrl.indexOf('/', hostStart);
+        
+        if (pathStart == -1) {
+            hostname = httpUrl.substring(hostStart);
+            path = "/";
+        } else {
+            hostname = httpUrl.substring(hostStart, pathStart);
+            path = httpUrl.substring(pathStart);
+        }
+        
+        // Check for port in hostname
+        int portIndex = hostname.indexOf(':');
+        if (portIndex != -1) {
+            port = hostname.substring(portIndex + 1).toInt();
+            hostname = hostname.substring(0, portIndex);
+        }
+    } else {
+        errorMsg = "Invalid URL format (must start with http://)";
+        downloadInProgress = false;
+        return false;
+    }
+    
+    Serial.printf("FileManager: Connecting to %s:%d, path: %s\n", hostname.c_str(), port, path.c_str());
     
     // Create directory structure with verification
     if (!createDirectoryStructure(localPath)) {
@@ -615,27 +679,87 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         SD.remove(tempPath);
     }
     
-    HTTPClient http;
-    http.begin(url);
-    http.setTimeout(DOWNLOAD_TIMEOUT_MS);
+    // Create WiFi client and connect
+    WiFiClient client;
+    // WiFiClient setTimeout takes uint16_t in milliseconds, max ~65 seconds
+    // We'll handle timeout manually using millis() for longer timeouts
+    client.setTimeout(30000); // 30 seconds for connection operations
     
-    int httpCode = http.GET();
-    
-    if (httpCode != HTTP_CODE_OK) {
-        errorMsg = "HTTP error: " + String(httpCode);
-        http.end();
+    if (!client.connect(hostname.c_str(), port)) {
+        errorMsg = "Failed to connect to server: " + hostname;
         downloadInProgress = false;
         return false;
     }
     
-    int contentLength = http.getSize();
-    WiFiClient* stream = http.getStreamPtr();
+    // Send HTTP GET request
+    String request = "GET " + path + " HTTP/1.1\r\n";
+    request += "Host: " + hostname + "\r\n";
+    request += "Connection: close\r\n";
+    request += "User-Agent: ESP32-FileManager/1.0\r\n";
+    request += "\r\n";
+    
+    client.print(request);
+    Serial.printf("FileManager: HTTP request sent\n");
+    
+    // Read response headers
+    unsigned long startTime = millis();
+    bool headersDone = false;
+    String responseHeaders = "";
+    int contentLength = -1;
+    int httpCode = 0;
+    
+    while (client.connected() && (millis() - startTime < DOWNLOAD_TIMEOUT_MS) && !headersDone) {
+        if (client.available()) {
+            String line = client.readStringUntil('\n');
+            line.trim();
+            
+            if (line.length() == 0) {
+                headersDone = true;
+                break;
+            }
+            
+            // Parse HTTP status code
+            if (line.startsWith("HTTP/")) {
+                int spaceIndex = line.indexOf(' ');
+                if (spaceIndex != -1) {
+                    httpCode = line.substring(spaceIndex + 1, spaceIndex + 4).toInt();
+                }
+            }
+            
+            // Parse Content-Length
+            if (line.startsWith("Content-Length:") || line.startsWith("content-length:")) {
+                int colonIndex = line.indexOf(':');
+                if (colonIndex != -1) {
+                    contentLength = line.substring(colonIndex + 1).toInt();
+                }
+            }
+            
+            Serial.printf("Header: %s\n", line.c_str());
+        }
+        delay(1);
+    }
+    
+    if (!headersDone) {
+        errorMsg = "Failed to read HTTP headers";
+        client.stop();
+        downloadInProgress = false;
+        return false;
+    }
+    
+    if (httpCode != 200) {
+        errorMsg = "HTTP error: " + String(httpCode);
+        client.stop();
+        downloadInProgress = false;
+        return false;
+    }
+    
+    Serial.printf("FileManager: HTTP 200 OK, Content-Length: %d\n", contentLength);
     
     // Check available space
     size_t freeSpace = getSDCardFreeSpace();
     if (contentLength > 0 && (size_t)contentLength > freeSpace) {
         errorMsg = "Insufficient SD card space";
-        http.end();
+        client.stop();
         downloadInProgress = false;
         return false;
     }
@@ -643,7 +767,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     File file = SD.open(tempPath, FILE_WRITE);
     if (!file) {
         errorMsg = "Failed to create temporary file: " + tempPath;
-        http.end();
+        client.stop();
         downloadInProgress = false;
         return false;
     }
@@ -652,7 +776,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     if (!buffer) {
         errorMsg = "Failed to allocate download buffer";
         file.close();
-        http.end();
+        client.stop();
         downloadInProgress = false;
         return false;
     }
@@ -661,12 +785,14 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     unsigned long lastProgress = 0;
     bool downloadSuccess = true;
     
-    while (http.connected() && downloadSuccess && (contentLength > 0 || contentLength == -1)) {
-        size_t availableData = stream->available();
+    // Download the file content
+    startTime = millis(); // Reset timer for download phase
+    while (client.connected() && downloadSuccess && (millis() - startTime < DOWNLOAD_TIMEOUT_MS)) {
+        size_t availableData = client.available();
         
         if (availableData > 0) {
             size_t bytesToRead = min(availableData, (size_t)DOWNLOAD_BUFFER_SIZE);
-            int readBytes = stream->readBytes(buffer, bytesToRead);
+            int readBytes = client.readBytes(buffer, bytesToRead);
             
             if (readBytes > 0) {
                 size_t written = file.write(buffer, readBytes);
@@ -687,12 +813,23 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
                                     progress, totalDownloaded, contentLength);
                         
                         if (downloadProgressCallback) {
-                            downloadProgressCallback(url, localPath, progress, totalDownloaded, contentLength);
+                            downloadProgressCallback(httpUrl, localPath, progress, totalDownloaded, contentLength);
                         }
                     }
                 }
                 
                 if (contentLength > 0 && totalDownloaded >= contentLength) {
+                    break;
+                }
+            }
+        } else {
+            // No data available, check if connection is still alive
+            if (!client.connected()) {
+                if (contentLength > 0 && totalDownloaded < contentLength) {
+                    errorMsg = "Connection lost before download completed";
+                    downloadSuccess = false;
+                } else {
+                    // Connection closed normally (for chunked transfer or unknown length)
                     break;
                 }
             }
@@ -703,7 +840,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     
     free(buffer);
     file.close();
-    http.end();
+    client.stop();
     
     if (!downloadSuccess) {
         SD.remove(tempPath);
@@ -760,7 +897,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
                   localPath.c_str(), totalDownloaded);
     
     if (downloadCompleteCallback) {
-        downloadCompleteCallback(url, localPath, true, "");
+        downloadCompleteCallback(httpUrl, localPath, true, "");
     }
     
     return true;
@@ -2132,4 +2269,3 @@ void FileManager::forceProcessDownloads() {
     
     Serial.println("FileManager: Force download processing completed.");
 }
-

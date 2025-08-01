@@ -88,7 +88,7 @@ public:
 
     // Update function (call in main loop)
     void update();
-
+    
     // Beep functions
     void beep(int frequency = 1000, int duration = 100);
     void volumeBeep(); // Beep to indicate volume level
@@ -106,10 +106,6 @@ private:
     AudioFileSourceBuffer* audioBuffer;
     AudioGeneratorMP3* audioMP3;
     AudioOutputI2S* audioOutput;
-    
-    // Pre-allocated reusable components to reduce fragmentation
-    AudioGeneratorMP3* pooledMP3;        // Keep one MP3 decoder alive for reuse
-    AudioFileSourceBuffer* pooledBuffer; // Keep buffer allocated for reuse
 
     // State variables
     AudioState currentState;
@@ -148,8 +144,7 @@ private:
     // Helper functions
     bool isValidAudioFile(const String& filePath);
     void cleanupAudioComponents();
-    void initializeComponentPool();
-    void cleanupComponentPool();
+    bool initializeAudioComponents();
     bool isNfcSessionActive(const String& expectedUid) const;
 
     // File manager reference

@@ -2,10 +2,10 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h> // Required for the insecure client
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <WebSocketsClient.h> // links2004/WebSockets v2.6.1
+#include <WebSocketsClient.h>
 
 // Include headers for all necessary device components to fetch status data
 #include "BatteryManagement.h"
@@ -40,22 +40,11 @@ public:
             return;
         }
 
-        // Check available memory and fragmentation before starting
+        // WebSocket is CRITICAL - only check for absolute minimum memory
         size_t freeHeap = ESP.getFreeHeap();
-        size_t largestBlock = ESP.getMaxAllocHeap();
-        
-        // Require sufficient memory for SSL WebSocket connections
-        if (freeHeap < 80000 || largestBlock < 40000) { 
+        if (freeHeap < 25000) {
+            Serial.printf("ReverbClient: CRITICAL memory shortage - Free: %d\n", freeHeap);
             return;
-        }
-        
-        // If fragmentation is too high, attempt cleanup
-        float fragmentation = (1.0f - (float)largestBlock / (float)freeHeap) * 100.0f;
-        if (fragmentation > 70.0f) {
-            String temp = String("cleanup");
-            temp.reserve(1000);
-            temp = "";
-            delay(100);
         }
 
         _host = host;
@@ -64,28 +53,27 @@ public:
         _authToken = authToken;
         _deviceId = deviceId;
 
-        // Initialize shared SSL client for HTTP requests to reduce memory allocations  
-        if (!_sslClient) {
-            _sslClient = new WiFiClientSecure();
-            _sslClient->setInsecure();  // Configure once for all HTTP requests
+        // Pre-allocate all objects at once to minimize fragmentation
+        if (!_httpClient) {
+            _httpClient = new WiFiClientSecure();
+            ((WiFiClientSecure*)_httpClient)->setInsecure();
         }
 
-        // Initialize the WebSocketsClient pointer only if we have enough memory
-        if (_ws == nullptr)
-        {
+        if (_ws == nullptr) {
             _ws = new WebSocketsClient();
         }
 
+        // Configure WebSocket with optimized settings
         instance = this;
         _ws->onEvent(webSocketEvent);
-        _ws->setReconnectInterval(30000); // Increased from 5000 to reduce reconnection frequency
-        // Reduce heartbeat frequency to minimize memory allocations
-        _ws->enableHeartbeat(30000, 5000, 2); // ping every 30s, 5s timeout, 2 failures max
-
-        // Pre-build WebSocket path to avoid String concatenation
+        _ws->setReconnectInterval(10000);
+        _ws->enableHeartbeat(15000, 2000, 1);
+        
+        // Pre-build WebSocket path to avoid String concatenation during runtime
         snprintf(urlBuffer, sizeof(urlBuffer), "/app/%s?protocol=7&client=esp32-client&version=1.0", _appKey.c_str());
 
-        // Use the standard beginSSL method (WebSocket library manages its own SSL client)
+        // Immediate connection attempt - WebSocket is critical
+        Serial.println("ReverbClient: Initiating critical WebSocket connection...");
         _ws->beginSSL(_host.c_str(), _port, urlBuffer);
     }
 
@@ -93,41 +81,39 @@ public:
     {
         if (!WiFi.isConnected())
         {
-            // Don't update WebSocket if WiFi is not connected
             return;
         }
         
-                // Handle automatic reconnection with fixed 3-second delay
-        if (!_isConnected && _ws && _connectionRetries > 0 && _connectionRetries <= MAX_CONNECTION_RETRIES)
-        {
-            if (millis() - _lastConnectionAttempt >= RETRY_DELAY)
-            {
-                // Check memory before reconnection attempt
-                size_t freeHeap = ESP.getFreeHeap();
-                size_t largestBlock = ESP.getMaxAllocHeap();
-                if (freeHeap < 80000 || largestBlock < 40000) {
-                    _lastConnectionAttempt = millis(); // Delay next attempt
-                    return;
-                }
-                
-                // Attempt reconnection using existing connection settings
-                if (_ws) {
-                    _ws->disconnect(); // Ensure clean state
-                    delay(1000); // Brief delay for cleanup
-                    _ws->beginSSL(_host.c_str(), _port, urlBuffer);
-                    _lastConnectionAttempt = millis();
-                }
-            }
-        }
-        
+        // ALWAYS handle WebSocket loop - this is critical
         if (_ws) {
             _ws->loop();
         }
-
-        // --- Reduce device report frequency to minimize memory allocations ---
-        static unsigned long lastReportTime = 0;
-        if (_isConnected && millis() - lastReportTime >= 10000) // Increased from 5000 to 10000ms
+        
+        // Handle reconnection more aggressively since WebSocket is critical
+        if (!_isConnected && _ws && _connectionRetries <= MAX_CONNECTION_RETRIES)
         {
+            if (millis() - _lastConnectionAttempt >= RETRY_DELAY)
+            {
+                Serial.printf("ReverbClient: Attempting critical reconnection (attempt %d/%d)\n", 
+                             _connectionRetries + 1, MAX_CONNECTION_RETRIES);
+                
+                if (_ws) {
+                    _ws->disconnect();
+                    delay(200);
+                    _ws->beginSSL(_host.c_str(), _port, urlBuffer);
+                    _lastConnectionAttempt = millis();
+                    _connectionRetries++;
+                }
+            }
+        }
+
+        // Adaptive device report frequency based on memory pressure
+        static unsigned long lastReportTime = 0;
+        static unsigned long reportInterval = 1000;
+        
+        if (_isConnected && millis() - lastReportTime >= reportInterval)
+        {
+            size_t freeHeap = ESP.getFreeHeap();
             lastReportTime = millis();
             sendDeviceReport();
         }
@@ -137,8 +123,6 @@ public:
     {
         return WiFi.isConnected() && _isConnected;
     }
-
-
 
     void disconnect()
     {
@@ -159,42 +143,34 @@ public:
             _isConnected = false;
         }
         
-        // Clean up shared SSL client to free memory
-        if (_sslClient) {
-            delete _sslClient;
-            _sslClient = nullptr;
+        if (_httpClient) {
+            delete _httpClient;
+            _httpClient = nullptr;
         }
-        
-        Serial.println(F("ReverbClient cleaned up - memory freed"));
     }
 
     bool sendMessage(const String &text)
     {
-        if (!WiFi.isConnected() || !_sslClient) {
+        if (!WiFi.isConnected() || !_httpClient) {
+            Serial.println("ReverbClient: Cannot send message - WiFi not connected or no HTTP client");
             return false;
         }
 
         HTTPClient http;
         snprintf(urlBuffer, sizeof(urlBuffer), "https://%s/api/chat/device/%s", _host.c_str(), _deviceId.c_str());
         
-        if (http.begin(*_sslClient, urlBuffer))
+        if (http.begin(*_httpClient, urlBuffer))
         {
             snprintf(headerBuffer, sizeof(headerBuffer), "Bearer %s", _authToken.c_str());
             http.addHeader("Authorization", headerBuffer);
             http.addHeader("Content-Type", "application/json");
-            http.addHeader("Accept", "application/json");
 
-            StaticJsonDocument<128> doc;
-            doc["text"] = text;
-            size_t payloadLength = serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+            // Build minimal JSON payload manually
+            String escapedText = text;
+            escapedText.replace("\"", "\\\"");
+            snprintf(tempBuffer, sizeof(tempBuffer), "{\"text\":\"%s\"}", escapedText.c_str());
             
-            if (payloadLength == 0) {
-                http.end();
-                return false;
-            }
-
-            Serial.printf("Sending message to API: %s\n", text.c_str());
-            int httpCode = http.POST((uint8_t*)jsonBuffer, payloadLength);
+            int httpCode = http.POST((uint8_t*)tempBuffer, strlen(tempBuffer));
             http.end();
 
             return (httpCode == 200);
@@ -205,14 +181,15 @@ public:
 private:
     ReverbClient() = default;
 
-    // Pre-allocated static buffers to reduce heap fragmentation - conservative sizes
-    static char jsonBuffer[768];            // For device reports and auth payloads
-    static char urlBuffer[200];             // For URL construction
-    static char headerBuffer[400];          // For header values
-    static char channelBuffer[100];         // For channel names
+    // Pre-allocated static buffers to reduce heap fragmentation
+    static char jsonBuffer[512];
+    static char urlBuffer[128];
+    static char headerBuffer[256];
+    static char channelBuffer[64];
+    static char tempBuffer[256];
 
     WebSocketsClient *_ws = nullptr;
-    WiFiClientSecure *_sslClient = nullptr;  // Shared SSL client to reduce allocations
+    WiFiClientSecure *_httpClient = nullptr;
     String _host, _appKey, _authToken, _deviceId, _socketId;
     uint16_t _port;
     std::function<void(const String &)> _chatCb;
@@ -221,8 +198,8 @@ private:
     // Connection retry management
     unsigned long _lastConnectionAttempt = 0;
     uint8_t _connectionRetries = 0;
-    static const uint8_t MAX_CONNECTION_RETRIES = 10;  // More retries since WebSocket is critical
-    static const unsigned long RETRY_DELAY = 3000; // Fixed 3 second delay between retries
+    static const uint8_t MAX_CONNECTION_RETRIES = 5;
+    static const unsigned long RETRY_DELAY = 2000;
 
     static ReverbClient *instance;
 
@@ -239,8 +216,6 @@ private:
         case WStype_DISCONNECTED:
             _isConnected = false;
             _socketId = "";
-            
-            // Implement fixed delay reconnections
             _connectionRetries++;
             if (_connectionRetries <= MAX_CONNECTION_RETRIES) {
                 _lastConnectionAttempt = millis();
@@ -249,176 +224,182 @@ private:
 
         case WStype_CONNECTED:
             _isConnected = true;
-            _connectionRetries = 0; // Reset retry counter on successful connection
+            _connectionRetries = 0;
             _lastConnectionAttempt = 0;
             break;
 
         case WStype_TEXT:
         {
-            StaticJsonDocument<512> doc;
-            DeserializationError error = deserializeJson(doc, payload, length);
-            if (error)
-            {
-                Serial.print(F("⚠️ JSON parsing failed: "));
-                Serial.println(error.c_str());
-                return;
-            }
-
-            const char *eventName = doc["event"];
-            if (!eventName)
-                return;
-
-            if (strcmp(eventName, "pusher:connection_established") == 0)
-            {
-                const char *socketData = doc["data"];
-                StaticJsonDocument<256> socketDoc;
-                deserializeJson(socketDoc, socketData);
-                _socketId = socketDoc["socket_id"].as<String>();
-                subscribeToPrivate();
-            }
-            else if (strcmp(eventName, "pusher:ping") == 0)
-            {
-                // Respond to ping with pong to keep connection alive
-                StaticJsonDocument<64> pongDoc;
-                pongDoc["event"] = "pusher:pong";
-                pongDoc["data"] = JsonObject();
-                size_t pongLength = serializeJson(pongDoc, jsonBuffer, sizeof(jsonBuffer));
-                if (pongLength > 0) {
-                    _ws->sendTXT(jsonBuffer, pongLength);
+            // Parse JSON minimally using string search
+            char* payloadStr = (char*)payload;
+            payloadStr[length] = '\0';
+            
+            if (strstr(payloadStr, "pusher:connection_established")) {
+                char* socketStart = strstr(payloadStr, "socket_id\":\"") + 12;
+                if (socketStart > payloadStr + 11) {
+                    char* socketEnd = strchr(socketStart, '"');
+                    if (socketEnd) {
+                        *socketEnd = '\0';
+                        _socketId = String(socketStart);
+                        *socketEnd = '"';
+                        subscribeToPrivate();
+                    }
                 }
             }
-            else if (strcmp(eventName, "chat-message") == 0 && _chatCb)
-            {
-                const char *chatDataStr = doc["data"];
-                StaticJsonDocument<256> chatDoc;
-                deserializeJson(chatDoc, chatDataStr);
-
-                const char *text = chatDoc["text"];
-                _chatCb(String(text));
+            else if (strstr(payloadStr, "pusher:ping")) {
+                const char* pong = "{\"event\":\"pusher:pong\",\"data\":{}}";
+                _ws->sendTXT(pong, strlen(pong));
+            }
+            else if (strstr(payloadStr, "chat-message")) {
+                char* textStart = strstr(payloadStr, "\"text\":\"") + 8;
+                if (textStart > payloadStr + 7 && _chatCb) {
+                    char* textEnd = strchr(textStart, '"');
+                    if (textEnd) {
+                        *textEnd = '\0';
+                        _chatCb(String(textStart));
+                        *textEnd = '"';
+                    }
+                }
             }
             break;
         }
+        case WStype_ERROR:
+            Serial.printf("ReverbClient: WebSocket error: %.*s\n", length, payload);
+            break;
         default:
             break;
         }
     }
     
-    /**
-     * @brief Constructs and sends a JSON object with the device's current state.
-     * This is a "client event" sent over the WebSocket to the private device channel.
-     * Optimized to minimize memory allocations during runtime.  
-     */
     void sendDeviceReport()
     {
         if (!isConnected()) return;
 
-        // Check available memory before creating device report
+        // Skip only if memory is critically low
         size_t freeHeap = ESP.getFreeHeap();
-        if (freeHeap < 30000) {
+        if (freeHeap < 20000) {
+            Serial.printf("ReverbClient: Skipping device report due to critical memory: %d bytes\n", freeHeap);
             return;
         }
 
-        // Use static JSON document to avoid heap allocation
-        StaticJsonDocument<768> reportFrame;
+        // Get and cache all values to minimize object access
+        BatteryManager &battery = BatteryManager::getInstance();
+        FileManager &fileManager = FileManager::getInstance();
+        AudioController &audio = AudioController::getInstance();
+        NfcController &nfc = NfcController::getInstance();
+        ConfigManager &config = ConfigManager::getInstance();
 
-        // Pre-build channel name to avoid string concatenation
+        bool isCharging = battery.getChargingStatus();
+        float batteryPercent = battery.getBatteryPercentage();
+        float batteryVoltage = battery.getBatteryVoltage();
+        bool isFileSyncing = fileManager.getPendingDownloadsCount() > 0;
+        uint32_t sdFreeSpace = fileManager.getSDCardFreeSpace();
+        String wifiSSID = config.getWiFiSSID();
+        int wifiRSSI = WiFi.RSSI();
+        int audioState = audio.getState(); // Use int instead of enum
+        bool isReedActive = nfc.isReedSwitchActive();
+        bool isCardPresent = nfc.isCardPresent();
+
+        // Pre-build channel name
         snprintf(channelBuffer, sizeof(channelBuffer), "device.%s", _deviceId.c_str());
 
-        // Set the event name and channel for the Pusher client event
-        reportFrame["event"] = "device-report";
-        reportFrame["channel"] = channelBuffer;
-
-        // Create the nested "data" and "device_report" objects
-        JsonObject dataObj = reportFrame.createNestedObject("data");
-        JsonObject reportObj = dataObj.createNestedObject("device_report");
-
-        // --- Populate device_report ---
-        reportObj["device_id"] = _deviceId;
-
-        // --- Battery Info ---
-        JsonObject batteryObj = reportObj.createNestedObject("battery");
-        BatteryManager &battery = BatteryManager::getInstance();
-        batteryObj["status"] = battery.getChargingStatus() ? "charging" : "discharging";
-        batteryObj["percent"] = battery.getBatteryPercentage();
-        batteryObj["voltage"] = battery.getBatteryVoltage();
-
-        // --- Files Info ---
-        JsonObject filesObj = reportObj.createNestedObject("files");
-        FileManager &fileManager = FileManager::getInstance();
-        filesObj["status"] = fileManager.getPendingDownloadsCount() > 0 ? "syncing" : "in_sync";
-        filesObj["sd_remaining"] = fileManager.getSDCardFreeSpace();
-        filesObj["wifi_ssid"] = ConfigManager::getInstance().getWiFiSSID();
-        filesObj["wifi_rssi"] = WiFi.RSSI();
-
-        // --- Audio Info ---
-        JsonObject audioObj = reportObj.createNestedObject("audio");
-        AudioController &audio = AudioController::getInstance();
-        switch (audio.getState())
-        {
-        case AudioController::PLAYING:
-            audioObj["current_track_status"] = "playing";
-            audioObj["current_track_id"] = audio.getCurrentTrack();
-            audioObj["current_track_seconds"] = audio.getCurrentTrackSeconds();
-            break;
-        case AudioController::PAUSED:
-            audioObj["current_track_status"] = "paused";
-            audioObj["current_track_id"] = audio.getCurrentTrack();
-            audioObj["current_track_seconds"] = audio.getCurrentTrackSeconds();
-            break;
-        case AudioController::STOPPED:
-            audioObj["current_track_status"] = "stopped";
-            audioObj["current_track_id"] = nullptr;
-            audioObj["current_track_seconds"] = nullptr;
-            break;
+        // Get audio status
+        const char* audioStatus = "stopped";
+        String currentTrack = "";
+        if (audioState == 1) { // PLAYING state
+            audioStatus = "playing";
+            currentTrack = audio.getCurrentTrack();
+        } else if (audioState == 2) { // PAUSED state
+            audioStatus = "paused";
+            currentTrack = audio.getCurrentTrack();
         }
 
-        // --- NFC Info ---
-        JsonObject nfcObj = reportObj.createNestedObject("nfc");
-        NfcController &nfc = NfcController::getInstance();
-        bool reedActive = nfc.isReedSwitchActive();
-        nfcObj["switch_status"] = reedActive ? "present" : "empty";
-        if (reedActive && nfc.isCardPresent()) {
-            nfcObj["docked_card_id"] = nfc.currentNFCData().uidString;
-        } else {
-            nfcObj["docked_card_id"] = nullptr;
+        // Sanitize strings
+        wifiSSID.replace("\"", "\\\"");
+        currentTrack.replace("\"", "\\\"");
+
+        // Get NFC card ID
+        String nfcCardId = "";
+        if (isReedActive && isCardPresent) {
+            nfcCardId = nfc.currentNFCData().uidString;
         }
 
-        // Serialize directly to static buffer to avoid String allocation
-        size_t jsonLength = serializeJson(reportFrame, jsonBuffer, sizeof(jsonBuffer));
-        if (jsonLength > 0 && jsonLength < sizeof(jsonBuffer) - 1) {
-            _ws->sendTXT(jsonBuffer, jsonLength);
+        // Build optimized JSON
+        int written = snprintf(jsonBuffer, sizeof(jsonBuffer),
+            "{"
+            "\"event\":\"device-report\","
+            "\"channel\":\"%s\","
+            "\"data\":{"
+                "\"device_report\":{"
+                    "\"device_id\":\"%s\","
+                    "\"battery\":{"
+                        "\"status\":\"%s\","
+                        "\"percent\":%.1f,"
+                        "\"voltage\":%.2f"
+                    "},"
+                    "\"files\":{"
+                        "\"status\":\"%s\","
+                        "\"sd_remaining\":%u,"
+                        "\"wifi_ssid\":\"%s\","
+                        "\"wifi_rssi\":%d"
+                    "},"
+                    "\"audio\":{"
+                        "\"current_track_status\":\"%s\""
+                        "%s%s%s"
+                    "},"
+                    "\"nfc\":{"
+                        "\"switch_status\":\"%s\""
+                        "%s%s%s"
+                    "}"
+                "}"
+            "}"
+            "}",
+            channelBuffer,
+            _deviceId.c_str(),
+            isCharging ? "charging" : "discharging",
+            batteryPercent,
+            batteryVoltage,
+            isFileSyncing ? "syncing" : "in_sync",
+            sdFreeSpace,
+            wifiSSID.c_str(),
+            wifiRSSI,
+            audioStatus,
+            currentTrack.length() > 0 ? ",\"current_track_id\":\"" : "",
+            currentTrack.c_str(),
+            currentTrack.length() > 0 ? "\"" : "",
+            isReedActive ? "present" : "empty",
+            nfcCardId.length() > 0 ? ",\"docked_card_id\":\"" : "",
+            nfcCardId.c_str(),
+            nfcCardId.length() > 0 ? "\"" : ""
+        );
+
+        if (written > 0 && written < sizeof(jsonBuffer) - 1) {
+            _ws->sendTXT(jsonBuffer, written);
         }
     }
 
     bool subscribeToPrivate()
     {
-        if (_socketId.length() == 0 || !_sslClient) {
+        if (_socketId.length() == 0 || !_httpClient) {
             return false;
         }
 
         HTTPClient http;
         snprintf(urlBuffer, sizeof(urlBuffer), "https://%s/broadcasting/auth", _host.c_str());
 
-        if (http.begin(*_sslClient, urlBuffer))
+        if (http.begin(*_httpClient, urlBuffer))
         {
             http.addHeader("Content-Type", "application/json");
             snprintf(headerBuffer, sizeof(headerBuffer), "Bearer %s", _authToken.c_str());
             http.addHeader("Authorization", headerBuffer);
-            http.addHeader("Accept", "application/json");
             http.addHeader("X-Client-Source", "esp32");
             
-            StaticJsonDocument<128> authPayloadDoc;
-            authPayloadDoc["socket_id"] = _socketId;
             snprintf(channelBuffer, sizeof(channelBuffer), "device.%s", _deviceId.c_str());
-            authPayloadDoc["channel_name"] = channelBuffer;
+            snprintf(tempBuffer, sizeof(tempBuffer), 
+                "{\"socket_id\":\"%s\",\"channel_name\":\"%s\"}", 
+                _socketId.c_str(), channelBuffer);
 
-            size_t authPayloadLength = serializeJson(authPayloadDoc, jsonBuffer, sizeof(jsonBuffer));
-            if (authPayloadLength == 0) {
-                http.end();
-                return false;
-            }
-
-            int httpCode = http.POST((uint8_t*)jsonBuffer, authPayloadLength);
+            int httpCode = http.POST((uint8_t*)tempBuffer, strlen(tempBuffer));
             if (httpCode != 200)
             {
                 http.end();
@@ -426,35 +407,31 @@ private:
             }
 
             String authResponse = http.getString();
-            StaticJsonDocument<512> authRespDoc;
-            DeserializationError error = deserializeJson(authRespDoc, authResponse);
             http.end();
-            if (error)
-            {
+
+            int authStart = authResponse.indexOf("\"auth\":\"") + 8;
+            int authEnd = authResponse.indexOf("\"", authStart);
+            if (authStart < 8 || authEnd < 0) {
                 return false;
             }
+            String authValue = authResponse.substring(authStart, authEnd);
 
-            StaticJsonDocument<512> subMsgDoc;
-            subMsgDoc["event"] = "pusher:subscribe";
-            JsonObject data = subMsgDoc.createNestedObject("data");
-            data["auth"] = authRespDoc["auth"].as<String>();
-            data["channel"] = channelBuffer; // Reuse the pre-built channel name
-            data["channel_data"] = authRespDoc["channel_data"];
+            snprintf(jsonBuffer, sizeof(jsonBuffer),
+                "{\"event\":\"pusher:subscribe\",\"data\":{\"auth\":\"%s\",\"channel\":\"%s\"}}",
+                authValue.c_str(), channelBuffer);
 
-            size_t subFrameLength = serializeJson(subMsgDoc, jsonBuffer, sizeof(jsonBuffer));
-            if (subFrameLength > 0) {
-                _ws->sendTXT(jsonBuffer, subFrameLength);
-                return true;
-            }
+            _ws->sendTXT(jsonBuffer, strlen(jsonBuffer));
+            return true;
         }
         return false;
     }
 };
 
-// Define static buffers with conservative sizes to minimize memory footprint
-char ReverbClient::jsonBuffer[768];      // Reduced from 1024 - sufficient for device reports
-char ReverbClient::urlBuffer[200];       // Reduced from 256 - URLs shouldn't be too long  
-char ReverbClient::headerBuffer[400];    // Reduced from 512 - headers are typically shorter
-char ReverbClient::channelBuffer[100];   // Reduced from 128 - device IDs are shorter
+// Define static buffers
+char ReverbClient::jsonBuffer[512];
+char ReverbClient::urlBuffer[128];
+char ReverbClient::headerBuffer[256];
+char ReverbClient::channelBuffer[64];
+char ReverbClient::tempBuffer[256];
 
 ReverbClient *ReverbClient::instance = nullptr;

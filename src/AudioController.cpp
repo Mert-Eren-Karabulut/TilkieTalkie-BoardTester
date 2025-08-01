@@ -1,5 +1,9 @@
 #include "AudioController.h"
 #include "NfcController.h"
+#include "AudioFileSourceSD.h"
+#include "AudioFileSourceBuffer.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2S.h"
 
 // Initialize static members
 AudioController* AudioController::instance = nullptr;
@@ -61,13 +65,10 @@ AudioController::AudioController() :
     audioBuffer(nullptr),
     audioMP3(nullptr),
     audioOutput(nullptr),
-    pooledMP3(nullptr),
-    pooledBuffer(nullptr),
     currentState(STOPPED),
     currentTrackPath(""),
     currentVolume(DEFAULT_VOLUME),
     initialized(false),
-    i2s_driver_installed(false),
     pausedPosition(0),
     hasPausedPosition(false),
     trackStartTime(0),
@@ -80,8 +81,8 @@ AudioController::AudioController() :
 }
 
 AudioController::~AudioController() {
-    cleanupComponentPool();
     end();
+    cleanupAudioComponents();
 }
 
 AudioController& AudioController::getInstance() {
@@ -96,60 +97,37 @@ bool AudioController::begin() {
         return true;
     }
 
-    Serial.println(F("AudioController: Initializing..."));
-
     // Initialize I2C for ES8388 control
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.setClock(100000); // 100kHz I2C speed
+    Wire.setClock(100000);
     
     // Initialize mute pin
     pinMode(MUTE_PIN, OUTPUT);
-    digitalWrite(MUTE_PIN, HIGH); // Start muted
+    digitalWrite(MUTE_PIN, HIGH);
     
     // Initialize ES8388
     if (!initializeES8388()) {
-        Serial.println(F("AudioController: Failed to initialize ES8388"));
         return false;
     }
 
     // Initialize I2S
     if (!initializeI2S()) {
-        Serial.println(F("AudioController: Failed to initialize I2S"));
         return false;
     }
 
-    // Create audio output
-    audioOutput = new AudioOutputI2S();
-    if (!audioOutput) {
-        Serial.println(F("AudioController: Failed to create audio output"));
+    // Initialize audio components
+    if (!initializeAudioComponents()) {
         return false;
     }
-
-    // Configure audio output
-    audioOutput->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
-    audioOutput->SetGain(currentVolume / 100.0f);
-
-    // Create MP3 generator
-    audioMP3 = new AudioGeneratorMP3();
-    if (!audioMP3) {
-        Serial.println(F("AudioController: Failed to create MP3 generator"));
-        delete audioOutput;
-        audioOutput = nullptr;
-        return false;
-    }
-    
-    // Initialize component pool for memory optimization
-    initializeComponentPool();
     
     initialized = true;
 
-    // Set volume to ensure hardware and software are synchronized
-    setVolume(currentVolume, true); // Initialize volume without checking current state
-    
-    // Unmute after volume is properly set
+    // Set volume and unmute
+    setVolume(currentVolume, true);
     digitalWrite(MUTE_PIN, LOW);
     
-    Serial.println(F("AudioController: Initialization complete"));
+    Serial.println("AudioController: Initialization complete");
+    
     return true;
 }
 
@@ -164,136 +142,103 @@ void AudioController::end() {
     // Mute
     digitalWrite(MUTE_PIN, HIGH);
 
-    // Clean up audio components (this will clear audioMP3 reference)
+    // Clean up audio components
     cleanupAudioComponents();
 
-    // Delete audio output safely
+    // Clean up audio output
     if (audioOutput) {
         delete audioOutput;
         audioOutput = nullptr;
     }
 
-    // AudioMP3 is already handled in cleanupAudioComponents()
-    // Don't try to delete it again here
-
-    // Deinitialize I2S
-    deinitializeI2S();
-
     initialized = false;
 }
 
 bool AudioController::play(const String& filePath) {
-    // Add heap check before major operations
-    size_t freeHeap = ESP.getFreeHeap();
-    if (freeHeap < 15000) {  // Less than 15KB free
-        Serial.println(F("AudioController: Insufficient heap memory for playback"));
+    Serial.printf("AudioController: play() called with filePath: '%s'\n", filePath.c_str());
+    
+    if (!initialized) {
+        Serial.println("AudioController: Not initialized");
         return false;
     }
     
-    // Ensure previous cleanup completed
-    if (audioMP3 != nullptr || audioBuffer != nullptr || audioFile != nullptr) {
-        cleanupAudioComponents();
-        delay(50);  // Give time for cleanup
-    }
-    
+    // Handle playlist case
     if (filePath.isEmpty()) {
-        // Play from playlist logic
         if (!hasPlaylist()) {
-            Serial.println(F("AudioController: No playlist available"));
+            Serial.println("AudioController: No playlist available");
             return false;
         }
         
-        // Check if NFC session is still active for the expected figure
+        // Check if NFC session is still active
         if (!isNfcSessionActive(playlistFigureUid)) {
-            Serial.println(F("AudioController: NFC session not active for playlist figure"));
+            Serial.println("AudioController: NFC session not active, clearing playlist");
             clearPlaylist();
             return false;
         }
         
-        // Handle playlist finished state or initial state
+        // Handle playlist navigation
         if (playlistFinished || currentPlaylistIndex == -1) {
-            currentPlaylistIndex = 0; // Start from beginning
+            currentPlaylistIndex = 0;
             playlistFinished = false;
         }
         
-        if (currentPlaylistIndex < 0 || currentPlaylistIndex >= playlist.size()) {
-            Serial.println(F("AudioController: Playlist index out of range"));
+        if (currentPlaylistIndex >= playlist.size()) {
+            Serial.println("AudioController: Playlist index out of range");
             return false;
         }
         
         String trackPath = playlist[currentPlaylistIndex];
+        Serial.printf("AudioController: Playing track %d: %s\n", currentPlaylistIndex, trackPath.c_str());
         return play(trackPath); // Recursive call with specific file
     }
 
     // Check if file exists
     if (!fileManager.fileExists(filePath)) {
-        Serial.println(F("AudioController: File does not exist"));
+        Serial.println("AudioController: File does not exist");
         return false;
     }
 
     // Check if it's a valid audio file
     if (!isValidAudioFile(filePath)) {
-        Serial.println(F("AudioController: Invalid audio file"));
+        Serial.println("AudioController: Invalid audio file");
         return false;
     }
 
-    // Stop current playback if any
+    // Stop current playback
     if (currentState != STOPPED) {
         stop();
-        delay(50); // Small delay for cleanup
+        delay(10);
     }
 
-    // Clear any previous paused position since we're starting a new track
-    pausedPosition = 0;
-    hasPausedPosition = false;
-
-    // Clean up previous audio components
+    // Clean up previous components following the working example pattern
     cleanupAudioComponents();
-
-    // Recreate audio output only if it doesn't exist
-    if (!audioOutput) {
-        if (!reinitializeAudioOutput()) {
-            Serial.println(F("AudioController: Failed to initialize audio output"));
-            return false;
-        }
+    
+    // Create new components (following the working example)
+    audioFile = new AudioFileSourceSD(filePath.c_str());
+    if (!audioFile) {
+        Serial.println("AudioController: Failed to create AudioFileSourceSD");
+        return false;
     }
-
-    // Always create a fresh MP3 generator for now to avoid pooling complications
-    // We can optimize this later once the crash is resolved
+    
+    audioBuffer = new AudioFileSourceBuffer(audioFile, 2048); // Using smaller buffer like example
+    if (!audioBuffer) {
+        Serial.println("AudioController: Failed to create AudioFileSourceBuffer");
+        delete audioFile;
+        audioFile = nullptr;
+        return false;
+    }
+    
     audioMP3 = new AudioGeneratorMP3();
     if (!audioMP3) {
-        Serial.println(F("AudioController: Failed to create MP3 generator"));
-        return false;
-    }
-    Serial.println("AudioController: Created fresh MP3 generator");
-
-    // Create new audio file source
-    audioFile = new AudioFileSourceSD(filePath.c_str());
-    if (!audioFile || !audioFile->isOpen()) {
-        Serial.println(F("AudioController: Failed to open audio file"));
+        Serial.println("AudioController: Failed to create AudioGeneratorMP3");
         cleanupAudioComponents();
         return false;
     }
 
-    // Create buffer - for now create new buffer each time to avoid complexity
-    // Buffer reuse would require more complex state management
-    audioBuffer = new AudioFileSourceBuffer(audioFile, AUDIO_BUFFER_SIZE);
-    if (!audioBuffer) {
-        Serial.println(F("AudioController: Failed to create audio buffer"));
-        cleanupAudioComponents();
-        return false;
-    }
-
-    // Verify audio output is ready
-    if (!audioOutput) {
-        Serial.println(F("AudioController: Audio output is null"));
-        cleanupAudioComponents();
-        return false;
-    }
-
-    // Start playback
+    // Start playback (following working example)
+    Serial.println("AudioController: Starting MP3 playback");
     if (!audioMP3->begin(audioBuffer, audioOutput)) {
-        Serial.println(F("AudioController: Failed to start MP3 playback"));
+        Serial.println("AudioController: Failed to start MP3 playback");
         cleanupAudioComponents();
         return false;
     }
@@ -301,12 +246,11 @@ bool AudioController::play(const String& filePath) {
     // Set current track info
     currentTrackPath = filePath;
     currentState = PLAYING;
-    
-    // Reset timing for new track
     trackStartTime = millis();
     accumulatedPlayTime = 0.0f;
     pauseStartTime = 0;
     
+    Serial.printf("AudioController: Successfully started playing: %s\n", filePath.c_str());
     return true;
 }
 
@@ -346,7 +290,7 @@ bool AudioController::resume() {
         // Clean up current audio components
         cleanupAudioComponents();
         
-        // Create fresh MP3 generator for resume - no pooling for now
+        // Create fresh MP3 generator for resume
         audioMP3 = new AudioGeneratorMP3();
         if (!audioMP3) {
             Serial.println("AudioController: Failed to create MP3 generator for resume");
@@ -355,12 +299,12 @@ bool AudioController::resume() {
             hasPausedPosition = false;
             return false;
         }
-        Serial.println("AudioController: Created fresh MP3 generator for resume");
         
         // Create new audio file source
         audioFile = new AudioFileSourceSD(currentTrackPath.c_str());
-        if (!audioFile || !audioFile->isOpen()) {
+        if (!audioFile) {
             Serial.printf("AudioController: Failed to reopen audio file: %s\n", currentTrackPath.c_str());
+            cleanupAudioComponents();
             currentState = STOPPED;
             currentTrackPath = "";
             hasPausedPosition = false;
@@ -378,7 +322,7 @@ bool AudioController::resume() {
         }
 
         // Create buffer
-        audioBuffer = new AudioFileSourceBuffer(audioFile, AUDIO_BUFFER_SIZE);
+        audioBuffer = new AudioFileSourceBuffer(audioFile, 2048);
         if (!audioBuffer) {
             Serial.printf("AudioController: Failed to create audio buffer\n");
             cleanupAudioComponents();
@@ -401,7 +345,7 @@ bool AudioController::resume() {
         // Restart timing for resumed playback
         trackStartTime = millis();
         
-        Serial.println("AudioController: Resumed");
+        Serial.println("AudioController: Resumed successfully");
         return true;
     }
 
@@ -413,25 +357,21 @@ bool AudioController::stop() {
         return false;
     }
 
-    if (audioMP3) {
+    if (audioMP3 && audioMP3->isRunning()) {
         audioMP3->stop();
+        delay(10);
     }
 
     cleanupAudioComponents();
     
     currentState = STOPPED;
     currentTrackPath = "";
-    
-    // Clear paused position
     pausedPosition = 0;
     hasPausedPosition = false;
-    
-    // Reset timing variables
     trackStartTime = 0;
     accumulatedPlayTime = 0.0f;
     pauseStartTime = 0;
     
-    Serial.println("AudioController: Stopped");
     return true;
 }
 
@@ -598,6 +538,7 @@ void AudioController::update() {
             }
         } else {
             // Should be playing but isn't - something went wrong
+            Serial.println("AudioController: Playback stopped unexpectedly");
             stop();
         }
     }
@@ -683,29 +624,73 @@ bool AudioController::initializeES8388() {
     writeES8388Register(ES8388_LOUT1VOL, 0x0F);     // Set left headphone volume to ~50%
     writeES8388Register(ES8388_ROUT1VOL, 0x0F);     // Set right headphone volume to ~50%
 
-    Serial.println(F("AudioController: ES8388 initialized"));
+    // Verify critical registers to ensure ES8388 is properly configured
+    uint8_t dacPower = readES8388Register(ES8388_DACPOWER);
+    uint8_t dacControl3 = readES8388Register(ES8388_DACCONTROL3);
+    Serial.printf("AudioController: ES8388 verification - DACPOWER: 0x%02X, DACCONTROL3: 0x%02X\n", dacPower, dacControl3);
+    
+    if (dacPower == 0xFF || dacControl3 == 0xFF) {
+        Serial.println("AudioController: WARNING - ES8388 register verification failed, I2C communication issues");
+        return false;
+    }
+
+    Serial.println(F("AudioController: ES8388 initialized and verified"));
     return true;
 }
 
 bool AudioController::writeES8388Register(uint8_t reg, uint8_t value) {
-    Wire.beginTransmission(ES8388_ADDR);
-    Wire.write(reg);
-    Wire.write(value);
-    uint8_t result = Wire.endTransmission();
+    // Add retry logic and error handling for I2C conflicts
+    const int maxRetries = 3;
+    const int retryDelay = 10;
     
-    return (result == 0);
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        Wire.beginTransmission(ES8388_ADDR);
+        Wire.write(reg);
+        Wire.write(value);
+        uint8_t result = Wire.endTransmission();
+        
+        if (result == 0) {
+            // Success
+            return true;
+        }
+        
+        // If not the last attempt, wait and retry
+        if (attempt < maxRetries - 1) {
+            delay(retryDelay);
+        } else {
+            // Last attempt failed, log the error
+            Serial.printf("AudioController: ES8388 write failed (reg=0x%02X, val=0x%02X, error=%d)\n", 
+                         reg, value, result);
+        }
+    }
+    
+    return false;
 }
 
 uint8_t AudioController::readES8388Register(uint8_t reg) {
-    Wire.beginTransmission(ES8388_ADDR);
-    Wire.write(reg);
-    Wire.endTransmission(false);
+    // Add retry logic for reads as well
+    const int maxRetries = 3;
+    const int retryDelay = 10;
     
-    Wire.requestFrom(ES8388_ADDR, (uint8_t)1);
-    if (Wire.available()) {
-        return Wire.read();
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        Wire.beginTransmission(ES8388_ADDR);
+        Wire.write(reg);
+        uint8_t result = Wire.endTransmission(false);
+        
+        if (result == 0) {
+            Wire.requestFrom(ES8388_ADDR, (uint8_t)1);
+            if (Wire.available()) {
+                return Wire.read();
+            }
+        }
+        
+        // If not the last attempt, wait and retry
+        if (attempt < maxRetries - 1) {
+            delay(retryDelay);
+        }
     }
     
+    Serial.printf("AudioController: ES8388 read failed (reg=0x%02X)\n", reg);
     return 0xFF; // Error value
 }
 
@@ -757,64 +742,24 @@ bool AudioController::muteES8388(bool mute) {
 }
 
 bool AudioController::initializeI2S() {
-    // Check if I2S is already initialized to prevent double initialization
-    if (i2s_driver_installed) {
-        return true;
-    }
-
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = 44100,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 6,  // Reduced from 8 to save memory
-        .dma_buf_len = 32,   // Reduced from 64 to save memory
-        .use_apll = true,    // Use APLL for higher clock accuracy
-        .tx_desc_auto_clear = true,
-        .fixed_mclk = 0
-    };
-
-    esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    if (err != ESP_OK) {
-        Serial.println(F("AudioController: Failed to install I2S driver"));
-        return false;
-    }
-
-    // Configure the I2S pins, now including the MCLK output.
-    i2s_pin_config_t pin_config = {
-        .mck_io_num = I2S_MCLK_PIN,       // Master Clock Pin
-        .bck_io_num = I2S_BCLK_PIN,
-        .ws_io_num = I2S_LRCK_PIN,
-        .data_out_num = I2S_DOUT_PIN,
-        .data_in_num = I2S_PIN_NO_CHANGE // Not used for output
-    };
-
-    err = i2s_set_pin(I2S_NUM_0, &pin_config);
-    if (err != ESP_OK) {
-        Serial.println(F("AudioController: Failed to set I2S pins"));
-        i2s_driver_uninstall(I2S_NUM_0);
-        return false;
-    }
-
-    i2s_driver_installed = true;
+    // Let ESP8266Audio library handle I2S initialization
+    // Don't manually install I2S driver as it conflicts with the library
     return true;
 }
 
 void AudioController::deinitializeI2S() {
-    if (i2s_driver_installed) {
-        i2s_driver_uninstall(I2S_NUM_0);
-        i2s_driver_installed = false;
-    }
+    // Let ESP8266Audio library handle I2S cleanup
+    // Don't manually uninstall as it's managed by AudioOutputI2S
+    i2s_driver_installed = false;
 }
 
 bool AudioController::reinitializeAudioOutput() {
+    Serial.println("AudioController: Reinitializing audio output");
+    
     // Clean up existing audio output
     if (audioOutput) {
         delete audioOutput;
         audioOutput = nullptr;
-        delay(50); // Reduced delay for faster cleanup
     }
     
     // Ensure I2S is properly initialized
@@ -823,20 +768,8 @@ bool AudioController::reinitializeAudioOutput() {
         return false;
     }
     
-    // Create new audio output (this handles I2S internally)
-    audioOutput = new AudioOutputI2S();
-    if (!audioOutput) {
-        Serial.println(F("AudioController: Failed to create new audio output"));
-        return false;
-    }
-    
-    // Set the pin configuration
-    audioOutput->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
-    
-    // Set gain to current volume
-    audioOutput->SetGain(currentVolume / 100.0f);
-    
-    return true;
+    // Create new audio output
+    return initializeAudioComponents();
 }
 
 float AudioController::getCurrentTrackSeconds() const {
@@ -866,58 +799,68 @@ bool AudioController::isValidAudioFile(const String& filePath) {
 }
 
 void AudioController::cleanupAudioComponents() {
-    Serial.println("AudioController: Cleaning up audio components");
+    // Following the working example pattern - stop and free components
+    if (audioMP3) {
+        if (audioMP3->isRunning()) {
+            audioMP3->stop();
+        }
+        delete audioMP3;
+        audioMP3 = nullptr;
+    }
     
     if (audioBuffer) {
-        Serial.println("AudioController: Deleting audio buffer");
         delete audioBuffer;
         audioBuffer = nullptr;
     }
     
     if (audioFile) {
-        Serial.println("AudioController: Deleting audio file");
+        // Clean up the file source
         delete audioFile;
         audioFile = nullptr;
     }
-    
-    // Ultra-safe MP3 generator cleanup - completely disable all deletion for now
-    if (audioMP3) {
-        Serial.printf("AudioController: audioMP3 = %p, pooledMP3 = %p\n", audioMP3, pooledMP3);
-        
-        // Stop the MP3 generator before cleanup
-        if (audioMP3->isRunning()) {
-            audioMP3->stop();
-            Serial.println("AudioController: Stopped MP3 generator before cleanup");
+}
+
+bool AudioController::initializeAudioComponents() {
+    // Create audio output if it doesn't exist
+    if (!audioOutput) {
+        audioOutput = new AudioOutputI2S();
+        if (!audioOutput) {
+            Serial.println("AudioController: Failed to create I2S output");
+            return false;
         }
         
-        // For now, just clear the reference without deleting to prevent crashes
-        // This will cause a memory leak but prevents the heap corruption
-        Serial.println("AudioController: Clearing MP3 generator reference (no deletion to prevent crash)");
-        audioMP3 = nullptr;
+        // Configure audio output
+        audioOutput->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
+        audioOutput->SetGain(currentVolume / 100.0f);
     }
     
-    Serial.printf("AudioController: Cleanup complete, %d bytes free heap\n", ESP.getFreeHeap());
+    return true;
 }
 
 bool AudioController::isNfcSessionActive(const String& expectedUid) const {
     // We need to include NfcController here to check the session
     extern NfcController &nfcController; // Reference to the global instance from main.cpp
     
+    Serial.printf("AudioController: Checking NFC session - expected UID: %s\n", expectedUid.c_str());
+    
     // Safety check - make sure we can access the NFC controller
     try {
         bool cardPresent = nfcController.isCardPresent();
+        Serial.printf("AudioController: Card present: %s\n", cardPresent ? "YES" : "NO");
         if (!cardPresent) {
             Serial.println("AudioController: No card present in NFC session check");
             return false;
         }
         
         String currentUid = nfcController.currentNFCData().uidString;
+        Serial.printf("AudioController: Current UID: %s\n", currentUid.c_str());
         if (currentUid != expectedUid) {
             Serial.printf("AudioController: UID mismatch - expected: %s, current: %s\n", 
                          expectedUid.c_str(), currentUid.c_str());
             return false;
         }
         
+        Serial.println("AudioController: NFC session is active and UID matches");
         return true;
     } catch (...) {
         Serial.println("AudioController: Exception in NFC session check");
@@ -925,23 +868,3 @@ bool AudioController::isNfcSessionActive(const String& expectedUid) const {
     }
 }
 
-void AudioController::initializeComponentPool() {
-    Serial.println("AudioController: Component pool disabled for stability");
-    
-    // Disable pooling completely to prevent memory corruption issues
-    // We'll take the memory usage hit to ensure stability
-    pooledMP3 = nullptr;
-    pooledBuffer = nullptr;
-    
-    Serial.printf("AudioController: Component pool initialization complete (disabled), %d bytes free heap\n", ESP.getFreeHeap());
-}
-
-void AudioController::cleanupComponentPool() {
-    Serial.println("AudioController: Component pool cleanup (no-op - pooling disabled)");
-    
-    // Pooling is disabled, so nothing to clean up
-    pooledMP3 = nullptr;
-    pooledBuffer = nullptr;
-    
-    Serial.printf("AudioController: Component pool cleanup complete, %d bytes free heap\n", ESP.getFreeHeap());
-}

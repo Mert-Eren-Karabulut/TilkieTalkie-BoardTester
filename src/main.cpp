@@ -174,9 +174,9 @@ void setup()
     digitalWrite(17, HIGH); // Enable power to peripherals
     delay(500);            // Give peripherals time to power up
 
-    // Initialize configuration (this will also initialize NVS)
-    Serial.println("Loading configuration...");
-    config.printAllSettings();
+    // // Initialize configuration (this will also initialize NVS)
+    // Serial.println("Loading configuration...");
+    // config.printAllSettings();
 
     // Initialize WiFi provisioning
     Serial.println("Initializing WiFi...");
@@ -275,97 +275,12 @@ void setup()
 
     // rapid pulse LED to indicate system is ready
     ledController.pulseRapid(0x00FF00, 3); // Rapid pulse green
-
-    Serial.println("System initialization complete!");
-    Serial.println("--- Terminal Commands ---");
-    Serial.println("WiFi Commands:");
-    Serial.println("  qr      - Print QR code for provisioning");
-    Serial.println("  reset   - Reset WiFi provisioning");
-    Serial.println("  stats   - Show WiFi connection status");
-    Serial.println("  store   - Store current WiFi credentials");
-    Serial.println("Note: BLE is automatically managed based on WiFi state");
-    Serial.println("System Commands:");
-    Serial.println("  restart - Restart the device");
-    Serial.println("  config  - Show all configuration");
-    Serial.println("  commit  - Force save configuration to flash");
-    Serial.println("  debug   - Show debug information");
-    Serial.println("  test    - Test NVS storage");
-    Serial.println("  factory - Factory reset (erase all data)");
-    Serial.println("Battery Commands:");
-    Serial.println("  battery - Show battery status");
-    Serial.println("  voltage - Show raw voltage reading");
-    Serial.println("  charging- Show charging status for downloads");
-    Serial.println("File Manager Commands:");
-    Serial.println("  sdinfo  - Show SD card information");
-    Serial.println("  sdtest  - Test file operations");
-    Serial.println("  sdstress- Run SD card stress test");
-    Serial.println("  sdspeed - Optimize SD card speed");
-    Serial.println("  sdtree  - Check SD card file tree");
-    Serial.println("  sdformat- Format SD card as FAT32");
-    Serial.println("  files   - List files on SD card");
-    Serial.println("  deletefile <path> - Delete file from SD card");
-    Serial.println("  delete  - Delete ALL required files from NVS and storage");
-    Serial.println("  deletefig <uid> - Delete all files for a specific figure");
-    Serial.println("  dlstats - Show download statistics");
-    Serial.println("  dlqueue - Show download queue");
-    Serial.println("  required- Show required files");
-    Serial.println("  download <url> <path> - Download file from URL");
-    Serial.println("  addfile <path> <url> - Add required file");
-    Serial.println("  checkfiles - Check and download missing files");
-    Serial.println("  forcedownload - Force download processing (ignore charging)");
-    Serial.println("  cleanup - Clean up temporary files");
-    Serial.println("Audio Commands:");
-    Serial.println("  play <path> - Play specific MP3 file");
-    Serial.println("  play       - Play/resume current playlist or paused track");
-    Serial.println("  pause      - Pause current playback");
-    Serial.println("  resume     - Resume paused playback");
-    Serial.println("  stop       - Stop playback");
-    Serial.println("  next       - Next track in playlist");
-    Serial.println("  prev       - Previous track in playlist");
-    Serial.println("  playlist   - Show current playlist status");
-    Serial.println("  volup      - Volume up");
-    Serial.println("  voldown    - Volume down");
-    Serial.println("  volume     - Show current volume");
-    Serial.println("  track      - Show current track");
-    Serial.println("LED Commands:");
-    Serial.println("  ledon <hex> <intensity> - Turn LED on with hex color and intensity (0-255)");
-    Serial.println("  ledoff  - Turn LED off");
-    Serial.println("  pulse <hex> - Start pulsing LED with hex color");
-    Serial.println("  rapid <hex> <count> - Rapid pulse LED for count times");
-    Serial.println("NFC Commands:");
-    Serial.println("  nfcstatus - Show NFC controller status");
-    Serial.println("  nfcdata   - Show current NFC card data");
-    Serial.println("  nfcreed   - Show reed switch status");
-    Serial.println("  nfcdiag   - Run NFC diagnostics");
-    Serial.println("Power Commands:");
-    Serial.println("  power   - Show peripheral power status");
-    Serial.println("  poweron - Enable peripheral power (IO17)");
-    Serial.println("  poweroff- Disable peripheral power (IO17)");
-    Serial.println("Reverb Commands:");
-    Serial.println("  send <message> - Send message to Reverb API for broadcast");
-    Serial.println("  wsstatus - Show WebSocket connection status");
-    Serial.println("  testauth - Test stored JWT token authorization with server");
-    Serial.println("Type any command for help\n");
     // audioController.play("/sounds/12.mp3"); // Play startup sound
 }
-unsigned long lastHeapPrint = 0;
-unsigned long lastHeapCheck = 0;
+    static unsigned long lastFreeCall = 0;
 
 void loop()
 {
-    // Add heap monitoring at the beginning of loop
-    if (millis() - lastHeapCheck >= 2000) { // Check every 2 seconds
-        size_t freeHeap = ESP.getFreeHeap();
-        
-        if (freeHeap < CRITICAL_HEAP_THRESHOLD) {
-            Serial.printf("🔴 CRITICAL: Very low heap memory: %d bytes\n", freeHeap);
-            // Could add emergency cleanup here later
-        } else if (freeHeap < WARNING_HEAP_THRESHOLD) {
-            Serial.printf("🟡 WARNING: Low heap memory: %d bytes\n", freeHeap);
-        }
-        
-        lastHeapCheck = millis();
-    }
 
     // Handle serial commands
     if (Serial.available())
@@ -388,8 +303,6 @@ void loop()
             Serial.println("  qr      - Print QR code for provisioning");
             Serial.println("  reset   - Reset WiFi provisioning");
             Serial.println("  stats   - Show WiFi connection status");
-            Serial.println("  store   - Store current WiFi credentials");
-            Serial.println("Note: BLE is automatically managed by ESP32 provisioning library");
             Serial.println("Reverb Commands:");
             Serial.println("  reverbstatus - Show Reverb connection status");
             Serial.println("  reverbclean  - Clean up Reverb client to free memory");
@@ -398,22 +311,13 @@ void loop()
             Serial.println("System Commands:");
             Serial.println("  restart - Restart the device");
             Serial.println("  config  - Show all configuration");
-            Serial.println("  commit  - Force save configuration to flash");
             Serial.println("  debug   - Show debug information");
-            Serial.println("  test    - Test NVS storage");
             Serial.println("  factory - Factory reset (erase all data)");
             Serial.println("Battery Commands:");
             Serial.println("  battery - Show battery status");
-            Serial.println("  voltage - Show raw voltage reading");
-            Serial.println("  charging- Show charging status for downloads");
             Serial.println("File Manager Commands:");
-            Serial.println("  sdinfo  - Show SD card information");
-            Serial.println("  sdtest  - Test file operations");
-            Serial.println("  sdstress- Run SD card stress test");
-            Serial.println("  sdspeed - Optimize SD card speed");
             Serial.println("  sdtree  - Check SD card file tree");
             Serial.println("  sdformat- Format SD card as FAT32");
-            Serial.println("  files   - List files on SD card");
             Serial.println("  deletefile <path> - Delete file from SD card");
             Serial.println("  delete  - Delete ALL required files from NVS and storage");
             Serial.println("  deletefig <uid> - Delete all files for a specific figure");
@@ -423,7 +327,6 @@ void loop()
             Serial.println("  download <url> <path> - Download file from URL");
             Serial.println("  addfile <path> <url> - Add required file");
             Serial.println("  checkfiles - Check and download missing files");
-            Serial.println("  forcedownload - Force download processing (ignore charging)");
             Serial.println("  cleanup - Clean up temporary files");
             Serial.println("Audio Commands:");
             Serial.println("  play <path> - Play MP3 file");
@@ -483,12 +386,6 @@ void loop()
         if (command == "qr" || command == "reset" || command == "stats")
         {
             wifiProv.handleCommand(command);
-        }
-        else if (command == "store")
-        {
-            Serial.println("\nManually storing current WiFi credentials...");
-            config.storeCurrentWiFiCredentials();
-            config.commit();
         }
         // Reverb related commands
         else if (command == "reverbstatus")
@@ -590,14 +487,6 @@ void loop()
                 Serial.println("❌ Failed to connect to server");
             }
         }
-        else if (command == "test")
-        {
-            Serial.println("\nTesting NVS storage...");
-            config.setWiFiCredentials("TestSSID", "TestPassword123");
-            config.commit();
-            Serial.println("Test credentials stored. Checking storage...");
-            config.printAllSettings();
-        }
         else if (command == "factory" && DEBUG)
         {
             Serial.println("\nWARNING: Factory reset will erase ALL stored data!");
@@ -620,22 +509,6 @@ void loop()
             }
         }
         // File Manager commands
-        else if (command == "sdinfo")
-        {
-            Serial.println(fileManager.getSDCardInfo());
-        }
-        else if (command == "sdtest")
-        {
-            fileManager.testFileOperations();
-        }
-        else if (command == "sdstress")
-        {
-            fileManager.runSDCardStressTest();
-        }
-        else if (command == "sdspeed")
-        {
-            fileManager.optimizeSDCardSpeed();
-        }
         else if (command == "sdtree")
         {
             fileManager.printFileTree();
@@ -643,22 +516,6 @@ void loop()
         else if (command == "sdformat")
         {
             fileManager.formatSDCard();
-        }
-        else if (command == "files")
-        {
-            fileManager.printFileList("/");
-        }
-        else if (command == "dlstats")
-        {
-            Serial.println(fileManager.getDownloadStatsString());
-        }
-        else if (command == "dlqueue")
-        {
-            fileManager.printDownloadQueue();
-        }
-        else if (command == "required")
-        {
-            fileManager.printRequiredFiles();
         }
         else if (command.startsWith("download "))
         {
@@ -713,37 +570,6 @@ void loop()
                 Serial.println("Usage: addfile <local_path> <url>");
                 Serial.println("Example: addfile /audio/sound.wav http://example.com/audio.wav");
             }
-        }
-        else if (command == "checkfiles")
-        {
-            Serial.println("Checking and downloading missing files...");
-            fileManager.checkRequiredFiles();
-
-            std::vector<String> missing = fileManager.getMissingFiles();
-            if (missing.size() > 0)
-            {
-                Serial.printf("Found %d missing files:\n", missing.size());
-                for (const auto &file : missing)
-                {
-                    Serial.println("  " + file);
-                }
-            }
-            else
-            {
-                Serial.println("All required files are present");
-            }
-        }
-        else if (command == "forcedownload")
-        {
-            Serial.println("Forcing download processing (ignoring charging requirement)...");
-            Serial.println("Note: This will attempt to download one file at a time for testing purposes.");
-            fileManager.forceProcessDownloads();
-        }
-        else if (command == "cleanup")
-        {
-            Serial.println("Cleaning up temporary files...");
-            fileManager.cleanupTempFiles();
-            Serial.println("Cleanup complete");
         }
         else if (command.startsWith("deletefile "))
         {
@@ -1276,38 +1102,6 @@ void loop()
         {
             battery.printBatteryInfo();
         }
-        else if (command == "voltage")
-        {
-            Serial.println("\n--- Battery Voltage Details ---");
-            Serial.println("Current voltage: " + String(battery.getBatteryVoltage(), 3) + "V");
-            Serial.println("Battery percentage: " + String(battery.getBatteryPercentage(), 1) + "%");
-            Serial.println("Charging status: " + String(battery.getChargingStatus() ? "Yes" : "No"));
-            Serial.println("Battery status: " + battery.getBatteryStatusString());
-            Serial.println("Raw ADC reading: " + String(analogRead(39)));
-            Serial.println("Charging pin state: " + String(digitalRead(34)));
-            Serial.println("------------------------------\n");
-        }
-        else if (command == "charging")
-        {
-            Serial.println("\n--- Charging Status for Downloads ---");
-            bool chargingStatus = battery.getChargingStatus();
-            Serial.println("Charging status: " + String(chargingStatus ? "CHARGING" : "NOT CHARGING"));
-            Serial.println("Charging required for downloads: " + String(chargingStatus ? "Met" : "NOT MET"));
-            Serial.println("Download queue size: " + String(fileManager.getPendingDownloadsCount()));
-            Serial.println("Download in progress: " + String(fileManager.isDownloadInProgress() ? "Yes" : "No"));
-            Serial.println("SD Card initialized: " + String(fileManager.isSDCardAvailable() ? "Yes" : "No"));
-            Serial.println("WiFi connected: " + String(WiFi.isConnected() ? "Yes" : "No"));
-
-            if (!chargingStatus)
-            {
-                Serial.println("\n⚠️  ISSUE: Device is not charging!");
-                Serial.println("Downloads will not start until device is connected to power.");
-                Serial.println("Use 'forcedownload' command to bypass charging requirement for testing.");
-            }
-
-            Serial.println("Note: Downloads only start when device is charging");
-            Serial.println("---------------------------------------\n");
-        }
         // System commands
         else if (command == "restart")
         {
@@ -1318,10 +1112,6 @@ void loop()
         else if (command == "config")
         {
             config.printAllSettings();
-        }
-        else if (command == "commit")
-        {
-            config.commit();
         }
         else if (command == "debug")
         {
@@ -1393,9 +1183,4 @@ void loop()
 
     // Update NFC controller (handles reed switch monitoring and NFC reading)
     nfcController.update();
-
-    // if (millis() - lastHeapPrint >= 1000) {
-    //     Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-    //     lastHeapPrint = millis();
-    // }
 }
