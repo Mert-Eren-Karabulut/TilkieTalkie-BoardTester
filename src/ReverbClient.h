@@ -26,6 +26,7 @@ public:
     void onChatMessage(std::function<void(const String &)> cb)
     {
         _chatCb = cb;
+        Serial.println("ReverbClient: Chat message callback registered");
     }
 
     void begin(
@@ -37,13 +38,6 @@ public:
     {
         if (!WiFi.isConnected())
         {
-            return;
-        }
-
-        // WebSocket is CRITICAL - only check for absolute minimum memory
-        size_t freeHeap = ESP.getFreeHeap();
-        if (freeHeap < 25000) {
-            Serial.printf("ReverbClient: CRITICAL memory shortage - Free: %d\n", freeHeap);
             return;
         }
 
@@ -66,8 +60,8 @@ public:
         // Configure WebSocket with optimized settings
         instance = this;
         _ws->onEvent(webSocketEvent);
-        _ws->setReconnectInterval(10000);
-        _ws->enableHeartbeat(15000, 2000, 1);
+        _ws->setReconnectInterval(3000);
+        _ws->enableHeartbeat(15000, 3000, 3);
         
         // Pre-build WebSocket path to avoid String concatenation during runtime
         snprintf(urlBuffer, sizeof(urlBuffer), "/app/%s?protocol=7&client=esp32-client&version=1.0", _appKey.c_str());
@@ -235,14 +229,37 @@ private:
             payloadStr[length] = '\0';
             
             if (strstr(payloadStr, "pusher:connection_established")) {
-                char* socketStart = strstr(payloadStr, "socket_id\":\"") + 12;
-                if (socketStart > payloadStr + 11) {
-                    char* socketEnd = strchr(socketStart, '"');
-                    if (socketEnd) {
-                        *socketEnd = '\0';
-                        _socketId = String(socketStart);
-                        *socketEnd = '"';
-                        subscribeToPrivate();
+                // Look for socket_id in the data field - handle both escaped and unescaped JSON
+                char* socketStart = strstr(payloadStr, "socket_id");
+                if (socketStart) {
+                    // Find the actual ID value after the colon and quotes
+                    socketStart = strchr(socketStart, ':');
+                    if (socketStart) {
+                        socketStart++; // Skip the colon
+                        // Skip whitespace and quotes
+                        while (*socketStart && (*socketStart == ' ' || *socketStart == '"' || *socketStart == '\\')) {
+                            socketStart++;
+                        }
+                        
+                        // Find the end of the socket ID
+                        char* socketEnd = socketStart;
+                        while (*socketEnd && *socketEnd != '"' && *socketEnd != '\\' && *socketEnd != ',' && *socketEnd != '}') {
+                            socketEnd++;
+                        }
+                        
+                        if (socketEnd > socketStart) {
+                            char tempChar = *socketEnd;
+                            *socketEnd = '\0';
+                            _socketId = String(socketStart);
+                            *socketEnd = tempChar; // Restore the character
+                            
+                            Serial.printf("ReverbClient: Connected with socket ID: %s\n", _socketId.c_str());
+                            if (subscribeToPrivate()) {
+                                Serial.println("ReverbClient: Successfully subscribed to private channel");
+                            } else {
+                                Serial.println("ReverbClient: Failed to subscribe to private channel");
+                            }
+                        }
                     }
                 }
             }
@@ -250,14 +267,65 @@ private:
                 const char* pong = "{\"event\":\"pusher:pong\",\"data\":{}}";
                 _ws->sendTXT(pong, strlen(pong));
             }
+            else if (strstr(payloadStr, "device.status.updated")) {
+                // Ignore device status updates (these are our own reports bounced back)
+                // No need to log these as they're just echoes of our own device reports
+            }
+            else if (strstr(payloadStr, "device.command.sent")) {
+                //1▕ { 
+//    2▕     "event": "device.command.sent", 
+//    3▕     "data": { 
+//    4▕         "device_id": "97535321118776", 
+//    5▕         "timestamp": "2025-08-01T02:05:16.362772Z", 
+//    6▕         "type": "next-track", 
+//    7▕         "value": null 
+//    8▕     }... 
+                //for now just print the command
+                Serial.printf("ReverbClient: Command sent event detected: %.*s\n", length, payload);
+                // We can handle commands here if needed, but for now just log it
+
+            }
+            
             else if (strstr(payloadStr, "chat-message")) {
-                char* textStart = strstr(payloadStr, "\"text\":\"") + 8;
-                if (textStart > payloadStr + 7 && _chatCb) {
-                    char* textEnd = strchr(textStart, '"');
+                Serial.println("ReverbClient: Chat message event detected!");
+                
+                if (!_chatCb) {
+                    Serial.println("ReverbClient: ERROR - No callback registered for chat messages!");
+                    break;
+                }
+                
+                // The data field contains escaped JSON, so we need to find the text field within it
+                // Look for "text":"<message>" pattern in the escaped JSON
+                char* textStart = strstr(payloadStr, "\\\"text\\\":\\\"");
+                if (textStart) {
+                    textStart += 12; // Skip past "\"text\":\""
+                    char* textEnd = strstr(textStart, "\\\"");
                     if (textEnd) {
                         *textEnd = '\0';
-                        _chatCb(String(textStart));
-                        *textEnd = '"';
+                        String messageText = String(textStart);
+                        *textEnd = '\\'; // Restore the backslash
+                        
+                        Serial.printf("ReverbClient: Received chat message: %s\n", messageText.c_str());
+                        _chatCb(messageText);
+                    } else {
+                        Serial.println("ReverbClient: Could not find end quote for text field");
+                    }
+                } else {
+                    // Fallback: try unescaped version in case format changes
+                    textStart = strstr(payloadStr, "\"text\":\"");
+                    if (textStart) {
+                        textStart += 8; // Skip past "text":"
+                        char* textEnd = strchr(textStart, '"');
+                        if (textEnd) {
+                            *textEnd = '\0';
+                            String messageText = String(textStart);
+                            *textEnd = '"'; // Restore the quote
+                            
+                            Serial.printf("ReverbClient: Received chat message (fallback): %s\n", messageText.c_str());
+                            _chatCb(messageText);
+                        }
+                    } else {
+                        Serial.printf("ReverbClient: Could not parse chat message. Full payload: %.*s\n", length, payload);
                     }
                 }
             }
@@ -275,12 +343,6 @@ private:
     {
         if (!isConnected()) return;
 
-        // Skip only if memory is critically low
-        size_t freeHeap = ESP.getFreeHeap();
-        if (freeHeap < 20000) {
-            Serial.printf("ReverbClient: Skipping device report due to critical memory: %d bytes\n", freeHeap);
-            return;
-        }
 
         // Get and cache all values to minimize object access
         BatteryManager &battery = BatteryManager::getInstance();
@@ -400,6 +462,7 @@ private:
                 _socketId.c_str(), channelBuffer);
 
             int httpCode = http.POST((uint8_t*)tempBuffer, strlen(tempBuffer));
+            
             if (httpCode != 200)
             {
                 http.end();

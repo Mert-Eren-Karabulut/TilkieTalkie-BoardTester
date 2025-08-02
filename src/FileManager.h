@@ -48,7 +48,7 @@ private:
     static const unsigned long RETRY_DELAY_MS = 10000; // 10 seconds between individual retries
     static const unsigned long RETRY_BATCH_DELAY_MS = 60000; // 1 minute between retry batches
     static const unsigned long CONNECTIVITY_TIMEOUT_MS = 10000; // 10 seconds
-    static const size_t DOWNLOAD_BUFFER_SIZE = 2048; // 2KB buffer for downloads (reduced from 8KB)
+    static const size_t DOWNLOAD_BUFFER_SIZE = 4096; // 4KB buffer for downloads (increased from 2KB)
     static const unsigned long DOWNLOAD_TIMEOUT_MS = 300000; // 5 minutes per download
     
     // NVS storage keys
@@ -142,6 +142,7 @@ private:
     bool removeRequiredFile(const String& localPath);
     void checkRequiredFiles();
     std::vector<String> getMissingFiles();
+    std::vector<String> getRequiredFilesByPattern(const String& pattern); // Get required files matching pattern
     void downloadMissingFiles();
     
     // Bulk deletion methods

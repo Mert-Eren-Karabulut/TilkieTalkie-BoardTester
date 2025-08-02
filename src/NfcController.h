@@ -13,10 +13,14 @@
 #define NFC_IRQ_PIN 33
 #define NFC_RESET_PIN 17
 
+// Constants for NFC operations
+#define MAX_UID_LENGTH 7
+#define NFC_READ_TIMEOUT_MS 50
+
 // Data structure to hold NFC card information
 struct NFCData
 {
-    uint8_t uid[7];
+    uint8_t uid[MAX_UID_LENGTH];
     uint8_t uidLength;
     String uidString;
     unsigned long timestamp;
@@ -80,7 +84,10 @@ private:
 
     // NFC reading timing control
     unsigned long lastNFCReadAttempt;
+    unsigned long lastSuccessfulNFCRead;
     static const unsigned long NFC_READ_INTERVAL = 100; // Read attempt every 100ms
+    static const unsigned long NFC_WATCHDOG_TIMEOUT = 30000; // 30 seconds without successful read
+    uint16_t consecutiveFailures;
 
     // Callback function pointers
     std::function<void(const NFCData &)> afterNFCReadCallback;

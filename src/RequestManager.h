@@ -7,6 +7,8 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <FileManager.h>
+#include <nvs_flash.h>
+#include <nvs.h>
 #include <vector>
 #include <map>
 #include <memory>
@@ -123,12 +125,16 @@ public:
     
     // Memory cleanup methods
     void clearDownloadTrackers();
-    void cleanupOldMappings(size_t maxMappings = 50);
     void cleanupCompletedTrackers();
 
 private:
     String lastError;
     int lastStatusCode;
+    
+    // NVS storage for UID to Figure ID mappings
+    static const char* NVS_NAMESPACE;
+    static const char* NVS_UID_MAPPING_KEY;
+    nvs_handle_t nvsHandle;
     
     // Figure download tracking
     FigureDownloadCompleteCallback figureDownloadCompleteCallback;
@@ -171,6 +177,17 @@ private:
     void onTrackDownloadComplete(const String &path, bool success);
     void storeUidToFigureIdMapping(const String &uid, const String &figureId);
     static void staticFileDownloadCallback(const String& url, const String& path, bool success, const String& error);
+    
+    // NVS operations for UID mappings
+    bool initializeNVS();
+    bool saveUidMappings();
+    bool loadUidMappings();
+    
+    // Offline mode methods
+    Figure constructFigureFromLocalFiles(const String &uid, const String &figureId);
+    std::vector<String> getRequiredFilesForFigure(const String &figureId);
+    void processOnlineFigureRequest(const String &uid);
+    void processOfflineFigureRequest(const String &uid);
 };
 
 #endif // REQUEST_MANAGER_H

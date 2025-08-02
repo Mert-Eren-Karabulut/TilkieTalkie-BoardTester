@@ -1,5 +1,9 @@
 #include "RequestManager.h"
 
+// Initialize static members
+const char* RequestManager::NVS_NAMESPACE = "requestmgr";
+const char* RequestManager::NVS_UID_MAPPING_KEY = "uid_mappings";
+
 // Singleton instance getter
 RequestManager &RequestManager::getInstance(const String &baseUrl)
 {
@@ -15,6 +19,7 @@ RequestManager::RequestManager(const String &baseUrl)
     this->lastStatusCode = 0;
     this->lastError = "";
     this->figureDownloadCompleteCallback = nullptr;
+    this->nvsHandle = 0;
     
     // Pre-reserve memory for containers to prevent frequent reallocations
     activeDownloads.reserve(5);
@@ -25,6 +30,15 @@ RequestManager::~RequestManager()
 {
     http.end();
     
+    // Save UID mappings before cleanup
+    saveUidMappings();
+    
+    // Close NVS handle
+    if (nvsHandle != 0) {
+        nvs_close(nvsHandle);
+        nvsHandle = 0;
+    }
+    
     // Clean up all tracking data
     clearDownloadTrackers();
     uidToFigureIdMap.clear();
@@ -34,6 +48,15 @@ RequestManager::~RequestManager()
 bool RequestManager::begin()
 {
     Serial.println(F("RequestManager: Initializing..."));
+    
+    // Initialize NVS for UID mappings
+    if (!initializeNVS()) {
+        Serial.println(F("RequestManager: Failed to initialize NVS"));
+        return false;
+    }
+    
+    // Load stored UID mappings
+    loadUidMappings();
     
     // Set up FileManager callback to track download completion
     FileManager &fileManager = FileManager::getInstance();
@@ -125,19 +148,6 @@ void RequestManager::clearDownloadTrackers()
 {
     activeDownloads.clear();
     activeDownloads.shrink_to_fit(); // Free unused capacity
-}
-
-void RequestManager::cleanupOldMappings(size_t maxMappings)
-{
-    if (uidToFigureIdMap.size() > maxMappings)
-    {
-        // Keep only the most recent mappings (simple cleanup strategy)
-        auto it = uidToFigureIdMap.begin();
-        std::advance(it, uidToFigureIdMap.size() - maxMappings);
-        uidToFigureIdMap.erase(uidToFigureIdMap.begin(), it);
-        
-        Serial.printf("RequestManager: Cleaned up old UID mappings, kept %zu entries\n", maxMappings);
-    }
 }
 
 void RequestManager::cleanupCompletedTrackers()
@@ -524,15 +534,26 @@ void RequestManager::initConnection()
 
 void RequestManager::getCheckFigureTracks(const String &uid)
 {
-    // Check network connectivity first
-    if (!checkNetworkConnectivity()) {
-        Serial.println(F("RequestManager: Network connectivity check failed"));
-        return;
+    Serial.println(F("RequestManager: Processing figure tracks request"));
+    Serial.print(F("UID: "));
+    Serial.println(uid);
+    
+    // Check if we have WiFi connectivity
+    bool isOnline = checkNetworkConnectivity();
+    Serial.print(F("RequestManager: Device is "));
+    Serial.println(isOnline ? F("online") : F("offline"));
+    
+    if (isOnline) {
+        // Online mode - fetch from server and update local storage
+        processOnlineFigureRequest(uid);
+    } else {
+        // Offline mode - check if we have local data for this UID
+        processOfflineFigureRequest(uid);
     }
-    
-    // Cleanup old mappings periodically to prevent memory bloat
-    cleanupOldMappings();
-    
+}
+
+void RequestManager::processOnlineFigureRequest(const String &uid)
+{
     String endpoint = "/units/" + uid;
     String url = buildUrl(endpoint);
     
@@ -551,7 +572,7 @@ void RequestManager::getCheckFigureTracks(const String &uid)
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     setDefaultHeaders();
 
-    Serial.println(F("RequestManager: Fetching figure tracks"));
+    Serial.println(F("RequestManager: Fetching figure tracks from server"));
     int httpResponseCode = http.GET();
     lastStatusCode = httpResponseCode;
 
@@ -593,6 +614,9 @@ void RequestManager::getCheckFigureTracks(const String &uid)
         String figureName = figure["name"].as<String>();
         JsonArray episodes = figure["episodes"].as<JsonArray>();
         
+        // Store UID to Figure ID mapping in NVS immediately
+        storeUidToFigureIdMapping(uid, figureId);
+        
         // Parse the complete figure structure for the callback
         Figure figureData;
         figureData.id = figureId;
@@ -633,12 +657,16 @@ void RequestManager::getCheckFigureTracks(const String &uid)
                 track.duration = trackObj["duration"].as<int>();
                 
                 // Create local path for the track using the original file structure
-                track.localPath = "/figures/" + figureId + "/" + episode.id + "/" + track.id + ".mp3";
+                track.localPath = "/figures/" + figureId + "/" + episode.id + "/" + track.id + ".wav";
                 trackPaths.push_back(track.localPath);
                 
-                // Only schedule download if file doesn't already exist
+                // Always add to required files list (regardless of whether file exists)
                 if (track.audioUrl.length() > 0)
                 {
+                    // Add to required files list first
+                    fileManager.addRequiredFile(track.localPath, track.audioUrl);
+                    
+                    // Then check if we need to download
                     if (!fileManager.fileExists(track.localPath))
                     {
                         Serial.print(F("RequestManager: Starting download: "));
@@ -659,9 +687,6 @@ void RequestManager::getCheckFigureTracks(const String &uid)
             
             figureData.episodes.push_back(std::move(episode));
         }
-        
-        // Store UID to Figure ID mapping
-        storeUidToFigureIdMapping(uid, figureId);
         
         // Start tracking the download progress
         startTrackingFigure(uid, figureName, figureId, trackPaths, figureData);
@@ -688,6 +713,55 @@ void RequestManager::getCheckFigureTracks(const String &uid)
         Serial.println("RequestManager: " + lastError);
         http.end();
     }
+}
+
+void RequestManager::processOfflineFigureRequest(const String &uid)
+{
+    Serial.println(F("RequestManager: Processing offline figure request"));
+    
+    // Check if we have a mapping for this UID
+    String figureId = getFigureIdFromUid(uid);
+    if (figureId.isEmpty()) {
+        Serial.println(F("RequestManager: No offline data found for this UID"));
+        if (figureDownloadCompleteCallback) {
+            Figure emptyFigure;
+            figureDownloadCompleteCallback(uid, "Unknown", false, "No offline data available for this figure", emptyFigure);
+        }
+        return;
+    }
+    
+    Serial.print(F("RequestManager: Found offline mapping for UID "));
+    Serial.print(uid);
+    Serial.print(F(" -> Figure ID "));
+    Serial.println(figureId);
+    
+    // Construct figure from local files
+    Figure figureData = constructFigureFromLocalFiles(uid, figureId);
+    
+    if (figureData.episodes.empty()) {
+        Serial.println(F("RequestManager: No local tracks found for figure"));
+        if (figureDownloadCompleteCallback) {
+            figureDownloadCompleteCallback(uid, figureData.name.isEmpty() ? "Unknown" : figureData.name, 
+                                         false, "No local tracks available", figureData);
+        }
+        return;
+    }
+    
+    // Create track paths for tracking
+    std::vector<String> trackPaths;
+    for (const auto& episode : figureData.episodes) {
+        for (const auto& track : episode.tracks) {
+            trackPaths.push_back(track.localPath);
+        }
+    }
+    
+    // Start tracking (all tracks should be ready since we're offline)
+    startTrackingFigure(uid, figureData.name, figureId, trackPaths, figureData);
+    
+    Serial.print(F("RequestManager: Offline figure ready with "));
+    Serial.print(trackPaths.size());
+    Serial.print(F(" tracks: "));
+    Serial.println(figureData.name);
 }
 
 // Figure download callback system implementation
@@ -837,6 +911,9 @@ void RequestManager::storeUidToFigureIdMapping(const String &uid, const String &
     Serial.print(uid);
     Serial.print(F(" -> "));
     Serial.println(figureId);
+    
+    // Save to NVS immediately for persistence
+    saveUidMappings();
 }
 
 // Get figure ID from UID for deletion purposes
@@ -852,4 +929,206 @@ String RequestManager::getFigureIdFromUid(const String &uid)
     Serial.print(F("No figure ID found for UID: "));
     Serial.println(uid);
     return String();
+}
+
+// NVS operations for UID mappings
+bool RequestManager::initializeNVS()
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("RequestManager: Failed to open NVS handle: %s\n", esp_err_to_name(err));
+        return false;
+    }
+    
+    Serial.println(F("RequestManager: NVS initialized successfully"));
+    return true;
+}
+
+bool RequestManager::saveUidMappings()
+{
+    if (nvsHandle == 0) {
+        Serial.println(F("RequestManager: NVS not initialized"));
+        return false;
+    }
+    
+    // Create JSON document to store mappings
+    DynamicJsonDocument doc(2048);
+    JsonObject mappings = doc.to<JsonObject>();
+    
+    for (const auto& pair : uidToFigureIdMap) {
+        mappings[pair.first] = pair.second;
+    }
+    
+    String jsonString;
+    serializeJson(doc, jsonString);
+    
+    esp_err_t err = nvs_set_str(nvsHandle, NVS_UID_MAPPING_KEY, jsonString.c_str());
+    if (err != ESP_OK) {
+        Serial.printf("RequestManager: Failed to save UID mappings: %s\n", esp_err_to_name(err));
+        return false;
+    }
+    
+    err = nvs_commit(nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("RequestManager: Failed to commit UID mappings: %s\n", esp_err_to_name(err));
+        return false;
+    }
+    
+    Serial.print(F("RequestManager: Saved "));
+    Serial.print(uidToFigureIdMap.size());
+    Serial.println(F(" UID mappings to NVS"));
+    return true;
+}
+
+bool RequestManager::loadUidMappings()
+{
+    if (nvsHandle == 0) {
+        Serial.println(F("RequestManager: NVS not initialized"));
+        return false;
+    }
+    
+    size_t required_size = 0;
+    esp_err_t err = nvs_get_str(nvsHandle, NVS_UID_MAPPING_KEY, NULL, &required_size);
+    
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        Serial.println(F("RequestManager: No UID mappings found in NVS"));
+        return true; // Not an error, just no data
+    }
+    
+    if (err != ESP_OK) {
+        Serial.printf("RequestManager: Failed to get UID mappings size: %s\n", esp_err_to_name(err));
+        return false;
+    }
+    
+    char* jsonString = (char*)malloc(required_size);
+    if (jsonString == NULL) {
+        Serial.println(F("RequestManager: Failed to allocate memory for UID mappings"));
+        return false;
+    }
+    
+    err = nvs_get_str(nvsHandle, NVS_UID_MAPPING_KEY, jsonString, &required_size);
+    if (err != ESP_OK) {
+        Serial.printf("RequestManager: Failed to load UID mappings: %s\n", esp_err_to_name(err));
+        free(jsonString);
+        return false;
+    }
+    
+    // Parse JSON
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, jsonString);
+    free(jsonString);
+    
+    if (error) {
+        Serial.printf("RequestManager: Failed to parse UID mappings JSON: %s\n", error.c_str());
+        return false;
+    }
+    
+    // Load mappings into memory
+    uidToFigureIdMap.clear();
+    JsonObject mappings = doc.as<JsonObject>();
+    for (JsonPair pair : mappings) {
+        uidToFigureIdMap[String(pair.key().c_str())] = String(pair.value().as<String>());
+    }
+    
+    Serial.print(F("RequestManager: Loaded "));
+    Serial.print(uidToFigureIdMap.size());
+    Serial.println(F(" UID mappings from NVS"));
+    return true;
+}
+
+RequestManager::Figure RequestManager::constructFigureFromLocalFiles(const String &uid, const String &figureId)
+{
+    Figure figure;
+    figure.id = figureId;
+    figure.name = "Local Figure"; // Default name since we don't have metadata
+    figure.description = "Offline figure data";
+    
+    // Get all required files for this figure
+    std::vector<String> figurePaths = getRequiredFilesForFigure(figureId);
+    
+    if (figurePaths.empty()) {
+        Serial.println(F("RequestManager: No local files found for figure"));
+        return figure;
+    }
+    
+    // Group files by episode (parse path structure: /figures/{figureId}/{episodeId}/{trackId}.wav)
+    std::map<String, std::vector<String>> episodeTrackMap;
+    FileManager &fileManager = FileManager::getInstance();
+    
+    // Pre-calculate prefix length to avoid repeated String operations
+    const int prefixLen = 9 + figureId.length() + 1; // "/figures/" + figureId + "/"
+    
+    for (const String& path : figurePaths) {
+        // Only process files that actually exist
+        if (!fileManager.fileExists(path)) {
+            continue;
+        }
+        
+        // Parse path to extract episode ID
+        // Expected format: /figures/{figureId}/{episodeId}/{trackId}.wav
+        if (path.length() > prefixLen && path.startsWith("/figures/" + figureId + "/")) {
+            // Find the episode ID (after the figureId)
+            int episodeEnd = path.indexOf('/', prefixLen);
+            
+            if (episodeEnd > prefixLen) {
+                String episodeId = path.substring(prefixLen, episodeEnd);
+                episodeTrackMap[episodeId].push_back(path);
+            }
+        }
+    }
+    
+    // Build episodes and tracks
+    for (const auto& episodePair : episodeTrackMap) {
+        Episode episode;
+        episode.id = episodePair.first;
+        episode.name = "Episode " + episodePair.first;
+        episode.description = "Local episode";
+        
+        for (const String& trackPath : episodePair.second) {
+            // Extract track ID from filename
+            String filename = trackPath.substring(trackPath.lastIndexOf('/') + 1);
+            String trackId = filename.substring(0, filename.lastIndexOf('.'));
+            
+            Track track;
+            track.id = trackId;
+            track.name = "Track " + trackId;
+            track.description = "Local track";
+            track.localPath = trackPath;
+            track.audioUrl = ""; // Not needed for offline
+            track.duration = 0; // Unknown for offline
+            
+            episode.tracks.push_back(std::move(track));
+        }
+        
+        if (!episode.tracks.empty()) {
+            figure.episodes.push_back(std::move(episode));
+        }
+    }
+    
+    Serial.print(F("RequestManager: Constructed figure with "));
+    Serial.print(figure.episodes.size());
+    Serial.println(F(" episodes"));
+    return figure;
+}
+
+std::vector<String> RequestManager::getRequiredFilesForFigure(const String &figureId)
+{
+    FileManager &fileManager = FileManager::getInstance();
+    String figurePrefix = "/figures/" + figureId + "/";
+    
+    // Use FileManager's pattern matching to get required files for this figure
+    std::vector<String> figurePaths = fileManager.getRequiredFilesByPattern(figurePrefix);
+    
+    Serial.print(F("RequestManager: Found "));
+    Serial.print(figurePaths.size());
+    Serial.print(F(" required files for figure "));
+    Serial.println(figureId);
+    return figurePaths;
 }

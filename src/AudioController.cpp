@@ -2,7 +2,7 @@
 #include "NfcController.h"
 #include "AudioFileSourceSD.h"
 #include "AudioFileSourceBuffer.h"
-#include "AudioGeneratorMP3.h"
+#include "AudioGeneratorWAV.h"
 #include "AudioOutputI2S.h"
 
 // Initialize static members
@@ -63,7 +63,7 @@ AudioController* AudioController::instance = nullptr;
 AudioController::AudioController() :
     audioFile(nullptr),
     audioBuffer(nullptr),
-    audioMP3(nullptr),
+    audioWAV(nullptr),
     audioOutput(nullptr),
     currentState(STOPPED),
     currentTrackPath(""),
@@ -228,17 +228,17 @@ bool AudioController::play(const String& filePath) {
         return false;
     }
     
-    audioMP3 = new AudioGeneratorMP3();
-    if (!audioMP3) {
-        Serial.println("AudioController: Failed to create AudioGeneratorMP3");
+    audioWAV = new AudioGeneratorWAV();
+    if (!audioWAV) {
+        Serial.println("AudioController: Failed to create AudioGeneratorWAV");
         cleanupAudioComponents();
         return false;
     }
 
     // Start playback (following working example)
-    Serial.println("AudioController: Starting MP3 playback");
-    if (!audioMP3->begin(audioBuffer, audioOutput)) {
-        Serial.println("AudioController: Failed to start MP3 playback");
+    Serial.println("AudioController: Starting WAV playback");
+    if (!audioWAV->begin(audioBuffer, audioOutput)) {
+        Serial.println("AudioController: Failed to start WAV playback");
         cleanupAudioComponents();
         return false;
     }
@@ -259,7 +259,7 @@ bool AudioController::pause() {
         return false;
     }
 
-    if (audioMP3 && audioMP3->isRunning()) {
+    if (audioWAV && audioWAV->isRunning()) {
         // Save current position before stopping
         if (audioFile) {
             pausedPosition = audioFile->getPos();
@@ -273,7 +273,7 @@ bool AudioController::pause() {
         }
         
         // Stop the audio playback
-        audioMP3->stop();
+        audioWAV->stop();
         currentState = PAUSED;
         return true;
     }
@@ -290,10 +290,10 @@ bool AudioController::resume() {
         // Clean up current audio components
         cleanupAudioComponents();
         
-        // Create fresh MP3 generator for resume
-        audioMP3 = new AudioGeneratorMP3();
-        if (!audioMP3) {
-            Serial.println("AudioController: Failed to create MP3 generator for resume");
+        // Create fresh WAV generator for resume
+        audioWAV = new AudioGeneratorWAV();
+        if (!audioWAV) {
+            Serial.println("AudioController: Failed to create WAV generator for resume");
             currentState = STOPPED;
             currentTrackPath = "";
             hasPausedPosition = false;
@@ -332,8 +332,8 @@ bool AudioController::resume() {
         }
 
         // Start playback
-        if (!audioMP3->begin(audioBuffer, audioOutput)) {
-            Serial.printf("AudioController: Failed to start MP3 playback\n");
+        if (!audioWAV->begin(audioBuffer, audioOutput)) {
+            Serial.printf("AudioController: Failed to start WAV playback\n");
             cleanupAudioComponents();
             currentState = STOPPED;
             currentTrackPath = "";
@@ -357,8 +357,8 @@ bool AudioController::stop() {
         return false;
     }
 
-    if (audioMP3 && audioMP3->isRunning()) {
-        audioMP3->stop();
+    if (audioWAV && audioWAV->isRunning()) {
+        audioWAV->stop();
         delay(10);
     }
 
@@ -526,8 +526,8 @@ void AudioController::update() {
 
     // Update audio processing only if playing
     if (currentState == PLAYING) {
-        if (audioMP3 && audioMP3->isRunning()) {
-            if (!audioMP3->loop()) {
+        if (audioWAV && audioWAV->isRunning()) {
+            if (!audioWAV->loop()) {
                 // Track finished
                 stop();
                 
@@ -542,7 +542,7 @@ void AudioController::update() {
             stop();
         }
     }
-    // For PAUSED state, we don't call audioMP3->loop() so playback remains stopped
+    // For PAUSED state, we don't call audioWAV->loop() so playback remains stopped
     // For STOPPED state, there's nothing to update
 }
 
@@ -552,8 +552,8 @@ void AudioController::volumeBeep() {
         return;
     }
     
-    // Play the beep.mp3 file instead of generating a tone
-    const String beepPath = "/sounds/beep.mp3";
+    // Play the beep.wav file instead of generating a tone
+    const String beepPath = "/sounds/beep.wav";
     
     // Check if beep file exists
     if (!fileManager.fileExists(beepPath)) {
@@ -624,6 +624,9 @@ bool AudioController::initializeES8388() {
     writeES8388Register(ES8388_LOUT1VOL, 0x0F);     // Set left headphone volume to ~50%
     writeES8388Register(ES8388_ROUT1VOL, 0x0F);     // Set right headphone volume to ~50%
 
+    // Small delay to let ES8388 process the writes before verification reads
+    delay(20);
+
     // Verify critical registers to ensure ES8388 is properly configured
     uint8_t dacPower = readES8388Register(ES8388_DACPOWER);
     uint8_t dacControl3 = readES8388Register(ES8388_DACCONTROL3);
@@ -690,7 +693,10 @@ uint8_t AudioController::readES8388Register(uint8_t reg) {
         }
     }
     
+    // Only log error in debug mode to reduce serial spam
+    #ifdef AUDIO_DEBUG_VERBOSE
     Serial.printf("AudioController: ES8388 read failed (reg=0x%02X)\n", reg);
+    #endif
     return 0xFF; // Error value
 }
 
@@ -700,6 +706,11 @@ bool AudioController::setES8388Volume(int volume) {
     // The control is a 6-bit value with a direct scale (not inverted).
     // 0x00 = -45dB (min), 0x1E = 0dB (a good max).
     // We will map the 0-100% volume to this range.
+    
+    // NOTE: Removed verification reads to prevent I2C Error 263 timeouts.
+    // The verification reads were causing frequent `Wire.requestFrom()` calls
+    // which were timing out when the ES8388 was busy, generating Error 263.
+    // Volume setting works fine without verification.
 
     uint8_t regValue;
     
@@ -716,12 +727,16 @@ bool AudioController::setES8388Volume(int volume) {
     // Write to both left and right headphone volume registers
     bool success = true;
     success &= writeES8388Register(ES8388_LOUT1VOL, regValue);
+    delayMicroseconds(500); // Small delay to prevent I2C bus congestion
     success &= writeES8388Register(ES8388_ROUT1VOL, regValue);
     
-    // Verify the write by reading back
+    // Optional verification read - disable to reduce I2C traffic and avoid timeout errors
+    // Only verify on critical operations or when debugging
+    #ifdef AUDIO_DEBUG_VERBOSE
     uint8_t readBackL = readES8388Register(ES8388_LOUT1VOL);
     uint8_t readBackR = readES8388Register(ES8388_ROUT1VOL);
     Serial.printf("AudioController: Volume readback - L: 0x%02X, R: 0x%02X\n", readBackL, readBackR);
+    #endif
     
     return success;
 }
@@ -788,24 +803,21 @@ float AudioController::getCurrentTrackSeconds() const {
 }
 
 bool AudioController::isValidAudioFile(const String& filePath) {
-    // Check file extension
+    // Check file extension - now only supporting WAV files
     String lowerPath = filePath;
     lowerPath.toLowerCase();
     
-    return lowerPath.endsWith(".mp3") || 
-           lowerPath.endsWith(".wav") || 
-           lowerPath.endsWith(".flac") || 
-           lowerPath.endsWith(".aac");
+    return lowerPath.endsWith(".wav");
 }
 
 void AudioController::cleanupAudioComponents() {
     // Following the working example pattern - stop and free components
-    if (audioMP3) {
-        if (audioMP3->isRunning()) {
-            audioMP3->stop();
+    if (audioWAV) {
+        if (audioWAV->isRunning()) {
+            audioWAV->stop();
         }
-        delete audioMP3;
-        audioMP3 = nullptr;
+        delete audioWAV;
+        audioWAV = nullptr;
     }
     
     if (audioBuffer) {

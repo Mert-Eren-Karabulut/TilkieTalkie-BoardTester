@@ -39,7 +39,7 @@ void handleChatMessage(const String &message)
 
     // You can add more complex logic here, e.g., parsing the message
     // if (message == "play_sound") {
-    //   audioController.play("/sounds/notification.mp3");
+    //   audioController.play("/sounds/notification.wav");
     // }
 }
 
@@ -67,17 +67,9 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
             
             // Add delay and heap check to prevent rapid execution
             delay(300);  // Give system time to stabilize
-            
-            size_t freeHeap = ESP.getFreeHeap();
-            Serial.printf("Free heap before playback: %d bytes\n", freeHeap);
-            
-            if (freeHeap < 20000) {  // Less than 20KB
-                Serial.println("Warning: Low heap memory, adding extra delay");
-                delay(500);
-            }
 
             // Pulse LED green to indicate success
-            ledController.pulseRapid(0x00FF00, 5); // Green color, 5 rapid pulses
+            ledController.pulseRapid(0x00FF00, 2); // Green color, 2 rapid pulses
 
             // Create playlist from the figure structure
             std::vector<String> playlist;
@@ -133,7 +125,7 @@ void afterNFCRead(const NFCData &nfcData)
     Serial.println(nfcData.timestamp);
 
     // Example: Play a sound and turn the LED green
-    // audioController.play("/sounds/nfc_success.mp3");
+    // audioController.play("/sounds/nfc_success.wav");
     ledController.pulseRapid(0x00FF00, 3); // Green color
     // we need to check if the figure tracks are downloaded and they exist
     // we need to send get request with bearer token to the url :https://portal.tilkietalkie.com/api/units/{nfc_uid}
@@ -275,7 +267,7 @@ void setup()
 
     // rapid pulse LED to indicate system is ready
     ledController.pulseRapid(0x00FF00, 3); // Rapid pulse green
-    // audioController.play("/sounds/12.mp3"); // Play startup sound
+    // audioController.play("/sounds/12.wav"); // Play startup sound
 }
     static unsigned long lastFreeCall = 0;
 
@@ -329,7 +321,7 @@ void loop()
             Serial.println("  checkfiles - Check and download missing files");
             Serial.println("  cleanup - Clean up temporary files");
             Serial.println("Audio Commands:");
-            Serial.println("  play <path> - Play MP3 file");
+            Serial.println("  play <path> - Play wav file");
             Serial.println("  pause   - Pause current playback");
             Serial.println("  resume  - Resume paused playback");
             Serial.println("  stop    - Stop playback");
@@ -762,7 +754,7 @@ void loop()
                 if (filePath.isEmpty())
                 {
                     Serial.println("Usage: play <file_path>");
-                    Serial.println("Example: play /audio/song.mp3");
+                    Serial.println("Example: play /audio/song.wav");
                 }
                 else
                 {
@@ -780,7 +772,7 @@ void loop()
             else
             {
                 Serial.println("Usage: play <file_path>");
-                Serial.println("Example: play /audio/song.mp3");
+                Serial.println("Example: play /audio/song.wav");
             }
         }
         else if (command == "play")
@@ -1153,6 +1145,31 @@ void loop()
                 Serial.println("Status: 🟢 OK - Memory levels normal");
             }
             Serial.println("----------------------------------\n");
+        }
+        // File Manager commands that were missing
+        else if (command == "dlstats")
+        {
+            Serial.println(fileManager.getDownloadStatsString());
+        }
+        else if (command == "dlqueue")
+        {
+            fileManager.printDownloadQueue();
+        }
+        else if (command == "required")
+        {
+            fileManager.printRequiredFiles();
+        }
+        else if (command == "checkfiles")
+        {
+            Serial.println("Checking required files and scheduling missing ones for download...");
+            fileManager.checkRequiredFiles();
+            Serial.println("Check complete. Use 'dlqueue' to see download queue.");
+        }
+        else if (command == "cleanup")
+        {
+            Serial.println("Cleaning up temporary files...");
+            fileManager.cleanupTempFiles();
+            Serial.println("Cleanup complete.");
         }
         else
         {

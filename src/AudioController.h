@@ -7,7 +7,7 @@
 #include <vector>
 #include "AudioFileSourceSD.h"
 #include "AudioFileSourceBuffer.h"
-#include "AudioGeneratorMP3.h"
+#include "AudioGeneratorWAV.h"
 #include "AudioOutputI2S.h"
 #include "FileManager.h"
 
@@ -90,7 +90,6 @@ public:
     void update();
     
     // Beep functions
-    void beep(int frequency = 1000, int duration = 100);
     void volumeBeep(); // Beep to indicate volume level
 
 private:
@@ -104,7 +103,7 @@ private:
     // Audio components
     AudioFileSourceSD* audioFile;
     AudioFileSourceBuffer* audioBuffer;
-    AudioGeneratorMP3* audioMP3;
+    AudioGeneratorWAV* audioWAV;
     AudioOutputI2S* audioOutput;
 
     // State variables

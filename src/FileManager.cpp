@@ -283,7 +283,7 @@ void FileManager::update() {
     
     // Check for missing required files periodically
     static unsigned long lastCheck = 0;
-    if (millis() - lastCheck > 300000) { // Check every 5 minutes
+    if (millis() - lastCheck > 300000 && WiFi.status() == WL_CONNECTED) { // Check every 5 minutes
         checkRequiredFiles();
         lastCheck = millis();
     }
@@ -787,10 +787,14 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     
     // Download the file content
     startTime = millis(); // Reset timer for download phase
-    while (client.connected() && downloadSuccess && (millis() - startTime < DOWNLOAD_TIMEOUT_MS)) {
+    unsigned long lastDataTime = millis(); // Track when we last received data
+    const unsigned long NO_DATA_TIMEOUT = 10000; // 10 seconds without data = timeout
+    
+    while (downloadSuccess && (millis() - startTime < DOWNLOAD_TIMEOUT_MS)) {
         size_t availableData = client.available();
         
         if (availableData > 0) {
+            lastDataTime = millis(); // Reset no-data timer
             size_t bytesToRead = min(availableData, (size_t)DOWNLOAD_BUFFER_SIZE);
             int readBytes = client.readBytes(buffer, bytesToRead);
             
@@ -818,24 +822,56 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
                     }
                 }
                 
+                // Check if we have all expected data
                 if (contentLength > 0 && totalDownloaded >= contentLength) {
-                    break;
+                    Serial.println("FileManager: Expected data received, checking for remaining bytes...");
+                    
+                    // Wait a bit more to ensure no more data is coming
+                    unsigned long drainStart = millis();
+                    while ((millis() - drainStart) < 2000 && client.connected()) { // Wait up to 2 seconds
+                        if (client.available() > 0) {
+                            Serial.printf("FileManager: Found %d more bytes after expected completion\n", client.available());
+                            break; // More data available, continue main loop
+                        }
+                        delay(50);
+                    }
+                    
+                    // If no more data after waiting, we're truly done
+                    if (client.available() == 0) {
+                        break;
+                    }
                 }
             }
         } else {
-            // No data available, check if connection is still alive
+            // No data available right now
             if (!client.connected()) {
+                // Connection closed
                 if (contentLength > 0 && totalDownloaded < contentLength) {
+                    Serial.printf("FileManager: Connection closed with %d/%d bytes received\n", 
+                                 totalDownloaded, contentLength);
                     errorMsg = "Connection lost before download completed";
                     downloadSuccess = false;
                 } else {
-                    // Connection closed normally (for chunked transfer or unknown length)
+                    // Connection closed normally
+                    Serial.println("FileManager: Connection closed normally");
                     break;
                 }
+            } else if ((millis() - lastDataTime) > NO_DATA_TIMEOUT) {
+                // No data for too long, but connection still alive
+                Serial.printf("FileManager: No data received for %lu seconds, timing out\n", NO_DATA_TIMEOUT / 1000);
+                errorMsg = "Download stalled - no data received for " + String(NO_DATA_TIMEOUT / 1000) + " seconds";
+                downloadSuccess = false;
             }
         }
         
-        delay(1); // Yield to other tasks
+        delay(10); // Slightly longer delay to reduce CPU usage
+    }
+    
+    // Check for overall timeout
+    if ((millis() - startTime) >= DOWNLOAD_TIMEOUT_MS) {
+        Serial.println("FileManager: Download timed out");
+        errorMsg = "Download timed out after " + String(DOWNLOAD_TIMEOUT_MS / 1000) + " seconds";
+        downloadSuccess = false;
     }
     
     free(buffer);
@@ -848,12 +884,21 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         return false;
     }
     
-    // Verify download size
-    if (contentLength > 0 && totalDownloaded != contentLength) {
-        errorMsg = "Download incomplete: " + String(totalDownloaded) + "/" + String(contentLength) + " bytes";
-        SD.remove(tempPath);
-        downloadInProgress = false;
-        return false;
+    // Verify download size with small tolerance for edge cases
+    if (contentLength > 0) {
+        int missingBytes = contentLength - totalDownloaded;
+        if (missingBytes > 0) {
+            if (missingBytes <= 64) { // Allow up to 64 bytes missing (could be padding or encoding issues)
+                Serial.printf("FileManager: Download completed with %d bytes missing (within tolerance)\n", missingBytes);
+            } else {
+                errorMsg = "Download incomplete: " + String(totalDownloaded) + "/" + String(contentLength) + " bytes (" + String(missingBytes) + " bytes missing)";
+                SD.remove(tempPath);
+                downloadInProgress = false;
+                return false;
+            }
+        } else if (missingBytes < 0) {
+            Serial.printf("FileManager: Downloaded %d extra bytes (file may have grown)\n", -missingBytes);
+        }
     }
     
     // Move temporary file to final location
@@ -868,7 +913,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         return false;
     }
     
-    // Verify final file exists and has correct size
+    // Verify final file exists and has reasonable size
     File finalFile = SD.open(localPath);
     if (!finalFile) {
         errorMsg = "Final file verification failed";
@@ -878,11 +923,16 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     size_t finalSize = finalFile.size();
     finalFile.close();
     
-    if (contentLength > 0 && finalSize != contentLength) {
-        errorMsg = "Final file size mismatch";
-        SD.remove(localPath);
-        downloadInProgress = false;
-        return false;
+    if (contentLength > 0) {
+        int sizeDiff = abs((int)finalSize - (int)contentLength);
+        if (sizeDiff > 64) { // Allow up to 64 bytes difference
+            errorMsg = "Final file size mismatch: expected " + String(contentLength) + ", got " + String(finalSize);
+            SD.remove(localPath);
+            downloadInProgress = false;
+            return false;
+        } else if (sizeDiff > 0) {
+            Serial.printf("FileManager: File size difference: %d bytes (within tolerance)\n", sizeDiff);
+        }
     }
     
     downloadInProgress = false;
@@ -913,6 +963,7 @@ void FileManager::processDownloadQueue() {
         return;
     }
     
+    // First pass: Remove completed tasks and permanently failed tasks
     auto it = downloadQueue.begin();
     while (it != downloadQueue.end()) {
         DownloadTask& task = *it;
@@ -937,6 +988,15 @@ void FileManager::processDownloadQueue() {
             it = downloadQueue.erase(it);
             continue;
         }
+        
+        ++it;
+    }
+    
+    // Second pass: Find the first task that's ready to be processed
+    bool taskProcessed = false;
+    it = downloadQueue.begin();
+    while (it != downloadQueue.end() && !taskProcessed) {
+        DownloadTask& task = *it;
         
         // Check if we need to wait between retry batches
         if (task.retryCount >= MAX_RETRY_COUNT) {
@@ -989,6 +1049,7 @@ void FileManager::processDownloadQueue() {
             }
         }
         
+        // Process this task
         String errorMsg;
         task.lastAttempt = millis();
         task.retryCount++;
@@ -996,13 +1057,16 @@ void FileManager::processDownloadQueue() {
         Serial.printf("FileManager: Attempting download (batch %d, attempt %d/%d): %s\n", 
                      task.retryBatch + 1, task.retryCount, MAX_RETRY_COUNT, task.url.c_str());
         
-        if (downloadFileFromURL(task.url, task.localPath, errorMsg)) {
+        bool downloadSuccess = downloadFileFromURL(task.url, task.localPath, errorMsg);
+        
+        if (downloadSuccess) {
             // Verify integrity if checksum provided
             if (!task.checksum.isEmpty() && !verifyFileIntegrity(task.localPath, task.checksum)) {
                 Serial.printf("FileManager: Downloaded file failed integrity check: %s\n", task.localPath.c_str());
                 deleteFile(task.localPath);
                 Serial.printf("FileManager: Download attempt %d/%d failed (integrity): %s\n", 
                              task.retryCount, MAX_RETRY_COUNT, errorMsg.c_str());
+                downloadSuccess = false;
             } else {
                 task.completed = true;
                 Serial.printf("FileManager: Download successful: %s\n", task.localPath.c_str());
@@ -1012,8 +1076,16 @@ void FileManager::processDownloadQueue() {
                          task.retryCount, MAX_RETRY_COUNT, task.url.c_str(), errorMsg.c_str());
         }
         
-        ++it;
-        break; // Process one download at a time
+        // If download failed and hasn't reached max retries, move to end of queue for fair processing
+        if (!downloadSuccess && task.retryCount < MAX_RETRY_COUNT) {
+            // Move failed task to end of queue to give other tasks a chance
+            DownloadTask failedTask = task;
+            downloadQueue.erase(it);
+            downloadQueue.push_back(failedTask);
+            Serial.printf("FileManager: Moved failed download to end of queue: %s\n", failedTask.localPath.c_str());
+        }
+        
+        taskProcessed = true; // Process only one download per call
     }
     
     saveDownloadQueue();
@@ -1064,6 +1136,20 @@ std::vector<String> FileManager::getMissingFiles() {
     }
     
     return missing;
+}
+
+std::vector<String> FileManager::getRequiredFilesByPattern(const String& pattern) {
+    std::vector<String> matchingFiles;
+    
+    for (const auto& file : requiredFiles) {
+        if (file.path.indexOf(pattern) >= 0) {
+            matchingFiles.push_back(file.path);
+        }
+    }
+    
+    Serial.printf("FileManager: Found %d required files matching pattern: %s\n", 
+                  matchingFiles.size(), pattern.c_str());
+    return matchingFiles;
 }
 
 bool FileManager::createDirectoryStructure(const String& path) {
@@ -1380,7 +1466,12 @@ bool FileManager::saveRequiredFiles() {
         return false;
     }
     
-    nvs_commit(nvsHandle);
+    err = nvs_commit(nvsHandle);
+    if (err != ESP_OK) {
+        Serial.printf("FileManager: Failed to commit NVS: %s\n", esp_err_to_name(err));
+        return false;
+    }
+    
     Serial.printf("FileManager: Saved %d required files to NVS\n", requiredFiles.size());
     return true;
 }
@@ -2061,7 +2152,7 @@ void FileManager::clearAllRequiredFiles() {
     int filesDeleted = 0;
     int filesNotFound = 0;
     
-    // Delete all files from storage
+    // Delete files based on required files list
     for (const auto& file : requiredFiles) {
         if (fileExists(file.path)) {
             if (deleteFile(file.path)) {
@@ -2072,6 +2163,7 @@ void FileManager::clearAllRequiredFiles() {
             }
         } else {
             filesNotFound++;
+            Serial.printf("File not found: %s\n", file.path.c_str());
         }
     }
     

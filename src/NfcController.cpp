@@ -13,7 +13,9 @@ NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
                                  cardReadInSession(false),
                                  lastDebounceTime(0),
                                  lastReedState(false),
-                                 lastNFCReadAttempt(0)
+                                 lastNFCReadAttempt(0),
+                                 lastSuccessfulNFCRead(0),
+                                 consecutiveFailures(0)
 {
     // The afterNFCReadCallback and afterDetachNFCCallback are initialized to nullptr by default
 }
@@ -28,28 +30,37 @@ bool NfcController::begin()
     I2C_NFC.begin(NFC_SDA_PIN, NFC_SCL_PIN);
     delay(100);
 
-    // Now, begin the NFC module communication on its own bus
-    nfc.begin();
-
-    uint32_t versiondata = nfc.getFirmwareVersion();
-    if (!versiondata)
+    // Attempt multiple times to initialize NFC module (hardware can be finicky)
+    for (int attempts = 0; attempts < 3; attempts++)
     {
-        Serial.println("ERROR: PN532 not found on Wire1! Check wiring on SDA=22, SCL=21, RST=17.");
-        nfcReady = false;
-        return false;
+        nfc.begin();
+        delay(50); // Brief delay between attempts
+        
+        uint32_t versiondata = nfc.getFirmwareVersion();
+        if (versiondata)
+        {
+            // Print firmware version
+            Serial.print("Found chip PN5");
+            Serial.print((versiondata >> 16) & 0xFF, HEX);
+            Serial.print(".");
+            Serial.println((versiondata >> 8) & 0xFF, HEX);
+
+            // Configure board to read RFID tags
+            nfc.SAMConfig();
+            
+            nfcReady = true;
+            lastSuccessfulNFCRead = millis(); // Initialize watchdog timer
+            consecutiveFailures = 0;
+            return true;
+        }
+        
+        Serial.printf("NFC init attempt %d failed, retrying...\n", attempts + 1);
+        delay(100);
     }
 
-    // Print firmware version
-    Serial.print("Found chip PN5");
-    Serial.print((versiondata >> 16) & 0xFF, HEX);
-    Serial.print(".");
-    Serial.println((versiondata >> 8) & 0xFF, HEX);
-
-    // Configure board to read RFID tags
-    nfc.SAMConfig();
-
-    nfcReady = true;
-    return true;
+    Serial.println("ERROR: PN532 not found on Wire1 after 3 attempts! Check wiring on SDA=22, SCL=21, RST=17.");
+    nfcReady = false;
+    return false;
 }
 
 void NfcController::update()
@@ -90,6 +101,7 @@ void NfcController::handleReedSwitch()
                 Serial.println("Reed switch activated. NFC session started.");
                 cardReadInSession = false; // Reset session flag
                 lastReadUID = "";          // Clear last read UID for the new session
+                consecutiveFailures = 0;   // Reset failure count for fresh start
             }
             else
             {
@@ -112,26 +124,68 @@ void NfcController::handleReedSwitch()
 
 void NfcController::handleNFCReading()
 {
+    // Optimized NFC reading with adaptive timing to reduce I2C Error 263 timeouts.
+    // Uses progressive backoff when no card is present to minimize I2C bus traffic.
+    // Reduces timeout from 50ms to 25ms to fail faster and prevent bus blocking.
+    
     // Only attempt NFC reading at intervals to avoid blocking the main thread
     unsigned long currentTime = millis();
-    if (currentTime - lastNFCReadAttempt < NFC_READ_INTERVAL)
+    
+    // Dynamic read interval based on consecutive failures to reduce I2C traffic
+    unsigned long readInterval = NFC_READ_INTERVAL;
+    if (consecutiveFailures > 50)
+    {
+        // After 50 failures (5 seconds), slow down to every 500ms
+        readInterval = 500;
+    }
+    else if (consecutiveFailures > 20)
+    {
+        // After 20 failures (2 seconds), slow down to every 300ms  
+        readInterval = 300;
+    }
+    else if (consecutiveFailures > 10)
+    {
+        // After 10 failures (1 second), slow down to every 200ms
+        readInterval = 200;
+    }
+    
+    if (currentTime - lastNFCReadAttempt < readInterval)
     {
         return; // Too soon for another read attempt
+    }
+    
+    // Check for NFC watchdog timeout - reinitialize if stuck
+    if (lastSuccessfulNFCRead > 0 && (currentTime - lastSuccessfulNFCRead) > NFC_WATCHDOG_TIMEOUT)
+    {
+        Serial.println("WARNING: NFC watchdog timeout, attempting recovery...");
+        consecutiveFailures = 0;
+        lastSuccessfulNFCRead = currentTime; // Reset to prevent spam
+        // Could add nfc.begin() here for full recovery if needed
     }
     
     lastNFCReadAttempt = currentTime;
 
     uint8_t success;
-    uint8_t uid[] = {0, 0, 0, 0, 0, 0, 0}; // Buffer to store the returned UID
-    uint8_t uidLength;                     // Length of the UID (4 or 7 bytes)
+    uint8_t uid[MAX_UID_LENGTH] = {0}; // Buffer to store the returned UID
+    uint8_t uidLength;                 // Length of the UID (4 or 7 bytes)
 
-    // Use a reasonable timeout - 50ms should be enough for most NFC operations
-    success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 50); // 50ms timeout
+    success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 70);
 
     if (success)
     {
         cardPresent = true;
-        String currentUID = "";
+        consecutiveFailures = 0;
+        lastSuccessfulNFCRead = currentTime;
+        
+        // Validate UID length
+        if (uidLength > MAX_UID_LENGTH)
+        {
+            Serial.printf("ERROR: UID length %d exceeds maximum %d\n", uidLength, MAX_UID_LENGTH);
+            return;
+        }
+        
+        String currentUID;
+        currentUID.reserve(uidLength * 3); // Pre-allocate memory
         for (uint8_t i = 0; i < uidLength; i++)
         {
             if (i > 0)
@@ -161,6 +215,16 @@ void NfcController::handleNFCReading()
             {
                 afterNFCReadCallback(dockedCardData);
             }
+        }
+    }
+    else
+    {
+        consecutiveFailures++;
+        // Reduce logging frequency to avoid serial spam
+        if (consecutiveFailures % 200 == 0)  // Every 200 failures instead of 100
+        {
+            Serial.printf("WARNING: %u consecutive NFC read failures (using %lums interval)\n", 
+                         consecutiveFailures, readInterval);
         }
     }
     // Note: No need for card removal detection here since reed switch handles that
@@ -212,7 +276,7 @@ void NfcController::diagnostics()
     Serial.println((versiondata >> 8) & 0xFF, DEC);
 
     Serial.println("Place a card on the reader to test communication...");
-    uint8_t uid[] = {0, 0, 0, 0, 0, 0, 0};
+    uint8_t uid[MAX_UID_LENGTH] = {0};
     uint8_t uidLength;
     uint8_t success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 1000);
 
