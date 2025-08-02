@@ -9,6 +9,7 @@
 #include "NfcController.h"
 #include "RequestManager.h"
 #include "ReverbClient.h"
+#include "Buttons.h"
 
 // Use the singleton instance from the header
 NfcController &nfcController = NfcController::getInstance();
@@ -22,6 +23,7 @@ FileManager &fileManager = FileManager::getInstance();
 AudioController &audioController = AudioController::getInstance();
 LedController ledController;
 ReverbClient &reverb = ReverbClient::getInstance(); // Create an alias for easier access
+ButtonController &buttonController = ButtonController::getInstance();
 
 const bool DEBUG = true; // Set to false to disable debug prints
 
@@ -264,6 +266,73 @@ void setup()
 
     // Initialize other modules here
     // e.g., sensors, etc.
+
+    // Initialize Button Controller
+    Serial.println("Initializing Button Controller...");
+    buttonController.begin();
+    
+    // Set up button callbacks
+    buttonController.onSingleClick([](ButtonController::ButtonId button) {
+        Serial.printf("[MAIN] Single click on button %d\n", button + 1);
+        // Example: Different actions for different buttons
+        switch(button) {
+            case ButtonController::BUTTON_1:
+                // Button 1: Toggle playback
+                Serial.println("Button 1: Toggle playback");
+                ledController.pulseLed(0x0000FF); // Blue pulse
+                break;
+            case ButtonController::BUTTON_2:
+                // Button 2: Next track
+                Serial.println("Button 2: Next track");
+                ledController.pulseLed(0x00FF00); // Green pulse
+                break;
+            case ButtonController::BUTTON_3:
+                // Button 3: Previous track
+                Serial.println("Button 3: Previous track");
+                ledController.pulseLed(0xFFFF00); // Yellow pulse
+                break;
+            case ButtonController::BUTTON_4:
+                // Button 4: Menu/Settings
+                Serial.println("Button 4: Menu/Settings");
+                ledController.pulseLed(0xFF00FF); // Magenta pulse
+                break;
+        }
+    });
+
+    buttonController.onHoldStart([](ButtonController::ButtonId button, unsigned long duration) {
+        Serial.printf("[MAIN] Hold started on button %d (duration: %lu ms)\n", button + 1, duration);
+        // Example: Volume control setup
+        if (button == ButtonController::BUTTON_2 || button == ButtonController::BUTTON_4) {
+            Serial.printf("Starting volume %s\n", (button == ButtonController::BUTTON_2) ? "up" : "down");
+        }
+    });
+
+    buttonController.onHoldContinuous([](ButtonController::ButtonId button, unsigned long duration) {
+        // Example: Continuous volume adjustment
+        if (button == ButtonController::BUTTON_2) {
+            // Volume up - called every 100ms while holding
+            Serial.printf("[MAIN] Volume up (held for %lu ms)\n", duration);
+            // audioController.increaseVolume(1); // Increase by 1 step
+        } else if (button == ButtonController::BUTTON_4) {
+            // Volume down - called every 100ms while holding
+            Serial.printf("[MAIN] Volume down (held for %lu ms)\n", duration);
+            // audioController.decreaseVolume(1); // Decrease by 1 step
+        }
+    });
+
+    buttonController.onHoldEnd([](ButtonController::ButtonId button, unsigned long duration) {
+        Serial.printf("[MAIN] Hold ended on button %d (total duration: %lu ms)\n", button + 1, duration);
+        // Volume adjustment finished
+    });
+
+    buttonController.onComboHold([]() {
+        Serial.println("[MAIN] COMBO HOLD TRIGGERED - RESTARTING DEVICE!");
+        ledController.pulseRapid(0xFF0000, 5); // Rapid red pulse
+        delay(2000); // Give time for LED animation
+        ESP.restart(); // Restart the device
+    });
+
+    Serial.println("Button Controller initialized successfully!");
 
     // rapid pulse LED to indicate system is ready
     ledController.pulseRapid(0x00FF00, 3); // Rapid pulse green
@@ -1197,6 +1266,9 @@ void loop()
 
     // Update LED controller (handles pulse and pulseRapid animations)
     ledController.update();
+
+    // Update Button controller (handles button state changes and callbacks)
+    buttonController.update();
 
     // Update NFC controller (handles reed switch monitoring and NFC reading)
     nfcController.update();
