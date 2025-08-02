@@ -36,16 +36,12 @@ public:
         const char *authToken,
         const char *deviceId)
     {
-        if (!WiFi.isConnected())
-        {
-            return;
-        }
-
         _host = host;
         _port = port;
         _appKey = appKey;
         _authToken = authToken;
         _deviceId = deviceId;
+        _initialized = true;
 
         // Pre-allocate all objects at once to minimize fragmentation
         if (!_httpClient) {
@@ -57,57 +53,53 @@ public:
             _ws = new WebSocketsClient();
         }
 
-        // Configure WebSocket with optimized settings
+        // Configure WebSocket to work WITH the library's built-in reconnection
         instance = this;
         _ws->onEvent(webSocketEvent);
-        _ws->setReconnectInterval(3000);
-        _ws->enableHeartbeat(15000, 3000, 3);
+        _ws->setReconnectInterval(2000); // Let library handle reconnection every 2 seconds
+        _ws->enableHeartbeat(15000, 3000, 2); // 15s ping, 3s pong timeout, 2 retries
         
         // Pre-build WebSocket path to avoid String concatenation during runtime
         snprintf(urlBuffer, sizeof(urlBuffer), "/app/%s?protocol=7&client=esp32-client&version=1.0", _appKey.c_str());
 
-        // Immediate connection attempt - WebSocket is critical
-        Serial.println("ReverbClient: Initiating critical WebSocket connection...");
-        _ws->beginSSL(_host.c_str(), _port, urlBuffer);
+        Serial.println("ReverbClient: Initialized, will connect when WiFi is available");
+        
+        // Start connection if WiFi is already available
+        if (WiFi.isConnected()) {
+            _ws->beginSSL(_host.c_str(), _port, urlBuffer);
+        }
     }
 
     void update()
     {
-        if (!WiFi.isConnected())
-        {
+        // Handle WiFi state changes
+        if (!WiFi.isConnected()) {
+            if (_isConnected || _wsStarted) {
+                Serial.println("ReverbClient: WiFi disconnected, stopping WebSocket");
+                if (_ws) {
+                    _ws->disconnect();
+                }
+                _isConnected = false;
+                _wsStarted = false;
+            }
             return;
         }
         
-        // ALWAYS handle WebSocket loop - this is critical
+        // WiFi is connected - start WebSocket if not already started
+        if (!_wsStarted && _initialized) {
+            Serial.println("ReverbClient: Starting WebSocket connection");
+            _ws->beginSSL(_host.c_str(), _port, urlBuffer);
+            _wsStarted = true;
+        }
+        
+        // Let the library handle everything (reconnection, heartbeat, etc.)
         if (_ws) {
             _ws->loop();
         }
-        
-        // Handle reconnection more aggressively since WebSocket is critical
-        if (!_isConnected && _ws && _connectionRetries <= MAX_CONNECTION_RETRIES)
-        {
-            if (millis() - _lastConnectionAttempt >= RETRY_DELAY)
-            {
-                Serial.printf("ReverbClient: Attempting critical reconnection (attempt %d/%d)\n", 
-                             _connectionRetries + 1, MAX_CONNECTION_RETRIES);
-                
-                if (_ws) {
-                    _ws->disconnect();
-                    delay(200);
-                    _ws->beginSSL(_host.c_str(), _port, urlBuffer);
-                    _lastConnectionAttempt = millis();
-                    _connectionRetries++;
-                }
-            }
-        }
 
-        // Adaptive device report frequency based on memory pressure
+        // Send device reports when connected
         static unsigned long lastReportTime = 0;
-        static unsigned long reportInterval = 1000;
-        
-        if (_isConnected && millis() - lastReportTime >= reportInterval)
-        {
-            size_t freeHeap = ESP.getFreeHeap();
+        if (_isConnected && millis() - lastReportTime >= 5000) {
             lastReportTime = millis();
             sendDeviceReport();
         }
@@ -115,26 +107,64 @@ public:
 
     bool isConnected()
     {
-        return WiFi.isConnected() && _isConnected;
+        return WiFi.isConnected() && _ws && _ws->isConnected();
+    }
+    
+    // Get simple connection status
+    String getConnectionStatus()
+    {
+        if (!WiFi.isConnected()) {
+            return "WiFi Disconnected";
+        }
+        
+        if (!_wsStarted) {
+            return "WebSocket Not Started";
+        }
+        
+        if (_ws && _ws->isConnected()) {
+            return "Fully Connected";
+        }
+        
+        return "WebSocket Connecting...";
     }
 
     void disconnect()
     {
+        Serial.println("ReverbClient: Manual disconnect requested");
         if (_ws)
         {
             _ws->disconnect();
-            _isConnected = false;
+        }
+        _isConnected = false;
+        _wsStarted = false;
+    }
+    
+    // Force immediate reconnection attempt
+    void forceReconnect()
+    {
+        Serial.println("ReverbClient: Force reconnection requested");
+        disconnect();
+        
+        if (WiFi.isConnected() && _initialized) {
+            Serial.println("ReverbClient: Restarting WebSocket connection");
+            _ws->beginSSL(_host.c_str(), _port, urlBuffer);
+            _wsStarted = true;
         }
     }
 
     void cleanup()
     {
+        Serial.println("ReverbClient: Cleaning up resources");
+        
+        _initialized = false;
+        _isConnected = false;
+        _wsStarted = false;
+        
         if (_ws)
         {
             _ws->disconnect();
             delete _ws;
             _ws = nullptr;
-            _isConnected = false;
         }
         
         if (_httpClient) {
@@ -145,8 +175,9 @@ public:
 
     bool sendMessage(const String &text)
     {
-        if (!WiFi.isConnected() || !_httpClient) {
-            Serial.println("ReverbClient: Cannot send message - WiFi not connected or no HTTP client");
+        if (!isConnected() || !_httpClient) {
+            Serial.printf("ReverbClient: Cannot send message - Connection status: %s\n", 
+                         getConnectionStatus().c_str());
             return false;
         }
 
@@ -164,11 +195,19 @@ public:
             escapedText.replace("\"", "\\\"");
             snprintf(tempBuffer, sizeof(tempBuffer), "{\"text\":\"%s\"}", escapedText.c_str());
             
+            Serial.printf("ReverbClient: Sending message: %s\n", text.c_str());
             int httpCode = http.POST((uint8_t*)tempBuffer, strlen(tempBuffer));
             http.end();
 
-            return (httpCode == 200);
+            if (httpCode == 200) {
+                Serial.println("ReverbClient: Message sent successfully");
+                return true;
+            } else {
+                Serial.printf("ReverbClient: Failed to send message, HTTP code: %d\n", httpCode);
+                return false;
+            }
         }
+        Serial.println("ReverbClient: Failed to initialize HTTP request");
         return false;
     }
 
@@ -188,12 +227,8 @@ private:
     uint16_t _port;
     std::function<void(const String &)> _chatCb;
     bool _isConnected = false;
-    
-    // Connection retry management
-    unsigned long _lastConnectionAttempt = 0;
-    uint8_t _connectionRetries = 0;
-    static const uint8_t MAX_CONNECTION_RETRIES = 5;
-    static const unsigned long RETRY_DELAY = 2000;
+    bool _initialized = false;
+    bool _wsStarted = false;
 
     static ReverbClient *instance;
 
@@ -208,18 +243,20 @@ private:
         switch (type)
         {
         case WStype_DISCONNECTED:
+            Serial.println("ReverbClient: WebSocket disconnected");
             _isConnected = false;
             _socketId = "";
-            _connectionRetries++;
-            if (_connectionRetries <= MAX_CONNECTION_RETRIES) {
-                _lastConnectionAttempt = millis();
-            }
             break;
 
         case WStype_CONNECTED:
+            Serial.printf("ReverbClient: WebSocket connected to: %s\n", payload);
             _isConnected = true;
-            _connectionRetries = 0;
-            _lastConnectionAttempt = 0;
+            break;
+
+        case WStype_ERROR:
+            Serial.printf("ReverbClient: WebSocket error: %.*s\n", length, payload);
+            _isConnected = false;
+            _socketId = "";
             break;
 
         case WStype_TEXT:
@@ -269,23 +306,11 @@ private:
             }
             else if (strstr(payloadStr, "device.status.updated")) {
                 // Ignore device status updates (these are our own reports bounced back)
-                // No need to log these as they're just echoes of our own device reports
             }
             else if (strstr(payloadStr, "device.command.sent")) {
-                //1▕ { 
-//    2▕     "event": "device.command.sent", 
-//    3▕     "data": { 
-//    4▕         "device_id": "97535321118776", 
-//    5▕         "timestamp": "2025-08-01T02:05:16.362772Z", 
-//    6▕         "type": "next-track", 
-//    7▕         "value": null 
-//    8▕     }... 
-                //for now just print the command
                 Serial.printf("ReverbClient: Command sent event detected: %.*s\n", length, payload);
                 // We can handle commands here if needed, but for now just log it
-
             }
-            
             else if (strstr(payloadStr, "chat-message")) {
                 Serial.println("ReverbClient: Chat message event detected!");
                 
@@ -331,9 +356,6 @@ private:
             }
             break;
         }
-        case WStype_ERROR:
-            Serial.printf("ReverbClient: WebSocket error: %.*s\n", length, payload);
-            break;
         default:
             break;
         }
@@ -342,7 +364,6 @@ private:
     void sendDeviceReport()
     {
         if (!isConnected()) return;
-
 
         // Get and cache all values to minimize object access
         BatteryManager &battery = BatteryManager::getInstance();
