@@ -4,6 +4,9 @@
 #include <FastLED.h>
 #include <Arduino.h>
 
+// Forward declaration
+class ConfigManager;
+
 class LedController {
 private:
     static const int LED_PIN = 16;          // GPIO16 for WS2812B data pin
@@ -21,6 +24,7 @@ private:
     uint32_t pulseRapidColor;
     int pulseDirection;
     int currentBrightness;
+    int maxBrightness;  // Dynamic max brightness (0-255)
     
     // Helper functions
     CRGB hexToRgb(uint32_t hexColor);
@@ -38,6 +42,8 @@ public:
     void pulseLed(uint32_t hexColor);
     void pulseRapid(uint32_t hexColor, int count);
     void turnOff();
+    void setMaxBrightness(int brightness);  // Set max brightness (0-255)
+    int getMaxBrightness() const { return maxBrightness; }
 };
 
 #endif // LED_CONTROLLER_H

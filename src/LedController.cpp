@@ -1,4 +1,5 @@
 #include "LedController.h"
+#include "ConfigManager.h"
 
 LedController::LedController() {
     pulseActive = false;
@@ -11,6 +12,14 @@ LedController::LedController() {
     pulseRapidColor = 0;
     pulseDirection = 1;
     currentBrightness = 0;
+    
+    // Load maxBrightness from NVS, default to LED_MAX_POWER if not set
+    ConfigManager& config = ConfigManager::getInstance();
+    maxBrightness = config.getInt("max_brightness", LED_MAX_POWER);
+    
+    // Ensure the value is within valid range
+    maxBrightness = min(maxBrightness, LED_MAX_POWER);
+    maxBrightness = max(maxBrightness, 0);
 }
 
 void LedController::begin() {
@@ -34,8 +43,8 @@ void LedController::simpleLed(uint32_t hexColor, int intensity) {
     pulseActive = false;
     pulseRapidActive = false;
     
-    // Clamp intensity to LED_MAX_POWER
-    intensity = min(intensity, LED_MAX_POWER);
+    // Clamp intensity to maxBrightness
+    intensity = min(intensity, maxBrightness);
     intensity = max(intensity, 0);
     
     CRGB color = hexToRgb(hexColor);
@@ -69,7 +78,7 @@ void LedController::pulseRapid(uint32_t hexColor, int count) {
     
     // Turn on LED immediately
     CRGB color = hexToRgb(hexColor);
-    leds[0] = scaleColor(color, LED_MAX_POWER);
+    leds[0] = scaleColor(color, maxBrightness);
     FastLED.show();
 }
 
@@ -79,6 +88,16 @@ void LedController::turnOff() {
     
     FastLED.clear();
     FastLED.show();
+}
+
+void LedController::setMaxBrightness(int brightness) {
+    // Clamp brightness to valid range (0-255)
+    maxBrightness = min(brightness, LED_MAX_POWER);
+    maxBrightness = max(maxBrightness, 0);
+    
+    // Store the value in NVS
+    ConfigManager& config = ConfigManager::getInstance();
+    config.storeInt("max_brightness", maxBrightness);
 }
 
 CRGB LedController::hexToRgb(uint32_t hexColor) {
@@ -108,8 +127,8 @@ void LedController::updatePulse() {
         currentBrightness += pulseDirection * 5;
         
         // Check bounds and reverse direction
-        if (currentBrightness >= LED_MAX_POWER) {
-            currentBrightness = LED_MAX_POWER;
+        if (currentBrightness >= maxBrightness) {
+            currentBrightness = maxBrightness;
             pulseDirection = -1;
         } else if (currentBrightness <= 0) {
             currentBrightness = 0;
@@ -143,7 +162,7 @@ void LedController::updatePulseRapid() {
     if (timeInCycle < 200) {
         // LED on for first 200ms
         CRGB color = hexToRgb(pulseRapidColor);
-        leds[0] = scaleColor(color, LED_MAX_POWER);
+        leds[0] = scaleColor(color, maxBrightness);
     } else {
         // LED off for remaining 100ms
         leds[0] = CRGB::Black;

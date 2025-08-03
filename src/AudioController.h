@@ -75,6 +75,10 @@ public:
     bool volumeDown();
     bool setVolume(int volume, bool initialize = false); // Added initialize flag for internal use
     int getCurrentVolume() const { return currentVolume; }
+    
+    // Volume ceiling control
+    void setVolumeCeiling(int ceiling);
+    int getVolumeCeiling() const;
 
     // Status
     AudioState getState() const { return currentState; }
@@ -110,6 +114,7 @@ private:
     AudioState currentState;
     String currentTrackPath;
     int currentVolume;
+    int volumeCeiling;  // Maximum allowed volume (0-100), stored in NVS
     bool initialized;
     bool i2s_driver_installed;  // Track I2S driver state to prevent double initialization
     

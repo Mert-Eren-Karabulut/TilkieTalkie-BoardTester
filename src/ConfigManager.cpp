@@ -3,6 +3,7 @@
 // Static member definitions
 ConfigManager* ConfigManager::instance = nullptr;
 const char* ConfigManager::NAMESPACE = "config";
+const char* ConfigManager::SETTINGS_NAMESPACE = "settings";
 const char* ConfigManager::WIFI_SSID_KEY = "ssid";        // Shortened key
 const char* ConfigManager::WIFI_PASSWORD_KEY = "pass";     // Shortened key
 const char* ConfigManager::DEVICE_NAME_KEY = "device";     // Shortened key
@@ -143,6 +144,13 @@ void ConfigManager::printAllSettings() {
     Serial.print(F("Config Valid: ")); Serial.println(isValid() ? F("Yes") : F("No"));
     Serial.print(F("Free NVS Space: ")); Serial.print(getFreeSpace()); Serial.println(F(" bytes"));
     
+    // Settings namespace info
+    Preferences settingsPrefs;
+    if (settingsPrefs.begin(SETTINGS_NAMESPACE, true)) {
+        Serial.print(F("Settings Namespace Entries: ")); Serial.println(settingsPrefs.freeEntries());
+        settingsPrefs.end();
+    }
+    
     // Essential NVS statistics only
     nvs_stats_t nvs_stats;
     if (nvs_get_stats(NULL, &nvs_stats) == ESP_OK) {
@@ -215,4 +223,87 @@ String ConfigManager::getJWTToken() {
 
 void ConfigManager::setJWTToken(const String &token) {
     preferences.putString(JWT_TOKEN_KEY, token);
+}
+
+// Simple settings storage methods
+void ConfigManager::storeInt(const String& keyname, int value) {
+    Preferences settingsPrefs;
+    if (settingsPrefs.begin(SETTINGS_NAMESPACE, false)) {
+        size_t result = settingsPrefs.putInt(keyname.c_str(), value);
+        if (result == 0) {
+            Serial.println("ERROR: Failed to store int setting: " + keyname);
+        }
+        settingsPrefs.end();
+    } else {
+        Serial.println("ERROR: Failed to open settings namespace for storing int");
+    }
+}
+
+void ConfigManager::storeString(const String& keyname, const String& value) {
+    Preferences settingsPrefs;
+    if (settingsPrefs.begin(SETTINGS_NAMESPACE, false)) {
+        size_t result = settingsPrefs.putString(keyname.c_str(), value);
+        if (result == 0) {
+            Serial.println("ERROR: Failed to store string setting: " + keyname);
+        }
+        settingsPrefs.end();
+    } else {
+        Serial.println("ERROR: Failed to open settings namespace for storing string");
+    }
+}
+
+int ConfigManager::getInt(const String& keyname, int defaultValue) {
+    Preferences settingsPrefs;
+    int value = defaultValue;
+    if (settingsPrefs.begin(SETTINGS_NAMESPACE, true)) {  // Read-only mode
+        if (settingsPrefs.isKey(keyname.c_str())) {
+            value = settingsPrefs.getInt(keyname.c_str(), defaultValue);
+        }
+        settingsPrefs.end();
+    } else {
+        Serial.println("ERROR: Failed to open settings namespace for reading int");
+    }
+    return value;
+}
+
+String ConfigManager::getString(const String& keyname, const String& defaultValue) {
+    Preferences settingsPrefs;
+    String value = defaultValue;
+    if (settingsPrefs.begin(SETTINGS_NAMESPACE, true)) {  // Read-only mode
+        if (settingsPrefs.isKey(keyname.c_str())) {
+            value = settingsPrefs.getString(keyname.c_str(), defaultValue);
+        }
+        settingsPrefs.end();
+    } else {
+        Serial.println("ERROR: Failed to open settings namespace for reading string");
+    }
+    return value;
+}
+
+void ConfigManager::deleteSetting(const String& keyname) {
+    Preferences settingsPrefs;
+    if (settingsPrefs.begin(SETTINGS_NAMESPACE, false)) {
+        bool result = settingsPrefs.remove(keyname.c_str());
+        if (!result) {
+            Serial.println("WARNING: Failed to delete setting or key not found: " + keyname);
+        }
+        settingsPrefs.end();
+    } else {
+        Serial.println("ERROR: Failed to open settings namespace for deleting setting");
+    }
+}
+
+void ConfigManager::deleteAllSettings() {
+    Preferences settingsPrefs;
+    if (settingsPrefs.begin(SETTINGS_NAMESPACE, false)) {
+        bool result = settingsPrefs.clear();
+        if (result) {
+            Serial.println("SUCCESS: All settings cleared");
+        } else {
+            Serial.println("ERROR: Failed to clear all settings");
+        }
+        settingsPrefs.end();
+    } else {
+        Serial.println("ERROR: Failed to open settings namespace for clearing all settings");
+    }
 }

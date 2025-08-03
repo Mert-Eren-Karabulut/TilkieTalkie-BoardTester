@@ -114,24 +114,17 @@ private:
     void update();
     
     // File management methods
-    bool writeFile(const String& path, const String& content);
-    bool writeFile(const String& path, const uint8_t* data, size_t length);
-    String readFile(const String& path);
-    bool readFile(const String& path, uint8_t* buffer, size_t& length);
     bool deleteFile(const String& path);
     bool deleteFileAndRemoveFromRequired(const String& path); // Smart delete that removes from required list
-    bool renameFile(const String& oldPath, const String& newPath);
     bool createDirectory(const String& path);
     bool removeDirectory(const String& path);
     std::vector<String> listFiles(const String& directory = "/");
-    bool copyFile(const String& sourcePath, const String& destPath);
     bool fileExists(const String& path);
     void printFileTree();
     void formatSDCard(); // Format SD card as FAT32
 
     // Download management methods
     bool scheduleDownload(const String& url, const String& localPath, const String& checksum = "");
-    bool downloadNow(const String& url, const String& localPath, String& errorMsg);
     void cancelAllDownloads();
     void retryFailedDownloads();
     int getPendingDownloadsCount();
@@ -139,21 +132,12 @@ private:
     
     // Required files management
     bool addRequiredFile(const String& localPath, const String& url, const String& checksum = "");
-    bool removeRequiredFile(const String& localPath);
     void checkRequiredFiles();
-    std::vector<String> getMissingFiles();
     std::vector<String> getRequiredFilesByPattern(const String& pattern); // Get required files matching pattern
-    void downloadMissingFiles();
     
     // Bulk deletion methods
     void clearAllRequiredFiles(); // Clear all required files from NVS and storage
     bool deleteFigureFiles(const String& figureId); // Delete all files for a specific figure
-    
-    // Development/debugging methods
-    void forceProcessDownloads(); // Force download processing regardless of charging status
-    
-    // Development/testing methods
-    void forceDownloads(); // Force process download queue regardless of charging status
     
     // Status and info methods
     bool isSDCardAvailable() const { return sdCardInitialized; }
@@ -168,23 +152,15 @@ private:
     String getDownloadStatsString();
     
     // Utility methods
-    void printFileList(const String& directory = "/");
     void printDownloadQueue();
     void printRequiredFiles();
     String formatBytes(size_t bytes);
     
-    // Diagnostic methods
-    bool testFileOperations();
-    void runSDCardStressTest();
-    void optimizeSDCardSpeed();
-    
     // File integrity
     String calculateFileChecksum(const String& filePath);
-    bool verifyFile(const String& filePath, const String& expectedChecksum);
     
     // Maintenance operations
     void cleanupTempFiles();
-    bool repairCorruptedFiles();
     
     // Event callbacks
     typedef void (*DownloadProgressCallback)(const String& url, const String& path, int progress, size_t downloaded, size_t total);

@@ -280,16 +280,30 @@ void setup()
                 // Button 1: Toggle playback
                 Serial.println("Button 1: Toggle playback");
                 ledController.pulseLed(0x0000FF); // Blue pulse
+                if (audioController.isPlaying()) {
+                    audioController.pause();
+                } else if (audioController.isPaused()) {
+                    audioController.resume();
+                } else if (audioController.isStopped()) {
+                    //check if there is a playlist set
+                    if (audioController.hasPlaylist()) {
+                        audioController.play(); // Start playing the first track
+                    } else {
+                        audioController.stop(); // Stop playback if no playlist is set
+                    }
+                }
                 break;
             case ButtonController::BUTTON_2:
                 // Button 2: Next track
                 Serial.println("Button 2: Next track");
                 ledController.pulseLed(0x00FF00); // Green pulse
+                audioController.nextTrack();
                 break;
             case ButtonController::BUTTON_3:
                 // Button 3: Previous track
                 Serial.println("Button 3: Previous track");
                 ledController.pulseLed(0xFFFF00); // Yellow pulse
+                audioController.prevTrack();
                 break;
             case ButtonController::BUTTON_4:
                 // Button 4: Menu/Settings
@@ -312,11 +326,11 @@ void setup()
         if (button == ButtonController::BUTTON_2) {
             // Volume up - called every 100ms while holding
             Serial.printf("[MAIN] Volume up (held for %lu ms)\n", duration);
-            // audioController.increaseVolume(1); // Increase by 1 step
+            audioController.volumeUp(); // Increase volume by 1 step
         } else if (button == ButtonController::BUTTON_4) {
             // Volume down - called every 100ms while holding
             Serial.printf("[MAIN] Volume down (held for %lu ms)\n", duration);
-            // audioController.decreaseVolume(1); // Decrease by 1 step
+            audioController.volumeDown(); // Decrease by 1 step
         }
     });
 

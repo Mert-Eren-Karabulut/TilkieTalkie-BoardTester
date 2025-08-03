@@ -1,4 +1,5 @@
 #include "AudioController.h"
+#include "ConfigManager.h"
 #include "NfcController.h"
 #include "AudioFileSourceSD.h"
 #include "AudioFileSourceBuffer.h"
@@ -78,6 +79,14 @@ AudioController::AudioController() :
     playlistFigureUid(""),
     playlistFinished(false),
     fileManager(FileManager::getInstance()) {
+    
+    // Load volume ceiling from NVS, default to MAX_VOLUME if not set
+    ConfigManager& config = ConfigManager::getInstance();
+    volumeCeiling = config.getInt("volume_ceiling", MAX_VOLUME);
+    
+    // Ensure the volume ceiling is within valid range
+    volumeCeiling = min(volumeCeiling, MAX_VOLUME);
+    volumeCeiling = max(volumeCeiling, MIN_VOLUME);
 }
 
 AudioController::~AudioController() {
@@ -311,17 +320,7 @@ bool AudioController::resume() {
             return false;
         }
 
-        // Seek to the paused position if we have one
-        if (hasPausedPosition) {
-            if (audioFile->seek(pausedPosition, SEEK_SET)) {
-                Serial.printf("AudioController: Resumed from position %u\n", pausedPosition);
-            } else {
-                Serial.printf("AudioController: Failed to seek to position %u, starting from beginning\n", pausedPosition);
-            }
-            hasPausedPosition = false;
-        }
-
-        // Create buffer
+        // Create buffer (file pointer is still at beginning)
         audioBuffer = new AudioFileSourceBuffer(audioFile, 2048);
         if (!audioBuffer) {
             Serial.printf("AudioController: Failed to create audio buffer\n");
@@ -331,13 +330,23 @@ bool AudioController::resume() {
             return false;
         }
 
-        // Start playback
+        // Start playback - this will read the WAV header first
         if (!audioWAV->begin(audioBuffer, audioOutput)) {
             Serial.printf("AudioController: Failed to start WAV playback\n");
             cleanupAudioComponents();
             currentState = STOPPED;
             currentTrackPath = "";
             return false;
+        }
+
+        // AFTER initialization is complete, seek to the paused position if we have one
+        if (hasPausedPosition) {
+            if (audioFile->seek(pausedPosition, SEEK_SET)) {
+                Serial.printf("AudioController: Resumed from position %u\n", pausedPosition);
+            } else {
+                Serial.printf("AudioController: Failed to seek to position %u, starting from beginning\n", pausedPosition);
+            }
+            hasPausedPosition = false;
         }
         
         currentState = PLAYING;
@@ -377,8 +386,8 @@ bool AudioController::stop() {
 
 bool AudioController::volumeUp() {
     int newVolume = currentVolume + VOLUME_STEP;
-    if (newVolume > MAX_VOLUME) {
-        newVolume = MAX_VOLUME;
+    if (newVolume > volumeCeiling) {
+        newVolume = volumeCeiling;
     }
     
     bool changed = setVolume(newVolume);
@@ -409,9 +418,9 @@ bool AudioController::setVolume(int volume, bool initialize /* = false */) {
         return false;
     }
 
-    // Clamp volume
+    // Clamp volume to valid range and volume ceiling
     if (volume < MIN_VOLUME) volume = MIN_VOLUME;
-    if (volume > MAX_VOLUME) volume = MAX_VOLUME;
+    if (volume > volumeCeiling) volume = volumeCeiling;
 
     if (volume == currentVolume && !initialize) {
         Serial.printf("AudioController: Volume already at %d%%, no change needed\n", volume);
@@ -432,6 +441,31 @@ bool AudioController::setVolume(int volume, bool initialize /* = false */) {
 
     Serial.printf("AudioController: Volume set to %d%%\n", volume);
     return true;
+}
+
+// Volume ceiling control methods
+void AudioController::setVolumeCeiling(int ceiling) {
+    // Clamp ceiling to valid range
+    ceiling = min(ceiling, MAX_VOLUME);
+    ceiling = max(ceiling, MIN_VOLUME);
+    
+    // Store the new ceiling
+    volumeCeiling = ceiling;
+    
+    // Store in NVS
+    ConfigManager& config = ConfigManager::getInstance();
+    config.storeInt("volume_ceiling", volumeCeiling);
+    
+    // If current volume is higher than new ceiling, lower it
+    if (currentVolume > volumeCeiling) {
+        setVolume(volumeCeiling);
+    }
+    
+    Serial.printf("AudioController: Volume ceiling set to %d%%\n", volumeCeiling);
+}
+
+int AudioController::getVolumeCeiling() const {
+    return volumeCeiling;
 }
 
 // Playlist management methods

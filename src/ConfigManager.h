@@ -16,6 +16,7 @@ private:
 
     // Configuration keys
     static const char *NAMESPACE;
+    static const char *SETTINGS_NAMESPACE;  // Separate namespace for user settings
     static const char *WIFI_SSID_KEY;
     static const char *WIFI_PASSWORD_KEY;
     static const char *DEVICE_NAME_KEY;
@@ -54,6 +55,14 @@ public:
     void commit();   // Force commit all changes to flash
     size_t getFreeSpace();  // Get available NVS space
     void factoryReset();  // Complete factory reset including NVS erase
+    
+    // Simple settings storage methods
+    void storeInt(const String& keyname, int value);
+    void storeString(const String& keyname, const String& value);
+    int getInt(const String& keyname, int defaultValue = 0);
+    String getString(const String& keyname, const String& defaultValue = "");
+    void deleteSetting(const String& keyname);
+    void deleteAllSettings();
 
     // Add more configuration variables as needed
     // Example: audio settings, sensor calibration, etc.
