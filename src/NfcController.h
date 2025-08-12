@@ -11,7 +11,7 @@
 #define NFC_SDA_PIN 22
 #define NFC_SCL_PIN 21
 #define NFC_IRQ_PIN 33
-#define NFC_RESET_PIN 17
+#define NFC_RESET_PIN 32  // Changed from 17 to avoid conflict with peripheral power
 
 // Constants for NFC operations
 #define MAX_UID_LENGTH 7

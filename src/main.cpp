@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <esp_wifi.h>
+#include <HTTPClient.h>
+#include <wifi_provisioning/manager.h>
 #include "ConfigManager.h"
 #include "WiFiProvisioning.h"
 #include "BatteryManagement.h"
@@ -388,6 +390,7 @@ void loop()
             Serial.println("  config  - Show all configuration");
             Serial.println("  debug   - Show debug information");
             Serial.println("  factory - Factory reset (erase all data)");
+            Serial.println("  speedtest - Test network download speed");
             Serial.println("Battery Commands:");
             Serial.println("  battery - Show battery status");
             Serial.println("File Manager Commands:");
@@ -1203,6 +1206,26 @@ void loop()
             Serial.println("Has WiFi credentials: " + String(config.hasWiFiCredentials()));
             Serial.println("WiFi SSID length: " + String(config.getWiFiSSID().length()));
             Serial.println("WiFi Password length: " + String(config.getWiFiPassword().length()));
+            
+            // Check ESP32 WiFi provisioning library status
+            bool provisioned = false;
+            esp_err_t ret = wifi_prov_mgr_is_provisioned(&provisioned);
+            Serial.println("ESP32 WiFi Library Provisioned: " + String(provisioned ? "Yes" : "No"));
+            if (ret != ESP_OK) {
+                Serial.printf("Provisioning check error: %s\n", esp_err_to_name(ret));
+            }
+            
+            // Check actual WiFi config stored by ESP32
+            wifi_config_t wifi_cfg;
+            ret = esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
+            if (ret == ESP_OK) {
+                String storedSSID = String((char*)wifi_cfg.sta.ssid);
+                Serial.println("ESP32 Stored SSID: " + (storedSSID.length() > 0 ? storedSSID : "(none)"));
+                Serial.println("ESP32 Stored Password Length: " + String(strlen((char*)wifi_cfg.sta.password)));
+            } else {
+                Serial.printf("Failed to get WiFi config: %s\n", esp_err_to_name(ret));
+            }
+            
             Serial.println("Note: BLE is automatically managed by ESP32 provisioning library");
             config.printAllSettings();
         }
@@ -1228,6 +1251,117 @@ void loop()
                 Serial.println("Status: 🟢 OK - Memory levels normal");
             }
             Serial.println("----------------------------------\n");
+        }
+        // Simple speed test command
+        else if (command == "speedtest")
+        {
+            if (!WiFi.isConnected())
+            {
+                Serial.println("❌ WiFi not connected - cannot perform speed test");
+                return;
+            }
+
+            Serial.println("\n--- Network Speed Test ---");
+            Serial.println("Testing download speed with HTTP request...");
+            
+            WiFiClient client;
+            HTTPClient http;
+            
+            // Use a reasonably sized test file (about 1MB)
+            String testUrl = "http://httpbin.org/bytes/1048576"; // 1MB of random bytes
+            
+            Serial.printf("Test URL: %s\n", testUrl.c_str());
+            Serial.println("Starting download...");
+            
+            unsigned long startTime = millis();
+            
+            if (http.begin(client, testUrl))
+            {
+                http.setTimeout(30000); // 30 second timeout
+                
+                int httpCode = http.GET();
+                
+                if (httpCode == 200)
+                {
+                    int contentLength = http.getSize();
+                    WiFiClient* stream = http.getStreamPtr();
+                    
+                    unsigned long totalBytes = 0;
+                    uint8_t buffer[1024];
+                    
+                    while (http.connected() && (contentLength <= 0 || totalBytes < contentLength))
+                    {
+                        size_t available = stream->available();
+                        if (available)
+                        {
+                            int bytesRead = stream->readBytes(buffer, min(available, sizeof(buffer)));
+                            if (bytesRead > 0)
+                            {
+                                totalBytes += bytesRead;
+                            }
+                        }
+                        
+                        // Show progress every 100KB
+                        if (totalBytes % 102400 == 0 && totalBytes > 0)
+                        {
+                            float progress = (float)totalBytes / contentLength * 100;
+                            Serial.printf("Progress: %.1f%% (%lu bytes)\n", progress, totalBytes);
+                        }
+                        
+                        yield(); // Allow other tasks to run
+                    }
+                    
+                    unsigned long endTime = millis();
+                    unsigned long duration = endTime - startTime;
+                    
+                    // Calculate speed
+                    float durationSec = duration / 1000.0;
+                    float speedKbps = (totalBytes * 8.0) / (durationSec * 1000.0); // Kbps
+                    float speedMbps = speedKbps / 1000.0; // Mbps
+                    float speedKBps = totalBytes / (durationSec * 1024.0); // KB/s
+                    
+                    Serial.println("\n--- Speed Test Results ---");
+                    Serial.printf("Downloaded: %lu bytes\n", totalBytes);
+                    Serial.printf("Duration: %lu ms (%.2f seconds)\n", duration, durationSec);
+                    Serial.printf("Speed: %.2f Kbps (%.2f Mbps)\n", speedKbps, speedMbps);
+                    Serial.printf("Speed: %.2f KB/s\n", speedKBps);
+                    
+                    // Performance rating
+                    if (speedMbps >= 10.0)
+                    {
+                        Serial.println("Performance: 🟢 Excellent");
+                    }
+                    else if (speedMbps >= 5.0)
+                    {
+                        Serial.println("Performance: 🟡 Good");
+                    }
+                    else if (speedMbps >= 1.0)
+                    {
+                        Serial.println("Performance: 🟠 Fair");
+                    }
+                    else
+                    {
+                        Serial.println("Performance: 🔴 Poor");
+                    }
+                }
+                else
+                {
+                    Serial.printf("❌ HTTP request failed with code: %d\n", httpCode);
+                    if (httpCode > 0)
+                    {
+                        String response = http.getString();
+                        Serial.println("Response: " + response);
+                    }
+                }
+                
+                http.end();
+            }
+            else
+            {
+                Serial.println("❌ Failed to connect to test server");
+            }
+            
+            Serial.println("-------------------------\n");
         }
         // File Manager commands that were missing
         else if (command == "dlstats")

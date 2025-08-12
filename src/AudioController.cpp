@@ -9,6 +9,12 @@
 // Initialize static members
 AudioController* AudioController::instance = nullptr;
 
+// Define static constants
+const int AudioController::MIN_VOLUME;
+const int AudioController::MAX_VOLUME;
+const int AudioController::DEFAULT_VOLUME;
+const int AudioController::VOLUME_STEP;
+
 // ES8388 register definitions
 #define ES8388_CONTROL1         0x00
 #define ES8388_CONTROL2         0x01
@@ -890,7 +896,7 @@ bool AudioController::isNfcSessionActive(const String& expectedUid) const {
     Serial.printf("AudioController: Checking NFC session - expected UID: %s\n", expectedUid.c_str());
     
     // Safety check - make sure we can access the NFC controller
-    try {
+ 
         bool cardPresent = nfcController.isCardPresent();
         Serial.printf("AudioController: Card present: %s\n", cardPresent ? "YES" : "NO");
         if (!cardPresent) {
@@ -908,9 +914,6 @@ bool AudioController::isNfcSessionActive(const String& expectedUid) const {
         
         Serial.println("AudioController: NFC session is active and UID matches");
         return true;
-    } catch (...) {
-        Serial.println("AudioController: Exception in NFC session check");
-        return false;
-    }
+   
 }
 

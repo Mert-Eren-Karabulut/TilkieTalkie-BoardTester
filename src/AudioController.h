@@ -2,7 +2,7 @@
 #define AUDIOCONTROLLER_H
 
 #include <Arduino.h>
-#include <driver/i2s.h>
+#include <driver/i2s_std.h>
 #include <Wire.h>
 #include <vector>
 #include "AudioFileSourceSD.h"

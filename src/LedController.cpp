@@ -1,6 +1,9 @@
 #include "LedController.h"
 #include "ConfigManager.h"
 
+// Define static constants
+const int LedController::LED_MAX_POWER;
+
 LedController::LedController() {
     pulseActive = false;
     pulseRapidActive = false;

@@ -8,7 +8,7 @@
 			"args": [
 				"run",
 				"--environment",
-				"esp32dev"
+				"adafruit_feather_esp32_v2"
 			],
 			"group": "build",
 			"problemMatcher": [

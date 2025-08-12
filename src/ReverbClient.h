@@ -233,11 +233,11 @@ private:
     ReverbClient() = default;
 
     // Pre-allocated static buffers to reduce heap fragmentation
-    static char jsonBuffer[512];
-    static char urlBuffer[128];
-    static char headerBuffer[256];
-    static char channelBuffer[64];
-    static char tempBuffer[256];
+    static char jsonBuffer[512] __attribute__((section(".data")));
+    static char urlBuffer[128] __attribute__((section(".data")));
+    static char headerBuffer[256] __attribute__((section(".data")));
+    static char channelBuffer[64] __attribute__((section(".data")));
+    static char tempBuffer[256] __attribute__((section(".data")));
 
     WebSocketsClient *_ws = nullptr;
     WiFiClientSecure *_httpClient = nullptr;
