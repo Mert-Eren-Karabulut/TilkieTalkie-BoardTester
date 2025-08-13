@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <esp_wifi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <wifi_provisioning/manager.h>
 #include "ConfigManager.h"
 #include "WiFiProvisioning.h"
@@ -355,9 +356,19 @@ void setup()
     // audioController.play("/sounds/12.wav"); // Play startup sound
 }
     static unsigned long lastFreeCall = 0;
+    static unsigned long lastStackCheck = 0;
 
 void loop()
 {
+    // Stack monitoring every 10 seconds
+    unsigned long now = millis();
+    if (now - lastStackCheck > 10000) {
+        lastStackCheck = now;
+        UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+        if (stackHighWaterMark < 1000) { // Less than 1KB remaining
+            Serial.printf("⚠️ WARNING: Low stack space remaining: %d bytes\n", stackHighWaterMark * sizeof(StackType_t));
+        }
+    }
 
     // Handle serial commands
     if (Serial.available())
@@ -389,6 +400,8 @@ void loop()
             Serial.println("  restart - Restart the device");
             Serial.println("  config  - Show all configuration");
             Serial.println("  debug   - Show debug information");
+            Serial.println("  heap    - Show detailed heap information");
+            Serial.println("  stack   - Show stack usage information");
             Serial.println("  factory - Factory reset (erase all data)");
             Serial.println("  speedtest - Test network download speed");
             Serial.println("Battery Commands:");
@@ -1252,7 +1265,33 @@ void loop()
             }
             Serial.println("----------------------------------\n");
         }
-        // Simple speed test command
+        // Stack monitoring command
+        else if (command == "stack")
+        {
+            Serial.println("\n--- Stack Information ---");
+            UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+            size_t stackRemaining = stackHighWaterMark * sizeof(StackType_t);
+            Serial.printf("Stack high water mark: %d words (%d bytes)\n", 
+                         stackHighWaterMark, stackRemaining);
+            
+            // Estimate stack usage (assuming 16KB total from build flags)
+            size_t totalStack = 16384; // From CONFIG_ARDUINO_LOOP_STACK_SIZE
+            size_t usedStack = totalStack - stackRemaining;
+            float usagePercent = (float)usedStack / totalStack * 100;
+            
+            Serial.printf("Estimated stack usage: %d/%d bytes (%.1f%%)\n", 
+                         usedStack, totalStack, usagePercent);
+            
+            if (stackRemaining < 1000) {
+                Serial.println("Status: 🔴 CRITICAL - Very low stack space");
+            } else if (stackRemaining < 2000) {
+                Serial.println("Status: 🟡 WARNING - Low stack space");
+            } else {
+                Serial.println("Status: 🟢 OK - Stack levels normal");
+            }
+            Serial.println("------------------------\n");
+        }
+        // Native ESP32 speed test command
         else if (command == "speedtest")
         {
             if (!WiFi.isConnected())
@@ -1261,107 +1300,220 @@ void loop()
                 return;
             }
 
-            Serial.println("\n--- Network Speed Test ---");
-            Serial.println("Testing download speed with HTTP request...");
+            Serial.println("\n--- Network Speed Test (Native ESP32 - Optimized) ---");
+            Serial.println("Testing download speed with optimized WiFiClient...");
+            
+            // Use TilkieTalkie portal audio file for testing (HTTP to avoid SSL overhead)
+            const char* host = "portal.tilkietalkie.com";
+            const int port = 80; // HTTP port
+            const char* path = "/storage/tracks/audio/vIr8dNzNhQgWEpc9uceF1Wncljn5mSCRoYlXTsOU.wav";
+            
+            Serial.printf("Host: %s:%d\n", host, port);
+            Serial.printf("Path: %s (TilkieTalkie audio file)\n", path);
+            Serial.println("Starting optimized download...");
+            Serial.println("Optimizations: 8KB buffer, reduced yield calls, minimal serial output");
             
             WiFiClient client;
-            HTTPClient http;
+            unsigned long connectStart = millis();
             
-            // Use a reasonably sized test file (about 1MB)
-            String testUrl = "http://httpbin.org/bytes/1048576"; // 1MB of random bytes
-            
-            Serial.printf("Test URL: %s\n", testUrl.c_str());
-            Serial.println("Starting download...");
-            
-            unsigned long startTime = millis();
-            
-            if (http.begin(client, testUrl))
+            if (client.connect(host, port))
             {
-                http.setTimeout(30000); // 30 second timeout
+                unsigned long connectTime = millis() - connectStart;
+                Serial.printf("Connected in %lu ms\n", connectTime);
                 
-                int httpCode = http.GET();
+                // Send HTTP GET request manually for minimal overhead
+                client.printf("GET %s HTTP/1.1\r\n", path);
+                client.printf("Host: %s\r\n", host);
+                client.printf("Connection: close\r\n");
+                client.printf("User-Agent: ESP32-SpeedTest/1.0\r\n");
+                client.printf("\r\n");
                 
-                if (httpCode == 200)
+                // Wait for response headers
+                unsigned long headerStart = millis();
+                String headers = "";
+                bool headersComplete = false;
+                int contentLength = -1;
+                
+                while (client.connected() && !headersComplete && (millis() - headerStart < 10000))
                 {
-                    int contentLength = http.getSize();
-                    WiFiClient* stream = http.getStreamPtr();
-                    
-                    unsigned long totalBytes = 0;
-                    uint8_t buffer[1024];
-                    
-                    while (http.connected() && (contentLength <= 0 || totalBytes < contentLength))
+                    if (client.available())
                     {
-                        size_t available = stream->available();
-                        if (available)
+                        String line = client.readStringUntil('\n');
+                        headers += line + "\n";
+                        
+                        if (line.startsWith("Content-Length:"))
                         {
-                            int bytesRead = stream->readBytes(buffer, min(available, sizeof(buffer)));
-                            if (bytesRead > 0)
+                            contentLength = line.substring(15).toInt();
+                            Serial.printf("Content-Length: %d bytes\n", contentLength);
+                        }
+                        
+                        if (line == "\r" || line.length() == 0)
+                        {
+                            headersComplete = true;
+                        }
+                    }
+                    yield();
+                }
+                
+                if (!headersComplete)
+                {
+                    Serial.println("❌ Failed to receive complete headers");
+                    client.stop();
+                    return;
+                }
+                
+                Serial.println("Headers received, starting data download...");
+                
+                // Optimized download with larger buffer and minimal overhead
+                unsigned long downloadStart = millis();
+                unsigned long totalBytes = 0;
+                unsigned long lastProgressTime = 0;
+                
+                // Use larger buffer for better throughput (8KB - optimal for ESP32 WiFi)
+                const size_t bufferSize = 8192; // Larger buffer for better performance
+                uint8_t* buffer = (uint8_t*)malloc(bufferSize);
+                if (!buffer) {
+                    Serial.println("❌ Failed to allocate download buffer");
+                    client.stop();
+                    return;
+                }
+                
+                // Set TCP receive buffer size for better performance
+                client.setTimeout(60000); // 60 second timeout
+                
+                while (client.connected() && (contentLength <= 0 || totalBytes < contentLength))
+                {
+                    size_t available = client.available();
+                    if (available > 0)
+                    {
+                        // Read larger chunks for better efficiency
+                        size_t toRead = min(available, bufferSize);
+                        int bytesRead = client.readBytes(buffer, toRead);
+                        
+                        if (bytesRead > 0)
+                        {
+                            totalBytes += bytesRead;
+                            
+                            // Reduce progress reporting frequency to minimize overhead
+                            unsigned long now = millis();
+                            if ((totalBytes % 1048576 == 0 && totalBytes > 0) || // Every 1MB
+                                (now - lastProgressTime > 3000 && totalBytes > 0)) // Every 3 seconds
                             {
-                                totalBytes += bytesRead;
+                                lastProgressTime = now;
+                                float progress = contentLength > 0 ? (float)totalBytes / contentLength * 100 : 0;
+                                unsigned long elapsed = now - downloadStart;
+                                float currentSpeed = elapsed > 0 ? (totalBytes * 8.0) / (elapsed / 1000.0) / 1000.0 : 0; // Kbps
+                                
+                                if (contentLength > 0)
+                                {
+                                    Serial.printf("Progress: %.1f%% (%lu/%d bytes) - %.1f Kbps\n", 
+                                                progress, totalBytes, contentLength, currentSpeed);
+                                }
+                                else
+                                {
+                                    Serial.printf("Downloaded: %lu bytes - %.1f Kbps\n", 
+                                                totalBytes, currentSpeed);
+                                }
                             }
                         }
-                        
-                        // Show progress every 100KB
-                        if (totalBytes % 102400 == 0 && totalBytes > 0)
+                        else
                         {
-                            float progress = (float)totalBytes / contentLength * 100;
-                            Serial.printf("Progress: %.1f%% (%lu bytes)\n", progress, totalBytes);
+                            break; // No more data available
                         }
-                        
-                        yield(); // Allow other tasks to run
-                    }
-                    
-                    unsigned long endTime = millis();
-                    unsigned long duration = endTime - startTime;
-                    
-                    // Calculate speed
-                    float durationSec = duration / 1000.0;
-                    float speedKbps = (totalBytes * 8.0) / (durationSec * 1000.0); // Kbps
-                    float speedMbps = speedKbps / 1000.0; // Mbps
-                    float speedKBps = totalBytes / (durationSec * 1024.0); // KB/s
-                    
-                    Serial.println("\n--- Speed Test Results ---");
-                    Serial.printf("Downloaded: %lu bytes\n", totalBytes);
-                    Serial.printf("Duration: %lu ms (%.2f seconds)\n", duration, durationSec);
-                    Serial.printf("Speed: %.2f Kbps (%.2f Mbps)\n", speedKbps, speedMbps);
-                    Serial.printf("Speed: %.2f KB/s\n", speedKBps);
-                    
-                    // Performance rating
-                    if (speedMbps >= 10.0)
-                    {
-                        Serial.println("Performance: 🟢 Excellent");
-                    }
-                    else if (speedMbps >= 5.0)
-                    {
-                        Serial.println("Performance: 🟡 Good");
-                    }
-                    else if (speedMbps >= 1.0)
-                    {
-                        Serial.println("Performance: 🟠 Fair");
                     }
                     else
                     {
-                        Serial.println("Performance: 🔴 Poor");
+                        // Minimal delay to prevent tight loop
+                        delayMicroseconds(100); // Much shorter delay
                     }
-                }
-                else
-                {
-                    Serial.printf("❌ HTTP request failed with code: %d\n", httpCode);
-                    if (httpCode > 0)
+                    
+                    // Reduced yield frequency for better performance
+                    if (totalBytes % 4096 == 0) { // Only yield every 4KB
+                        yield();
+                    }
+                    
+                    // Extended timeout protection (60 seconds total)
+                    if (millis() - downloadStart > 60000)
                     {
-                        String response = http.getString();
-                        Serial.println("Response: " + response);
+                        Serial.println("⚠️ Download timeout (60s)");
+                        break;
                     }
                 }
                 
-                http.end();
+                unsigned long downloadEnd = millis();
+                unsigned long totalDuration = downloadEnd - connectStart;
+                unsigned long downloadDuration = downloadEnd - downloadStart;
+                
+                // Free the allocated buffer
+                free(buffer);
+                
+                client.stop();
+                
+                // Calculate final speeds
+                float downloadSec = downloadDuration / 1000.0;
+                float totalSec = totalDuration / 1000.0;
+                
+                float downloadSpeedKbps = downloadSec > 0 ? (totalBytes * 8.0) / (downloadSec * 1000.0) : 0;
+                float downloadSpeedMbps = downloadSpeedKbps / 1000.0;
+                float downloadSpeedKBps = downloadSec > 0 ? totalBytes / (downloadSec * 1024.0) : 0;
+                
+                float overallSpeedKbps = totalSec > 0 ? (totalBytes * 8.0) / (totalSec * 1000.0) : 0;
+                float overallSpeedMbps = overallSpeedKbps / 1000.0;
+                
+                Serial.println("\n--- Optimized ESP32 Speed Test Results ---");
+                Serial.printf("Downloaded: %lu bytes", totalBytes);
+                if (contentLength > 0)
+                {
+                    Serial.printf(" of %d bytes (%.1f%%)\n", contentLength, (float)totalBytes / contentLength * 100);
+                }
+                else
+                {
+                    Serial.println();
+                }
+                
+                Serial.printf("Connection time: %lu ms\n", connectTime);
+                Serial.printf("Download time: %lu ms (%.2f seconds)\n", downloadDuration, downloadSec);
+                Serial.printf("Total time: %lu ms (%.2f seconds)\n", totalDuration, totalSec);
+                
+                Serial.println("\n📊 Download Speed (data transfer only):");
+                Serial.printf("  %.2f Kbps (%.2f Mbps)\n", downloadSpeedKbps, downloadSpeedMbps);
+                Serial.printf("  %.2f KB/s\n", downloadSpeedKBps);
+                
+                Serial.println("\n📊 Overall Speed (including connection):");
+                Serial.printf("  %.2f Kbps (%.2f Mbps)\n", overallSpeedKbps, overallSpeedMbps);
+                
+                // Performance rating based on download speed
+                Serial.print("\n📈 Performance: ");
+                if (downloadSpeedMbps >= 20.0)
+                {
+                    Serial.println("🟢 Excellent (>20 Mbps)");
+                }
+                else if (downloadSpeedMbps >= 10.0)
+                {
+                    Serial.println("🟢 Very Good (10-20 Mbps)");
+                }
+                else if (downloadSpeedMbps >= 5.0)
+                {
+                    Serial.println("� Good (5-10 Mbps)");
+                }
+                else if (downloadSpeedMbps >= 1.0)
+                {
+                    Serial.println("🟠 Fair (1-5 Mbps)");
+                }
+                else
+                {
+                    Serial.println("🔴 Poor (<1 Mbps)");
+                }
+                
+                // Memory usage after test
+                Serial.printf("\n💾 Free heap after test: %d bytes\n", ESP.getFreeHeap());
             }
             else
             {
-                Serial.println("❌ Failed to connect to test server");
+                Serial.printf("❌ Failed to connect to %s:%d\n", host, port);
             }
             
-            Serial.println("-------------------------\n");
+            Serial.println("------------------------------------------\n");
         }
         // File Manager commands that were missing
         else if (command == "dlstats")
