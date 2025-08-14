@@ -1369,8 +1369,8 @@ void loop()
                 unsigned long totalBytes = 0;
                 unsigned long lastProgressTime = 0;
                 
-                // Use larger buffer for better throughput (8KB - optimal for ESP32 WiFi)
-                const size_t bufferSize = 8192; // Larger buffer for better performance
+                // Use larger buffer for better throughput (16KB - matches FileManager optimization)
+                const size_t bufferSize = 16384; // 16KB buffer for better performance
                 uint8_t* buffer = (uint8_t*)malloc(bufferSize);
                 if (!buffer) {
                     Serial.println("❌ Failed to allocate download buffer");

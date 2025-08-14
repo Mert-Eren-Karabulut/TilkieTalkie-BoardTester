@@ -507,11 +507,8 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     String httpUrl = url;
     if (httpUrl.startsWith("https://")) {
         httpUrl.replace("https://", "http://");
-        Serial.printf("FileManager: Converted HTTPS to HTTP for memory efficiency\n");
+        Serial.printf("FileManager: Starting download: %s -> %s\n", httpUrl.c_str(), localPath.c_str());
     }
-    
-    Serial.printf("FileManager: Starting download: %s -> %s\n", httpUrl.c_str(), localPath.c_str());
-    
     // Parse URL to extract hostname and path
     String hostname, path;
     int port = 80;
@@ -540,7 +537,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         return false;
     }
     
-    Serial.printf("FileManager: Connecting to %s:%d, path: %s\n", hostname.c_str(), port, path.c_str());
+    Serial.printf("FileManager: Connecting to %s:%d\n", hostname.c_str(), port);
     
     // Create directory structure with verification
     if (!createDirectoryStructure(localPath)) {
@@ -570,25 +567,24 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     
     // Create WiFi client and connect
     WiFiClient client;
-    // WiFiClient setTimeout takes uint16_t in milliseconds, max ~65 seconds
-    // We'll handle timeout manually using millis() for longer timeouts
+    // Optimize client settings for better throughput
     client.setTimeout(30000); // 30 seconds for connection operations
-    
+    // Connect to server
     if (!client.connect(hostname.c_str(), port)) {
         errorMsg = "Failed to connect to server: " + hostname;
         downloadInProgress = false;
         return false;
     }
     
-    // Send HTTP GET request
+    // Send optimized HTTP GET request with larger receive buffer hint
     String request = "GET " + path + " HTTP/1.1\r\n";
     request += "Host: " + hostname + "\r\n";
     request += "Connection: close\r\n";
     request += "User-Agent: ESP32-FileManager/1.0\r\n";
+    request += "Accept: */*\r\n"; // Add Accept header for better compatibility
     request += "\r\n";
     
     client.print(request);
-    Serial.printf("FileManager: HTTP request sent\n");
     
     // Read response headers
     unsigned long startTime = millis();
@@ -622,8 +618,6 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
                     contentLength = line.substring(colonIndex + 1).toInt();
                 }
             }
-            
-            Serial.printf("Header: %s\n", line.c_str());
         }
         delay(1);
     }
@@ -642,7 +636,9 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         return false;
     }
     
-    Serial.printf("FileManager: HTTP 200 OK, Content-Length: %d\n", contentLength);
+    Serial.printf("FileManager: Starting download: %s (%s)\n", 
+                  getDirectoryFromPath(localPath).c_str(), 
+                  contentLength > 0 ? String(contentLength) + " bytes" : "unknown size");
     
     // Check available space
     size_t freeSpace = getSDCardFreeSpace();
@@ -663,12 +659,15 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     
     uint8_t* buffer = (uint8_t*)malloc(DOWNLOAD_BUFFER_SIZE);
     if (!buffer) {
-        errorMsg = "Failed to allocate download buffer";
+        errorMsg = "Failed to allocate download buffer (" + String(DOWNLOAD_BUFFER_SIZE) + " bytes)";
+        Serial.printf("FileManager: Heap before allocation attempt: %d bytes\n", ESP.getFreeHeap());
         file.close();
         client.stop();
         downloadInProgress = false;
         return false;
     }
+    
+    Serial.printf("FileManager: Allocated %d KB buffer\n", DOWNLOAD_BUFFER_SIZE / 1024);
     
     int totalDownloaded = 0;
     unsigned long lastProgress = 0;
@@ -677,13 +676,15 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     // Download the file content
     startTime = millis(); // Reset timer for download phase
     unsigned long lastDataTime = millis(); // Track when we last received data
-    const unsigned long NO_DATA_TIMEOUT = 10000; // 10 seconds without data = timeout
+    const unsigned long NO_DATA_TIMEOUT = 15000; // 15 seconds without data = timeout (increased from 10s)
     
     while (downloadSuccess && (millis() - startTime < DOWNLOAD_TIMEOUT_MS)) {
         size_t availableData = client.available();
         
         if (availableData > 0) {
             lastDataTime = millis(); // Reset no-data timer
+            
+            // Optimize: Read larger chunks when available
             size_t bytesToRead = min(availableData, (size_t)DOWNLOAD_BUFFER_SIZE);
             int readBytes = client.readBytes(buffer, bytesToRead);
             
@@ -696,13 +697,23 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
                 }
                 totalDownloaded += readBytes;
                 
+                // Optimized progress reporting - less frequent updates
                 if (contentLength > 0) {
                     int progress = (totalDownloaded * 100) / contentLength;
                     
-                    // Report progress every 5%
-                    if (progress >= lastProgress + 5) {
+                    // Report progress every 10% or every 1MB (whichever comes first)
+                    unsigned long now = millis();
+                    bool shouldReport = false;
+                    
+                    if (progress >= lastProgress + 10) { // Every 10% instead of 5%
+                        shouldReport = true;
                         lastProgress = progress;
-                        Serial.printf("FileManager: Download progress: %d%% (%d/%d bytes)\n", 
+                    } else if ((totalDownloaded % 1048576 == 0) && totalDownloaded > 0) { // Every 1MB
+                        shouldReport = true;
+                    }
+                    
+                    if (shouldReport) {
+                        Serial.printf("Download: %d%% (%d/%d bytes)\n", 
                                     progress, totalDownloaded, contentLength);
                         
                         if (downloadProgressCallback) {
@@ -713,13 +724,10 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
                 
                 // Check if we have all expected data
                 if (contentLength > 0 && totalDownloaded >= contentLength) {
-                    Serial.println("FileManager: Expected data received, checking for remaining bytes...");
-                    
                     // Wait a bit more to ensure no more data is coming
                     unsigned long drainStart = millis();
                     while ((millis() - drainStart) < 2000 && client.connected()) { // Wait up to 2 seconds
                         if (client.available() > 0) {
-                            Serial.printf("FileManager: Found %d more bytes after expected completion\n", client.available());
                             break; // More data available, continue main loop
                         }
                         delay(50);
@@ -742,23 +750,29 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
                     downloadSuccess = false;
                 } else {
                     // Connection closed normally
-                    Serial.println("FileManager: Connection closed normally");
                     break;
                 }
             } else if ((millis() - lastDataTime) > NO_DATA_TIMEOUT) {
                 // No data for too long, but connection still alive
-                Serial.printf("FileManager: No data received for %lu seconds, timing out\n", NO_DATA_TIMEOUT / 1000);
                 errorMsg = "Download stalled - no data received for " + String(NO_DATA_TIMEOUT / 1000) + " seconds";
                 downloadSuccess = false;
             }
         }
         
-        delay(10); // Slightly longer delay to reduce CPU usage
+        // Optimized timing: Reduce system call overhead
+        if (availableData == 0) {
+            // Only delay when no data is available to prevent tight loop
+            delayMicroseconds(500); // Reduced from delay(10) - much more efficient
+        }
+        
+        // Reduced yield frequency for better performance - only yield every 8KB processed
+        if ((totalDownloaded % 8192) == 0 && totalDownloaded > 0) {
+            yield();
+        }
     }
     
     // Check for overall timeout
     if ((millis() - startTime) >= DOWNLOAD_TIMEOUT_MS) {
-        Serial.println("FileManager: Download timed out");
         errorMsg = "Download timed out after " + String(DOWNLOAD_TIMEOUT_MS / 1000) + " seconds";
         downloadSuccess = false;
     }
@@ -770,6 +784,12 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     if (!downloadSuccess) {
         SD.remove(tempPath);
         downloadInProgress = false;
+        
+        // Update failure statistics
+        downloadStats.totalDownloads++;
+        downloadStats.failedDownloads++;
+        saveDownloadStats();
+        
         return false;
     }
     
@@ -778,7 +798,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         int missingBytes = contentLength - totalDownloaded;
         if (missingBytes > 0) {
             if (missingBytes <= 64) { // Allow up to 64 bytes missing (could be padding or encoding issues)
-                Serial.printf("FileManager: Download completed with %d bytes missing (within tolerance)\n", missingBytes);
+                // Size difference within tolerance, continue silently
             } else {
                 errorMsg = "Download incomplete: " + String(totalDownloaded) + "/" + String(contentLength) + " bytes (" + String(missingBytes) + " bytes missing)";
                 SD.remove(tempPath);
@@ -820,7 +840,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
             downloadInProgress = false;
             return false;
         } else if (sizeDiff > 0) {
-            Serial.printf("FileManager: File size difference: %d bytes (within tolerance)\n", sizeDiff);
+            // Size difference within tolerance, continue silently
         }
     }
     
@@ -832,8 +852,8 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     downloadStats.totalBytesDownloaded += totalDownloaded;
     saveDownloadStats();
     
-    Serial.printf("FileManager: Download completed successfully: %s (%d bytes)\n", 
-                  localPath.c_str(), totalDownloaded);
+    Serial.printf("Download completed: %s (%d bytes)\n", 
+                  localPath.substring(localPath.lastIndexOf('/') + 1).c_str(), totalDownloaded);
     
     if (downloadCompleteCallback) {
         downloadCompleteCallback(httpUrl, localPath, true, "");

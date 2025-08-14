@@ -669,14 +669,14 @@ void RequestManager::processOnlineFigureRequest(const String &uid)
                     // Then check if we need to download
                     if (!fileManager.fileExists(track.localPath))
                     {
-                        Serial.print(F("RequestManager: Starting download: "));
+                        Serial.print(F("Downloading: "));
                         Serial.println(track.name);
                         fileManager.scheduleDownload(track.audioUrl, track.localPath);
                         tracksToDownload++;
                     }
                     else
                     {
-                        Serial.print(F("RequestManager: File already exists, skipping download: "));
+                        Serial.print(F("Cached: "));
                         Serial.println(track.name);
                         tracksAlreadyExist++;
                     }
@@ -694,17 +694,11 @@ void RequestManager::processOnlineFigureRequest(const String &uid)
         // More informative download summary
         if (tracksToDownload > 0)
         {
-            Serial.print(F("RequestManager: Started downloading "));
-            Serial.print(tracksToDownload);
-            Serial.print(F(" new tracks for figure: "));
-            Serial.println(figureName);
+            Serial.printf("Starting %d track downloads for: %s\n", tracksToDownload, figureName.c_str());
         }
         if (tracksAlreadyExist > 0)
         {
-            Serial.print(F("RequestManager: "));
-            Serial.print(tracksAlreadyExist);
-            Serial.print(F(" tracks already exist for figure: "));
-            Serial.println(figureName);
+            Serial.printf("%d tracks already cached for: %s\n", tracksAlreadyExist, figureName.c_str());
         }
     }
     else
@@ -807,15 +801,8 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
         }
     }
     
-    Serial.print(F("Started tracking figure '"));
-    Serial.print(figureName);
-    Serial.print(F("' (UID: "));
-    Serial.print(uid);
-    Serial.print(F("): "));
-    Serial.print(tracker.totalTracks);
-    Serial.print(F(" total tracks, "));
-    Serial.print(tracker.tracksReady);
-    Serial.println(F(" already ready"));
+    Serial.printf("Tracking figure '%s': %d tracks (%d ready)\n", 
+                  figureName.c_str(), tracker.totalTracks, tracker.tracksReady);
     
     // Check if all tracks are already ready before adding to activeDownloads
     bool allTracksReady = (tracker.tracksReady >= tracker.totalTracks && tracker.totalTracks > 0);
@@ -851,15 +838,8 @@ void RequestManager::checkFigureDownloadStatus(const String &uid)
                     figureDownloadCompleteCallback(uid, tracker.figureName, success, error, tracker.figureData);
                 }
                 
-                Serial.print(F("Figure download completed for: "));
-                Serial.print(tracker.figureName);
-                Serial.print(F(" - Success: "));
-                Serial.print(success ? "Yes" : "No");
-                Serial.print(F(" ("));
-                Serial.print(tracker.tracksReady);
-                Serial.print(F("/"));
-                Serial.print(tracker.totalTracks);
-                Serial.println(F(" tracks ready)"));
+                Serial.printf("Figure download completed: %s (%d/%d tracks)\n", 
+                              tracker.figureName.c_str(), tracker.tracksReady, tracker.totalTracks);
                 break;
             }
         }
