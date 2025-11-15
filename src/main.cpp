@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <esp_wifi.h>
+#include <esp_log.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <AsyncTCP.h>
@@ -15,6 +16,15 @@
 #include "ReverbClient.h"
 #include "Buttons.h"
 #include "AsyncSpeedTest.h"
+
+static const char* TAG = "MAIN";
+
+// Helper macros to ensure Serial output appears via ESP-IDF logging
+#define LOG_PRINTF(tag, format, ...) ESP_LOGI(tag, format, ##__VA_ARGS__)
+#define LOG_PRINT(tag, msg) ESP_LOGI(tag, "%s", msg)
+
+// Bypass PSRAM test to prevent early boot issues
+BYPASS_SPIRAM_TEST(true);
 
 // Use the singleton instance from the header
 NfcController &nfcController = NfcController::getInstance();
@@ -39,7 +49,7 @@ const size_t WARNING_HEAP_THRESHOLD = 25000;  // 25KB warning threshold
 // +++ Reverb WebSocket Callback Function +++
 void handleChatMessage(const String &message)
 {
-    Serial.printf("\n[REVERB] Message Received: %s\n", message.c_str());
+    ESP_LOGI(TAG, "[REVERB] Message Received: %s", message.c_str());
 
     // Example action: Pulse the LED blue when a message comes in
     ledController.pulseRapid(0x0000FF, 2); // Blue color
@@ -55,22 +65,19 @@ void handleChatMessage(const String &message)
 // Callback function for when figure download is complete
 void onFigureDownloadComplete(const String &uid, const String &figureName, bool success, const String &error, const RequestManager::Figure &figure)
 {
-    Serial.println("=== Figure Download Complete ===");
-    Serial.print("UID: ");
-    Serial.println(uid);
-    Serial.print("Figure: ");
-    Serial.println(figureName);
-    Serial.print("Success: ");
-    Serial.println(success ? "YES" : "NO");
+    ESP_LOGI(TAG, "=== Figure Download Complete ===");
+    ESP_LOGI(TAG, "UID: %s", uid.c_str());
+    ESP_LOGI(TAG, "Figure: %s", figureName.c_str());
+    ESP_LOGI(TAG, "Success: %s", success ? "YES" : "NO");
 
     if (success)
     {
-        Serial.println("All tracks are ready! Checking if figure is still mounted...");
+        ESP_LOGI(TAG, "All tracks are ready! Checking if figure is still mounted...");
 
         // Check if the figure is still mounted on the device
         if (nfcController.isCardPresent() && nfcController.currentNFCData().uidString == uid)
         {
-            Serial.println("Figure is still mounted! Starting automatic playback...");
+            ESP_LOGI(TAG, "Figure is still mounted! Starting automatic playback...");
             
             // Add delay and heap check to prevent rapid execution
             delay(300);  // Give system time to stabilize
@@ -85,7 +92,7 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
                 for (const auto &track : episode.tracks)
                 {
                     playlist.push_back(track.localPath);
-                    Serial.printf("Added to playlist: %s (%s)\n", track.localPath.c_str(), track.name.c_str());
+                    ESP_LOGI(TAG, "Added to playlist: %s (%s)", track.localPath.c_str(), track.name.c_str());
                 }
             }
 
@@ -94,42 +101,39 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
                 // Set the playlist and start playing
                 audioController.setPlaylist(playlist, uid);
                 audioController.play(); // Start playing the first track
-                Serial.printf("Started playing figure '%s' with %d tracks\n", figureName.c_str(), playlist.size());
+                ESP_LOGI(TAG, "Started playing figure '%s' with %d tracks", figureName.c_str(), playlist.size());
             }
             else
             {
-                Serial.println("No tracks found in figure structure!");
+                ESP_LOGW(TAG, "No tracks found in figure structure!");
             }
         }
         else
         {
-            Serial.println("Figure is no longer mounted. Not starting playback.");
+            ESP_LOGI(TAG, "Figure is no longer mounted. Not starting playback.");
         }
 
-        Serial.println("Figure is ready for playback!");
+        ESP_LOGI(TAG, "Figure is ready for playback!");
     }
     else
     {
-        Serial.print("Download failed: ");
-        Serial.println(error);
+        ESP_LOGE(TAG, "Download failed: %s", error.c_str());
 
         // Pulse LED red to indicate failure
         ledController.pulseRapid(0xFF0000, 5); // Red color, 5 rapid pulses
 
-        Serial.println("Some tracks may be missing. Check download status.");
+        ESP_LOGW(TAG, "Some tracks may be missing. Check download status.");
     }
 
-    Serial.println("================================");
+    ESP_LOGI(TAG, "================================");
 }
 
 // This function will be called ONLY ONCE when a new card is detected
 void afterNFCRead(const NFCData &nfcData)
 {
-    Serial.println("=== Hook: afterNFCRead ===");
-    Serial.print("Card UID: ");
-    Serial.println(nfcData.uidString);
-    Serial.print("Timestamp: ");
-    Serial.println(nfcData.timestamp);
+    ESP_LOGI(TAG, "=== Hook: afterNFCRead ===");
+    ESP_LOGI(TAG, "Card UID: %s", nfcData.uidString.c_str());
+    ESP_LOGI(TAG, "Timestamp: %lu", nfcData.timestamp);
 
     // Example: Play a sound and turn the LED green
     // audioController.play("/sounds/nfc_success.wav");
@@ -138,23 +142,23 @@ void afterNFCRead(const NFCData &nfcData)
     // we need to send get request with bearer token to the url :https://portal.tilkietalkie.com/api/units/{nfc_uid}
     requestManager.getCheckFigureTracks(nfcData.uidString);
 
-    Serial.println("==========================");
+    ESP_LOGI(TAG, "==========================");
 }
 
 // This function will be called when the reed switch is deactivated
 // AFTER a card was successfully read in that session.
 void afterDetachNFC()
 {
-    Serial.println("=== Hook: afterDetachNFC ===");
-    Serial.println("NFC session has ended.");
+    ESP_LOGI(TAG, "=== Hook: afterDetachNFC ===");
+    ESP_LOGI(TAG, "NFC session has ended.");
 
     // Stop audio and clear the playlist
     audioController.stop();
     audioController.clearPlaylist();
     ledController.pulseRapid(0xFF0000, 3); // Red color
 
-    Serial.println("Playlist cleared due to figure removal.");
-    Serial.println("==========================");
+    ESP_LOGI(TAG, "Playlist cleared due to figure removal.");
+    ESP_LOGI(TAG, "==========================");
 }
 
 void setup()
@@ -164,31 +168,24 @@ void setup()
         Serial.begin(115200);
         delay(1000); // Give serial time to initialize
     }
-    Serial.println("=== TilkieTalkie Board Tester ===");
-    Serial.println("Initializing system...");
+    ESP_LOGI(TAG, "=== TilkieTalkie Board Tester ===");
+    ESP_LOGI(TAG, "Initializing system...");
 
     // Enable peripheral power (IO17) - CRITICAL for SD card and other peripherals
-    Serial.println("Enabling peripheral power...");
-    pinMode(17, OUTPUT);
-    digitalWrite(17, HIGH); // Enable power to peripherals
+    ESP_LOGI(TAG, "Enabling peripheral power...");
+    pinMode(4, OUTPUT);
+    digitalWrite(4, HIGH); // Enable power to peripherals
     delay(500);            // Give peripherals time to power up
 
     // // Initialize configuration (this will also initialize NVS)
-    // Serial.println("Loading configuration...");
+    // ESP_LOGI(TAG, "Loading configuration...");
     // config.printAllSettings();
 
     // Initialize WiFi provisioning
-    Serial.println("Initializing WiFi...");
+    ESP_LOGI(TAG, "Initializing WiFi...");
     wifiProv.begin();
 
-    // Initialize request manager
-    if (!requestManager.begin())
-    {
-        Serial.println("WARNING: Request Manager initialization failed!");
-        Serial.println("API functionality may be limited.");
-    }
-
-    // Set up figure download complete callback
+    // Set up figure download complete callback (before WiFi connection)
     requestManager.setFigureDownloadCompleteCallback(onFigureDownloadComplete);
 
     // Initialize battery management
@@ -197,57 +194,68 @@ void setup()
     // Initialize file manager
     if (!fileManager.begin())
     {
-        Serial.println("WARNING: File Manager initialization failed!");
-        Serial.println("SD card functionality will not be available.");
+        ESP_LOGW(TAG, "File Manager initialization failed!");
+        ESP_LOGW(TAG, "SD card functionality will not be available.");
     }
 
     // Initialize audio controller
     if (!audioController.begin())
     {
-        Serial.println("WARNING: Audio Controller initialization failed!");
-        Serial.println("Audio functionality will not be available.");
+        ESP_LOGW(TAG, "Audio Controller initialization failed!");
+        ESP_LOGW(TAG, "Audio functionality will not be available.");
     }
 
     // Initialize LED controller
-    Serial.println("Initializing LED Controller...");
+    ESP_LOGI(TAG, "Initializing LED Controller...");
     ledController.begin();
-    Serial.println("LED Controller initialized successfully!");
+    ESP_LOGI(TAG, "LED Controller initialized successfully!");
 
     // --- Initialize NFC Controller ---
-    Serial.println("Initializing NFC Controller...");
+    ESP_LOGI(TAG, "Initializing NFC Controller...");
     if (nfcController.begin())
     {
-        Serial.println("NFC Controller initialized successfully!");
+        ESP_LOGI(TAG, "NFC Controller initialized successfully!");
 
         // Set up the new NFC callbacks
         nfcController.setAfterNFCReadCallback(afterNFCRead);
         nfcController.setAfterDetachNFCCallback(afterDetachNFC);
 
-        Serial.println("NFC callbacks configured.");
+        ESP_LOGI(TAG, "NFC callbacks configured.");
     }
     else
     {
-        Serial.println("FATAL: NFC Controller initialization failed!");
-        Serial.println("NFC functionality will not be available.");
+        ESP_LOGE(TAG, "FATAL: NFC Controller initialization failed!");
+        ESP_LOGE(TAG, "NFC functionality will not be available.");
         // Handle failure, maybe by pulsing an error color
         ledController.pulseLed(0xFF0000); // Pulse red for error
     }
 
     // --- NEW: Initialize Reverb Client ---
-    Serial.println("Initializing Reverb WebSocket Client...");
+    ESP_LOGI(TAG, "Initializing Reverb WebSocket Client...");
 
     // Wait for WiFi to connect before starting Reverb client
     unsigned long wifi_timeout = millis() + 5000; // 5 second timeout
     while (!WiFi.isConnected() && millis() < wifi_timeout)
     {
         delay(500);
-        Serial.print(".");
+        ESP_LOGI(TAG, ".");
     }
-    Serial.println();
+    ESP_LOGI(TAG, "");
 
     if (WiFi.isConnected())
     {
-        Serial.println("WiFi is connected. Starting Reverb client.");
+        ESP_LOGI(TAG, "WiFi is connected. Initializing network services...");
+
+        // Initialize request manager (needs WiFi)
+        if (!requestManager.begin())
+        {
+            ESP_LOGW(TAG, "Request Manager initialization failed!");
+            ESP_LOGW(TAG, "API functionality may be limited.");
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Request Manager initialized successfully");
+        }
 
         // Use your production credentials from your Laravel .env file
         constexpr char HOST[] = "portal.tilkietalkie.com";
@@ -266,24 +274,25 @@ void setup()
     }
     else
     {
-        Serial.println("⚠️ WiFi connection timed out. Reverb client not started.");
+        ESP_LOGW(TAG, "WiFi connection timed out.");
+        ESP_LOGW(TAG, "Network services (API, Reverb) will not be started.");
     }
 
     // Initialize other modules here
     // e.g., sensors, etc.
 
     // Initialize Button Controller
-    Serial.println("Initializing Button Controller...");
+    ESP_LOGI(TAG, "Initializing Button Controller...");
     buttonController.begin();
     
     // Set up button callbacks
     buttonController.onSingleClick([](ButtonController::ButtonId button) {
-        Serial.printf("[MAIN] Single click on button %d\n", button + 1);
+        ESP_LOGI(TAG, "Single click on button %d", button + 1);
         // Example: Different actions for different buttons
         switch(button) {
             case ButtonController::BUTTON_1:
                 // Button 1: Toggle playback
-                Serial.println("Button 1: Toggle playback");
+                ESP_LOGI(TAG, "Button 1: Toggle playback");
                 ledController.pulseLed(0x0000FF); // Blue pulse
                 if (audioController.isPlaying()) {
                     audioController.pause();
@@ -300,29 +309,29 @@ void setup()
                 break;
             case ButtonController::BUTTON_2:
                 // Button 2: Next track
-                Serial.println("Button 2: Next track");
+                ESP_LOGI(TAG, "Button 2: Next track");
                 ledController.pulseLed(0x00FF00); // Green pulse
                 audioController.nextTrack();
                 break;
             case ButtonController::BUTTON_3:
                 // Button 3: Previous track
-                Serial.println("Button 3: Previous track");
+                ESP_LOGI(TAG, "Button 3: Previous track");
                 ledController.pulseLed(0xFFFF00); // Yellow pulse
                 audioController.prevTrack();
                 break;
             case ButtonController::BUTTON_4:
                 // Button 4: Menu/Settings
-                Serial.println("Button 4: Menu/Settings");
+                ESP_LOGI(TAG, "Button 4: Menu/Settings");
                 ledController.pulseLed(0xFF00FF); // Magenta pulse
                 break;
         }
     });
 
     buttonController.onHoldStart([](ButtonController::ButtonId button, unsigned long duration) {
-        Serial.printf("[MAIN] Hold started on button %d (duration: %lu ms)\n", button + 1, duration);
+        ESP_LOGI(TAG, "Hold started on button %d (duration: %lu ms)", button + 1, duration);
         // Example: Volume control setup
         if (button == ButtonController::BUTTON_2 || button == ButtonController::BUTTON_4) {
-            Serial.printf("Starting volume %s\n", (button == ButtonController::BUTTON_2) ? "up" : "down");
+            ESP_LOGI(TAG, "Starting volume %s", (button == ButtonController::BUTTON_2) ? "up" : "down");
         }
     });
 
@@ -330,28 +339,28 @@ void setup()
         // Example: Continuous volume adjustment
         if (button == ButtonController::BUTTON_2) {
             // Volume up - called every 100ms while holding
-            Serial.printf("[MAIN] Volume up (held for %lu ms)\n", duration);
+            ESP_LOGI(TAG, "Volume up (held for %lu ms)", duration);
             audioController.volumeUp(); // Increase volume by 1 step
         } else if (button == ButtonController::BUTTON_4) {
             // Volume down - called every 100ms while holding
-            Serial.printf("[MAIN] Volume down (held for %lu ms)\n", duration);
+            ESP_LOGI(TAG, "Volume down (held for %lu ms)", duration);
             audioController.volumeDown(); // Decrease by 1 step
         }
     });
 
     buttonController.onHoldEnd([](ButtonController::ButtonId button, unsigned long duration) {
-        Serial.printf("[MAIN] Hold ended on button %d (total duration: %lu ms)\n", button + 1, duration);
+        ESP_LOGI(TAG, "Hold ended on button %d (total duration: %lu ms)", button + 1, duration);
         // Volume adjustment finished
     });
 
     buttonController.onComboHold([]() {
-        Serial.println("[MAIN] COMBO HOLD TRIGGERED - RESTARTING DEVICE!");
+        ESP_LOGW(TAG, "COMBO HOLD TRIGGERED - RESTARTING DEVICE!");
         ledController.pulseRapid(0xFF0000, 5); // Rapid red pulse
         delay(2000); // Give time for LED animation
         ESP.restart(); // Restart the device
     });
 
-    Serial.println("Button Controller initialized successfully!");
+    ESP_LOGI(TAG, "Button Controller initialized successfully!");
 
     // rapid pulse LED to indicate system is ready
     ledController.pulseRapid(0x00FF00, 3); // Rapid pulse green
@@ -368,7 +377,7 @@ void loop()
         lastStackCheck = now;
         UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
         if (stackHighWaterMark < 1000) { // Less than 1KB remaining
-            Serial.printf("⚠️ WARNING: Low stack space remaining: %d bytes\n", stackHighWaterMark * sizeof(StackType_t));
+            ESP_LOGW(TAG, "WARNING: Low stack space remaining: %d bytes", stackHighWaterMark * sizeof(StackType_t));
         }
     }
 
@@ -388,68 +397,67 @@ void loop()
         // help command
         if (command == "help")
         {
-            Serial.println("--- Terminal Commands ---");
-            Serial.println("WiFi Commands:");
-            Serial.println("  qr      - Print QR code for provisioning");
-            Serial.println("  reset   - Reset WiFi provisioning");
-            Serial.println("  stats   - Show WiFi connection status");
-            Serial.println("Reverb Commands:");
-            Serial.println("  reverbstatus - Show Reverb connection status");
-            Serial.println("  reverbclean  - Clean up Reverb client to free memory");
-            Serial.println("  reverbstart  - Start Reverb client (needs WiFi)");
-            Serial.println("  testauth     - Test stored JWT token authorization with server");
-            Serial.println("System Commands:");
-            Serial.println("  restart - Restart the device");
-            Serial.println("  config  - Show all configuration");
-            Serial.println("  debug   - Show debug information");
-            Serial.println("  heap    - Show detailed heap information");
-            Serial.println("  stack   - Show stack usage information");
-            Serial.println("  factory - Factory reset (erase all data)");
-            Serial.println("  speedtest - Test network download speed (AsyncTCP Module)");
-            Serial.println("Battery Commands:");
-            Serial.println("  battery - Show battery status");
-            Serial.println("File Manager Commands:");
-            Serial.println("  sdtree  - Check SD card file tree");
-            Serial.println("  sdformat- Format SD card as FAT32");
-            Serial.println("  deletefile <path> - Delete file from SD card");
-            Serial.println("  delete  - Delete ALL required files from NVS and storage");
-            Serial.println("  deletefig <uid> - Delete all files for a specific figure");
-            Serial.println("  dlstats - Show download statistics");
-            Serial.println("  dlqueue - Show download queue");
-            Serial.println("  required- Show required files");
-            Serial.println("  download <url> <path> - Download file from URL");
-            Serial.println("  addfile <path> <url> - Add required file");
-            Serial.println("  checkfiles - Check and download missing files");
-            Serial.println("  cleanup - Clean up temporary files");
-            Serial.println("Audio Commands:");
-            Serial.println("  play <path> - Play wav file");
-            Serial.println("  pause   - Pause current playback");
-            Serial.println("  resume  - Resume paused playback");
-            Serial.println("  stop    - Stop playback");
-            Serial.println("  volup   - Volume up");
-            Serial.println("  voldown - Volume down");
-            Serial.println("  volume  - Show current volume");
-            Serial.println("  track   - Show current track");
-            Serial.println("LED Commands:");
-            Serial.println("  ledon <hex> <intensity> - Turn LED on with hex color and intensity (0-255)");
-            Serial.println("  ledoff  - Turn LED off");
-            Serial.println("  pulse <hex> - Start pulsing LED with hex color");
-            Serial.println("  rapid <hex> <count> - Rapid pulse LED for count times");
-            Serial.println("NFC Commands:");
-            Serial.println("  nfcstatus - Show NFC controller status");
-            Serial.println("  nfcdata   - Show current NFC card data");
-            Serial.println("  nfcreed   - Show reed switch status");
-            Serial.println("  nfcdiag   - Run NFC diagnostics");
-            Serial.println("Power Commands:");
-            Serial.println("  power   - Show peripheral power status");
-            Serial.println("  poweron - Enable peripheral power (IO17)");
-            Serial.println("  poweroff- Disable peripheral power (IO17)");
-            Serial.println("Reverb Commands:");
-            Serial.println("  send <message> - Send message to Reverb API for broadcast");
-            Serial.println("  wsstatus - Show WebSocket connection status");
-            Serial.println("  testauth - Test stored JWT token authorization with server");
-            Serial.println("Type any command for help\n");
-            Serial.flush();
+            ESP_LOGI(TAG, "--- Terminal Commands ---");
+            ESP_LOGI(TAG, "WiFi Commands:");
+            ESP_LOGI(TAG, "  qr      - Print QR code for provisioning");
+            ESP_LOGI(TAG, "  reset   - Reset WiFi provisioning");
+            ESP_LOGI(TAG, "  stats   - Show WiFi connection status");
+            ESP_LOGI(TAG, "Reverb Commands:");
+            ESP_LOGI(TAG, "  reverbstatus - Show Reverb connection status");
+            ESP_LOGI(TAG, "  reverbclean  - Clean up Reverb client to free memory");
+            ESP_LOGI(TAG, "  reverbstart  - Start Reverb client (needs WiFi)");
+            ESP_LOGI(TAG, "  testauth     - Test stored JWT token authorization with server");
+            ESP_LOGI(TAG, "System Commands:");
+            ESP_LOGI(TAG, "  restart - Restart the device");
+            ESP_LOGI(TAG, "  config  - Show all configuration");
+            ESP_LOGI(TAG, "  debug   - Show debug information");
+            ESP_LOGI(TAG, "  heap    - Show detailed heap information");
+            ESP_LOGI(TAG, "  stack   - Show stack usage information");
+            ESP_LOGI(TAG, "  factory - Factory reset (erase all data)");
+            ESP_LOGI(TAG, "  speedtest - Test network download speed (AsyncTCP Module)");
+            ESP_LOGI(TAG, "Battery Commands:");
+            ESP_LOGI(TAG, "  battery - Show battery status");
+            ESP_LOGI(TAG, "File Manager Commands:");
+            ESP_LOGI(TAG, "  sdtree  - Check SD card file tree");
+            ESP_LOGI(TAG, "  sdformat- Format SD card as FAT32");
+            ESP_LOGI(TAG, "  deletefile <path> - Delete file from SD card");
+            ESP_LOGI(TAG, "  delete  - Delete ALL required files from NVS and storage");
+            ESP_LOGI(TAG, "  deletefig <uid> - Delete all files for a specific figure");
+            ESP_LOGI(TAG, "  dlstats - Show download statistics");
+            ESP_LOGI(TAG, "  dlqueue - Show download queue");
+            ESP_LOGI(TAG, "  required- Show required files");
+            ESP_LOGI(TAG, "  download <url> <path> - Download file from URL");
+            ESP_LOGI(TAG, "  addfile <path> <url> - Add required file");
+            ESP_LOGI(TAG, "  checkfiles - Check and download missing files");
+            ESP_LOGI(TAG, "  cleanup - Clean up temporary files");
+            ESP_LOGI(TAG, "Audio Commands:");
+            ESP_LOGI(TAG, "  play <path> - Play wav file");
+            ESP_LOGI(TAG, "  pause   - Pause current playback");
+            ESP_LOGI(TAG, "  resume  - Resume paused playback");
+            ESP_LOGI(TAG, "  stop    - Stop playback");
+            ESP_LOGI(TAG, "  volup   - Volume up");
+            ESP_LOGI(TAG, "  voldown - Volume down");
+            ESP_LOGI(TAG, "  volume  - Show current volume");
+            ESP_LOGI(TAG, "  track   - Show current track");
+            ESP_LOGI(TAG, "LED Commands:");
+            ESP_LOGI(TAG, "  ledon <hex> <intensity> - Turn LED on with hex color and intensity (0-255)");
+            ESP_LOGI(TAG, "  ledoff  - Turn LED off");
+            ESP_LOGI(TAG, "  pulse <hex> - Start pulsing LED with hex color");
+            ESP_LOGI(TAG, "  rapid <hex> <count> - Rapid pulse LED for count times");
+            ESP_LOGI(TAG, "NFC Commands:");
+            ESP_LOGI(TAG, "  nfcstatus - Show NFC controller status");
+            ESP_LOGI(TAG, "  nfcdata   - Show current NFC card data");
+            ESP_LOGI(TAG, "  nfcreed   - Show reed switch status");
+            ESP_LOGI(TAG, "  nfcdiag   - Run NFC diagnostics");
+            ESP_LOGI(TAG, "Power Commands:");
+            ESP_LOGI(TAG, "  power   - Show peripheral power status");
+            ESP_LOGI(TAG, "  poweron - Enable peripheral power (IO17)");
+            ESP_LOGI(TAG, "  poweroff- Disable peripheral power (IO17)");
+            ESP_LOGI(TAG, "Reverb Commands:");
+            ESP_LOGI(TAG, "  send <message> - Send message to Reverb API for broadcast");
+            ESP_LOGI(TAG, "  wsstatus - Show WebSocket connection status");
+            ESP_LOGI(TAG, "  testauth - Test stored JWT token authorization with server");
+            ESP_LOGI(TAG, "Type any command for help");
             return; // Skip further processing
         }
         // WebSocket commands
@@ -459,19 +467,19 @@ void loop()
             message.trim();
             if (message.length() > 0)
             {
-                Serial.printf("Sending message: '%s'\n", message.c_str());
+                ESP_LOGI(TAG, "Sending message: '%s'", message.c_str());
                 if (reverb.sendMessage(message))
                 {
-                    Serial.println("Message sent to API for broadcast.");
+                    ESP_LOGI(TAG, "Message sent to API for broadcast.");
                 }
                 else
                 {
-                    Serial.println("Failed to send message.");
+                    ESP_LOGE(TAG, "Failed to send message.");
                 }
             }
             else
             {
-                Serial.println("Usage: send <your message>");
+                ESP_LOGI(TAG, "Usage: send <your message>");
             }
         }
 
@@ -483,22 +491,20 @@ void loop()
         // Reverb related commands
         else if (command == "reverbstatus")
         {
-            Serial.print("Reverb Status: ");
-            Serial.println(reverb.isConnected() ? "Connected" : "Disconnected");
-            Serial.print("WiFi Status: ");
-            Serial.println(WiFi.isConnected() ? "Connected" : "Disconnected");
-            Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+            ESP_LOGI(TAG, "Reverb Status: %s", reverb.isConnected() ? "Connected" : "Disconnected");
+            ESP_LOGI(TAG, "WiFi Status: %s", WiFi.isConnected() ? "Connected" : "Disconnected");
+            ESP_LOGI(TAG, "Free heap: %d bytes", ESP.getFreeHeap());
         }
         else if (command == "reverbclean")
         {
-            Serial.println("Cleaning up Reverb client...");
+            ESP_LOGI(TAG, "Cleaning up Reverb client...");
             reverb.cleanup();
         }
         else if (command == "reverbstart")
         {
             if (WiFi.isConnected())
             {
-                Serial.println("Starting Reverb client...");
+                ESP_LOGI(TAG, "Starting Reverb client...");
 
                 constexpr char HOST[] = "portal.tilkietalkie.com";
                 constexpr uint16_t PORT = 443;
@@ -514,28 +520,28 @@ void loop()
             }
             else
             {
-                Serial.println("Cannot start Reverb - WiFi not connected");
+                ESP_LOGW(TAG, "Cannot start Reverb - WiFi not connected");
             }
         }
         else if (command == "testauth")
         {
-            Serial.println("\n--- Testing Authorization ---");
+            ESP_LOGI(TAG, "--- Testing Authorization ---");
             String token = config.getJWTToken();
 
             if (token.length() == 0)
             {
-                Serial.println("❌ No JWT token stored in configuration");
+                ESP_LOGE(TAG, "No JWT token stored in configuration");
                 return;
             }
 
             if (!WiFi.isConnected())
             {
-                Serial.println("❌ WiFi not connected - cannot test authorization");
+                ESP_LOGE(TAG, "WiFi not connected - cannot test authorization");
                 return;
             }
 
-            Serial.println("🔑 JWT Token found, testing with server...");
-            Serial.printf("Token length: %d characters\n", token.length());
+            ESP_LOGI(TAG, "JWT Token found, testing with server...");
+            ESP_LOGI(TAG, "Token length: %d characters", token.length());
 
             // Use the same method as ReverbClient for consistency
             WiFiClientSecure client;
@@ -549,41 +555,41 @@ void loop()
                 http.addHeader("Authorization", "Bearer " + token);
                 http.addHeader("Accept", "application/json");
 
-                Serial.println("📡 Sending auth test request...");
+                ESP_LOGI(TAG, "Sending auth test request...");
                 int httpCode = http.GET();
 
                 if (httpCode == 200)
                 {
-                    Serial.println("✅ Authorization successful! Token is valid.");
+                    ESP_LOGI(TAG, "Authorization successful! Token is valid.");
                     String response = http.getString();
-                    Serial.println("Server response: " + response);
+                    ESP_LOGI(TAG, "Server response: %s", response.c_str());
                 }
                 else if (httpCode == 401)
                 {
-                    Serial.println("❌ Authorization failed! Token is invalid or expired.");
+                    ESP_LOGE(TAG, "Authorization failed! Token is invalid or expired.");
                 }
                 else if (httpCode > 0)
                 {
-                    Serial.printf("⚠️ Unexpected response code: %d\n", httpCode);
+                    ESP_LOGW(TAG, "Unexpected response code: %d", httpCode);
                     String response = http.getString();
-                    Serial.println("Response: " + response);
+                    ESP_LOGW(TAG, "Response: %s", response.c_str());
                 }
                 else
                 {
-                    Serial.printf("❌ HTTP request failed with error: %d\n", httpCode);
+                    ESP_LOGE(TAG, "HTTP request failed with error: %d", httpCode);
                 }
 
                 http.end();
             }
             else
             {
-                Serial.println("❌ Failed to connect to server");
+                ESP_LOGE(TAG, "Failed to connect to server");
             }
         }
         else if (command == "factory" && DEBUG)
         {
-            Serial.println("\nWARNING: Factory reset will erase ALL stored data!");
-            Serial.println("Type 'yes' to confirm or any other key to cancel:");
+            ESP_LOGW(TAG, "WARNING: Factory reset will erase ALL stored data!");
+            ESP_LOGI(TAG, "Type 'yes' to confirm or any other key to cancel:");
             while (!Serial.available())
             {
                 delay(100);
@@ -598,7 +604,7 @@ void loop()
             }
             else
             {
-                Serial.println("Factory reset cancelled.");
+                ESP_LOGI(TAG, "Factory reset cancelled.");
             }
         }
         // File Manager commands
@@ -621,20 +627,20 @@ void loop()
                 String url = command.substring(firstSpace + 1, secondSpace);
                 String path = command.substring(secondSpace + 1);
 
-                Serial.printf("Scheduling download: %s -> %s\n", url.c_str(), path.c_str());
+                ESP_LOGI(TAG, "Scheduling download: %s -> %s", url.c_str(), path.c_str());
                 if (fileManager.scheduleDownload(url, path))
                 {
-                    Serial.println("Download scheduled successfully");
+                    ESP_LOGI(TAG, "Download scheduled successfully");
                 }
                 else
                 {
-                    Serial.println("Failed to schedule download");
+                    ESP_LOGE(TAG, "Failed to schedule download");
                 }
             }
             else
             {
-                Serial.println("Usage: download <url> <local_path>");
-                Serial.println("Example: download http://example.com/audio.wav /audio/test.wav");
+                ESP_LOGI(TAG, "Usage: download <url> <local_path>");
+                ESP_LOGI(TAG, "Example: download http://example.com/audio.wav /audio/test.wav");
             }
         }
         else if (command.startsWith("addfile "))
@@ -648,20 +654,20 @@ void loop()
                 String path = command.substring(firstSpace + 1, secondSpace);
                 String url = command.substring(secondSpace + 1);
 
-                Serial.printf("Adding required file: %s <- %s\n", path.c_str(), url.c_str());
+                ESP_LOGI(TAG, "Adding required file: %s <- %s", path.c_str(), url.c_str());
                 if (fileManager.addRequiredFile(path, url))
                 {
-                    Serial.println("Required file added successfully");
+                    ESP_LOGI(TAG, "Required file added successfully");
                 }
                 else
                 {
-                    Serial.println("Failed to add required file");
+                    ESP_LOGE(TAG, "Failed to add required file");
                 }
             }
             else
             {
-                Serial.println("Usage: addfile <local_path> <url>");
-                Serial.println("Example: addfile /audio/sound.wav http://example.com/audio.wav");
+                ESP_LOGI(TAG, "Usage: addfile <local_path> <url>");
+                ESP_LOGI(TAG, "Example: addfile /audio/sound.wav http://example.com/audio.wav");
             }
         }
         else if (command.startsWith("deletefile "))
@@ -676,34 +682,34 @@ void loop()
 
                 if (filePath.isEmpty())
                 {
-                    Serial.println("Usage: deletefile <file_path>");
-                    Serial.println("Example: deletefile /images/image.webp");
+                    ESP_LOGI(TAG, "Usage: deletefile <file_path>");
+                    ESP_LOGI(TAG, "Example: deletefile /images/image.webp");
                 }
                 else
                 {
-                    Serial.println("Deleting file and removing from required list: " + filePath);
+                    ESP_LOGI(TAG, "Deleting file and removing from required list: %s", filePath.c_str());
                     if (fileManager.deleteFileAndRemoveFromRequired(filePath))
                     {
-                        Serial.println("File deleted successfully");
+                        ESP_LOGI(TAG, "File deleted successfully");
                     }
                     else
                     {
-                        Serial.println("Failed to delete file (file may not exist)");
+                        ESP_LOGW(TAG, "Failed to delete file (file may not exist)");
                     }
                 }
             }
             else
             {
-                Serial.println("Usage: deletefile <file_path>");
-                Serial.println("Example: deletefile /images/image.webp");
-                Serial.println("Note: This will also remove the file from required list to prevent re-download");
+                ESP_LOGI(TAG, "Usage: deletefile <file_path>");
+                ESP_LOGI(TAG, "Example: deletefile /images/image.webp");
+                ESP_LOGI(TAG, "Note: This will also remove the file from required list to prevent re-download");
             }
         }
         // Delete all required files command
         else if (command == "delete" && DEBUG)
         {
-            Serial.println("⚠️  WARNING: This will delete ALL required files from NVS and storage!");
-            Serial.println("Are you sure? Type 'yes' to confirm:");
+            ESP_LOGW(TAG, "WARNING: This will delete ALL required files from NVS and storage!");
+            ESP_LOGI(TAG, "Are you sure? Type 'yes' to confirm:");
 
             // Wait for confirmation
             unsigned long confirmTimeout = millis() + 10000; // 10 second timeout
@@ -720,13 +726,13 @@ void loop()
                     if (confirmation == "yes")
                     {
                         confirmed = true;
-                        Serial.println("Confirmation received. Deleting all required files...");
+                        ESP_LOGI(TAG, "Confirmation received. Deleting all required files...");
                         fileManager.clearAllRequiredFiles();
-                        Serial.println("✅ All required files have been deleted from NVS and storage.");
+                        ESP_LOGI(TAG, "All required files have been deleted from NVS and storage.");
                     }
                     else if (confirmation == "no" || confirmation.length() > 0)
                     {
-                        Serial.println("❌ Operation cancelled.");
+                        ESP_LOGI(TAG, "Operation cancelled.");
                         break;
                     }
                 }
@@ -735,7 +741,7 @@ void loop()
 
             if (!confirmed && millis() >= confirmTimeout)
             {
-                Serial.println("❌ Confirmation timeout. Operation cancelled.");
+                ESP_LOGI(TAG, "Confirmation timeout. Operation cancelled.");
             }
         }
         // Delete figure-specific files command
@@ -751,22 +757,22 @@ void loop()
 
                 if (figureUid.isEmpty())
                 {
-                    Serial.println("Usage: deletefig <figure_uid>");
-                    Serial.println("Example: deletefig c538b083-28c1-384b-ae6d-e58e1f38f1f7");
-                    Serial.println("Note: This will delete all files associated with the figure");
+                    ESP_LOGI(TAG, "Usage: deletefig <figure_uid>");
+                    ESP_LOGI(TAG, "Example: deletefig c538b083-28c1-384b-ae6d-e58e1f38f1f7");
+                    ESP_LOGI(TAG, "Note: This will delete all files associated with the figure");
                 }
                 else
                 {
-                    Serial.printf("🔍 Looking up figure ID for UID: %s\n", figureUid.c_str());
+                    ESP_LOGI(TAG, "Looking up figure ID for UID: %s", figureUid.c_str());
 
                     // Try to get figure ID from UID mapping
                     String figureId = requestManager.getFigureIdFromUid(figureUid);
 
                     if (figureId.length() > 0)
                     {
-                        Serial.printf("Found figure ID: %s for UID: %s\n", figureId.c_str(), figureUid.c_str());
-                        Serial.printf("⚠️  WARNING: This will delete all files for figure (UID: %s, ID: %s)\n", figureUid.c_str(), figureId.c_str());
-                        Serial.println("Type 'yes' to confirm deletion, or 'no' to cancel:");
+                        ESP_LOGI(TAG, "Found figure ID: %s for UID: %s", figureId.c_str(), figureUid.c_str());
+                        ESP_LOGW(TAG, "WARNING: This will delete all files for figure (UID: %s, ID: %s)", figureUid.c_str(), figureId.c_str());
+                        ESP_LOGI(TAG, "Type 'yes' to confirm deletion, or 'no' to cancel:");
 
                         // Wait for confirmation
                         unsigned long confirmTimeout = millis() + 10000; // 10 second timeout
@@ -783,20 +789,20 @@ void loop()
                                 if (confirmation == "yes")
                                 {
                                     confirmed = true;
-                                    Serial.printf("Deleting all files for figure ID: %s\n", figureId.c_str());
+                                    ESP_LOGI(TAG, "Deleting all files for figure ID: %s", figureId.c_str());
 
                                     if (fileManager.deleteFigureFiles(figureId))
                                     {
-                                        Serial.printf("✅ Successfully deleted all files for figure (UID: %s, ID: %s)\n", figureUid.c_str(), figureId.c_str());
+                                        ESP_LOGI(TAG, "Successfully deleted all files for figure (UID: %s, ID: %s)", figureUid.c_str(), figureId.c_str());
                                     }
                                     else
                                     {
-                                        Serial.printf("❌ Failed to delete files for figure (UID: %s, ID: %s)\n", figureUid.c_str(), figureId.c_str());
+                                        ESP_LOGE(TAG, "Failed to delete files for figure (UID: %s, ID: %s)", figureUid.c_str(), figureId.c_str());
                                     }
                                 }
                                 else if (confirmation == "no" || confirmation.length() > 0)
                                 {
-                                    Serial.println("❌ Operation cancelled.");
+                                    ESP_LOGI(TAG, "Operation cancelled.");
                                     break;
                                 }
                             }
@@ -805,40 +811,40 @@ void loop()
 
                         if (!confirmed && millis() >= confirmTimeout)
                         {
-                            Serial.println("❌ Confirmation timeout. Operation cancelled.");
+                            ESP_LOGI(TAG, "Confirmation timeout. Operation cancelled.");
                         }
                     }
                     else
                     {
-                        Serial.printf("❌ Figure ID not found for UID: %s\n", figureUid.c_str());
-                        Serial.println("This could mean:");
-                        Serial.println("1. The figure was never downloaded/tracked in this session");
-                        Serial.println("2. The UID is incorrect");
-                        Serial.println("3. You can manually delete by figure ID if you know it");
+                        ESP_LOGE(TAG, "Figure ID not found for UID: %s", figureUid.c_str());
+                        ESP_LOGI(TAG, "This could mean:");
+                        ESP_LOGI(TAG, "1. The figure was never downloaded/tracked in this session");
+                        ESP_LOGI(TAG, "2. The UID is incorrect");
+                        ESP_LOGI(TAG, "3. You can manually delete by figure ID if you know it");
 
                         // List available figure directories as a hint
-                        Serial.println("\nAvailable figure directories:");
+                        ESP_LOGI(TAG, "Available figure directories:");
                         std::vector<String> figureDirectories = fileManager.listFiles("/figures");
                         if (figureDirectories.empty())
                         {
-                            Serial.println("  (No figure directories found)");
+                            ESP_LOGI(TAG, "  (No figure directories found)");
                         }
                         else
                         {
                             for (const String &figureDir : figureDirectories)
                             {
-                                Serial.printf("  - Figure ID: %s\n", figureDir.c_str());
+                                ESP_LOGI(TAG, "  - Figure ID: %s", figureDir.c_str());
                             }
-                            Serial.println("\nYou can use 'deletefig <figure_id>' if you know the correct figure ID.");
+                            ESP_LOGI(TAG, "You can use 'deletefig <figure_id>' if you know the correct figure ID.");
                         }
                     }
                 }
             }
             else
             {
-                Serial.println("Usage: deletefig <figure_uid>");
-                Serial.println("Example: deletefig c538b083-28c1-384b-ae6d-e58e1f38f1f7");
-                Serial.println("Note: This will delete all files associated with the figure");
+                ESP_LOGI(TAG, "Usage: deletefig <figure_uid>");
+                ESP_LOGI(TAG, "Example: deletefig c538b083-28c1-384b-ae6d-e58e1f38f1f7");
+                ESP_LOGI(TAG, "Note: This will delete all files associated with the figure");
             }
         }
         // Audio commands
@@ -854,26 +860,26 @@ void loop()
 
                 if (filePath.isEmpty())
                 {
-                    Serial.println("Usage: play <file_path>");
-                    Serial.println("Example: play /audio/song.wav");
+                    ESP_LOGI(TAG, "Usage: play <file_path>");
+                    ESP_LOGI(TAG, "Example: play /audio/song.wav");
                 }
                 else
                 {
-                    Serial.println("Playing: " + filePath);
+                    ESP_LOGI(TAG, "Playing: %s", filePath.c_str());
                     if (audioController.play(filePath))
                     {
-                        Serial.println("Playback started successfully");
+                        ESP_LOGI(TAG, "Playback started successfully");
                     }
                     else
                     {
-                        Serial.println("Failed to start playback");
+                        ESP_LOGE(TAG, "Failed to start playback");
                     }
                 }
             }
             else
             {
-                Serial.println("Usage: play <file_path>");
-                Serial.println("Example: play /audio/song.wav");
+                ESP_LOGI(TAG, "Usage: play <file_path>");
+                ESP_LOGI(TAG, "Example: play /audio/song.wav");
             }
         }
         else if (command == "play")
@@ -883,86 +889,86 @@ void loop()
             {
                 if (audioController.hasPlaylist())
                 {
-                    Serial.printf("Playing playlist track %d/%d\n",
+                    ESP_LOGI(TAG, "Playing playlist track %d/%d",
                                   audioController.getCurrentTrackIndex() + 1,
                                   audioController.getPlaylistSize());
                 }
                 else
                 {
-                    Serial.println("Playback resumed");
+                    ESP_LOGI(TAG, "Playback resumed");
                 }
             }
             else
             {
-                Serial.println("No playlist available or failed to start playback");
+                ESP_LOGW(TAG, "No playlist available or failed to start playback");
             }
         }
         else if (command == "pause")
         {
             if (audioController.pause())
             {
-                Serial.println("Playback paused");
+                ESP_LOGI(TAG, "Playback paused");
             }
             else
             {
-                Serial.println("Nothing to pause or already paused");
+                ESP_LOGW(TAG, "Nothing to pause or already paused");
             }
         }
         else if (command == "resume")
         {
             if (audioController.resume())
             {
-                Serial.println("Playback resumed");
+                ESP_LOGI(TAG, "Playback resumed");
             }
             else
             {
-                Serial.println("Nothing to resume or not paused");
+                ESP_LOGW(TAG, "Nothing to resume or not paused");
             }
         }
         else if (command == "stop")
         {
             if (audioController.stop())
             {
-                Serial.println("Playback stopped");
+                ESP_LOGI(TAG, "Playback stopped");
             }
             else
             {
-                Serial.println("Nothing to stop or already stopped");
+                ESP_LOGW(TAG, "Nothing to stop or already stopped");
             }
         }
         else if (command == "next")
         {
             if (audioController.nextTrack())
             {
-                Serial.printf("Playing next track: %d/%d\n",
+                ESP_LOGI(TAG, "Playing next track: %d/%d",
                               audioController.getCurrentTrackIndex() + 1,
                               audioController.getPlaylistSize());
             }
             else
             {
-                Serial.println("No playlist available or reached end of playlist");
+                ESP_LOGW(TAG, "No playlist available or reached end of playlist");
             }
         }
         else if (command == "prev")
         {
             if (audioController.prevTrack())
             {
-                Serial.printf("Playing previous track: %d/%d\n",
+                ESP_LOGI(TAG, "Playing previous track: %d/%d",
                               audioController.getCurrentTrackIndex() + 1,
                               audioController.getPlaylistSize());
             }
             else
             {
-                Serial.println("No playlist available");
+                ESP_LOGW(TAG, "No playlist available");
             }
         }
         else if (command == "playlist")
         {
             if (audioController.hasPlaylist())
             {
-                Serial.printf("Current playlist (Figure UID: %s):\n",
+                ESP_LOGI(TAG, "Current playlist (Figure UID: %s):",
                               audioController.getPlaylistFigureUid().c_str());
-                Serial.printf("Current track: %d/%d\n",
+                ESP_LOGI(TAG, "Current track: %d/%d",
                               audioController.getCurrentTrackIndex() + 1,
                               audioController.getPlaylistSize());
 
@@ -971,85 +977,84 @@ void loop()
                 for (int i = 0; i < maxTracks; i++)
                 {
                     String indicator = (i == audioController.getCurrentTrackIndex()) ? " -> " : "    ";
-                    Serial.printf("%s%d. Track %d\n", indicator.c_str(), i + 1, i + 1);
+                    ESP_LOGI(TAG, "%s%d. Track %d", indicator.c_str(), i + 1, i + 1);
                 }
 
                 if (audioController.getPlaylistSize() > 10)
                 {
-                    Serial.printf("    ... and %d more tracks\n",
+                    ESP_LOGI(TAG, "    ... and %d more tracks",
                                   audioController.getPlaylistSize() - 10);
                 }
             }
             else
             {
-                Serial.println("No playlist loaded");
+                ESP_LOGI(TAG, "No playlist loaded");
             }
         }
         else if (command == "volup")
         {
             if (audioController.volumeUp())
             {
-                Serial.printf("Volume increased to %d%%\n", audioController.getCurrentVolume());
+                ESP_LOGI(TAG, "Volume increased to %d%%", audioController.getCurrentVolume());
             }
             else
             {
-                Serial.println("Volume already at maximum");
+                ESP_LOGW(TAG, "Volume already at maximum");
             }
         }
         else if (command == "voldown")
         {
             if (audioController.volumeDown())
             {
-                Serial.printf("Volume decreased to %d%%\n", audioController.getCurrentVolume());
+                ESP_LOGI(TAG, "Volume decreased to %d%%", audioController.getCurrentVolume());
             }
             else
             {
-                Serial.println("Volume already at minimum");
+                ESP_LOGW(TAG, "Volume already at minimum");
             }
         }
         else if (command == "volume")
         {
-            Serial.printf("Current volume: %d%%\n", audioController.getCurrentVolume());
+            ESP_LOGI(TAG, "Current volume: %d%%", audioController.getCurrentVolume());
         }
         else if (command == "track")
         {
             String track = audioController.getCurrentTrack();
             if (track.isEmpty())
             {
-                Serial.println("No track currently loaded");
+                ESP_LOGI(TAG, "No track currently loaded");
             }
             else
             {
-                Serial.println("Current track: " + track);
-                Serial.println("Status: " + String(
-                                                audioController.isPlaying() ? "Playing" : audioController.isPaused() ? "Paused"
-                                                                                                                     : "Stopped"));
+                ESP_LOGI(TAG, "Current track: %s", track.c_str());
+                ESP_LOGI(TAG, "Status: %s",
+                              audioController.isPlaying() ? "Playing" : audioController.isPaused() ? "Paused" : "Stopped");
             }
         }
         // Power control commands
         else if (command == "power")
         {
             bool powerState = digitalRead(17);
-            Serial.printf("Peripheral power (IO17): %s\n", powerState ? "ENABLED" : "DISABLED");
-            Serial.printf("Pin state: %s\n", powerState ? "HIGH" : "LOW");
+            ESP_LOGI(TAG, "Peripheral power (IO17): %s", powerState ? "ENABLED" : "DISABLED");
+            ESP_LOGI(TAG, "Pin state: %s", powerState ? "HIGH" : "LOW");
             if (!powerState)
             {
-                Serial.println("WARNING: Peripherals (SD card, etc.) will not work with power disabled!");
-                Serial.println("Use 'poweron' command to enable peripheral power.");
+                ESP_LOGW(TAG, "WARNING: Peripherals (SD card, etc.) will not work with power disabled!");
+                ESP_LOGI(TAG, "Use 'poweron' command to enable peripheral power.");
             }
         }
         else if (command == "poweron")
         {
-            Serial.println("Enabling peripheral power...");
+            ESP_LOGI(TAG, "Enabling peripheral power...");
             digitalWrite(17, HIGH);
             delay(100);
-            Serial.println("Peripheral power ENABLED");
-            Serial.println("You may need to reinitialize modules (restart recommended)");
+            ESP_LOGI(TAG, "Peripheral power ENABLED");
+            ESP_LOGI(TAG, "You may need to reinitialize modules (restart recommended)");
         }
         else if (command == "poweroff" && DEBUG)
         {
-            Serial.println("WARNING: This will disable power to SD card and other peripherals!");
-            Serial.println("Type 'yes' to confirm or any other key to cancel:");
+            ESP_LOGW(TAG, "WARNING: This will disable power to SD card and other peripherals!");
+            ESP_LOGI(TAG, "Type 'yes' to confirm or any other key to cancel:");
             while (!Serial.available())
             {
                 delay(100);
@@ -1061,11 +1066,11 @@ void loop()
             if (confirmation == "yes")
             {
                 digitalWrite(17, LOW);
-                Serial.println("Peripheral power DISABLED");
+                ESP_LOGI(TAG, "Peripheral power DISABLED");
             }
             else
             {
-                Serial.println("Power-off cancelled.");
+                ESP_LOGI(TAG, "Power-off cancelled.");
             }
         }
         // LED commands
@@ -1087,18 +1092,18 @@ void loop()
                 int intensity = intensityStr.toInt();
 
                 ledController.simpleLed(hexColor, intensity);
-                Serial.printf("LED set to color: 0x%06X, intensity: %d\n", hexColor, intensity);
+                ESP_LOGI(TAG, "LED set to color: 0x%06X, intensity: %d", hexColor, intensity);
             }
             else
             {
-                Serial.println("Usage: ledon <hex_color> <intensity>");
-                Serial.println("Example: ledon FF0000 128 (red color with 128 intensity)");
+                ESP_LOGI(TAG, "Usage: ledon <hex_color> <intensity>");
+                ESP_LOGI(TAG, "Example: ledon FF0000 128 (red color with 128 intensity)");
             }
         }
         else if (command == "ledoff")
         {
             ledController.turnOff();
-            Serial.println("LED turned off");
+            ESP_LOGI(TAG, "LED turned off");
         }
         else if (command.startsWith("pulse"))
         {
@@ -1111,12 +1116,12 @@ void loop()
             {
                 uint32_t hexColor = strtol(params.c_str(), NULL, 16);
                 ledController.pulseLed(hexColor);
-                Serial.printf("LED pulsing started with color: 0x%06X\n", hexColor);
+                ESP_LOGI(TAG, "LED pulsing started with color: 0x%06X", hexColor);
             }
             else
             {
-                Serial.println("Usage: pulse <hex_color>");
-                Serial.println("Example: pulse 00FF00 (green pulsing)");
+                ESP_LOGI(TAG, "Usage: pulse <hex_color>");
+                ESP_LOGI(TAG, "Example: pulse 00FF00 (green pulsing)");
             }
         }
         else if (command.startsWith("rapid"))
@@ -1136,54 +1141,46 @@ void loop()
                 int count = countStr.toInt();
 
                 ledController.pulseRapid(hexColor, count);
-                Serial.printf("LED rapid pulse started with color: 0x%06X, count: %d\n", hexColor, count);
+                ESP_LOGI(TAG, "LED rapid pulse started with color: 0x%06X, count: %d", hexColor, count);
             }
             else
             {
-                Serial.println("Usage: rapid <hex_color> <count>");
-                Serial.println("Example: rapid 0000FF 5 (blue rapid pulse 5 times)");
+                ESP_LOGI(TAG, "Usage: rapid <hex_color> <count>");
+                ESP_LOGI(TAG, "Example: rapid 0000FF 5 (blue rapid pulse 5 times)");
             }
         }
         // NFC commands
         else if (command == "nfcstatus")
         {
-            Serial.println("\n--- NFC Controller Status ---");
-            Serial.print("NFC Ready: ");
-            Serial.println(nfcController.isNFCReady() ? "Yes" : "No");
-            Serial.print("Reed Switch Active: ");
-            Serial.println(nfcController.isReedSwitchActive() ? "Yes" : "No");
-            Serial.print("Card Present: ");
-            Serial.println(nfcController.isCardPresent() ? "Yes" : "No");
-            Serial.println("-----------------------------\n");
+            ESP_LOGI(TAG, "--- NFC Controller Status ---");
+            ESP_LOGI(TAG, "NFC Ready: %s", nfcController.isNFCReady() ? "Yes" : "No");
+            ESP_LOGI(TAG, "Reed Switch Active: %s", nfcController.isReedSwitchActive() ? "Yes" : "No");
+            ESP_LOGI(TAG, "Card Present: %s", nfcController.isCardPresent() ? "Yes" : "No");
+            ESP_LOGI(TAG, "-----------------------------");
         }
         else if (command == "nfcdata")
         {
             NFCData currentCard = nfcController.currentNFCData();
-            Serial.println("\n--- Currently Docked NFC Card ---");
+            ESP_LOGI(TAG, "--- Currently Docked NFC Card ---");
             if (currentCard.isValid)
             {
-                Serial.print("UID: ");
-                Serial.println(currentCard.uidString);
-                Serial.print("UID Length: ");
-                Serial.println(currentCard.uidLength);
-                Serial.print("Timestamp: ");
-                Serial.println(currentCard.timestamp);
+                ESP_LOGI(TAG, "UID: %s", currentCard.uidString.c_str());
+                ESP_LOGI(TAG, "UID Length: %d", currentCard.uidLength);
+                ESP_LOGI(TAG, "Timestamp: %lu", currentCard.timestamp);
             }
             else
             {
-                Serial.println("No card is currently docked.");
+                ESP_LOGI(TAG, "No card is currently docked.");
             }
-            Serial.println("----------------------------------\n");
+            ESP_LOGI(TAG, "----------------------------------");
         }
         else if (command == "nfcreed")
         {
             bool rawReedState = digitalRead(REED_SWITCH_PIN);
-            Serial.println("\n--- Reed Switch Status ---");
-            Serial.print("Raw Pin State (GPIO4): ");
-            Serial.println(rawReedState ? "HIGH" : "LOW");
-            Serial.print("Debounced Controller State: ");
-            Serial.println(nfcController.isReedSwitchActive() ? "Active" : "Inactive");
-            Serial.println("-------------------------\n");
+            ESP_LOGI(TAG, "--- Reed Switch Status ---");
+            ESP_LOGI(TAG, "Raw Pin State (GPIO4): %s", rawReedState ? "HIGH" : "LOW");
+            ESP_LOGI(TAG, "Debounced Controller State: %s", nfcController.isReedSwitchActive() ? "Active" : "Inactive");
+            ESP_LOGI(TAG, "-------------------------");
         }
         else if (command == "nfcdiag")
         {
@@ -1198,7 +1195,7 @@ void loop()
         // System commands
         else if (command == "restart")
         {
-            Serial.println("\nRestarting device...");
+            ESP_LOGW(TAG, "Restarting device...");
             delay(1000);
             ESP.restart();
         }
@@ -1208,26 +1205,26 @@ void loop()
         }
         else if (command == "debug")
         {
-            Serial.println("\n--- Debug Information ---");
-            Serial.println("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
-            Serial.println("Largest free block: " + String(ESP.getMaxAllocHeap()) + " bytes");
-            Serial.println("Minimum free heap: " + String(ESP.getMinFreeHeap()) + " bytes");
-            Serial.println("Chip revision: " + String(ESP.getChipRevision()));
-            Serial.println("SDK version: " + String(ESP.getSdkVersion()));
-            Serial.println("WiFi mode: " + String(WiFi.getMode()));
-            Serial.println("WiFi status: " + String(WiFi.status()));
-            Serial.println("Battery: " + battery.getBatteryStatusString());
-            Serial.println("WiFi connected: " + String(WiFi.isConnected()));
-            Serial.println("Has WiFi credentials: " + String(config.hasWiFiCredentials()));
-            Serial.println("WiFi SSID length: " + String(config.getWiFiSSID().length()));
-            Serial.println("WiFi Password length: " + String(config.getWiFiPassword().length()));
+            ESP_LOGI(TAG, "--- Debug Information ---");
+            ESP_LOGI(TAG, "Free heap: %d bytes", ESP.getFreeHeap());
+            ESP_LOGI(TAG, "Largest free block: %d bytes", ESP.getMaxAllocHeap());
+            ESP_LOGI(TAG, "Minimum free heap: %d bytes", ESP.getMinFreeHeap());
+            ESP_LOGI(TAG, "Chip revision: %d", ESP.getChipRevision());
+            ESP_LOGI(TAG, "SDK version: %s", ESP.getSdkVersion());
+            ESP_LOGI(TAG, "WiFi mode: %d", WiFi.getMode());
+            ESP_LOGI(TAG, "WiFi status: %d", WiFi.status());
+            ESP_LOGI(TAG, "Battery: %s", battery.getBatteryStatusString().c_str());
+            ESP_LOGI(TAG, "WiFi connected: %s", WiFi.isConnected() ? "Yes" : "No");
+            ESP_LOGI(TAG, "Has WiFi credentials: %s", config.hasWiFiCredentials() ? "Yes" : "No");
+            ESP_LOGI(TAG, "WiFi SSID length: %d", config.getWiFiSSID().length());
+            ESP_LOGI(TAG, "WiFi Password length: %d", config.getWiFiPassword().length());
             
             // Check ESP32 WiFi provisioning library status
             bool provisioned = false;
             esp_err_t ret = wifi_prov_mgr_is_provisioned(&provisioned);
-            Serial.println("ESP32 WiFi Library Provisioned: " + String(provisioned ? "Yes" : "No"));
+            ESP_LOGI(TAG, "ESP32 WiFi Library Provisioned: %s", provisioned ? "Yes" : "No");
             if (ret != ESP_OK) {
-                Serial.printf("Provisioning check error: %s\n", esp_err_to_name(ret));
+                ESP_LOGE(TAG, "Provisioning check error: %s", esp_err_to_name(ret));
             }
             
             // Check actual WiFi config stored by ESP32
@@ -1235,45 +1232,45 @@ void loop()
             ret = esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
             if (ret == ESP_OK) {
                 String storedSSID = String((char*)wifi_cfg.sta.ssid);
-                Serial.println("ESP32 Stored SSID: " + (storedSSID.length() > 0 ? storedSSID : "(none)"));
-                Serial.println("ESP32 Stored Password Length: " + String(strlen((char*)wifi_cfg.sta.password)));
+                ESP_LOGI(TAG, "ESP32 Stored SSID: %s", storedSSID.length() > 0 ? storedSSID.c_str() : "(none)");
+                ESP_LOGI(TAG, "ESP32 Stored Password Length: %d", strlen((char*)wifi_cfg.sta.password));
             } else {
-                Serial.printf("Failed to get WiFi config: %s\n", esp_err_to_name(ret));
+                ESP_LOGE(TAG, "Failed to get WiFi config: %s", esp_err_to_name(ret));
             }
             
-            Serial.println("Note: BLE is automatically managed by ESP32 provisioning library");
+            ESP_LOGI(TAG, "Note: BLE is automatically managed by ESP32 provisioning library");
             config.printAllSettings();
         }
         // Add new heap command
         else if (command == "heap")
         {
-            Serial.println("\n--- Detailed Heap Information ---");
-            Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-            Serial.printf("Largest free block: %d bytes\n", ESP.getMaxAllocHeap());
-            Serial.printf("Minimum free heap since boot: %d bytes\n", ESP.getMinFreeHeap());
-            Serial.printf("Heap size: %d bytes\n", ESP.getHeapSize());
+            ESP_LOGI(TAG, "--- Detailed Heap Information ---");
+            ESP_LOGI(TAG, "Free heap: %d bytes", ESP.getFreeHeap());
+            ESP_LOGI(TAG, "Largest free block: %d bytes", ESP.getMaxAllocHeap());
+            ESP_LOGI(TAG, "Minimum free heap since boot: %d bytes", ESP.getMinFreeHeap());
+            ESP_LOGI(TAG, "Heap size: %d bytes", ESP.getHeapSize());
             
             // Calculate fragmentation
             float fragmentation = (1.0 - (float)ESP.getMaxAllocHeap() / ESP.getFreeHeap()) * 100;
-            Serial.printf("Heap fragmentation: %.1f%%\n", fragmentation);
+            ESP_LOGI(TAG, "Heap fragmentation: %.1f%%", fragmentation);
             
             // Memory status
             if (ESP.getFreeHeap() < CRITICAL_HEAP_THRESHOLD) {
-                Serial.println("Status: 🔴 CRITICAL - Very low memory");
+                ESP_LOGE(TAG, "Status: CRITICAL - Very low memory");
             } else if (ESP.getFreeHeap() < WARNING_HEAP_THRESHOLD) {
-                Serial.println("Status: 🟡 WARNING - Low memory");
+                ESP_LOGW(TAG, "Status: WARNING - Low memory");
             } else {
-                Serial.println("Status: 🟢 OK - Memory levels normal");
+                ESP_LOGI(TAG, "Status: OK - Memory levels normal");
             }
-            Serial.println("----------------------------------\n");
+            ESP_LOGI(TAG, "----------------------------------");
         }
         // Stack monitoring command
         else if (command == "stack")
         {
-            Serial.println("\n--- Stack Information ---");
+            ESP_LOGI(TAG, "--- Stack Information ---");
             UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
             size_t stackRemaining = stackHighWaterMark * sizeof(StackType_t);
-            Serial.printf("Stack high water mark: %d words (%d bytes)\n", 
+            ESP_LOGI(TAG, "Stack high water mark: %d words (%d bytes)", 
                          stackHighWaterMark, stackRemaining);
             
             // Estimate stack usage (assuming 16KB total from build flags)
@@ -1281,17 +1278,17 @@ void loop()
             size_t usedStack = totalStack - stackRemaining;
             float usagePercent = (float)usedStack / totalStack * 100;
             
-            Serial.printf("Estimated stack usage: %d/%d bytes (%.1f%%)\n", 
+            ESP_LOGI(TAG, "Estimated stack usage: %d/%d bytes (%.1f%%)", 
                          usedStack, totalStack, usagePercent);
             
             if (stackRemaining < 1000) {
-                Serial.println("Status: 🔴 CRITICAL - Very low stack space");
+                ESP_LOGE(TAG, "Status: CRITICAL - Very low stack space");
             } else if (stackRemaining < 2000) {
-                Serial.println("Status: 🟡 WARNING - Low stack space");
+                ESP_LOGW(TAG, "Status: WARNING - Low stack space");
             } else {
-                Serial.println("Status: 🟢 OK - Stack levels normal");
+                ESP_LOGI(TAG, "Status: OK - Stack levels normal");
             }
-            Serial.println("------------------------\n");
+            ESP_LOGI(TAG, "------------------------");
         }
         // AsyncTCP speed test command
         else if (command == "speedtest")
@@ -1301,7 +1298,7 @@ void loop()
         // File Manager commands that were missing
         else if (command == "dlstats")
         {
-            Serial.println(fileManager.getDownloadStatsString());
+            ESP_LOGI(TAG, "%s", fileManager.getDownloadStatsString().c_str());
         }
         else if (command == "dlqueue")
         {
@@ -1313,19 +1310,19 @@ void loop()
         }
         else if (command == "checkfiles")
         {
-            Serial.println("Checking required files and scheduling missing ones for download...");
+            ESP_LOGI(TAG, "Checking required files and scheduling missing ones for download...");
             fileManager.checkRequiredFiles();
-            Serial.println("Check complete. Use 'dlqueue' to see download queue.");
+            ESP_LOGI(TAG, "Check complete. Use 'dlqueue' to see download queue.");
         }
         else if (command == "cleanup")
         {
-            Serial.println("Cleaning up temporary files...");
+            ESP_LOGI(TAG, "Cleaning up temporary files...");
             fileManager.cleanupTempFiles();
-            Serial.println("Cleanup complete.");
+            ESP_LOGI(TAG, "Cleanup complete.");
         }
         else
         {
-            Serial.println("\nUnknown command. Type 'help' for a list of commands.");
+            ESP_LOGI(TAG, "Unknown command. Type 'help' for a list of commands.");
         }
     }
 

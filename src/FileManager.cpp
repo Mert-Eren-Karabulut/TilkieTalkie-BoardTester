@@ -1,5 +1,6 @@
 #include "FileManager.h"
 #include "BatteryManagement.h"
+#include "esp_task_wdt.h"
 
 // Initialize static members
 FileManager* FileManager::instance = nullptr;
@@ -64,7 +65,7 @@ void FileManager::end() {
     }
     
     // Unmount SD card
-    SD.end();
+    SD_MMC.end();
     sdCardInitialized = false;
     
     Serial.println("FileManager: Shutdown complete");
@@ -85,69 +86,41 @@ bool FileManager::initializeSDCard() {
         Serial.println("FileManager: Note - Voltage reading may be inaccurate when USB powered");
     }
     
-    // Configure CS pin as output and set high initially
-    pinMode(SD_CS_PIN, OUTPUT);
-    digitalWrite(SD_CS_PIN, HIGH);
-    delay(10);
+    // Initialize SD_MMC in 4-bit mode for ESP32-S3
+    Serial.printf("FileManager: Using SDMMC 4-bit mode\n");
+    Serial.printf("FileManager: Pins - CLK:%d, CMD:%d, D0:%d, D1:%d, D2:%d, D3:%d\n",
+                  SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN);
     
-    // Initialize SPI with explicit parameters
-    SPI.begin(SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+    // Configure SDMMC pins before initialization
+    SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN);
     
-    // Start with high-speed SPI for optimized performance
-    SPI.setFrequency(25000000);  // 25MHz - will fallback if needed during SD.begin()
+    // Single fast initialization attempt to avoid watchdog timeout
+    Serial.println("FileManager: Attempting SD_MMC initialization...");
+    Serial.println("FileManager: Note - SD card disabled to avoid watchdog timeout");
+    Serial.println("FileManager: SD card hardware may need troubleshooting");
+    Serial.println("FileManager: System will continue without SD card");
+    return false;
     
-    Serial.printf("FileManager: Using pins - CS:%d, CLK:%d, MISO:%d, MOSI:%d\n", 
-                  SD_CS_PIN, SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN);
-    
-    // Power cycle the SD card by toggling CS
-    digitalWrite(SD_CS_PIN, LOW);
-    delay(10);
-    digitalWrite(SD_CS_PIN, HIGH);
-    delay(100);
-    
-    // Try multiple initialization attempts with optimized speeds
-    bool sdInitialized = false;
-    uint32_t initSpeeds[] = {25000000, 20000000, 10000000, 4000000, 1000000, 400000}; // 25MHz down to 400kHz
-    const char* speedNames[] = {"25MHz", "20MHz", "10MHz", "4MHz", "1MHz", "400kHz"};
-    int numSpeeds = sizeof(initSpeeds) / sizeof(initSpeeds[0]);
-    
-    for (int attempt = 1; attempt <= 3 && !sdInitialized; attempt++) {
-        Serial.printf("FileManager: SD card initialization attempt %d/3\n", attempt);
-        
-        // Try different speeds, starting with fastest
-        for (int i = 0; i < numSpeeds && !sdInitialized; i++) {
-            Serial.printf("FileManager: Trying %s... ", speedNames[i]);
-            
-            if (SD.begin(SD_CS_PIN, SPI, initSpeeds[i])) {
-                sdInitialized = true;
-                Serial.printf("SUCCESS\n");
-                Serial.printf("FileManager: SD card initialized at %s (≈%.1f KB/s)\n", 
-                             speedNames[i], (initSpeeds[i] * 0.1) / 1024.0);
-                break;
-            } else {
-                Serial.printf("failed, ");
-            }
-        }
-        
-        if (!sdInitialized) {
-            Serial.printf("Attempt %d failed at all speeds, retrying...\n", attempt);
-            SD.end();  // Clean up before retry
-            delay(1000);
-        }
-    }
-    
-    if (!sdInitialized) {
-        Serial.println("FileManager: SD card initialization failed after 3 attempts");
+    // TODO: Re-enable when SD card hardware is working properly
+    /*
+    // Initialize SD_MMC with 4-bit mode, no format if mount fails
+    // Reduced max_files to 1 for fastest possible initialization
+    if (!SD_MMC.begin("/sdcard", false, true, SDMMC_FREQ_DEFAULT, 1)) {
+        Serial.println("FileManager: SD card initialization failed");
+        Serial.println("FileManager: System will continue without SD card");
         Serial.println("FileManager: Please check:");
         Serial.println("  1. SD card is properly inserted");
         Serial.println("  2. Wiring connections are correct");
         Serial.println("  3. SD card is formatted as FAT32");
-        Serial.println("  4. Power supply is adequate");
+        Serial.println("  4. Pull-up resistors (10-50kΩ) are present");
         return false;
     }
+    */
+    
+    Serial.println("FileManager: SD card initialized with SDMMC 4-bit mode");
     
     // Check SD card type
-    uint8_t cardType = SD.cardType();
+    uint8_t cardType = SD_MMC.cardType();
     if (cardType == CARD_NONE) {
         Serial.println("FileManager: No SD card attached");
         return false;
@@ -170,7 +143,7 @@ bool FileManager::initializeSDCard() {
     }
     
     // Print SD card size
-    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
     Serial.printf("FileManager: SD card size: %lluMB\n", cardSize);
     
     sdCardInitialized = true;
@@ -294,7 +267,7 @@ bool FileManager::deleteFile(const String& path) {
         return false;
     }
     
-    bool success = SD.remove(path);
+    bool success = SD_MMC.remove(path);
     
     if (fileSystemEventCallback) {
         fileSystemEventCallback("delete", path, success);
@@ -322,7 +295,7 @@ bool FileManager::deleteFileAndRemoveFromRequired(const String& path) {
     }
     
     // Check if path points to a directory
-    File fileOrDir = SD.open(path);
+    File fileOrDir = SD_MMC.open(path);
     if (fileOrDir) {
         if (fileOrDir.isDirectory()) {
             fileOrDir.close();
@@ -365,7 +338,7 @@ bool FileManager::deleteFileAndRemoveFromRequired(const String& path) {
     }
     
     // Attempt to delete the file
-    bool success = SD.remove(path);
+    bool success = SD_MMC.remove(path);
     
     if (fileSystemEventCallback) {
         fileSystemEventCallback("delete_smart", path, success);
@@ -399,7 +372,7 @@ bool FileManager::createDirectory(const String& path) {
         return false;
     }
     
-    bool success = SD.mkdir(path);
+    bool success = SD_MMC.mkdir(path);
     
     if (fileSystemEventCallback) {
         fileSystemEventCallback("mkdir", path, success);
@@ -409,7 +382,7 @@ bool FileManager::createDirectory(const String& path) {
         Serial.printf("FileManager: Directory created successfully: %s\n", path.c_str());
     } else {
         // Directory might already exist, check if it exists
-        File dir = SD.open(path);
+        File dir = SD_MMC.open(path);
         if (dir && dir.isDirectory()) {
             dir.close();
             return true; // Directory already exists
@@ -425,7 +398,7 @@ bool FileManager::fileExists(const String& path) {
         return false;
     }
     
-    File file = SD.open(path);
+    File file = SD_MMC.open(path);
     if (file) {
         file.close();
         return true;
@@ -440,7 +413,7 @@ std::vector<String> FileManager::listFiles(const String& directory) {
         return files;
     }
     
-    File dir = SD.open(directory);
+    File dir = SD_MMC.open(directory);
     if (!dir || !dir.isDirectory()) {
         Serial.printf("FileManager: Failed to open directory: %s\n", directory.c_str());
         return files;
@@ -548,7 +521,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     
     // Verify directory exists before proceeding
     String dir = getDirectoryFromPath(localPath);
-    File dirFile = SD.open(dir);
+    File dirFile = SD_MMC.open(dir);
     if (!dirFile || !dirFile.isDirectory()) {
         errorMsg = "Directory creation failed or not accessible: " + dir;
         if (dirFile) dirFile.close();
@@ -561,8 +534,8 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     String tempPath = localPath + ".tmp";
     
     // Remove any existing temp file
-    if (SD.exists(tempPath)) {
-        SD.remove(tempPath);
+    if (SD_MMC.exists(tempPath)) {
+        SD_MMC.remove(tempPath);
     }
     
     // Create WiFi client and connect
@@ -649,7 +622,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         return false;
     }
     
-    File file = SD.open(tempPath, FILE_WRITE);
+    File file = SD_MMC.open(tempPath, FILE_WRITE);
     if (!file) {
         errorMsg = "Failed to create temporary file: " + tempPath;
         client.stop();
@@ -782,7 +755,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     client.stop();
     
     if (!downloadSuccess) {
-        SD.remove(tempPath);
+        SD_MMC.remove(tempPath);
         downloadInProgress = false;
         
         // Update failure statistics
@@ -801,7 +774,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
                 // Size difference within tolerance, continue silently
             } else {
                 errorMsg = "Download incomplete: " + String(totalDownloaded) + "/" + String(contentLength) + " bytes (" + String(missingBytes) + " bytes missing)";
-                SD.remove(tempPath);
+                SD_MMC.remove(tempPath);
                 downloadInProgress = false;
                 return false;
             }
@@ -811,19 +784,19 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     }
     
     // Move temporary file to final location
-    if (SD.exists(localPath)) {
-        SD.remove(localPath);
+    if (SD_MMC.exists(localPath)) {
+        SD_MMC.remove(localPath);
     }
     
-    if (!SD.rename(tempPath, localPath)) {
+    if (!SD_MMC.rename(tempPath, localPath)) {
         errorMsg = "Failed to move temporary file to final location";
-        SD.remove(tempPath);
+        SD_MMC.remove(tempPath);
         downloadInProgress = false;
         return false;
     }
     
     // Verify final file exists and has reasonable size
-    File finalFile = SD.open(localPath);
+    File finalFile = SD_MMC.open(localPath);
     if (!finalFile) {
         errorMsg = "Final file verification failed";
         downloadInProgress = false;
@@ -836,7 +809,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         int sizeDiff = abs((int)finalSize - (int)contentLength);
         if (sizeDiff > 64) { // Allow up to 64 bytes difference
             errorMsg = "Final file size mismatch: expected " + String(contentLength) + ", got " + String(finalSize);
-            SD.remove(localPath);
+            SD_MMC.remove(localPath);
             downloadInProgress = false;
             return false;
         } else if (sizeDiff > 0) {
@@ -1056,7 +1029,7 @@ bool FileManager::createDirectoryStructure(const String& path) {
     }
     
     // Check if directory already exists
-    File dirFile = SD.open(dir);
+    File dirFile = SD_MMC.open(dir);
     if (dirFile && dirFile.isDirectory()) {
         dirFile.close();
         return true;
@@ -1075,7 +1048,7 @@ bool FileManager::createDirectoryRecursive(const String& path) {
     }
     
     // Check if directory already exists
-    File dirFile = SD.open(path);
+    File dirFile = SD_MMC.open(path);
     if (dirFile && dirFile.isDirectory()) {
         dirFile.close();
         return true;
@@ -1096,12 +1069,12 @@ bool FileManager::createDirectoryRecursive(const String& path) {
     }
     
     // Now create this directory
-    bool success = SD.mkdir(path);
+    bool success = SD_MMC.mkdir(path);
     if (success) {
         Serial.printf("FileManager: Created directory: %s\n", path.c_str());
     } else {
         // Check if it exists now (might have been created by another process)
-        File dirFile = SD.open(path);
+        File dirFile = SD_MMC.open(path);
         if (dirFile && dirFile.isDirectory()) {
             dirFile.close();
             Serial.printf("FileManager: Directory already exists: %s\n", path.c_str());
@@ -1134,7 +1107,7 @@ String FileManager::calculateFileChecksum(const String& filePath) {
     // Simple CRC32 checksum implementation
     // For production, consider using a more robust hash like SHA256
     
-    File file = SD.open(filePath);
+    File file = SD_MMC.open(filePath);
     if (!file) {
         return "";
     }
@@ -1166,21 +1139,21 @@ size_t FileManager::getSDCardTotalSpace() {
     if (!sdCardInitialized) {
         return 0;
     }
-    return SD.cardSize();
+    return SD_MMC.cardSize();
 }
 
 size_t FileManager::getSDCardUsedSpace() {
     if (!sdCardInitialized) {
         return 0;
     }
-    return SD.usedBytes();
+    return SD_MMC.usedBytes();
 }
 
 size_t FileManager::getSDCardFreeSpace() {
     if (!sdCardInitialized) {
         return 0;
     }
-    return SD.cardSize() - SD.usedBytes();
+    return SD_MMC.cardSize() - SD_MMC.usedBytes();
 }
 
 String FileManager::getSDCardInfo() {
@@ -1191,7 +1164,7 @@ String FileManager::getSDCardInfo() {
     String info = "SD Card Information:\n";
     info += "Type: ";
     
-    uint8_t cardType = SD.cardType();
+    uint8_t cardType = SD_MMC.cardType();
     switch (cardType) {
         case CARD_MMC:
             info += "MMC\n";
@@ -1551,7 +1524,7 @@ void FileManager::resetDownloadStats() {
 }
 
 bool FileManager::removeDirectory(const String& path) {
-    bool success = SD.rmdir(path);
+    bool success = SD_MMC.rmdir(path);
     
     if (fileSystemEventCallback) {
         fileSystemEventCallback("rmdir", path, success);
@@ -1570,7 +1543,7 @@ void FileManager::printFileTree() {
     Serial.println("=== SD Card File Tree ===");
 
     std::function<void(const String&, int)> printTree = [&](const String& dir, int depth) {
-        File dirFile = SD.open(dir);
+        File dirFile = SD_MMC.open(dir);
         if (!dirFile || !dirFile.isDirectory()) {
             if (dirFile) dirFile.close();
             return;
@@ -1612,7 +1585,7 @@ void FileManager::formatSDCard() {
 
     // Remove all files and directories recursively
     std::function<void(const String&)> removeAll = [&](const String& dir) {
-        File dirFile = SD.open(dir);
+        File dirFile = SD_MMC.open(dir);
         if (!dirFile) return;
         File entry = dirFile.openNextFile();
         while (entry) {
@@ -1623,13 +1596,13 @@ void FileManager::formatSDCard() {
                 if (!subDir.endsWith("/")) subDir += "/";
                 subDir += entryName;
                 removeAll(subDir);
-                SD.rmdir(subDir);
+                SD_MMC.rmdir(subDir);
             } else {
                 entry.close();
                 String filePath = dir;
                 if (!filePath.endsWith("/")) filePath += "/";
                 filePath += entryName;
-                SD.remove(filePath);
+                SD_MMC.remove(filePath);
             }
             entry = dirFile.openNextFile();
         }

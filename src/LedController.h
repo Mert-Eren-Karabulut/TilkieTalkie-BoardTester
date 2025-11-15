@@ -9,7 +9,7 @@ class ConfigManager;
 
 class LedController {
 private:
-    static const int LED_PIN = 16;          // GPIO16 for WS2812B data pin
+    static const int LED_PIN = 5;           // GPIO5 for WS2812B data pin (ESP32-S3)
     static const int NUM_LEDS = 1;          // Single LED
     static const int LED_MAX_POWER = 255;   // Max brightness (0-255)
     

@@ -1,7 +1,7 @@
 #include "Buttons.h"
 
 // Static member definitions
-const int ButtonController::BUTTON_PINS[MAX_BUTTONS] = {36, 32, 33, 27}; // GPIO pins for buttons 1-4
+const int ButtonController::BUTTON_PINS[MAX_BUTTONS] = {12, 13, 14, 21}; // GPIO pins for buttons 1-4 (ESP32-S3)
 volatile bool ButtonController::interruptFlag = false;
 
 ButtonController& ButtonController::getInstance() {

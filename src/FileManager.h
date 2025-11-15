@@ -2,7 +2,7 @@
 #define FILEMANAGER_H
 
 #include <Arduino.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <WiFi.h>
 #include <nvs_flash.h>
 #include <nvs.h>
@@ -33,11 +33,13 @@ private:
     // Singleton instance
     static FileManager* instance;
     
-    // SD Card pin definitions
-    static const int SD_CS_PIN = 15;
-    static const int SD_MISO_PIN = 12;
-    static const int SD_MOSI_PIN = 13;
-    static const int SD_CLK_PIN = 14;
+    // SD Card pin definitions (SDMMC 4-bit mode for ESP32-S3)
+    static const int SD_CLK_PIN = 36;      // SD_CLK (GPIO36)
+    static const int SD_CMD_PIN = 35;      // SD_CMD (GPIO35)
+    static const int SD_D0_PIN = 37;       // SD_D0 (GPIO37)
+    static const int SD_D1_PIN = 38;       // SD_D1 (GPIO38)
+    static const int SD_D2_PIN = 39;       // SD_D2 (GPIO39)
+    static const int SD_D3_PIN = 40;       // SD_D3 (GPIO40)
     
     // SD Card speed configuration (optimized for high-speed cards)
     // Default initialization tries 25MHz first, falls back to slower speeds if neededß

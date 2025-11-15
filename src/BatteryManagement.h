@@ -9,8 +9,8 @@ private:
     static BatteryManager* instance;
     
     // Pin definitions
-    static const int BATTERY_ADC_PIN = 39;     // SENSOR_VN (GPIO39)
-    static const int CHARGING_PIN = 34;         // IO34 for charging indicator
+    static const int BATTERY_ADC_PIN = 1;      // v_sense (GPIO1) ESP32-S3
+    static const int CHARGING_PIN = 2;         // charging (GPIO2) ESP32-S3
     
     // Battery voltage constants (for single cell Li-ion/Li-Po)
     static constexpr float BATTERY_MIN_VOLTAGE = 3.0;    // Minimum safe voltage

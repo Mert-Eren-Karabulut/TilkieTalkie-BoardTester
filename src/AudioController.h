@@ -33,13 +33,13 @@ public:
     static const uint8_t ES8388_ADDR = 0x10;
 
     // Pin definitions (updated with actual GPIO assignments)
-    static const int I2S_BCLK_PIN = 5;     // c_sclk - I2S bit clock (GPIO5)
-    static const int I2S_LRCK_PIN = 25;    // c_lrck - I2S left/right clock (GPIO25)
-    static const int I2S_DOUT_PIN = 26;    // c_dsdin - I2S data from ESP32 to ES8388 (GPIO26)
-    static const int I2S_MCLK_PIN = 0;     // c_mclk - I2S master clock (GPIO0) - ADDED
-    static const int I2C_SDA_PIN = 18;     // c_sda - I2C data for ES8388 control (GPIO18)
-    static const int I2C_SCL_PIN = 23;     // c_scl - I2C clock for ES8388 control (GPIO23)
-    static const int MUTE_PIN = 19;        // Optional mute control pin (you can change this)
+    static const int I2S_BCLK_PIN = 7;     // c_sclk - I2S bit clock (GPIO7) ESP32-S3
+    static const int I2S_LRCK_PIN = 8;     // c_lrck - I2S left/right clock (GPIO8) ESP32-S3
+    static const int I2S_DOUT_PIN = 10;    // c_dsdin - I2S data from ESP32 to ES8388 (GPIO10) ESP32-S3
+    static const int I2S_MCLK_PIN = 11;    // c_mclk - I2S master clock (GPIO11) ESP32-S3
+    static const int I2C_SDA_PIN = 17;     // c_sda - I2C data for ES8388 control (GPIO17) ESP32-S3
+    static const int I2C_SCL_PIN = 18;     // c_scl - I2C clock for ES8388 control (GPIO18) ESP32-S3
+    static const int MUTE_PIN = 49;        // Optional mute control pin (you can change this)
     // Available but not used: c_asdout (GPIO35)
 
     // Buffer size for audio streaming

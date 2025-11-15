@@ -7,11 +7,11 @@
 #include <functional>
 
 // Pin definitions based on the working example sketch
-#define REED_SWITCH_PIN 4
-#define NFC_SDA_PIN 22
-#define NFC_SCL_PIN 21
-#define NFC_IRQ_PIN 33
-#define NFC_RESET_PIN 32  // Changed from 17 to avoid conflict with peripheral power
+#define REED_SWITCH_PIN 6     // ESP32-S3
+#define NFC_SDA_PIN 16        // ESP32-S3
+#define NFC_SCL_PIN 15        // ESP32-S3
+#define NFC_IRQ_PIN 47        // Not used
+#define NFC_RESET_PIN 48      // Not used
 
 // Constants for NFC operations
 #define MAX_UID_LENGTH 7
