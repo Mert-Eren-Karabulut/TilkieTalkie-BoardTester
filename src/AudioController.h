@@ -5,7 +5,7 @@
 #include <driver/i2s_std.h>
 #include <Wire.h>
 #include <vector>
-#include "AudioFileSourceSD.h"
+#include "AudioFileSourceFS.h"
 #include "AudioFileSourceBuffer.h"
 #include "AudioGeneratorWAV.h"
 #include "AudioOutputI2S.h"
@@ -105,7 +105,7 @@ private:
     ~AudioController();
 
     // Audio components
-    AudioFileSourceSD* audioFile;
+    AudioFileSourceFS* audioFile;
     AudioFileSourceBuffer* audioBuffer;
     AudioGeneratorWAV* audioWAV;
     AudioOutputI2S* audioOutput;

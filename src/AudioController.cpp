@@ -1,7 +1,9 @@
 #include "AudioController.h"
 #include "ConfigManager.h"
 #include "NfcController.h"
-#include "AudioFileSourceSD.h"
+#include "AudioFileSourceFS.h"
+#include <SD_MMC.h>
+    
 #include "AudioFileSourceBuffer.h"
 #include "AudioGeneratorWAV.h"
 #include "AudioOutputI2S.h"
@@ -235,10 +237,19 @@ bool AudioController::play(const String& filePath) {
     // Clean up previous components following the working example pattern
     cleanupAudioComponents();
     
-    // Create new components (following the working example)
-    audioFile = new AudioFileSourceSD(filePath.c_str());
+    // Create new components using AudioFileSourceFS with SD_MMC filesystem
+    // Pass &SD_MMC as the filesystem reference, then open the file
+    audioFile = new AudioFileSourceFS(SD_MMC);
     if (!audioFile) {
-        Serial.println("AudioController: Failed to create AudioFileSourceSD");
+        Serial.println("AudioController: Failed to create AudioFileSourceFS");
+        return false;
+    }
+    
+    // Open the file on the SD_MMC filesystem
+    if (!audioFile->open(filePath.c_str())) {
+        Serial.printf("AudioController: Failed to open file: %s\n", filePath.c_str());
+        delete audioFile;
+        audioFile = nullptr;
         return false;
     }
     
@@ -322,11 +333,24 @@ bool AudioController::resume() {
             return false;
         }
         
-        // Create new audio file source
-        audioFile = new AudioFileSourceSD(currentTrackPath.c_str());
+        // Create new audio file source with SD_MMC filesystem
+        audioFile = new AudioFileSourceFS(SD_MMC);
         if (!audioFile) {
-            Serial.printf("AudioController: Failed to reopen audio file: %s\n", currentTrackPath.c_str());
+            Serial.printf("AudioController: Failed to create AudioFileSourceFS for resume\n");
             cleanupAudioComponents();
+            currentState = STOPPED;
+            currentTrackPath = "";
+            hasPausedPosition = false;
+            return false;
+        }
+        
+        // Open the file on the SD_MMC filesystem
+        if (!audioFile->open(currentTrackPath.c_str())) {
+            Serial.printf("AudioController: Failed to open audio file for resume: %s\n", currentTrackPath.c_str());
+            delete audioFile;
+            audioFile = nullptr;
+            delete audioWAV;
+            audioWAV = nullptr;
             currentState = STOPPED;
             currentTrackPath = "";
             hasPausedPosition = false;

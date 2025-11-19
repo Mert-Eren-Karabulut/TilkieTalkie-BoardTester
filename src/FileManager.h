@@ -2,7 +2,7 @@
 #define FILEMANAGER_H
 
 #include <Arduino.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <WiFi.h>
 #include <nvs_flash.h>
 #include <nvs.h>
@@ -36,22 +36,13 @@ private:
     // Singleton instance
     static FileManager *instance;
 
-    // SD Card pin definitions
-    // static const int SD_CLK_PIN = 48; // SD_CLK
-    // static const int SD_CMD_PIN = 47; // SD_CMD
-    // static const int SD_D0_PIN = 42;  // SD_D0 (Changed from GPIO45 - strapping pin!)
-    // static const int SD_D1_PIN = 38;  // SD_D1
-    // static const int SD_D2_PIN = 39;  // SD_D2
-    // static const int SD_D3_PIN = 40;  // SD_D3
-
-    // SPI Mode pin mapping (converted from SDMMC pins above)
-    static const int SD_CS_PIN = 40;    // SD_D3 becomes CS in SPI mode
-    static const int SD_MISO_PIN = 42;  // SD_D0 becomes MISO in SPI mode
-    static const int SD_MOSI_PIN = 47;  // SD_CMD becomes MOSI in SPI mode
-    static const int SD_CLK_PIN = 48;   // SD_CLK remains CLK in SPI mode 
-
-    // SD Card speed configuration (optimized for high-speed cards)
-    // Default initialization tries 25MHz first, falls back to slower speeds if neededß
+    // SD Card pin definitions (4-bit SDMMC mode)
+    static const int SD_CLK_PIN = 48; // SD_CLK
+    static const int SD_CMD_PIN = 47; // SD_CMD
+    static const int SD_D0_PIN = 42;  // SD_D0 
+    static const int SD_D1_PIN = 38;  // SD_D1
+    static const int SD_D2_PIN = 39;  // SD_D2
+    static const int SD_D3_PIN = 40;  // SD_D3
 
     // Download configuration
     static const int MAX_RETRY_COUNT = 5;
