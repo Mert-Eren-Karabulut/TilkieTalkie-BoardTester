@@ -112,26 +112,34 @@ bool AudioController::begin() {
         return true;
     }
 
+    Serial.println("AudioController: Beginning initialization...");
+    
     // Initialize I2C for ES8388 control
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(100000);
     
-    // Initialize mute pin
+    // Initialize mute pin (mute during initialization)
     pinMode(MUTE_PIN, OUTPUT);
     digitalWrite(MUTE_PIN, HIGH);
     
-    // Initialize ES8388
-    if (!initializeES8388()) {
-        return false;
-    }
-
-    // Initialize I2S
+    // CRITICAL: Initialize I2S and audio components FIRST
+    // This starts the MCLK signal that the ES8388 needs
     if (!initializeI2S()) {
+        Serial.println("AudioController: Failed to initialize I2S");
         return false;
     }
 
-    // Initialize audio components
     if (!initializeAudioComponents()) {
+        Serial.println("AudioController: Failed to initialize audio components");
+        return false;
+    }
+    
+    // Small delay to let MCLK stabilize before configuring ES8388
+    delay(100);
+    
+    // Now initialize ES8388 (it needs MCLK running)
+    if (!initializeES8388()) {
+        Serial.println("AudioController: Failed to initialize ES8388");
         return false;
     }
     
@@ -139,9 +147,10 @@ bool AudioController::begin() {
 
     // Set volume and unmute
     setVolume(currentVolume, true);
+    delay(50); // Let volume setting propagate
     digitalWrite(MUTE_PIN, LOW);
     
-    Serial.println("AudioController: Initialization complete");
+    Serial.println("AudioController: Initialization complete - ready for playback");
     
     return true;
 }
@@ -169,9 +178,7 @@ void AudioController::end() {
     initialized = false;
 }
 
-bool AudioController::play(const String& filePath) {
-    Serial.printf("AudioController: play() called with filePath: '%s'\n", filePath.c_str());
-    
+bool AudioController::play(const String& filePath) {    
     if (!initialized) {
         Serial.println("AudioController: Not initialized");
         return false;
@@ -623,6 +630,8 @@ void AudioController::volumeBeep() {
 }
 
 bool AudioController::initializeES8388() {
+    Serial.println("AudioController: Initializing ES8388...");
+    
     // Reset ES8388 to default values
     writeES8388Register(ES8388_CONTROL1, 0x80);
     delay(50);
@@ -631,33 +640,38 @@ bool AudioController::initializeES8388() {
 
     // --- Power Management ---
     // Power up analog and bias generation
-    writeES8388Register(ES8388_CONTROL2, 0x40);  // Power up analog, disable low power modes [cite: 392]
-    writeES8388Register(ES8388_CONTROL1, 0x04);  // Enable reference circuits [cite: 390]
-    writeES8388Register(ES8388_CHIPPOWER, 0x00); // Power up digital blocks [cite: 399]
+    writeES8388Register(ES8388_CONTROL2, 0x40);  // Power up analog, disable low power modes
+    writeES8388Register(ES8388_CONTROL1, 0x04);  // Enable reference circuits
+    writeES8388Register(ES8388_CHIPPOWER, 0x00); // Power up digital blocks
     
     // **NEW**: Explicitly power down the entire ADC path to reduce noise
     writeES8388Register(ES8388_ADCPOWER, 0xFF);  // Power down ADC, Mic Bias, and analog inputs 
     
     // --- Clocking and Format ---
-    writeES8388Register(ES8388_MASTERMODE, 0x00);   // Set to Slave mode [cite: 423]
-    writeES8388Register(ES8388_ADCCONTROL4, 0x0C);  // Set ADC to I2S, 16-bit (good practice) [cite: 449]
-    writeES8388Register(ES8388_DACCONTROL1, 0x18);  // Set DAC to I2S, 16-bit [cite: 510]
+    writeES8388Register(ES8388_MASTERMODE, 0x00);   // Set to Slave mode (ESP32-S3 is master)
+    writeES8388Register(ES8388_ADCCONTROL4, 0x0C);  // Set ADC to I2S, 16-bit
+    writeES8388Register(ES8388_DACCONTROL1, 0x18);  // Set DAC to I2S, 16-bit
+
+    // --- Clocking and Format ---
+    writeES8388Register(ES8388_MASTERMODE, 0x00);   // Set to Slave mode (ESP32-S3 is master)
+    writeES8388Register(ES8388_ADCCONTROL4, 0x0C);  // Set ADC to I2S, 16-bit
+    writeES8388Register(ES8388_DACCONTROL1, 0x18);  // Set DAC to I2S, 16-bit
 
     // --- Gain and Volume (Fix for distortion) ---
-    // **NEW**: Apply -12dB of digital attenuation to the DAC to prevent clipping
+    // Apply -12dB of digital attenuation to the DAC to prevent clipping
     // The digital volume registers attenuate in 0.5dB steps. 24 * -0.5dB = -12dB.
     writeES8388Register(ES8388_DACCONTROL4, 0x00);  // Left DAC digital volume to -12dB 
-    writeES8388Register(ES8388_DACCONTROL5, 0x00);  // Right DAC digital volume to -12dB [cite: 525]
+    writeES8388Register(ES8388_DACCONTROL5, 0x00);  // Right DAC digital volume to -12dB
 
     // --- Output Mixer Configuration ---
     // Route the DAC signal to the headphone output (LOUT1/ROUT1)
-    writeES8388Register(ES8388_DACCONTROL17, 0x80); // Enable Left DAC to Left Mixer [cite: 564]
-    writeES8388Register(ES8388_DACCONTROL20, 0x80); // Enable Right DAC to Right Mixer [cite: 577]
+    writeES8388Register(ES8388_DACCONTROL17, 0x80); // Enable Left DAC to Left Mixer
+    writeES8388Register(ES8388_DACCONTROL20, 0x80); // Enable Right DAC to Right Mixer
 
     // --- Final Power-Up ---
     // Power up the DACs and enable the Headphone Outputs (LOUT1/ROUT1)
-    writeES8388Register(ES8388_DACPOWER, 0x30);     // Enable DAC L/R and LOUT1/ROUT1 [cite: 411]
-    writeES8388Register(ES8388_DACCONTROL3, 0x20);  // Unmute DAC with soft ramp enabled [cite: 515]
+    writeES8388Register(ES8388_DACPOWER, 0x30);     // Enable DAC L/R and LOUT1/ROUT1
+    writeES8388Register(ES8388_DACCONTROL3, 0x20);  // Unmute DAC with soft ramp enabled
     
     // Initialize headphone output volume to a reasonable default (will be overridden by setVolume later)
     // Set to about 50% volume initially to avoid any potential issues
@@ -881,9 +895,12 @@ bool AudioController::initializeAudioComponents() {
             return false;
         }
         
-        // Configure audio output
-        audioOutput->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
+        // Configure audio output WITH MCLK - critical for ES8388!
+        audioOutput->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN);
         audioOutput->SetGain(currentVolume / 100.0f);
+        
+        Serial.printf("AudioController: I2S configured - BCLK:%d, LRCK:%d, DOUT:%d, MCLK:%d\n",
+                     I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN);
     }
     
     return true;

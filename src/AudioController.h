@@ -39,7 +39,7 @@ public:
     static const int I2S_MCLK_PIN = 11;    // c_mclk - I2S master clock (GPIO11) ESP32-S3
     static const int I2C_SDA_PIN = 17;     // c_sda - I2C data for ES8388 control (GPIO17) ESP32-S3
     static const int I2C_SCL_PIN = 18;     // c_scl - I2C clock for ES8388 control (GPIO18) ESP32-S3
-    static const int MUTE_PIN = 49;        // Optional mute control pin (you can change this)
+    static const int MUTE_PIN = 41;        // Optional mute control pin (you can change this)
     // Available but not used: c_asdout (GPIO35)
 
     // Buffer size for audio streaming

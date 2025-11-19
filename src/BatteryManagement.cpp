@@ -151,7 +151,7 @@ float BatteryManager::voltageToPercentage(float voltage) {
 void BatteryManager::updateChargingStatus() {
     // Read charging pin (assuming active LOW when charging)
     // Adjust this logic based on your charging circuit
-    isCharging = !digitalRead(CHARGING_PIN);
+    isCharging = digitalRead(CHARGING_PIN);
 }
 
 String BatteryManager::getBatteryStatusString() const {

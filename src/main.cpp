@@ -17,7 +17,7 @@
 #include "Buttons.h"
 #include "AsyncSpeedTest.h"
 
-static const char* TAG = "MAIN";
+static const char *TAG = "MAIN";
 
 // Helper macros to ensure Serial output appears via ESP-IDF logging
 #define LOG_PRINTF(tag, format, ...) ESP_LOGI(tag, format, ##__VA_ARGS__)
@@ -78,9 +78,9 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
         if (nfcController.isCardPresent() && nfcController.currentNFCData().uidString == uid)
         {
             ESP_LOGI(TAG, "Figure is still mounted! Starting automatic playback...");
-            
+
             // Add delay and heap check to prevent rapid execution
-            delay(300);  // Give system time to stabilize
+            delay(300); // Give system time to stabilize
 
             // Pulse LED green to indicate success
             ledController.pulseRapid(0x00FF00, 2); // Green color, 2 rapid pulses
@@ -91,6 +91,7 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
             {
                 for (const auto &track : episode.tracks)
                 {
+                    // Path is already in correct format for SD_MMC
                     playlist.push_back(track.localPath);
                     ESP_LOGI(TAG, "Added to playlist: %s (%s)", track.localPath.c_str(), track.name.c_str());
                 }
@@ -175,7 +176,8 @@ void setup()
     ESP_LOGI(TAG, "Enabling peripheral power...");
     pinMode(4, OUTPUT);
     digitalWrite(4, HIGH); // Enable power to peripherals
-    delay(500);            // Give peripherals time to power up
+    // Initialize file manager
+    delay(500); // Give peripherals time to power up
 
     // // Initialize configuration (this will also initialize NVS)
     // ESP_LOGI(TAG, "Loading configuration...");
@@ -184,19 +186,16 @@ void setup()
     // Initialize WiFi provisioning
     ESP_LOGI(TAG, "Initializing WiFi...");
     wifiProv.begin();
-
-    // Set up figure download complete callback (before WiFi connection)
-    requestManager.setFigureDownloadCompleteCallback(onFigureDownloadComplete);
-
-    // Initialize battery management
-    battery.begin();
-
-    // Initialize file manager
     if (!fileManager.begin())
     {
         ESP_LOGW(TAG, "File Manager initialization failed!");
         ESP_LOGW(TAG, "SD card functionality will not be available.");
     }
+    // Set up figure download complete callback (before WiFi connection)
+    requestManager.setFigureDownloadCompleteCallback(onFigureDownloadComplete);
+
+    // Initialize battery management
+    battery.begin();
 
     // Initialize audio controller
     if (!audioController.begin())
@@ -284,9 +283,10 @@ void setup()
     // Initialize Button Controller
     ESP_LOGI(TAG, "Initializing Button Controller...");
     buttonController.begin();
-    
+
     // Set up button callbacks
-    buttonController.onSingleClick([](ButtonController::ButtonId button) {
+    buttonController.onSingleClick([](ButtonController::ButtonId button)
+                                   {
         ESP_LOGI(TAG, "Single click on button %d", button + 1);
         // Example: Different actions for different buttons
         switch(button) {
@@ -324,18 +324,18 @@ void setup()
                 ESP_LOGI(TAG, "Button 4: Menu/Settings");
                 ledController.pulseLed(0xFF00FF); // Magenta pulse
                 break;
-        }
-    });
+        } });
 
-    buttonController.onHoldStart([](ButtonController::ButtonId button, unsigned long duration) {
+    buttonController.onHoldStart([](ButtonController::ButtonId button, unsigned long duration)
+                                 {
         ESP_LOGI(TAG, "Hold started on button %d (duration: %lu ms)", button + 1, duration);
         // Example: Volume control setup
         if (button == ButtonController::BUTTON_2 || button == ButtonController::BUTTON_4) {
             ESP_LOGI(TAG, "Starting volume %s", (button == ButtonController::BUTTON_2) ? "up" : "down");
-        }
-    });
+        } });
 
-    buttonController.onHoldContinuous([](ButtonController::ButtonId button, unsigned long duration) {
+    buttonController.onHoldContinuous([](ButtonController::ButtonId button, unsigned long duration)
+                                      {
         // Example: Continuous volume adjustment
         if (button == ButtonController::BUTTON_2) {
             // Volume up - called every 100ms while holding
@@ -345,20 +345,21 @@ void setup()
             // Volume down - called every 100ms while holding
             ESP_LOGI(TAG, "Volume down (held for %lu ms)", duration);
             audioController.volumeDown(); // Decrease by 1 step
-        }
-    });
+        } });
 
-    buttonController.onHoldEnd([](ButtonController::ButtonId button, unsigned long duration) {
-        ESP_LOGI(TAG, "Hold ended on button %d (total duration: %lu ms)", button + 1, duration);
-        // Volume adjustment finished
-    });
+    buttonController.onHoldEnd([](ButtonController::ButtonId button, unsigned long duration)
+                               {
+                                   ESP_LOGI(TAG, "Hold ended on button %d (total duration: %lu ms)", button + 1, duration);
+                                   // Volume adjustment finished
+                               });
 
-    buttonController.onComboHold([]() {
-        ESP_LOGW(TAG, "COMBO HOLD TRIGGERED - RESTARTING DEVICE!");
-        ledController.pulseRapid(0xFF0000, 5); // Rapid red pulse
-        delay(2000); // Give time for LED animation
-        ESP.restart(); // Restart the device
-    });
+    buttonController.onComboHold([]()
+                                 {
+                                     ESP_LOGW(TAG, "COMBO HOLD TRIGGERED - RESTARTING DEVICE!");
+                                     ledController.pulseRapid(0xFF0000, 5); // Rapid red pulse
+                                     delay(2000);                           // Give time for LED animation
+                                     ESP.restart();                         // Restart the device
+                                 });
 
     ESP_LOGI(TAG, "Button Controller initialized successfully!");
 
@@ -366,17 +367,19 @@ void setup()
     ledController.pulseRapid(0x00FF00, 3); // Rapid pulse green
     // audioController.play("/sounds/12.wav"); // Play startup sound
 }
-    static unsigned long lastFreeCall = 0;
-    static unsigned long lastStackCheck = 0;
+static unsigned long lastFreeCall = 0;
+static unsigned long lastStackCheck = 0;
 
 void loop()
 {
     // Stack monitoring every 10 seconds
     unsigned long now = millis();
-    if (now - lastStackCheck > 10000) {
+    if (now - lastStackCheck > 10000)
+    {
         lastStackCheck = now;
         UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
-        if (stackHighWaterMark < 1000) { // Less than 1KB remaining
+        if (stackHighWaterMark < 1000)
+        { // Less than 1KB remaining
             ESP_LOGW(TAG, "WARNING: Low stack space remaining: %d bytes", stackHighWaterMark * sizeof(StackType_t));
         }
     }
@@ -890,8 +893,8 @@ void loop()
                 if (audioController.hasPlaylist())
                 {
                     ESP_LOGI(TAG, "Playing playlist track %d/%d",
-                                  audioController.getCurrentTrackIndex() + 1,
-                                  audioController.getPlaylistSize());
+                             audioController.getCurrentTrackIndex() + 1,
+                             audioController.getPlaylistSize());
                 }
                 else
                 {
@@ -941,8 +944,8 @@ void loop()
             if (audioController.nextTrack())
             {
                 ESP_LOGI(TAG, "Playing next track: %d/%d",
-                              audioController.getCurrentTrackIndex() + 1,
-                              audioController.getPlaylistSize());
+                         audioController.getCurrentTrackIndex() + 1,
+                         audioController.getPlaylistSize());
             }
             else
             {
@@ -954,8 +957,8 @@ void loop()
             if (audioController.prevTrack())
             {
                 ESP_LOGI(TAG, "Playing previous track: %d/%d",
-                              audioController.getCurrentTrackIndex() + 1,
-                              audioController.getPlaylistSize());
+                         audioController.getCurrentTrackIndex() + 1,
+                         audioController.getPlaylistSize());
             }
             else
             {
@@ -967,10 +970,10 @@ void loop()
             if (audioController.hasPlaylist())
             {
                 ESP_LOGI(TAG, "Current playlist (Figure UID: %s):",
-                              audioController.getPlaylistFigureUid().c_str());
+                         audioController.getPlaylistFigureUid().c_str());
                 ESP_LOGI(TAG, "Current track: %d/%d",
-                              audioController.getCurrentTrackIndex() + 1,
-                              audioController.getPlaylistSize());
+                         audioController.getCurrentTrackIndex() + 1,
+                         audioController.getPlaylistSize());
 
                 // Print playlist tracks (limit to 10 for readability)
                 int maxTracks = min(10, audioController.getPlaylistSize());
@@ -983,7 +986,7 @@ void loop()
                 if (audioController.getPlaylistSize() > 10)
                 {
                     ESP_LOGI(TAG, "    ... and %d more tracks",
-                                  audioController.getPlaylistSize() - 10);
+                             audioController.getPlaylistSize() - 10);
                 }
             }
             else
@@ -1028,7 +1031,8 @@ void loop()
             {
                 ESP_LOGI(TAG, "Current track: %s", track.c_str());
                 ESP_LOGI(TAG, "Status: %s",
-                              audioController.isPlaying() ? "Playing" : audioController.isPaused() ? "Paused" : "Stopped");
+                         audioController.isPlaying() ? "Playing" : audioController.isPaused() ? "Paused"
+                                                                                              : "Stopped");
             }
         }
         // Power control commands
@@ -1218,26 +1222,30 @@ void loop()
             ESP_LOGI(TAG, "Has WiFi credentials: %s", config.hasWiFiCredentials() ? "Yes" : "No");
             ESP_LOGI(TAG, "WiFi SSID length: %d", config.getWiFiSSID().length());
             ESP_LOGI(TAG, "WiFi Password length: %d", config.getWiFiPassword().length());
-            
+
             // Check ESP32 WiFi provisioning library status
             bool provisioned = false;
             esp_err_t ret = wifi_prov_mgr_is_provisioned(&provisioned);
             ESP_LOGI(TAG, "ESP32 WiFi Library Provisioned: %s", provisioned ? "Yes" : "No");
-            if (ret != ESP_OK) {
+            if (ret != ESP_OK)
+            {
                 ESP_LOGE(TAG, "Provisioning check error: %s", esp_err_to_name(ret));
             }
-            
+
             // Check actual WiFi config stored by ESP32
             wifi_config_t wifi_cfg;
             ret = esp_wifi_get_config(WIFI_IF_STA, &wifi_cfg);
-            if (ret == ESP_OK) {
-                String storedSSID = String((char*)wifi_cfg.sta.ssid);
+            if (ret == ESP_OK)
+            {
+                String storedSSID = String((char *)wifi_cfg.sta.ssid);
                 ESP_LOGI(TAG, "ESP32 Stored SSID: %s", storedSSID.length() > 0 ? storedSSID.c_str() : "(none)");
-                ESP_LOGI(TAG, "ESP32 Stored Password Length: %d", strlen((char*)wifi_cfg.sta.password));
-            } else {
+                ESP_LOGI(TAG, "ESP32 Stored Password Length: %d", strlen((char *)wifi_cfg.sta.password));
+            }
+            else
+            {
                 ESP_LOGE(TAG, "Failed to get WiFi config: %s", esp_err_to_name(ret));
             }
-            
+
             ESP_LOGI(TAG, "Note: BLE is automatically managed by ESP32 provisioning library");
             config.printAllSettings();
         }
@@ -1249,17 +1257,22 @@ void loop()
             ESP_LOGI(TAG, "Largest free block: %d bytes", ESP.getMaxAllocHeap());
             ESP_LOGI(TAG, "Minimum free heap since boot: %d bytes", ESP.getMinFreeHeap());
             ESP_LOGI(TAG, "Heap size: %d bytes", ESP.getHeapSize());
-            
+
             // Calculate fragmentation
             float fragmentation = (1.0 - (float)ESP.getMaxAllocHeap() / ESP.getFreeHeap()) * 100;
             ESP_LOGI(TAG, "Heap fragmentation: %.1f%%", fragmentation);
-            
+
             // Memory status
-            if (ESP.getFreeHeap() < CRITICAL_HEAP_THRESHOLD) {
+            if (ESP.getFreeHeap() < CRITICAL_HEAP_THRESHOLD)
+            {
                 ESP_LOGE(TAG, "Status: CRITICAL - Very low memory");
-            } else if (ESP.getFreeHeap() < WARNING_HEAP_THRESHOLD) {
+            }
+            else if (ESP.getFreeHeap() < WARNING_HEAP_THRESHOLD)
+            {
                 ESP_LOGW(TAG, "Status: WARNING - Low memory");
-            } else {
+            }
+            else
+            {
                 ESP_LOGI(TAG, "Status: OK - Memory levels normal");
             }
             ESP_LOGI(TAG, "----------------------------------");
@@ -1270,22 +1283,27 @@ void loop()
             ESP_LOGI(TAG, "--- Stack Information ---");
             UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
             size_t stackRemaining = stackHighWaterMark * sizeof(StackType_t);
-            ESP_LOGI(TAG, "Stack high water mark: %d words (%d bytes)", 
-                         stackHighWaterMark, stackRemaining);
-            
+            ESP_LOGI(TAG, "Stack high water mark: %d words (%d bytes)",
+                     stackHighWaterMark, stackRemaining);
+
             // Estimate stack usage (assuming 16KB total from build flags)
             size_t totalStack = 16384; // From CONFIG_ARDUINO_LOOP_STACK_SIZE
             size_t usedStack = totalStack - stackRemaining;
             float usagePercent = (float)usedStack / totalStack * 100;
-            
-            ESP_LOGI(TAG, "Estimated stack usage: %d/%d bytes (%.1f%%)", 
-                         usedStack, totalStack, usagePercent);
-            
-            if (stackRemaining < 1000) {
+
+            ESP_LOGI(TAG, "Estimated stack usage: %d/%d bytes (%.1f%%)",
+                     usedStack, totalStack, usagePercent);
+
+            if (stackRemaining < 1000)
+            {
                 ESP_LOGE(TAG, "Status: CRITICAL - Very low stack space");
-            } else if (stackRemaining < 2000) {
+            }
+            else if (stackRemaining < 2000)
+            {
                 ESP_LOGW(TAG, "Status: WARNING - Low stack space");
-            } else {
+            }
+            else
+            {
                 ESP_LOGI(TAG, "Status: OK - Stack levels normal");
             }
             ESP_LOGI(TAG, "------------------------");
