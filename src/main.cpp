@@ -747,6 +747,10 @@ void loop()
                 ESP_LOGI(TAG, "Confirmation timeout. Operation cancelled.");
             }
         }
+        else if (command.startsWith("sdbench"))
+        {
+            fileManager.benchmarkSDCard();
+        }
         // Delete figure-specific files command
         else if (command.startsWith("deletefig ") && DEBUG)
         {

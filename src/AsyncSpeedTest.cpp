@@ -49,8 +49,6 @@ bool AsyncSpeedTest::start(const char* host, uint16_t port, const char* path) {
     Serial.println("\n--- AsyncTCP Speed Test (Optimized) ---");
     Serial.printf("Host: %s:%d\n", host, port);
     Serial.printf("Path: %s\n", path);
-    Serial.println("Features: Lean callbacks, no String ops, TCP optimized");
-    Serial.printf("LWIP Settings: TCP_WND=%d, TCP_MSS=%d\n", 34816, 1460);
     Serial.println("Connecting...");
     
     data.connectStart = millis();

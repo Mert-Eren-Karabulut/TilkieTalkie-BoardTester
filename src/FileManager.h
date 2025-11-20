@@ -9,6 +9,7 @@
 #include <vector>
 #include <map>
 #include <esp_vfs_fat.h>  // For explicit VFS unmount to fix ESP_ERR_INVALID_STATE
+#include <AsyncTCP.h>
 
 struct DownloadTask
 {
@@ -50,7 +51,7 @@ private:
     static const unsigned long RETRY_DELAY_MS = 10000;          // 10 seconds between individual retries
     static const unsigned long RETRY_BATCH_DELAY_MS = 60000;    // 1 minute between retry batches
     static const unsigned long CONNECTIVITY_TIMEOUT_MS = 10000; // 10 seconds
-    static const size_t DOWNLOAD_BUFFER_SIZE = 16384;           // 16KB buffer for downloads (optimized for speed)
+    static const size_t DOWNLOAD_BUFFER_SIZE = 32768;           // 32KB internal SRAM (DMA-aligned) - 2x32KB = 64KB total
     static const unsigned long DOWNLOAD_TIMEOUT_MS = 300000;    // 5 minutes per download
 
     // NVS storage keys
@@ -59,9 +60,78 @@ private:
     static const char *NVS_FILE_LIST_KEY;
     static const char *NVS_DOWNLOAD_STATS_KEY;
 
+    // Async download state
+    struct AsyncDownloadState {
+        AsyncClient* client;
+        File file;
+        String url;
+        String localPath;
+        String tempPath;
+        String checksum;
+        int contentLength;
+        int totalDownloaded;
+        bool headersParsed;
+        unsigned long startTime;
+        unsigned long connectTime;
+        unsigned long headerParseTime;
+        unsigned long lastDataTime;
+        unsigned long lastFlushTime;
+        unsigned long totalFlushTime;
+        unsigned long totalWriteTime;
+        int flushCount;
+        int writeCount;
+        int lastReportedProgress;
+        
+        // Double buffer system
+        uint8_t* bufferA;  // Network receive buffer
+        uint8_t* bufferB;  // SD write buffer
+        size_t bufferSize;
+        size_t bufferAUsed;
+        size_t bufferBUsed;
+        
+        // FreeRTOS task coordination
+        TaskHandle_t writeTaskHandle;
+        SemaphoreHandle_t bufferSwapSemaphore;  // Signals write task to start writing
+        SemaphoreHandle_t writeCompleteSemaphore;  // Signals network that write is done
+        volatile bool writeTaskRunning;
+        volatile bool swapRequested;
+        
+        void reset() {
+            client = nullptr;
+            contentLength = -1;
+            totalDownloaded = 0;
+            headersParsed = false;
+            startTime = 0;
+            connectTime = 0;
+            headerParseTime = 0;
+            lastDataTime = 0;
+            lastFlushTime = 0;
+            totalFlushTime = 0;
+            totalWriteTime = 0;
+            flushCount = 0;
+            writeCount = 0;
+            lastReportedProgress = 0;
+            bufferA = nullptr;
+            bufferB = nullptr;
+            bufferSize = 0;
+            bufferAUsed = 0;
+            bufferBUsed = 0;
+            writeTaskHandle = nullptr;
+            bufferSwapSemaphore = nullptr;
+            writeCompleteSemaphore = nullptr;
+            writeTaskRunning = false;
+            swapRequested = false;
+            url = "";
+            localPath = "";
+            tempPath = "";
+            checksum = "";
+        }
+    };
+
     // Private members
     bool sdCardInitialized;
     bool downloadInProgress;
+    AsyncDownloadState asyncState;
     std::vector<DownloadTask> downloadQueue;
     std::vector<FileEntry> requiredFiles;
     nvs_handle_t nvsHandle;
@@ -84,6 +154,8 @@ private:
     bool pingGoogle();
     bool isChargingRequired();
 
+    
+    
     // NVS operations
     bool initializeNVS();
     bool saveDownloadQueue();
@@ -98,6 +170,19 @@ private:
     bool verifyFileIntegrity(const String &filePath, const String &expectedChecksum);
     void processDownloadQueue();
     void addToDownloadQueue(const String &url, const String &localPath, const String &checksum = "");
+    
+    // Async download callbacks
+    static void onAsyncConnect(void* arg, AsyncClient* client);
+    static void onAsyncData(void* arg, AsyncClient* client, void* data, size_t len);
+    static void onAsyncDisconnect(void* arg, AsyncClient* client);
+    static void onAsyncError(void* arg, AsyncClient* client, int8_t error);
+    static void onAsyncTimeout(void* arg, AsyncClient* client, uint32_t time);
+    
+    // Async download helpers
+    void cleanupAsyncDownload(bool success, const String& errorMsg);
+    static void sdWriteTask(void* parameter);
+    void swapBuffers();
+
 
     // File operations
     bool createDirectoryStructure(const String &path);
@@ -125,6 +210,8 @@ public:
     bool fileExists(const String &path);
     void printFileTree();
     void formatSDCard(); // Format SD card as FAT32
+    // SD Card diagnostics
+    void benchmarkSDCard();
 
     // Download management methods
     bool scheduleDownload(const String &url, const String &localPath, const String &checksum = "");
