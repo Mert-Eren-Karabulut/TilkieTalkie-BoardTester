@@ -54,6 +54,7 @@ public:
     void onHoldContinuous(HoldCallback callback);
     void onHoldEnd(HoldCallback callback);
     void onComboHold(ComboCallback callback);
+    void onComboHold2(ComboCallback callback); // Button 2 + 4 combo
 
     // Configuration
     void setDebounceTime(unsigned long debounceMs);
@@ -91,10 +92,15 @@ private:
 
     ButtonState buttons[MAX_BUTTONS];
     
-    // Combo state
+    // Combo state (Button 1 + 3)
     bool comboActive = false;
     unsigned long comboStartTime = 0;
     bool comboProcessed = false;
+
+    // Combo2 state (Button 2 + 4)
+    bool combo2Active = false;
+    unsigned long combo2StartTime = 0;
+    bool combo2Processed = false;
 
     // Callbacks
     ButtonCallback singleClickCallback = nullptr;
@@ -102,6 +108,7 @@ private:
     HoldCallback holdContinuousCallback = nullptr;
     HoldCallback holdEndCallback = nullptr;
     ComboCallback comboHoldCallback = nullptr;
+    ComboCallback comboHold2Callback = nullptr;
 
     // Singleton constructor
     ButtonController() = default;
@@ -115,6 +122,7 @@ private:
     void updateCombo();
     void resetButton(ButtonId button);
     void resetCombo();
+    void resetCombo2();
     bool readButtonRaw(ButtonId button);
     
     // Interrupt handlers (static methods)

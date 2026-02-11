@@ -3,20 +3,24 @@
 #include <SD_MMC.h>
 #include <AsyncTCP.h>
 #include <esp_heap_caps.h>
+#include <algorithm>
 
 // Initialize static members
 FileManager* FileManager::instance = nullptr;
-const char* FileManager::NVS_NAMESPACE = "filemanager";
-const char* FileManager::NVS_DOWNLOAD_QUEUE_KEY = "dl_queue";
-const char* FileManager::NVS_FILE_LIST_KEY = "file_list";
-const char* FileManager::NVS_DOWNLOAD_STATS_KEY = "dl_stats";
+const char* FileManager::SD_DATA_DIR = "/.filemanager";
+const char* FileManager::SD_DOWNLOAD_QUEUE_FILE = "/.filemanager/download_queue.json";
+const char* FileManager::SD_REQUIRED_FILES_FILE = "/.filemanager/required_files.json";
+const char* FileManager::SD_DOWNLOAD_STATS_FILE = "/.filemanager/download_stats.json";
 
 FileManager::FileManager() : 
     sdCardInitialized(false),
     downloadInProgress(false),
     downloadProgressCallback(nullptr),
     downloadCompleteCallback(nullptr),
-    fileSystemEventCallback(nullptr) {
+    fileSystemEventCallback(nullptr),
+    persistentBufferA(nullptr),
+    persistentBufferB(nullptr),
+    buffersAllocated(false) {
     // Initialize download stats
     downloadStats.totalDownloads = 0;
     downloadStats.successfulDownloads = 0;
@@ -34,43 +38,62 @@ FileManager& FileManager::getInstance() {
 bool FileManager::begin() {
     Serial.println("FileManager: Initializing...");
     
-    // Initialize NVS
-    if (!initializeNVS()) {
-        Serial.println("FileManager: Failed to initialize NVS");
-        return false;
+    // Pre-allocate persistent download buffers from internal SRAM
+    if (!buffersAllocated) {
+        Serial.println("FileManager: Pre-allocating download buffers from internal SRAM...");
+        persistentBufferA = (uint8_t*)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        persistentBufferB = (uint8_t*)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        
+        if (!persistentBufferA || !persistentBufferB) {
+            Serial.printf("FileManager: ❌ CRITICAL: Failed to pre-allocate 2x%dKB buffers from internal SRAM\n", DOWNLOAD_BUFFER_SIZE / 1024);
+            Serial.println("FileManager: System cannot perform downloads - insufficient memory");
+            if (persistentBufferA) {
+                free(persistentBufferA);
+                persistentBufferA = nullptr;
+            }
+            if (persistentBufferB) {
+                free(persistentBufferB);
+                persistentBufferB = nullptr;
+            }
+            buffersAllocated = false;
+        } else {
+            buffersAllocated = true;
+            Serial.printf("FileManager: ✓ Pre-allocated 2x%dKB DMA-aligned buffers from internal SRAM (will never be freed)\n", DOWNLOAD_BUFFER_SIZE / 1024);
+        }
     }
     
-    // Load persistent data
-    loadDownloadStats();
-    loadDownloadQueue();
-    loadRequiredFiles();
-    
-    // Initialize SD card
+    // Initialize SD card first (needed for persistence)
     if (!initializeSDCard()) {
         Serial.println("FileManager: Failed to initialize SD card");
         return false;
     }
+    
+    // Create data directory for persistence files
+    createDirectory(SD_DATA_DIR);
+    
+    // Load persistent data from SD card
+    loadDownloadStats();
+    loadDownloadQueue();
+    loadRequiredFiles();
     
     Serial.println("FileManager: Initialization complete");
     return true;
 }
 
 void FileManager::end() {
-    // Save current state
+    // Save current state to SD card
     saveDownloadQueue();
     saveRequiredFiles();
     saveDownloadStats();
-    
-    // Close NVS
-    if (nvsHandle != 0) {
-        nvs_close(nvsHandle);
-    }
     
     // Unmount SD card
     SD_MMC.end();
     sdCardInitialized = false;
     
-    Serial.println("FileManager: Shutdown complete");
+    // NOTE: We intentionally DO NOT free persistentBufferA/B here
+    // They remain allocated for the lifetime of the device to prevent fragmentation
+    
+    Serial.println("FileManager: Shutdown complete (persistent buffers remain allocated)");
 }
 
 void FileManager::benchmarkSDCard() {
@@ -260,23 +283,6 @@ bool FileManager::initializeSDCard() {
     createDirectory("/logs");
     createDirectory("/images");
     createDirectory("/figures");
-    
-    return true;
-}
-
-bool FileManager::initializeNVS() {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-    
-    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvsHandle);
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Error opening NVS handle: %s\n", esp_err_to_name(err));
-        return false;
-    }
     
     return true;
 }
@@ -546,10 +552,7 @@ void FileManager::addToDownloadQueue(const String& url, const String& localPath,
     task.localPath = localPath;
     task.checksum = checksum;
     task.retryCount = 0;
-    task.retryBatch = 0;
-    task.completed = false;
     task.lastAttempt = 0;
-    task.lastBatchAttempt = 0;
     
     downloadQueue.push_back(task);
 }
@@ -632,21 +635,22 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         return false;
     }
     
-    // Allocate double buffers from internal SRAM with DMA alignment
-    asyncState.bufferSize = DOWNLOAD_BUFFER_SIZE;
-    asyncState.bufferA = (uint8_t*)heap_caps_malloc(asyncState.bufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    asyncState.bufferB = (uint8_t*)heap_caps_malloc(asyncState.bufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    
-    if (!asyncState.bufferA || !asyncState.bufferB) {
-        errorMsg = "Failed to allocate double buffers from internal SRAM";
-        Serial.printf("FileManager: ❌ Failed to allocate 2x%dKB buffers from internal SRAM\n", DOWNLOAD_BUFFER_SIZE / 1024);
-        if (asyncState.bufferA) free(asyncState.bufferA);
-        if (asyncState.bufferB) free(asyncState.bufferB);
+    // Use pre-allocated persistent buffers
+    if (!buffersAllocated || !persistentBufferA || !persistentBufferB) {
+        errorMsg = "Download buffers not available (not pre-allocated at startup)";
+        Serial.println("FileManager: ❌ Cannot download - persistent buffers not available");
         asyncState.file.close();
         downloadInProgress = false;
         return false;
     }
-    Serial.printf("FileManager: ✓ Allocated 2x%dKB DMA-aligned double buffers from internal SRAM\n", asyncState.bufferSize / 1024);
+    
+    asyncState.bufferSize = DOWNLOAD_BUFFER_SIZE;
+    asyncState.bufferA = persistentBufferA;
+    asyncState.bufferB = persistentBufferB;
+    asyncState.bufferAUsed = 0;
+    asyncState.bufferBUsed = 0;
+    
+    Serial.printf("FileManager: ✓ Using pre-allocated 2x%dKB DMA-aligned buffers\n", asyncState.bufferSize / 1024);
     
     // Create semaphores for buffer coordination
     asyncState.bufferSwapSemaphore = xSemaphoreCreateBinary();
@@ -735,75 +739,37 @@ void FileManager::processDownloadQueue() {
         return;
     }
     
-    // First pass: Remove completed tasks and permanently failed tasks
+    // Find the first task that's ready to be processed
     auto it = downloadQueue.begin();
     while (it != downloadQueue.end()) {
         DownloadTask& task = *it;
         
-        if (task.completed) {
-            it = downloadQueue.erase(it);
-            continue;
-        }
-        
-        // Check if we've exceeded the maximum retry batches
-        if (task.retryBatch >= MAX_RETRY_BATCHES) {
-            Serial.printf("FileManager: Download permanently failed after %d retry batches: %s\n", 
-                         MAX_RETRY_BATCHES, task.url.c_str());
+        // Check if we've exceeded the maximum retries - remove from queue
+        if (task.retryCount >= MAX_RETRY_COUNT) {
+            Serial.printf("FileManager: Download permanently failed after %d retries: %s\n", 
+                         MAX_RETRY_COUNT, task.url.c_str());
             
             downloadStats.totalDownloads++;
             downloadStats.failedDownloads++;
             
             if (downloadCompleteCallback) {
-                downloadCompleteCallback(task.url, task.localPath, false, "Max retry batches exceeded");
+                downloadCompleteCallback(task.url, task.localPath, false, "Max retries exceeded");
             }
             
             it = downloadQueue.erase(it);
+            saveDownloadQueue();
             continue;
         }
         
-        ++it;
-    }
-    
-    // Second pass: Find the first task that's ready to be processed
-    bool taskProcessed = false;
-    it = downloadQueue.begin();
-    while (it != downloadQueue.end() && !taskProcessed) {
-        DownloadTask& task = *it;
-        
-        // Check if we need to wait between retry batches
-        if (task.retryCount >= MAX_RETRY_COUNT) {
-            // We've exhausted this batch of retries, need to wait before starting next batch
-            if (task.lastBatchAttempt == 0) {
-                task.lastBatchAttempt = millis();
-                Serial.printf("FileManager: Retry batch %d failed for %s, waiting %d seconds before next batch\n", 
-                             task.retryBatch + 1, task.url.c_str(), RETRY_BATCH_DELAY_MS / 1000);
-            }
-            
-            if ((millis() - task.lastBatchAttempt) >= RETRY_BATCH_DELAY_MS) {
-                // Start new retry batch
-                task.retryBatch++;
-                task.retryCount = 0;
-                task.lastBatchAttempt = 0;
-                task.lastAttempt = 0;
-                Serial.printf("FileManager: Starting retry batch %d for %s\n", 
-                             task.retryBatch + 1, task.url.c_str());
-            } else {
-                ++it;
-                continue;
-            }
-        }
-        
-        // Check if enough time has passed since last individual retry
-        if (task.lastAttempt > 0 && 
-            (millis() - task.lastAttempt) < RETRY_DELAY_MS) {
+        // Check if enough time has passed since last retry
+        if (task.lastAttempt > 0 && (millis() - task.lastAttempt) < RETRY_DELAY_MS) {
             ++it;
             continue;
         }
         
         // Check connectivity before attempting download
         if (!checkConnectivity()) {
-            // Don't increment retry count for connectivity issues, just wait
-            task.lastAttempt = millis();
+            // Don't increment retry count for connectivity issues
             ++it;
             continue;
         }
@@ -812,8 +778,8 @@ void FileManager::processDownloadQueue() {
         if (fileExists(task.localPath)) {
             if (task.checksum.isEmpty() || verifyFileIntegrity(task.localPath, task.checksum)) {
                 Serial.printf("FileManager: File already exists and is valid: %s\n", task.localPath.c_str());
-                task.completed = true;
-                ++it;
+                it = downloadQueue.erase(it);
+                saveDownloadQueue();
                 continue;
             } else {
                 Serial.printf("FileManager: Existing file failed integrity check, re-downloading: %s\n", task.localPath.c_str());
@@ -826,41 +792,27 @@ void FileManager::processDownloadQueue() {
         task.lastAttempt = millis();
         task.retryCount++;
         
-        Serial.printf("FileManager: Attempting download (batch %d, attempt %d/%d): %s\n", 
-                     task.retryBatch + 1, task.retryCount, MAX_RETRY_COUNT, task.url.c_str());
+        Serial.printf("FileManager: Attempting download (attempt %d/%d): %s\n", 
+                     task.retryCount, MAX_RETRY_COUNT, task.url.c_str());
         
-        bool downloadSuccess = downloadFileFromURL(task.url, task.localPath, errorMsg);
+        bool downloadStarted = downloadFileFromURL(task.url, task.localPath, errorMsg);
         
-        if (downloadSuccess) {
-            // Verify integrity if checksum provided
-            if (!task.checksum.isEmpty() && !verifyFileIntegrity(task.localPath, task.checksum)) {
-                Serial.printf("FileManager: Downloaded file failed integrity check: %s\n", task.localPath.c_str());
-                deleteFile(task.localPath);
-                Serial.printf("FileManager: Download attempt %d/%d failed (integrity): %s\n", 
-                             task.retryCount, MAX_RETRY_COUNT, errorMsg.c_str());
-                downloadSuccess = false;
-            } else {
-                task.completed = true;
-                Serial.printf("FileManager: Download successful: %s\n", task.localPath.c_str());
-            }
-        } else {
-            Serial.printf("FileManager: Download attempt %d/%d failed: %s (Error: %s)\n", 
+        if (!downloadStarted) {
+            Serial.printf("FileManager: Download attempt %d/%d failed to start: %s (Error: %s)\n", 
                          task.retryCount, MAX_RETRY_COUNT, task.url.c_str(), errorMsg.c_str());
+            
+            // Move failed task to end of queue for fair processing
+            if (task.retryCount < MAX_RETRY_COUNT) {
+                DownloadTask failedTask = task;
+                it = downloadQueue.erase(it);
+                downloadQueue.push_back(failedTask);
+                Serial.printf("FileManager: Moved failed download to end of queue: %s\n", failedTask.localPath.c_str());
+            }
         }
         
-        // If download failed and hasn't reached max retries, move to end of queue for fair processing
-        if (!downloadSuccess && task.retryCount < MAX_RETRY_COUNT) {
-            // Move failed task to end of queue to give other tasks a chance
-            DownloadTask failedTask = task;
-            downloadQueue.erase(it);
-            downloadQueue.push_back(failedTask);
-            Serial.printf("FileManager: Moved failed download to end of queue: %s\n", failedTask.localPath.c_str());
-        }
-        
-        taskProcessed = true; // Process only one download per call
+        saveDownloadQueue();
+        return; // Process only one download per call
     }
-    
-    saveDownloadQueue();
 }
 
 bool FileManager::addRequiredFile(const String& localPath, const String& url, const String& checksum) {
@@ -1069,15 +1021,12 @@ void FileManager::printDownloadQueue() {
     for (size_t i = 0; i < downloadQueue.size(); i++) {
         const auto& task = downloadQueue[i];
         Serial.printf("  %d. %s -> %s\n", i + 1, task.url.c_str(), task.localPath.c_str());
-        Serial.printf("      Batch: %d/%d, Attempt: %d/%d, Completed: %s\n", 
-                      task.retryBatch + 1, MAX_RETRY_BATCHES,
-                      task.retryCount, MAX_RETRY_COUNT,
-                      task.completed ? "yes" : "no");
+        Serial.printf("      Attempts: %d/%d\n", task.retryCount, MAX_RETRY_COUNT);
         
-        if (!task.completed && task.retryCount >= MAX_RETRY_COUNT && task.lastBatchAttempt > 0) {
-            unsigned long timeLeft = RETRY_BATCH_DELAY_MS - (millis() - task.lastBatchAttempt);
-            if (timeLeft > 0) {
-                Serial.printf("      Waiting %lu seconds before next batch\n", timeLeft / 1000);
+        if (task.lastAttempt > 0) {
+            unsigned long timeSince = millis() - task.lastAttempt;
+            if (timeSince < RETRY_DELAY_MS) {
+                Serial.printf("      Next retry in %lu seconds\n", (RETRY_DELAY_MS - timeSince) / 1000);
             }
         }
     }
@@ -1109,217 +1058,168 @@ String FileManager::getDownloadStatsString() {
     return stats;
 }
 
-// NVS operations implementation
+// SD card-based persistence operations
 bool FileManager::saveDownloadQueue() {
-    // For simplicity, we'll save as a JSON string
-    // In production, consider using a more efficient binary format
+    if (!sdCardInitialized) return false;
     
-    String json = "[";
-    for (size_t i = 0; i < downloadQueue.size(); i++) {
-        if (i > 0) json += ",";
-        const auto& task = downloadQueue[i];
-        json += "{\"url\":\"" + task.url + "\",";
-        json += "\"path\":\"" + task.localPath + "\",";
-        json += "\"retries\":" + String(task.retryCount) + ",";
-        json += "\"retryBatch\":" + String(task.retryBatch) + ",";
-        json += "\"completed\":" + String(task.completed ? "true" : "false") + ",";
-        json += "\"lastAttempt\":" + String(task.lastAttempt) + ",";
-        json += "\"lastBatchAttempt\":" + String(task.lastBatchAttempt) + ",";
-        json += "\"checksum\":\"" + task.checksum + "\"}";
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    
+    for (const auto& task : downloadQueue) {
+        JsonObject obj = arr.add<JsonObject>();
+        obj["url"] = task.url;
+        obj["path"] = task.localPath;
+        obj["retries"] = task.retryCount;
+        obj["lastAttempt"] = task.lastAttempt;
+        obj["checksum"] = task.checksum;
     }
-    json += "]";
     
-    esp_err_t err = nvs_set_str(nvsHandle, NVS_DOWNLOAD_QUEUE_KEY, json.c_str());
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to save download queue: %s\n", esp_err_to_name(err));
+    File file = SD_MMC.open(SD_DOWNLOAD_QUEUE_FILE, FILE_WRITE);
+    if (!file) {
+        Serial.println("FileManager: Failed to open download queue file for writing");
         return false;
     }
     
-    nvs_commit(nvsHandle);
+    serializeJson(doc, file);
+    file.close();
     return true;
 }
 
 bool FileManager::loadDownloadQueue() {
-    size_t required_size = 0;
-    esp_err_t err = nvs_get_str(nvsHandle, NVS_DOWNLOAD_QUEUE_KEY, NULL, &required_size);
+    if (!sdCardInitialized) return false;
     
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
+    File file = SD_MMC.open(SD_DOWNLOAD_QUEUE_FILE, FILE_READ);
+    if (!file) {
         // No saved queue, start fresh
         return true;
     }
     
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to get download queue size: %s\n", esp_err_to_name(err));
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
+    
+    if (error) {
+        Serial.printf("FileManager: Failed to parse download queue: %s\n", error.c_str());
         return false;
     }
     
-    char* json_str = (char*)malloc(required_size);
-    err = nvs_get_str(nvsHandle, NVS_DOWNLOAD_QUEUE_KEY, json_str, &required_size);
-    
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to load download queue: %s\n", esp_err_to_name(err));
-        free(json_str);
-        return false;
-    }
-    
-    // Parse JSON and populate download queue
-    // This is a simplified parser - in production, use ArduinoJson
     downloadQueue.clear();
+    JsonArray arr = doc.as<JsonArray>();
+    for (JsonObject obj : arr) {
+        DownloadTask task;
+        task.url = obj["url"].as<String>();
+        task.localPath = obj["path"].as<String>();
+        task.retryCount = obj["retries"] | 0;
+        task.lastAttempt = obj["lastAttempt"] | 0;
+        task.checksum = obj["checksum"].as<String>();
+        downloadQueue.push_back(task);
+    }
     
-    free(json_str);
+    Serial.printf("FileManager: Loaded %d items from download queue\n", downloadQueue.size());
     return true;
 }
 
 bool FileManager::saveRequiredFiles() {
-    // Save required files as JSON string, similar to download queue
-    String json = "[";
-    for (size_t i = 0; i < requiredFiles.size(); i++) {
-        if (i > 0) json += ",";
-        const auto& file = requiredFiles[i];
-        json += "{\"path\":\"" + file.path + "\",";
-        json += "\"url\":\"" + file.url + "\",";
-        json += "\"required\":" + String(file.required ? "true" : "false") + ",";
-        json += "\"checksum\":\"" + file.checksum + "\"}";
-    }
-    json += "]";
+    if (!sdCardInitialized) return false;
     
-    esp_err_t err = nvs_set_str(nvsHandle, NVS_FILE_LIST_KEY, json.c_str());
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to save required files: %s\n", esp_err_to_name(err));
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    
+    for (const auto& entry : requiredFiles) {
+        JsonObject obj = arr.add<JsonObject>();
+        obj["path"] = entry.path;
+        obj["url"] = entry.url;
+        obj["checksum"] = entry.checksum;
+    }
+    
+    File file = SD_MMC.open(SD_REQUIRED_FILES_FILE, FILE_WRITE);
+    if (!file) {
+        Serial.println("FileManager: Failed to open required files file for writing");
         return false;
     }
     
-    err = nvs_commit(nvsHandle);
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to commit NVS: %s\n", esp_err_to_name(err));
-        return false;
-    }
+    serializeJson(doc, file);
+    file.close();
     
-    Serial.printf("FileManager: Saved %d required files to NVS\n", requiredFiles.size());
+    Serial.printf("FileManager: Saved %d required files to SD card\n", requiredFiles.size());
     return true;
 }
 
 bool FileManager::loadRequiredFiles() {
-    size_t required_size = 0;
-    esp_err_t err = nvs_get_str(nvsHandle, NVS_FILE_LIST_KEY, NULL, &required_size);
+    if (!sdCardInitialized) return false;
     
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        // No saved required files, start fresh
+    File file = SD_MMC.open(SD_REQUIRED_FILES_FILE, FILE_READ);
+    if (!file) {
         Serial.println("FileManager: No saved required files found");
         return true;
     }
     
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to get required files size: %s\n", esp_err_to_name(err));
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
+    
+    if (error) {
+        Serial.printf("FileManager: Failed to parse required files: %s\n", error.c_str());
         return false;
     }
     
-    char* json_str = (char*)malloc(required_size);
-    if (!json_str) {
-        Serial.println("FileManager: Failed to allocate memory for required files");
-        return false;
-    }
-    
-    err = nvs_get_str(nvsHandle, NVS_FILE_LIST_KEY, json_str, &required_size);
-    
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to load required files: %s\n", esp_err_to_name(err));
-        free(json_str);
-        return false;
-    }
-    
-    // Parse JSON and populate required files
-    // This is a simplified parser - in production, use ArduinoJson
     requiredFiles.clear();
-    
-    String json(json_str);
-    free(json_str);
-    
-    // Simple JSON parsing for required files
-    int startPos = 0;
-    int braceCount = 0;
-    bool inString = false;
-    char prevChar = 0;
-    
-    for (int i = 0; i < json.length(); i++) {
-        char c = json.charAt(i);
-        
-        if (c == '"' && prevChar != '\\') {
-            inString = !inString;
-        } else if (!inString) {
-            if (c == '{') {
-                if (braceCount == 0) startPos = i;
-                braceCount++;
-            } else if (c == '}') {
-                braceCount--;
-                if (braceCount == 0) {
-                    // Found complete object, parse it
-                    String objStr = json.substring(startPos, i + 1);
-                    
-                    // Extract fields using simple string operations
-                    FileEntry entry;
-                    
-                    // Extract path
-                    int pathStart = objStr.indexOf("\"path\":\"") + 8;
-                    int pathEnd = objStr.indexOf("\"", pathStart);
-                    if (pathStart > 7 && pathEnd > pathStart) {
-                        entry.path = objStr.substring(pathStart, pathEnd);
-                    }
-                    
-                    // Extract url
-                    int urlStart = objStr.indexOf("\"url\":\"") + 7;
-                    int urlEnd = objStr.indexOf("\"", urlStart);
-                    if (urlStart > 6 && urlEnd > urlStart) {
-                        entry.url = objStr.substring(urlStart, urlEnd);
-                    }
-                    
-                    // Extract checksum
-                    int checksumStart = objStr.indexOf("\"checksum\":\"") + 12;
-                    int checksumEnd = objStr.indexOf("\"", checksumStart);
-                    if (checksumStart > 11 && checksumEnd > checksumStart) {
-                        entry.checksum = objStr.substring(checksumStart, checksumEnd);
-                    }
-                    
-                    // Set required to true (we only store required files)
-                    entry.required = true;
-                    
-                    if (!entry.path.isEmpty() && !entry.url.isEmpty()) {
-                        requiredFiles.push_back(entry);
-                    }
-                }
-            }
-        }
-        prevChar = c;
+    JsonArray arr = doc.as<JsonArray>();
+    for (JsonObject obj : arr) {
+        FileEntry entry;
+        entry.path = obj["path"].as<String>();
+        entry.url = obj["url"].as<String>();
+        entry.checksum = obj["checksum"].as<String>();
+        entry.required = true;
+        requiredFiles.push_back(entry);
     }
     
-    Serial.printf("FileManager: Loaded %d required files from NVS\n", requiredFiles.size());
+    Serial.printf("FileManager: Loaded %d required files from SD card\n", requiredFiles.size());
     return true;
 }
 
 bool FileManager::saveDownloadStats() {
-    esp_err_t err = nvs_set_blob(nvsHandle, NVS_DOWNLOAD_STATS_KEY, &downloadStats, sizeof(downloadStats));
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to save download stats: %s\n", esp_err_to_name(err));
+    if (!sdCardInitialized) return false;
+    
+    JsonDocument doc;
+    doc["totalDownloads"] = downloadStats.totalDownloads;
+    doc["successfulDownloads"] = downloadStats.successfulDownloads;
+    doc["failedDownloads"] = downloadStats.failedDownloads;
+    doc["totalBytesDownloaded"] = downloadStats.totalBytesDownloaded;
+    
+    File file = SD_MMC.open(SD_DOWNLOAD_STATS_FILE, FILE_WRITE);
+    if (!file) {
+        Serial.println("FileManager: Failed to open download stats file for writing");
         return false;
     }
     
-    nvs_commit(nvsHandle);
+    serializeJson(doc, file);
+    file.close();
     return true;
 }
 
 bool FileManager::loadDownloadStats() {
-    size_t required_size = sizeof(downloadStats);
-    esp_err_t err = nvs_get_blob(nvsHandle, NVS_DOWNLOAD_STATS_KEY, &downloadStats, &required_size);
+    if (!sdCardInitialized) return false;
     
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        // No saved stats, start with zeros (already initialized in constructor)
+    File file = SD_MMC.open(SD_DOWNLOAD_STATS_FILE, FILE_READ);
+    if (!file) {
+        // No saved stats, start with defaults (already initialized in constructor)
         return true;
     }
     
-    if (err != ESP_OK) {
-        Serial.printf("FileManager: Failed to load download stats: %s\n", esp_err_to_name(err));
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
+    
+    if (error) {
+        Serial.printf("FileManager: Failed to parse download stats: %s\n", error.c_str());
         return false;
     }
+    
+    downloadStats.totalDownloads = doc["totalDownloads"] | 0;
+    downloadStats.successfulDownloads = doc["successfulDownloads"] | 0;
+    downloadStats.failedDownloads = doc["failedDownloads"] | 0;
+    downloadStats.totalBytesDownloaded = doc["totalBytesDownloaded"] | 0UL;
     
     return true;
 }
@@ -1346,25 +1246,15 @@ void FileManager::cancelAllDownloads() {
 
 void FileManager::retryFailedDownloads() {
     for (auto& task : downloadQueue) {
-        if (!task.completed) {
-            task.retryCount = 0; // Reset retry count within current batch
-            task.retryBatch = 0; // Reset to first batch
-            task.lastAttempt = 0; // Reset last attempt time
-            task.lastBatchAttempt = 0; // Reset batch attempt time
-        }
+        task.retryCount = 0;
+        task.lastAttempt = 0;
     }
     saveDownloadQueue();
-    Serial.println("FileManager: All failed downloads reset for retry");
+    Serial.println("FileManager: All downloads reset for retry");
 }
 
 int FileManager::getPendingDownloadsCount() {
-    int count = 0;
-    for (const auto& task : downloadQueue) {
-        if (!task.completed) {
-            count++;
-        }
-    }
-    return count;
+    return downloadQueue.size();
 }
 
 void FileManager::cleanupTempFiles() {
@@ -1927,15 +1817,12 @@ void FileManager::cleanupAsyncDownload(bool success, const String& errorMsg) {
         asyncState.file.close();
     }
     
-    // Free buffers
-    if (asyncState.bufferA) {
-        free(asyncState.bufferA);
-        asyncState.bufferA = nullptr;
-    }
-    if (asyncState.bufferB) {
-        free(asyncState.bufferB);
-        asyncState.bufferB = nullptr;
-    }
+    // Clear buffer pointers (but don't free - they're persistent)
+    // The buffers remain allocated and will be reused for next download
+    asyncState.bufferA = nullptr;
+    asyncState.bufferB = nullptr;
+    asyncState.bufferAUsed = 0;
+    asyncState.bufferBUsed = 0;
     
     // Clean up client
     if (asyncState.client) {
@@ -1949,11 +1836,21 @@ void FileManager::cleanupAsyncDownload(bool success, const String& errorMsg) {
         SD_MMC.remove(asyncState.tempPath);
     }
     
-    // Update statistics
+    // Update statistics and handle queue
     downloadStats.totalDownloads++;
     if (success) {
         downloadStats.successfulDownloads++;
         downloadStats.totalBytesDownloaded += asyncState.totalDownloaded;
+        
+        // Remove successful download from queue
+        auto it = std::find_if(downloadQueue.begin(), downloadQueue.end(),
+            [this](const DownloadTask& task) {
+                return task.localPath == asyncState.localPath;
+            });
+        if (it != downloadQueue.end()) {
+            downloadQueue.erase(it);
+            saveDownloadQueue();
+        }
         
         Serial.printf("Download completed: %s (%d bytes)\n", 
                      asyncState.localPath.substring(asyncState.localPath.lastIndexOf('/') + 1).c_str(),

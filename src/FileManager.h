@@ -4,23 +4,19 @@
 #include <Arduino.h>
 #include <SD_MMC.h>
 #include <WiFi.h>
-#include <nvs_flash.h>
-#include <nvs.h>
 #include <vector>
 #include <map>
 #include <esp_vfs_fat.h>  // For explicit VFS unmount to fix ESP_ERR_INVALID_STATE
 #include <AsyncTCP.h>
+#include <ArduinoJson.h>
 
 struct DownloadTask
 {
     String url;
     String localPath;
-    int retryCount;
-    int retryBatch; // Track which batch of retries we're on
-    bool completed;
-    unsigned long lastAttempt;
-    unsigned long lastBatchAttempt; // Track when the last retry batch was attempted
-    String checksum;                // Optional for file integrity verification
+    int retryCount;           // Simple retry counter
+    unsigned long lastAttempt; // Last attempt timestamp for retry delay
+    String checksum;           // Optional for file integrity verification
 };
 
 struct FileEntry
@@ -46,19 +42,16 @@ private:
     static const int SD_D3_PIN = 40;  // SD_D3
 
     // Download configuration
-    static const int MAX_RETRY_COUNT = 5;
-    static const int MAX_RETRY_BATCHES = 10;                    // Maximum number of retry batches
-    static const unsigned long RETRY_DELAY_MS = 10000;          // 10 seconds between individual retries
-    static const unsigned long RETRY_BATCH_DELAY_MS = 60000;    // 1 minute between retry batches
-    static const unsigned long CONNECTIVITY_TIMEOUT_MS = 10000; // 10 seconds
+    static const int MAX_RETRY_COUNT = 10;                      // Max retries per file before giving up
+    static const unsigned long RETRY_DELAY_MS = 30000;          // 30 seconds between retries
     static const size_t DOWNLOAD_BUFFER_SIZE = 32768;           // 32KB internal SRAM (DMA-aligned) - 2x32KB = 64KB total
     static const unsigned long DOWNLOAD_TIMEOUT_MS = 300000;    // 5 minutes per download
 
-    // NVS storage keys
-    static const char *NVS_NAMESPACE;
-    static const char *NVS_DOWNLOAD_QUEUE_KEY;
-    static const char *NVS_FILE_LIST_KEY;
-    static const char *NVS_DOWNLOAD_STATS_KEY;
+    // SD card persistence paths (instead of NVS to avoid bloat)
+    static const char* SD_DATA_DIR;
+    static const char* SD_DOWNLOAD_QUEUE_FILE;
+    static const char* SD_REQUIRED_FILES_FILE;
+    static const char* SD_DOWNLOAD_STATS_FILE;
 
     // Async download state
     struct AsyncDownloadState {
@@ -134,7 +127,11 @@ private:
     AsyncDownloadState asyncState;
     std::vector<DownloadTask> downloadQueue;
     std::vector<FileEntry> requiredFiles;
-    nvs_handle_t nvsHandle;
+    
+    // Pre-allocated persistent download buffers (allocated once at startup)
+    uint8_t* persistentBufferA;
+    uint8_t* persistentBufferB;
+    bool buffersAllocated;
 
     // Download statistics
     struct DownloadStats
@@ -156,8 +153,7 @@ private:
 
     
     
-    // NVS operations
-    bool initializeNVS();
+    // SD-based persistence operations
     bool saveDownloadQueue();
     bool loadDownloadQueue();
     bool saveRequiredFiles();

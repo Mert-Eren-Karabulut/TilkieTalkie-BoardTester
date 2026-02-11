@@ -49,6 +49,7 @@ private:
     uint16_t _port;
     std::function<void(const String &)> _chatCb;
     bool _isConnected = false;
+    bool _isPrivateSubscribed = false;
     bool _initialized = false;
     bool _wsStarted = false;
     

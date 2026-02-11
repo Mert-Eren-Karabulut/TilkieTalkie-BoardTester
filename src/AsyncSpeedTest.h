@@ -33,7 +33,7 @@ public:
      */
     bool start(const char* host = "portal.tilkietalkie.com", 
                uint16_t port = 80,
-               const char* path = "/storage/tracks/audio/vIr8dNzNhQgWEpc9uceF1Wncljn5mSCRoYlXTsOU.wav");
+               const char* path = "/storage/tracks/audio/test.wav");
     
     /**
      * Check if a test is currently active

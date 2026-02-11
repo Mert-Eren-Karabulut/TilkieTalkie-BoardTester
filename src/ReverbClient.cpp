@@ -19,12 +19,14 @@ char ReverbClient::channelBuffer[64];
 char ReverbClient::tempBuffer[256];
 ReverbClient *ReverbClient::instance = nullptr;
 
-ReverbClient &ReverbClient::getInstance() {
+ReverbClient &ReverbClient::getInstance()
+{
     static ReverbClient inst;
     return inst;
 }
 
-void ReverbClient::onChatMessage(std::function<void(const String &)> cb) {
+void ReverbClient::onChatMessage(std::function<void(const String &)> cb)
+{
     _chatCb = cb;
     Serial.println("ReverbClient: Chat message callback registered");
 }
@@ -34,8 +36,9 @@ void ReverbClient::begin(
     uint16_t port,
     const char *appKey,
     const char *authToken,
-    const char *deviceId) {
-    
+    const char *deviceId)
+{
+
     _host = host;
     _port = port;
     _appKey = appKey;
@@ -44,12 +47,14 @@ void ReverbClient::begin(
     _initialized = true;
 
     // Pre-allocate all objects at once to minimize fragmentation
-    if (!_httpClient) {
+    if (!_httpClient)
+    {
         _httpClient = new WiFiClientSecure();
         ((WiFiClientSecure *)_httpClient)->setInsecure();
     }
 
-    if (_ws == nullptr) {
+    if (_ws == nullptr)
+    {
         _ws = new WebSocketsClient();
     }
 
@@ -65,17 +70,22 @@ void ReverbClient::begin(
     Serial.println("ReverbClient: Initialized, will connect when WiFi is available");
 
     // Start connection if WiFi is already available
-    if (WiFi.isConnected()) {
+    if (WiFi.isConnected())
+    {
         _ws->beginSSL(_host.c_str(), _port, urlBuffer);
     }
 }
 
-void ReverbClient::update() {
+void ReverbClient::update()
+{
     // Handle WiFi state changes
-    if (!WiFi.isConnected()) {
-        if (_isConnected || _wsStarted) {
+    if (!WiFi.isConnected())
+    {
+        if (_isConnected || _wsStarted)
+        {
             Serial.println("ReverbClient: WiFi disconnected, stopping WebSocket");
-            if (_ws) {
+            if (_ws)
+            {
                 _ws->disconnect();
             }
             _isConnected = false;
@@ -85,86 +95,103 @@ void ReverbClient::update() {
     }
 
     // WiFi is connected - start WebSocket if not already started
-    if (!_wsStarted && _initialized) {
+    if (!_wsStarted && _initialized)
+    {
         Serial.println("ReverbClient: Starting WebSocket connection");
         _ws->beginSSL(_host.c_str(), _port, urlBuffer);
         _wsStarted = true;
     }
 
     // Let the library handle everything (reconnection, heartbeat, etc.)
-    if (_ws) {
+    if (_ws)
+    {
         _ws->loop();
     }
 
     // Send device reports when connected
     static unsigned long lastReportTime = 0;
-    if (_isConnected && millis() - lastReportTime >= 5000) {
+    if (_isConnected && millis() - lastReportTime >= 1000)
+    {
         lastReportTime = millis();
         sendDeviceReport();
     }
 }
 
-bool ReverbClient::isConnected() {
-    return WiFi.isConnected() && _ws && _ws->isConnected();
+bool ReverbClient::isConnected()
+{
+    return WiFi.isConnected() && _ws && _ws->isConnected() && _isPrivateSubscribed;
 }
 
-String ReverbClient::getConnectionStatus() {
-    if (!WiFi.isConnected()) {
+String ReverbClient::getConnectionStatus()
+{
+    if (!WiFi.isConnected())
+    {
         return "WiFi Disconnected";
     }
 
-    if (!_wsStarted) {
+    if (!_wsStarted)
+    {
         return "WebSocket Not Started";
     }
 
-    if (_ws && _ws->isConnected()) {
+    if (_ws && _ws->isConnected() && _isPrivateSubscribed)
+    {
         return "Fully Connected";
     }
 
     return "WebSocket Connecting...";
 }
 
-void ReverbClient::disconnect() {
+void ReverbClient::disconnect()
+{
     Serial.println("ReverbClient: Manual disconnect requested");
-    if (_ws) {
+    if (_ws)
+    {
         _ws->disconnect();
     }
     _isConnected = false;
     _wsStarted = false;
 }
 
-void ReverbClient::forceReconnect() {
+void ReverbClient::forceReconnect()
+{
     Serial.println("ReverbClient: Force reconnection requested");
     disconnect();
 
-    if (WiFi.isConnected() && _initialized) {
+    if (WiFi.isConnected() && _initialized)
+    {
         Serial.println("ReverbClient: Restarting WebSocket connection");
         _ws->beginSSL(_host.c_str(), _port, urlBuffer);
         _wsStarted = true;
     }
 }
 
-void ReverbClient::cleanup() {
+void ReverbClient::cleanup()
+{
     Serial.println("ReverbClient: Cleaning up resources");
 
     _initialized = false;
     _isConnected = false;
     _wsStarted = false;
 
-    if (_ws) {
+    if (_ws)
+    {
         _ws->disconnect();
         delete _ws;
         _ws = nullptr;
     }
 
-    if (_httpClient) {
+    if (_httpClient)
+    {
         delete _httpClient;
         _httpClient = nullptr;
     }
 }
 
-bool ReverbClient::sendMessage(const String &text) {
-    if (!isConnected() || !_httpClient) {
+bool ReverbClient::sendMessage(const String &text)
+{
+    if (!isConnected() || !_httpClient)
+    {
         Serial.printf("ReverbClient: Cannot send message - Connection status: %s\n",
                       getConnectionStatus().c_str());
         return false;
@@ -173,7 +200,8 @@ bool ReverbClient::sendMessage(const String &text) {
     HTTPClient http;
     snprintf(urlBuffer, sizeof(urlBuffer), "https://%s/api/chat/device/%s", _host.c_str(), _deviceId.c_str());
 
-    if (http.begin(*_httpClient, urlBuffer)) {
+    if (http.begin(*_httpClient, urlBuffer))
+    {
         snprintf(headerBuffer, sizeof(headerBuffer), "Bearer %s", _authToken.c_str());
         http.addHeader("Authorization", headerBuffer);
         http.addHeader("Content-Type", "application/json");
@@ -187,10 +215,13 @@ bool ReverbClient::sendMessage(const String &text) {
         int httpCode = http.POST((uint8_t *)tempBuffer, strlen(tempBuffer));
         http.end();
 
-        if (httpCode == 200) {
+        if (httpCode == 200)
+        {
             Serial.println("ReverbClient: Message sent successfully");
             return true;
-        } else {
+        }
+        else
+        {
             Serial.printf("ReverbClient: Failed to send message, HTTP code: %d\n", httpCode);
             return false;
         }
@@ -199,13 +230,16 @@ bool ReverbClient::sendMessage(const String &text) {
     return false;
 }
 
-void ReverbClient::webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+void ReverbClient::webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
+{
     if (instance)
         instance->handleEvent(type, payload, length);
 }
 
-void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length) {
-    switch (type) {
+void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
+{
+    switch (type)
+    {
     case WStype_DISCONNECTED:
         Serial.println("ReverbClient: WebSocket disconnected");
         _isConnected = false;
@@ -223,56 +257,77 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length) {
         _socketId = "";
         break;
 
-    case WStype_TEXT: {
+    case WStype_TEXT:
+    {
         // Parse JSON minimally using string search
         char *payloadStr = (char *)payload;
         payloadStr[length] = '\0';
 
-        if (strstr(payloadStr, "pusher:connection_established")) {
+        if (strstr(payloadStr, "pusher:connection_established"))
+        {
             // Look for socket_id in the data field - handle both escaped and unescaped JSON
             char *socketStart = strstr(payloadStr, "socket_id");
-            if (socketStart) {
+            if (socketStart)
+            {
                 // Find the actual ID value after the colon and quotes
                 socketStart = strchr(socketStart, ':');
-                if (socketStart) {
+                if (socketStart)
+                {
                     socketStart++; // Skip the colon
                     // Skip whitespace and quotes
-                    while (*socketStart && (*socketStart == ' ' || *socketStart == '"' || *socketStart == '\\')) {
+                    while (*socketStart && (*socketStart == ' ' || *socketStart == '"' || *socketStart == '\\'))
+                    {
                         socketStart++;
                     }
 
                     // Find the end of the socket ID
                     char *socketEnd = socketStart;
-                    while (*socketEnd && *socketEnd != '"' && *socketEnd != '\\' && *socketEnd != ',' && *socketEnd != '}') {
+                    while (*socketEnd && *socketEnd != '"' && *socketEnd != '\\' && *socketEnd != ',' && *socketEnd != '}')
+                    {
                         socketEnd++;
                     }
 
-                    if (socketEnd > socketStart) {
+                    if (socketEnd > socketStart)
+                    {
                         char tempChar = *socketEnd;
                         *socketEnd = '\0';
                         _socketId = String(socketStart);
                         *socketEnd = tempChar; // Restore the character
 
                         Serial.printf("ReverbClient: Connected with socket ID: %s\n", _socketId.c_str());
-                        if (subscribeToPrivate()) {
+                        if (subscribeToPrivate())
+                        {
                             Serial.println("ReverbClient: Successfully subscribed to private channel");
-                        } else {
+                            _isPrivateSubscribed = true;
+                        }
+                        else
+                        {
                             Serial.println("ReverbClient: Failed to subscribe to private channel");
+                            _isPrivateSubscribed = false;
                         }
                     }
                 }
             }
-        } else if (strstr(payloadStr, "pusher:ping")) {
+        }
+        else if (strstr(payloadStr, "pusher:ping"))
+        {
             const char *pong = "{\"event\":\"pusher:pong\",\"data\":{}}";
             _ws->sendTXT(pong, strlen(pong));
-        } else if (strstr(payloadStr, "device.status.updated")) {
+        }
+        else if (strstr(payloadStr, "device.status.updated"))
+        {
             // Ignore device status updates (these are our own reports bounced back)
-        } else if (strstr(payloadStr, "device.command.sent")) {
+        }
+        else if (strstr(payloadStr, "device.command.sent"))
+        {
             handleDeviceCommand(payloadStr);
-        } else if (strstr(payloadStr, "chat-message")) {
+        }
+        else if (strstr(payloadStr, "chat-message"))
+        {
             Serial.println("ReverbClient: Chat message event detected!");
 
-            if (!_chatCb) {
+            if (!_chatCb)
+            {
                 Serial.println("ReverbClient: ERROR - No callback registered for chat messages!");
                 break;
             }
@@ -280,26 +335,34 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length) {
             // The data field contains escaped JSON, so we need to find the text field within it
             // Look for "text":"<message>" pattern in the escaped JSON
             char *textStart = strstr(payloadStr, "\\\"text\\\":\\\"");
-            if (textStart) {
+            if (textStart)
+            {
                 textStart += 12; // Skip past "\"text\":\""
                 char *textEnd = strstr(textStart, "\\\"");
-                if (textEnd) {
+                if (textEnd)
+                {
                     *textEnd = '\0';
                     String messageText = String(textStart);
                     *textEnd = '\\'; // Restore the backslash
 
                     Serial.printf("ReverbClient: Received chat message: %s\n", messageText.c_str());
                     _chatCb(messageText);
-                } else {
+                }
+                else
+                {
                     Serial.println("ReverbClient: Could not find end quote for text field");
                 }
-            } else {
+            }
+            else
+            {
                 // Fallback: try unescaped version in case format changes
                 textStart = strstr(payloadStr, "\"text\":\"");
-                if (textStart) {
+                if (textStart)
+                {
                     textStart += 8; // Skip past "text":"
                     char *textEnd = strchr(textStart, '"');
-                    if (textEnd) {
+                    if (textEnd)
+                    {
                         *textEnd = '\0';
                         String messageText = String(textStart);
                         *textEnd = '"'; // Restore the quote
@@ -307,7 +370,9 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length) {
                         Serial.printf("ReverbClient: Received chat message (fallback): %s\n", messageText.c_str());
                         _chatCb(messageText);
                     }
-                } else {
+                }
+                else
+                {
                     Serial.printf("ReverbClient: Could not parse chat message. Full payload: %.*s\n", length, payload);
                 }
             }
@@ -319,7 +384,8 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length) {
     }
 }
 
-void ReverbClient::sendDeviceReport() {
+void ReverbClient::sendDeviceReport()
+{
     if (!isConnected())
         return;
 
@@ -347,12 +413,20 @@ void ReverbClient::sendDeviceReport() {
     // Get audio status
     const char *audioStatus = "stopped";
     String currentTrack = "";
-    if (audioState == 1) { // PLAYING state
+    int currentSecond = 0;
+    int currentVolume = audio.getCurrentVolume();
+    int volumeCeiling = audio.getVolumeCeiling();
+    if (audioState == 1)
+    { // PLAYING state
         audioStatus = "playing";
         currentTrack = audio.getCurrentTrack();
-    } else if (audioState == 2) { // PAUSED state
+        currentSecond = (int)audio.getCurrentTrackSeconds();
+    }
+    else if (audioState == 2)
+    { // PAUSED state
         audioStatus = "paused";
         currentTrack = audio.getCurrentTrack();
+        currentSecond = (int)audio.getCurrentTrackSeconds();
     }
 
     // Sanitize strings
@@ -361,7 +435,8 @@ void ReverbClient::sendDeviceReport() {
 
     // Get NFC card ID
     String nfcCardId = "";
-    if (isReedActive && isCardPresent) {
+    if (isReedActive && isCardPresent)
+    {
         nfcCardId = nfc.currentNFCData().uidString;
     }
 
@@ -387,6 +462,9 @@ void ReverbClient::sendDeviceReport() {
                            "\"audio\":{"
                            "\"current_track_status\":\"%s\""
                            "%s%s%s"
+                           ",\"current_track_second\":%d"
+                           ",\"current_volume\":%d"
+                           ",\"volume_ceiling\":%d"
                            "},"
                            "\"nfc\":{"
                            "\"switch_status\":\"%s\""
@@ -408,25 +486,32 @@ void ReverbClient::sendDeviceReport() {
                            currentTrack.length() > 0 ? ",\"current_track_id\":\"" : "",
                            currentTrack.c_str(),
                            currentTrack.length() > 0 ? "\"" : "",
+                           currentSecond,
+                           currentVolume,
+                           volumeCeiling,
                            isReedActive ? "present" : "empty",
                            nfcCardId.length() > 0 ? ",\"docked_card_id\":\"" : "",
                            nfcCardId.c_str(),
                            nfcCardId.length() > 0 ? "\"" : "");
 
-    if (written > 0 && written < sizeof(jsonBuffer) - 1) {
+    if (written > 0 && written < sizeof(jsonBuffer) - 1)
+    {
         _ws->sendTXT(jsonBuffer, written);
     }
 }
 
-bool ReverbClient::subscribeToPrivate() {
-    if (_socketId.length() == 0 || !_httpClient) {
+bool ReverbClient::subscribeToPrivate()
+{
+    if (_socketId.length() == 0 || !_httpClient)
+    {
         return false;
     }
 
     HTTPClient http;
     snprintf(urlBuffer, sizeof(urlBuffer), "https://%s/broadcasting/auth", _host.c_str());
 
-    if (http.begin(*_httpClient, urlBuffer)) {
+    if (http.begin(*_httpClient, urlBuffer))
+    {
         http.addHeader("Content-Type", "application/json");
         snprintf(headerBuffer, sizeof(headerBuffer), "Bearer %s", _authToken.c_str());
         http.addHeader("Authorization", headerBuffer);
@@ -439,7 +524,8 @@ bool ReverbClient::subscribeToPrivate() {
 
         int httpCode = http.POST((uint8_t *)tempBuffer, strlen(tempBuffer));
 
-        if (httpCode != 200) {
+        if (httpCode != 200)
+        {
             http.end();
             return false;
         }
@@ -449,7 +535,8 @@ bool ReverbClient::subscribeToPrivate() {
 
         int authStart = authResponse.indexOf("\"auth\":\"") + 8;
         int authEnd = authResponse.indexOf("\"", authStart);
-        if (authStart < 8 || authEnd < 0) {
+        if (authStart < 8 || authEnd < 0)
+        {
             return false;
         }
         String authValue = authResponse.substring(authStart, authEnd);
@@ -464,19 +551,24 @@ bool ReverbClient::subscribeToPrivate() {
     return false;
 }
 
-void ReverbClient::handleDeviceCommand(const char *payloadStr) {
+void ReverbClient::handleDeviceCommand(const char *payloadStr)
+{
     // Parse the command data from the escaped JSON
     // Look for the data field which contains escaped JSON with device_id, timestamp, type, and value
     char *dataStart = strstr(payloadStr, "\\\"data\\\":\\\"");
-    if (!dataStart) {
+    if (!dataStart)
+    {
         // Fallback: try unescaped version
         dataStart = strstr(payloadStr, "\"data\":\"");
-        if (!dataStart) {
+        if (!dataStart)
+        {
             Serial.println("ReverbClient: Could not find data field in command");
             return;
         }
         dataStart += 8; // Skip past "data":"
-    } else {
+    }
+    else
+    {
         dataStart += 12; // Skip past "\"data\":\""
     }
 
@@ -487,28 +579,35 @@ void ReverbClient::handleDeviceCommand(const char *payloadStr) {
 
     // Look for the pattern that indicates end of data field
     char *channelStart = strstr(dataStart, "\\\",\\\"channel\\\"");
-    if (!channelStart) {
+    if (!channelStart)
+    {
         channelStart = strstr(dataStart, "\",\"channel\"");
     }
 
-    if (channelStart) {
+    if (channelStart)
+    {
         dataEnd = channelStart;
-    } else {
+    }
+    else
+    {
         // Fallback: look for closing quote near end
         char *endBrace = strstr(dataStart, "\"}");
-        if (endBrace) {
+        if (endBrace)
+        {
             dataEnd = endBrace;
         }
     }
 
-    if (!dataEnd) {
+    if (!dataEnd)
+    {
         Serial.println("ReverbClient: Could not find end of data field");
         return;
     }
 
     // Create a temporary buffer for the data content
     size_t dataLen = dataEnd - dataStart;
-    if (dataLen >= sizeof(tempBuffer) - 1) {
+    if (dataLen >= sizeof(tempBuffer) - 1)
+    {
         Serial.println("ReverbClient: Command data too large to parse");
         return;
     }
@@ -527,10 +626,12 @@ void ReverbClient::handleDeviceCommand(const char *payloadStr) {
     // Extract command type
     String commandType = "";
     int typeStart = unescapedData.indexOf("\"type\":\"");
-    if (typeStart >= 0) {
+    if (typeStart >= 0)
+    {
         typeStart += 8; // Skip past "type":"
         int typeEnd = unescapedData.indexOf("\"", typeStart);
-        if (typeEnd > typeStart) {
+        if (typeEnd > typeStart)
+        {
             commandType = unescapedData.substring(typeStart, typeEnd);
         }
     }
@@ -539,37 +640,48 @@ void ReverbClient::handleDeviceCommand(const char *payloadStr) {
     String commandValue = "";
     bool hasValue = false;
     int valueStart = unescapedData.indexOf("\"value\":");
-    if (valueStart >= 0) {
+    if (valueStart >= 0)
+    {
         valueStart += 8; // Skip past "value":
 
         // Skip whitespace
         while (valueStart < unescapedData.length() &&
-               (unescapedData.charAt(valueStart) == ' ' || unescapedData.charAt(valueStart) == '\t')) {
+               (unescapedData.charAt(valueStart) == ' ' || unescapedData.charAt(valueStart) == '\t'))
+        {
             valueStart++;
         }
 
-        if (valueStart < unescapedData.length()) {
+        if (valueStart < unescapedData.length())
+        {
             char valueChar = unescapedData.charAt(valueStart);
-            if (valueChar == 'n') {
+            if (valueChar == 'n')
+            {
                 // Check for null
-                if (unescapedData.substring(valueStart, valueStart + 4) == "null") {
+                if (unescapedData.substring(valueStart, valueStart + 4) == "null")
+                {
                     hasValue = false;
                 }
-            } else if (valueChar == '"') {
+            }
+            else if (valueChar == '"')
+            {
                 // String value
                 valueStart++; // Skip opening quote
                 int valueEnd = unescapedData.indexOf("\"", valueStart);
-                if (valueEnd > valueStart) {
+                if (valueEnd > valueStart)
+                {
                     commandValue = unescapedData.substring(valueStart, valueEnd);
                     hasValue = true;
                 }
-            } else if (isdigit(valueChar) || valueChar == '-') {
+            }
+            else if (isdigit(valueChar) || valueChar == '-')
+            {
                 // Numeric value
                 int valueEnd = valueStart;
                 while (valueEnd < unescapedData.length() &&
                        (isdigit(unescapedData.charAt(valueEnd)) ||
                         unescapedData.charAt(valueEnd) == '.' ||
-                        unescapedData.charAt(valueEnd) == '-')) {
+                        unescapedData.charAt(valueEnd) == '-'))
+                {
                     valueEnd++;
                 }
                 commandValue = unescapedData.substring(valueStart, valueEnd);
@@ -578,7 +690,8 @@ void ReverbClient::handleDeviceCommand(const char *payloadStr) {
         }
     }
 
-    if (commandType.length() == 0) {
+    if (commandType.length() == 0)
+    {
         Serial.println("ReverbClient: Could not extract command type");
         return;
     }
@@ -591,7 +704,8 @@ void ReverbClient::handleDeviceCommand(const char *payloadStr) {
     executeCommand(commandType, commandValue, hasValue);
 }
 
-void ReverbClient::executeCommand(const String &type, const String &value, bool hasValue) {
+void ReverbClient::executeCommand(const String &type, const String &value, bool hasValue)
+{
     // Get instances of controllers we might need
     AudioController &audio = AudioController::getInstance();
 
@@ -599,103 +713,209 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
     String lowerType = type;
     lowerType.toLowerCase();
 
-    if (lowerType == "volup") {
+    if (lowerType == "volup")
+    {
         Serial.println("ReverbClient: Executing volume up command");
-        if (audio.volumeUp()) {
+        if (audio.volumeUp())
+        {
             Serial.printf("ReverbClient: Volume increased to %d\n", audio.getCurrentVolume());
-        } else {
+        }
+        else
+        {
             Serial.println("ReverbClient: Failed to increase volume (may be at maximum)");
         }
-    } else if (lowerType == "voldown") {
+    }
+    else if (lowerType == "voldown")
+    {
         Serial.println("ReverbClient: Executing volume down command");
-        if (audio.volumeDown()) {
+        if (audio.volumeDown())
+        {
             Serial.printf("ReverbClient: Volume decreased to %d\n", audio.getCurrentVolume());
-        } else {
+        }
+        else
+        {
             Serial.println("ReverbClient: Failed to decrease volume (may be at minimum)");
         }
-    } else if (lowerType == "play") {
+    }
+    else if (lowerType == "play")
+    {
         Serial.println("ReverbClient: Executing play command");
-        if (hasValue && value.length() > 0) {
+        if (hasValue && value.length() > 0)
+        {
             Serial.printf("ReverbClient: Playing track: %s\n", value.c_str());
-            if (audio.play(value)) {
+            if (audio.play(value))
+            {
                 Serial.println("ReverbClient: Track playback started successfully");
-            } else {
+            }
+            else
+            {
                 Serial.println("ReverbClient: Failed to start track playback");
             }
-        } else {
+        }
+        else
+        {
             Serial.println("ReverbClient: Resuming playback");
-            if (audio.resume()) {
+            if (audio.resume())
+            {
                 Serial.println("ReverbClient: Playback resumed successfully");
-            } else {
+            }
+            else
+            {
                 Serial.println("ReverbClient: Failed to resume playback");
             }
         }
-    } else if (lowerType == "stop-track") {
+    }
+    else if (lowerType == "stop-track")
+    {
         Serial.println("ReverbClient: Executing stop command");
-        if (audio.stop()) {
+        if (audio.stop())
+        {
             Serial.println("ReverbClient: Playback stopped successfully");
-        } else {
+        }
+        else
+        {
             Serial.println("ReverbClient: Failed to stop playback");
         }
-    } else if (lowerType == "next-track") {
+    }
+    else if (lowerType == "next-track")
+    {
         Serial.println("ReverbClient: Executing next-track command");
-        if (audio.nextTrack()) {
+        if (audio.nextTrack())
+        {
             Serial.println("ReverbClient: Skipped to next track successfully");
-        } else {
+        }
+        else
+        {
             Serial.println("ReverbClient: Failed to skip to next track (may be at end of playlist)");
         }
-    } else if (lowerType == "prev-track") {
+    }
+    else if (lowerType == "prev-track")
+    {
         Serial.println("ReverbClient: Executing previous-track command");
-        if (audio.prevTrack()) {
+        if (audio.prevTrack())
+        {
             Serial.println("ReverbClient: Skipped to previous track successfully");
-        } else {
+        }
+        else
+        {
             Serial.println("ReverbClient: Failed to skip to previous track (may be at beginning of playlist)");
         }
-    } else if (lowerType == "pause-track") {
+    }
+    else if (lowerType == "pause-track")
+    {
         Serial.println("ReverbClient: Executing pause-track command");
-        if (audio.pause()) {
+        if (audio.pause())
+        {
             Serial.println("ReverbClient: Playback paused successfully");
-        } else {
+        }
+        else
+        {
             Serial.println("ReverbClient: Failed to pause playback");
         }
-    } else if (lowerType == "resume-track") {
+    }
+    else if (lowerType == "resume-track")
+    {
         Serial.println("ReverbClient: Executing resume-track command");
-        if (audio.resume()) {
+        if (audio.resume())
+        {
             Serial.println("ReverbClient: Playback resumed successfully");
-        } else {
+        }
+        else
+        {
             Serial.println("ReverbClient: Failed to resume playback");
         }
-    } else if (lowerType == "volset") {
-        if (hasValue && value.length() > 0) {
+    }
+    else if (lowerType == "volset")
+    {
+        if (hasValue && value.length() > 0)
+        {
             int volume = value.toInt();
-            if (volume >= AudioController::MIN_VOLUME && volume <= AudioController::MAX_VOLUME) {
+            if (volume >= AudioController::MIN_VOLUME && volume <= AudioController::MAX_VOLUME)
+            {
                 Serial.printf("ReverbClient: Setting volume to: %d\n", volume);
-                if (audio.setVolume(volume)) {
+                if (audio.setVolume(volume))
+                {
                     Serial.printf("ReverbClient: Volume set to %d successfully\n", audio.getCurrentVolume());
-                } else {
+                }
+                else
+                {
                     Serial.println("ReverbClient: Failed to set volume");
                 }
-            } else {
+            }
+            else
+            {
                 Serial.printf("ReverbClient: Invalid volume value: %d (must be %d-%d)\n",
                               volume, AudioController::MIN_VOLUME, AudioController::MAX_VOLUME);
             }
-        } else {
+        }
+        else
+        {
             Serial.println("ReverbClient: SetVolume command missing value");
         }
-    } else if (lowerType == "seek") {
-        if (hasValue && value.length() > 0) {
-            int position = value.toInt();
-            Serial.printf("ReverbClient: Seeking to position: %d\n", position);
-            // audio.seekTo(position);
-        } else {
+    }
+    else if(lowerType == "set-max-volume")
+    {
+        if (hasValue && value.length() > 0)
+        {
+            int maxVolume = value.toInt();
+            if (maxVolume >= AudioController::MIN_VOLUME && maxVolume <= AudioController::MAX_VOLUME)
+            {
+                Serial.printf("ReverbClient: Setting max volume to: %d\n", maxVolume);
+                audio.setVolumeCeiling(maxVolume);
+                Serial.printf("ReverbClient: Max volume set to %d successfully\n", maxVolume);
+            }
+            else
+            {
+                Serial.printf("ReverbClient: Invalid max volume value: %d (must be %d-%d)\n",
+                              maxVolume, AudioController::MIN_VOLUME, AudioController::MAX_VOLUME);
+            }
+        }
+        else
+        {
+            Serial.println("ReverbClient: Set-Max-Volume command missing value");
+        }
+    }
+    else if (lowerType == "play-track")
+    {
+        if (hasValue && value.length() > 0)
+        {
+            Serial.printf("ReverbClient: Playing track: %s\n", value.c_str());
+            if (audio.playTrack(value))
+            {
+                Serial.println("ReverbClient: Track playback started successfully");
+            }
+            else
+            {
+                Serial.println("ReverbClient: Failed to start track playback");
+            }
+        }
+        else
+        {
+            Serial.println("ReverbClient: Play command missing value");
+        }
+    }
+    else if (lowerType == "seek-in-track")
+    {
+        if (hasValue && value.length() > 0)
+        {
+            int seconds = value.toInt();
+            Serial.printf("ReverbClient: Seeking to seconds: %d\n", seconds);
+            audio.seekTo(seconds);
+        }
+        else
+        {
             Serial.println("ReverbClient: Seek command missing value");
         }
-    } else if (lowerType == "reboot" || lowerType == "restart") {
+    }
+    else if (lowerType == "reboot" || lowerType == "restart")
+    {
         Serial.println("ReverbClient: Executing reboot command");
         // Add a small delay to allow the response to be sent
         delay(1000);
         ESP.restart();
-    } else {
+    }
+    else
+    {
         Serial.printf("ReverbClient: Unknown command type: %s\n", type.c_str());
     }
 }

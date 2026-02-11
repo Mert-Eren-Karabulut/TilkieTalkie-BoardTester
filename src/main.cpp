@@ -16,6 +16,7 @@
 #include "ReverbClient.h"
 #include "Buttons.h"
 #include "AsyncSpeedTest.h"
+#include "SleepController.h"
 
 static const char *TAG = "MAIN";
 
@@ -39,6 +40,7 @@ AudioController &audioController = AudioController::getInstance();
 LedController ledController;
 ReverbClient &reverb = ReverbClient::getInstance(); // Create an alias for easier access
 ButtonController &buttonController = ButtonController::getInstance();
+SleepController &sleepController = SleepController::getInstance();
 
 const bool DEBUG = true; // Set to false to disable debug prints
 
@@ -56,7 +58,7 @@ void handleChatMessage(const String &message)
 
     // You can add more complex logic here, e.g., parsing the message
     // if (message == "play_sound") {
-    //   audioController.play("/sounds/notification.wav");
+    //   audioController.play("/sounds/notification.mp3");
     // }
 }
 
@@ -78,12 +80,8 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
         if (nfcController.isCardPresent() && nfcController.currentNFCData().uidString == uid)
         {
             ESP_LOGI(TAG, "Figure is still mounted! Starting automatic playback...");
-
-            // Add delay and heap check to prevent rapid execution
-            delay(300); // Give system time to stabilize
-
             // Pulse LED green to indicate success
-            ledController.pulseRapid(0x00FF00, 2); // Green color, 2 rapid pulses
+            // ledController.pulseRapid(0x00FF00, 2); // Green color, 2 rapid pulses
 
             // Create playlist from the figure structure
             std::vector<String> playlist;
@@ -137,7 +135,7 @@ void afterNFCRead(const NFCData &nfcData)
     ESP_LOGI(TAG, "Timestamp: %lu", nfcData.timestamp);
 
     // Example: Play a sound and turn the LED green
-    // audioController.play("/sounds/nfc_success.wav");
+    // audioController.play("/sounds/nfc_success.mp3");
     ledController.pulseRapid(0x00FF00, 3); // Green color
     // we need to check if the figure tracks are downloaded and they exist
     // we need to send get request with bearer token to the url :https://portal.tilkietalkie.com/api/units/{nfc_uid}
@@ -209,26 +207,6 @@ void setup()
     ledController.begin();
     ESP_LOGI(TAG, "LED Controller initialized successfully!");
 
-    // --- Initialize NFC Controller ---
-    ESP_LOGI(TAG, "Initializing NFC Controller...");
-    if (nfcController.begin())
-    {
-        ESP_LOGI(TAG, "NFC Controller initialized successfully!");
-
-        // Set up the new NFC callbacks
-        nfcController.setAfterNFCReadCallback(afterNFCRead);
-        nfcController.setAfterDetachNFCCallback(afterDetachNFC);
-
-        ESP_LOGI(TAG, "NFC callbacks configured.");
-    }
-    else
-    {
-        ESP_LOGE(TAG, "FATAL: NFC Controller initialization failed!");
-        ESP_LOGE(TAG, "NFC functionality will not be available.");
-        // Handle failure, maybe by pulsing an error color
-        ledController.pulseLed(0xFF0000); // Pulse red for error
-    }
-
     // --- NEW: Initialize Reverb Client ---
     ESP_LOGI(TAG, "Initializing Reverb WebSocket Client...");
 
@@ -277,6 +255,48 @@ void setup()
         ESP_LOGW(TAG, "Network services (API, Reverb) will not be started.");
     }
 
+    // --- Initialize NFC Controller ---
+    ESP_LOGI(TAG, "Initializing NFC Controller...");
+
+    // If network is available, wait for Reverb to connect before proceeding
+    if (WiFi.isConnected())
+    {
+        ESP_LOGI(TAG, "Network available, waiting for Reverb to connect...");
+        unsigned long reverbTimeout = millis() + 10000; // 10 second timeout
+        while (!reverb.isConnected() && millis() < reverbTimeout)
+        {
+            reverb.update(); // Keep updating Reverb to help it connect
+            delay(100);
+        }
+
+        if (reverb.isConnected())
+        {
+            ESP_LOGI(TAG, "Reverb connected successfully!");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Reverb connection timeout, proceeding anyway");
+        }
+    }
+
+    if (nfcController.begin())
+    {
+        ESP_LOGI(TAG, "NFC Controller initialized successfully!");
+
+        // Set up the new NFC callbacks
+        nfcController.setAfterNFCReadCallback(afterNFCRead);
+        nfcController.setAfterDetachNFCCallback(afterDetachNFC);
+
+        ESP_LOGI(TAG, "NFC callbacks configured.");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "FATAL: NFC Controller initialization failed!");
+        ESP_LOGE(TAG, "NFC functionality will not be available.");
+        // Handle failure, maybe by pulsing an error color
+        ledController.pulseLed(0xFF0000); // Pulse red for error
+    }
+
     // Initialize other modules here
     // e.g., sensors, etc.
 
@@ -287,6 +307,9 @@ void setup()
     // Set up button callbacks
     buttonController.onSingleClick([](ButtonController::ButtonId button)
                                    {
+        // Reset sleep timer on any button activity
+        sleepController.resetActivity();
+        
         ESP_LOGI(TAG, "Single click on button %d", button + 1);
         // Example: Different actions for different buttons
         switch(button) {
@@ -328,6 +351,9 @@ void setup()
 
     buttonController.onHoldStart([](ButtonController::ButtonId button, unsigned long duration)
                                  {
+        // Reset sleep timer on button hold
+        sleepController.resetActivity();
+        
         ESP_LOGI(TAG, "Hold started on button %d (duration: %lu ms)", button + 1, duration);
         // Example: Volume control setup
         if (button == ButtonController::BUTTON_2 || button == ButtonController::BUTTON_4) {
@@ -355,17 +381,44 @@ void setup()
 
     buttonController.onComboHold([]()
                                  {
-                                     ESP_LOGW(TAG, "COMBO HOLD TRIGGERED - RESTARTING DEVICE!");
+                                     ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (1+3) - RESTARTING DEVICE!");
                                      ledController.pulseRapid(0xFF0000, 5); // Rapid red pulse
                                      delay(2000);                           // Give time for LED animation
                                      ESP.restart();                         // Restart the device
                                  });
 
+    buttonController.onComboHold2([]()
+                                  {
+                                      ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (2+4) - RESETTING WIFI & RESTARTING!");
+                                      ledController.pulseRapid(0xFF00FF, 5); // Rapid magenta pulse
+                                      delay(1000);                           // Give time for LED animation
+                                      wifiProv.reset();                      // Reset WiFi provisioning
+                                      delay(1000);                           // Give time for reset
+                                      ESP.restart();                         // Restart the device
+                                  });
+
     ESP_LOGI(TAG, "Button Controller initialized successfully!");
+
+    // Initialize Sleep Controller
+    ESP_LOGI(TAG, "Initializing Sleep Controller...");
+    sleepController.begin();
+
+    // Set inactivity timeout to 5 minutes (300000 ms)
+    sleepController.setInactivityTimeout(300000);
+ 
+    // Optional: Set a sleep callback to be called before entering sleep
+    sleepController.onSleep([]()
+                            {
+                                ESP_LOGI(TAG, "Device is about to enter deep sleep...");
+                                ledController.pulseRapid(0xFFFF00, 3); // Yellow pulse before sleep
+                                delay(1000);                           // Give time for LED animation
+                            });
+
+    ESP_LOGI(TAG, "Sleep Controller initialized successfully!");
 
     // rapid pulse LED to indicate system is ready
     ledController.pulseRapid(0x00FF00, 3); // Rapid pulse green
-    // audioController.play("/sounds/12.wav"); // Play startup sound
+    // audioController.play("/sounds/12.mp3"); // Play startup sound
 }
 static unsigned long lastFreeCall = 0;
 static unsigned long lastStackCheck = 0;
@@ -434,7 +487,7 @@ void loop()
             ESP_LOGI(TAG, "  checkfiles - Check and download missing files");
             ESP_LOGI(TAG, "  cleanup - Clean up temporary files");
             ESP_LOGI(TAG, "Audio Commands:");
-            ESP_LOGI(TAG, "  play <path> - Play wav file");
+            ESP_LOGI(TAG, "  play <path> - Play mp3 file");
             ESP_LOGI(TAG, "  pause   - Pause current playback");
             ESP_LOGI(TAG, "  resume  - Resume paused playback");
             ESP_LOGI(TAG, "  stop    - Stop playback");
@@ -456,6 +509,11 @@ void loop()
             ESP_LOGI(TAG, "  power   - Show peripheral power status");
             ESP_LOGI(TAG, "  poweron - Enable peripheral power (IO17)");
             ESP_LOGI(TAG, "  poweroff- Disable peripheral power (IO17)");
+            ESP_LOGI(TAG, "Sleep Commands:");
+            ESP_LOGI(TAG, "  sleep   - Enter deep sleep immediately");
+            ESP_LOGI(TAG, "  sleepafter <ms> - Schedule sleep after specified milliseconds");
+            ESP_LOGI(TAG, "  cancelsleep - Cancel scheduled sleep");
+            ESP_LOGI(TAG, "  sleepstatus - Show sleep controller status");
             ESP_LOGI(TAG, "Reverb Commands:");
             ESP_LOGI(TAG, "  send <message> - Send message to Reverb API for broadcast");
             ESP_LOGI(TAG, "  wsstatus - Show WebSocket connection status");
@@ -643,7 +701,7 @@ void loop()
             else
             {
                 ESP_LOGI(TAG, "Usage: download <url> <local_path>");
-                ESP_LOGI(TAG, "Example: download http://example.com/audio.wav /audio/test.wav");
+                ESP_LOGI(TAG, "Example: download http://example.com/audio.mp3 /audio/test.mp3");
             }
         }
         else if (command.startsWith("addfile "))
@@ -670,7 +728,7 @@ void loop()
             else
             {
                 ESP_LOGI(TAG, "Usage: addfile <local_path> <url>");
-                ESP_LOGI(TAG, "Example: addfile /audio/sound.wav http://example.com/audio.wav");
+                ESP_LOGI(TAG, "Example: addfile /audio/sound.mp3 http://example.com/audio.mp3");
             }
         }
         else if (command.startsWith("deletefile "))
@@ -868,7 +926,7 @@ void loop()
                 if (filePath.isEmpty())
                 {
                     ESP_LOGI(TAG, "Usage: play <file_path>");
-                    ESP_LOGI(TAG, "Example: play /audio/song.wav");
+                    ESP_LOGI(TAG, "Example: play /audio/song.mp3");
                 }
                 else
                 {
@@ -886,7 +944,7 @@ void loop()
             else
             {
                 ESP_LOGI(TAG, "Usage: play <file_path>");
-                ESP_LOGI(TAG, "Example: play /audio/song.wav");
+                ESP_LOGI(TAG, "Example: play /audio/song.mp3");
             }
         }
         else if (command == "play")
@@ -1214,7 +1272,8 @@ void loop()
         else if (command == "debug")
         {
             ESP_LOGI(TAG, "--- Debug Information ---");
-            ESP_LOGI(TAG, "Free heap: %d bytes", ESP.getFreeHeap());
+            ESP_LOGI(TAG, "Free internal SRAM: %d bytes", ESP.getFreeHeap());
+            ESP_LOGI(TAG, "Free PSRAM: %d bytes", ESP.getFreePsram());
             ESP_LOGI(TAG, "Largest free block: %d bytes", ESP.getMaxAllocHeap());
             ESP_LOGI(TAG, "Minimum free heap: %d bytes", ESP.getMinFreeHeap());
             ESP_LOGI(TAG, "Chip revision: %d", ESP.getChipRevision());
@@ -1257,28 +1316,83 @@ void loop()
         else if (command == "heap")
         {
             ESP_LOGI(TAG, "--- Detailed Heap Information ---");
-            ESP_LOGI(TAG, "Free heap: %d bytes", ESP.getFreeHeap());
-            ESP_LOGI(TAG, "Largest free block: %d bytes", ESP.getMaxAllocHeap());
-            ESP_LOGI(TAG, "Minimum free heap since boot: %d bytes", ESP.getMinFreeHeap());
-            ESP_LOGI(TAG, "Heap size: %d bytes", ESP.getHeapSize());
 
-            // Calculate fragmentation
-            float fragmentation = (1.0 - (float)ESP.getMaxAllocHeap() / ESP.getFreeHeap()) * 100;
-            ESP_LOGI(TAG, "Heap fragmentation: %.1f%%", fragmentation);
+            // Internal SRAM Heap Statistics
+            ESP_LOGI(TAG, "");
+            ESP_LOGI(TAG, "Internal SRAM Heap:");
+            ESP_LOGI(TAG, "  Total heap size: %d bytes", ESP.getHeapSize());
+            ESP_LOGI(TAG, "  Free heap: %d bytes", ESP.getFreeHeap());
+            ESP_LOGI(TAG, "  Largest free block: %d bytes", ESP.getMaxAllocHeap());
+            ESP_LOGI(TAG, "  Minimum free heap since boot: %d bytes", ESP.getMinFreeHeap());
 
-            // Memory status
+            // Calculate internal heap usage
+            uint32_t usedHeap = ESP.getHeapSize() - ESP.getFreeHeap();
+            float heapUsagePercent = (float)usedHeap / ESP.getHeapSize() * 100;
+            ESP_LOGI(TAG, "  Used heap: %d bytes (%.1f%%)", usedHeap, heapUsagePercent);
+
+            // Calculate internal heap fragmentation
+            float heapFragmentation = 0;
+            if (ESP.getFreeHeap() > 0)
+            {
+                heapFragmentation = (1.0 - (float)ESP.getMaxAllocHeap() / ESP.getFreeHeap()) * 100;
+            }
+            ESP_LOGI(TAG, "  Heap fragmentation: %.1f%%", heapFragmentation);
+
+            // External PSRAM Statistics
+            ESP_LOGI(TAG, "");
+            ESP_LOGI(TAG, "External PSRAM:");
+            ESP_LOGI(TAG, "  Total PSRAM size: %d bytes", ESP.getPsramSize());
+            ESP_LOGI(TAG, "  Free PSRAM: %d bytes", ESP.getFreePsram());
+            ESP_LOGI(TAG, "  Minimum free PSRAM since boot: %d bytes", ESP.getMinFreePsram());
+
+            // Calculate PSRAM usage
+            uint32_t usedPsram = ESP.getPsramSize() - ESP.getFreePsram();
+            float psramUsagePercent = 0;
+            if (ESP.getPsramSize() > 0)
+            {
+                psramUsagePercent = (float)usedPsram / ESP.getPsramSize() * 100;
+            }
+            ESP_LOGI(TAG, "  Used PSRAM: %d bytes (%.1f%%)", usedPsram, psramUsagePercent);
+
+            // Overall memory status
+            ESP_LOGI(TAG, "");
+            ESP_LOGI(TAG, "Combined Memory Status:");
+            uint32_t totalFree = ESP.getFreeHeap() + ESP.getFreePsram();
+            uint32_t totalSize = ESP.getHeapSize() + ESP.getPsramSize();
+            ESP_LOGI(TAG, "  Total free memory: %d bytes", totalFree);
+            ESP_LOGI(TAG, "  Total memory size: %d bytes", totalSize);
+
+            // Memory health status
+            ESP_LOGI(TAG, "");
             if (ESP.getFreeHeap() < CRITICAL_HEAP_THRESHOLD)
             {
-                ESP_LOGE(TAG, "Status: CRITICAL - Very low memory");
+                ESP_LOGE(TAG, "Internal Heap Status: CRITICAL - Very low memory");
             }
             else if (ESP.getFreeHeap() < WARNING_HEAP_THRESHOLD)
             {
-                ESP_LOGW(TAG, "Status: WARNING - Low memory");
+                ESP_LOGW(TAG, "Internal Heap Status: WARNING - Low memory");
             }
             else
             {
-                ESP_LOGI(TAG, "Status: OK - Memory levels normal");
+                ESP_LOGI(TAG, "Internal Heap Status: OK - Memory levels normal");
             }
+
+            if (ESP.getPsramSize() > 0)
+            {
+                if (ESP.getFreePsram() < 100000)
+                { // Less than 100KB PSRAM free
+                    ESP_LOGW(TAG, "PSRAM Status: WARNING - Low PSRAM");
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "PSRAM Status: OK - PSRAM levels normal");
+                }
+            }
+            else
+            {
+                ESP_LOGW(TAG, "PSRAM Status: No PSRAM detected or disabled");
+            }
+
             ESP_LOGI(TAG, "----------------------------------");
         }
         // Stack monitoring command
@@ -1316,6 +1430,50 @@ void loop()
         else if (command == "speedtest")
         {
             speedTest.start();
+        }
+        // Sleep commands
+        else if (command == "sleep")
+        {
+            ESP_LOGI(TAG, "Entering deep sleep immediately...");
+            sleepController.checkAndSleep();
+        }
+        else if (command.startsWith("sleepafter "))
+        {
+            String timeStr = command.substring(11);
+            unsigned long timeMs = timeStr.toInt();
+            if (timeMs > 0)
+            {
+                sleepController.scheduleSleep(timeMs);
+                ESP_LOGI(TAG, "Sleep scheduled after %lu ms", timeMs);
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Usage: sleepafter <milliseconds>");
+                ESP_LOGI(TAG, "Example: sleepafter 30000 (sleep after 30 seconds)");
+            }
+        }
+        else if (command == "cancelsleep")
+        {
+            sleepController.cancelSleep();
+            ESP_LOGI(TAG, "Scheduled sleep cancelled");
+        }
+        else if (command == "sleepstatus")
+        {
+            ESP_LOGI(TAG, "--- Sleep Controller Status ---");
+            ESP_LOGI(TAG, "Inactivity timeout: %lu ms", sleepController.getInactivityTimeout());
+            ESP_LOGI(TAG, "Was woken from sleep: %s", sleepController.wasWokenFromSleep() ? "Yes" : "No");
+            if (sleepController.wasWokenFromSleep())
+            {
+                sleepController.printWakeupReason();
+            }
+
+            // Check sleep conditions
+            FileManager &fm = FileManager::getInstance();
+            AudioController &ac = AudioController::getInstance();
+            ESP_LOGI(TAG, "Pending downloads: %d", fm.getPendingDownloadsCount());
+            ESP_LOGI(TAG, "Audio state: %d (0=STOPPED, 1=PLAYING, 2=PAUSED)", ac.getState());
+            ESP_LOGI(TAG, "Can enter sleep: %s", (fm.getPendingDownloadsCount() == 0 && ac.getState() != 1) ? "Yes" : "No");
+            ESP_LOGI(TAG, "-------------------------------");
         }
         // File Manager commands that were missing
         else if (command == "dlstats")
@@ -1374,4 +1532,7 @@ void loop()
 
     // Update NFC controller (handles reed switch monitoring and NFC reading)
     nfcController.update();
+
+    // Update Sleep controller (handles inactivity timeout and sleep scheduling)
+    sleepController.update();
 }

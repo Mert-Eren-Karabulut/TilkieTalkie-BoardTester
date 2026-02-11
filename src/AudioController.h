@@ -7,7 +7,7 @@
 #include <vector>
 #include "AudioFileSourceFS.h"
 #include "AudioFileSourceBuffer.h"
-#include "AudioGeneratorWAV.h"
+#include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
 #include "FileManager.h"
 
@@ -57,10 +57,12 @@ public:
     bool pause();
     bool resume();
     bool stop();
+    bool seekTo(float seconds); // Seek to specific time position (works during playback or when paused)
     
     // Playlist control methods
     bool nextTrack();
     bool prevTrack();
+    bool playTrack(const String& trackId); // Jump to a specific track by backend ID
     void setPlaylist(const std::vector<String>& trackPaths, const String& figureUid);
     void clearPlaylist();
     
@@ -95,6 +97,9 @@ public:
     
     // Beep functions
     void volumeBeep(); // Beep to indicate volume level
+    
+    // NFC session check (public for SleepController)
+    bool isNfcSessionActive(const String& expectedUid) const;
 
 private:
     // Singleton instance
@@ -107,7 +112,7 @@ private:
     // Audio components
     AudioFileSourceFS* audioFile;
     AudioFileSourceBuffer* audioBuffer;
-    AudioGeneratorWAV* audioWAV;
+    AudioGeneratorMP3* audioMP3;
     AudioOutputI2S* audioOutput;
 
     // State variables
@@ -118,9 +123,9 @@ private:
     bool initialized;
     bool i2s_driver_installed;  // Track I2S driver state to prevent double initialization
     
-    // Pause/resume position tracking
-    uint32_t pausedPosition;
-    bool hasPausedPosition;
+    // Pause/resume time tracking (time-based instead of byte-based for accurate MP3 resume)
+    float pausedTimeSeconds;         // Time position in seconds when paused
+    bool hasPausedTime;              // Whether we have a valid paused time
     
     // Track timing variables
     unsigned long trackStartTime;    // millis() when track started playing
@@ -149,7 +154,6 @@ private:
     bool isValidAudioFile(const String& filePath);
     void cleanupAudioComponents();
     bool initializeAudioComponents();
-    bool isNfcSessionActive(const String& expectedUid) const;
 
     // File manager reference
     FileManager& fileManager;

@@ -40,7 +40,7 @@ void ButtonController::update() {
     // Process hold continuous callbacks
     for (int i = 0; i < MAX_BUTTONS; i++) {
         ButtonState& btn = buttons[i];
-        if (btn.isHolding && !comboActive) {
+        if (btn.isHolding && !comboActive && !combo2Active) {
             if (currentTime - btn.lastHoldTime >= holdInterval) {
                 btn.lastHoldTime = currentTime;
                 if (holdContinuousCallback) {
@@ -50,12 +50,22 @@ void ButtonController::update() {
         }
     }
     
-    // Check combo hold completion
+    // Check combo hold completion (Button 1 + 3)
     if (comboActive && !comboProcessed) {
         if (currentTime - comboStartTime >= comboHoldTime) {
             comboProcessed = true;
             if (comboHoldCallback) {
                 comboHoldCallback();
+            }
+        }
+    }
+    
+    // Check combo2 hold completion (Button 2 + 4)
+    if (combo2Active && !combo2Processed) {
+        if (currentTime - combo2StartTime >= comboHoldTime) {
+            combo2Processed = true;
+            if (comboHold2Callback) {
+                comboHold2Callback();
             }
         }
     }
@@ -115,13 +125,13 @@ void ButtonController::handleButtonRelease(ButtonId button) {
     // Handle hold end
     if (btn.isHolding) {
         btn.isHolding = false;
-        if (holdEndCallback && !comboActive) {
+        if (holdEndCallback && !comboActive && !combo2Active) {
             holdEndCallback(button, pressDuration);
         }
     }
     
     // Handle single click (only if not part of combo and wasn't holding)
-    if (btn.singleClickPending && !comboActive && pressDuration < holdThreshold) {
+    if (btn.singleClickPending && !comboActive && !combo2Active && pressDuration < holdThreshold) {
         btn.singleClickPending = false;
         if (singleClickCallback) {
             singleClickCallback(button);
@@ -130,7 +140,7 @@ void ButtonController::handleButtonRelease(ButtonId button) {
     
     btn.singleClickPending = false;
     
-    // Check if this release affects combo state
+    // Check if this release affects combo state (Button 1 + 3)
     if (comboActive && (button == BUTTON_1 || button == BUTTON_3)) {
         bool button1Pressed = buttons[BUTTON_1].currentState;
         bool button3Pressed = buttons[BUTTON_3].currentState;
@@ -141,8 +151,19 @@ void ButtonController::handleButtonRelease(ButtonId button) {
         }
     }
     
+    // Check if this release affects combo2 state (Button 1 + 2)
+    if (combo2Active && (button == BUTTON_1 || button == BUTTON_2)) {
+        bool button1Pressed = buttons[BUTTON_1].currentState;
+        bool button2Pressed = buttons[BUTTON_2].currentState;
+        
+        if (!button1Pressed && !button2Pressed) {
+            // Both combo2 buttons released
+            resetCombo2();
+        }
+    }
+    
     // Start hold detection timer (non-blocking)
-    if (pressDuration >= holdThreshold && !comboActive) {
+    if (pressDuration >= holdThreshold && !comboActive && !combo2Active) {
         // This was a hold, not a click
         btn.singleClickPending = false;
     }
@@ -175,8 +196,31 @@ void ButtonController::updateCombo() {
         }
     }
     
-    // Handle hold start for individual buttons (only if not in combo)
-    if (!comboActive) {
+    // Check for combo2 start (Button 1 + 2)
+    bool button2Pressed = buttons[BUTTON_2].currentState;
+    
+    if (!combo2Active && button1Pressed && button2Pressed) {
+        unsigned long btn1PressTime = buttons[BUTTON_1].pressStartTime;
+        unsigned long btn2PressTime = buttons[BUTTON_2].pressStartTime;
+        
+        // Allow some tolerance for simultaneous press (within 200ms)
+        if (abs((long)(btn1PressTime - btn2PressTime)) <= 200) {
+            combo2Active = true;
+            combo2StartTime = max(btn1PressTime, btn2PressTime);
+            combo2Processed = false;
+            
+            // Cancel individual button events
+            buttons[BUTTON_1].singleClickPending = false;
+            buttons[BUTTON_2].singleClickPending = false;
+            buttons[BUTTON_1].processed = true;
+            buttons[BUTTON_2].processed = true;
+            
+            Serial.println("[BUTTONS] Combo2 hold started (Button 1 + 2)");
+        }
+    }
+    
+    // Handle hold start for individual buttons (only if not in any combo)
+    if (!comboActive && !combo2Active) {
         for (int i = 0; i < MAX_BUTTONS; i++) {
             ButtonState& btn = buttons[i];
             if (btn.currentState && !btn.isHolding && !btn.processed) {
@@ -215,6 +259,19 @@ void ButtonController::resetCombo() {
     }
 }
 
+void ButtonController::resetCombo2() {
+    if (combo2Active) {
+        Serial.println("[BUTTONS] Combo2 hold ended");
+        combo2Active = false;
+        combo2Processed = false;
+        
+        // Reset combo2 buttons
+        resetButton(BUTTON_1);
+        resetButton(BUTTON_2);
+        
+    }
+}
+
 bool ButtonController::readButtonRaw(ButtonId button) {
     // Direct reading - HIGH = pressed, LOW = not pressed
     bool reading = digitalRead(BUTTON_PINS[button]);
@@ -240,6 +297,10 @@ void ButtonController::onHoldEnd(HoldCallback callback) {
 
 void ButtonController::onComboHold(ComboCallback callback) {
     comboHoldCallback = callback;
+}
+
+void ButtonController::onComboHold2(ComboCallback callback) {
+    comboHold2Callback = callback;
 }
 
 // Configuration methods

@@ -26,14 +26,12 @@ private:
     static constexpr size_t MAX_RESPONSE_SIZE = 16384; // 16KB max response
     
     // Private helper methods
-    bool isWiFiConnected();
-    bool checkNetworkConnectivity();
+    bool isNetworkReady();
     void setDefaultHeaders();
     JsonDocument parseResponse(const String& response);
-    String convertToHttp(const String& url);
     
-    // Memory-efficient string building helper
-    String buildUrl(const String& endpoint) const;
+    // HTTP request helper - consolidates common request patterns
+    JsonDocument executeHttpRequest(const String& endpoint, const String& method, const String* payload = nullptr);
 
     // Private constructor for singleton
     RequestManager(const String &baseUrl = "http://your-laravel-api.com/api");
@@ -71,21 +69,14 @@ public:
 
     void getCheckFigureTracks(const String &uid); // Method to fetch figure tracks
 
-    // Track and Episode structures for playlist - using move semantics and reserved capacity
+    // Track and Episode structures for playlist
     struct Track {
         String id;
         String name;
         String description;
         String audioUrl;
         String localPath;  // Local file path after download
-        int duration;
-        
-        // Move constructor and assignment operator for better memory management
-        Track() = default;
-        Track(Track&& other) noexcept = default;
-        Track& operator=(Track&& other) noexcept = default;
-        Track(const Track& other) = default;
-        Track& operator=(const Track& other) = default;
+        int duration = 0;
     };
     
     struct Episode {
@@ -93,13 +84,6 @@ public:
         String name;
         String description;
         std::vector<Track> tracks;
-        
-        // Constructor with reserved capacity to prevent reallocations
-        Episode() { tracks.reserve(10); } // Reserve space for typical episode size
-        Episode(Episode&& other) noexcept = default;
-        Episode& operator=(Episode&& other) noexcept = default;
-        Episode(const Episode& other) = default;
-        Episode& operator=(const Episode& other) = default;
     };
     
     struct Figure {
@@ -107,13 +91,6 @@ public:
         String name;
         String description;
         std::vector<Episode> episodes;
-        
-        // Constructor with reserved capacity to prevent reallocations
-        Figure() { episodes.reserve(5); } // Reserve space for typical figure size
-        Figure(Figure&& other) noexcept = default;
-        Figure& operator=(Figure&& other) noexcept = default;
-        Figure(const Figure& other) = default;
-        Figure& operator=(const Figure& other) = default;
     };
 
     // Figure download callback system
@@ -122,10 +99,6 @@ public:
     
     // Helper method to get figure ID from UID (for deletion purposes)
     String getFigureIdFromUid(const String &uid);
-    
-    // Memory cleanup methods
-    void clearDownloadTrackers();
-    void cleanupCompletedTrackers();
 
 private:
     String lastError;
@@ -143,27 +116,12 @@ private:
         String uid;
         String figureName;
         String figureId;
-        int totalTracks;
-        int tracksReady; // tracks that existed or were successfully downloaded
-        int tracksFailed; // tracks that failed to download
+        int totalTracks = 0;
+        int tracksReady = 0;   // tracks that existed or were successfully downloaded
+        int tracksFailed = 0;  // tracks that failed to download
         std::vector<String> trackPaths;
-        bool completed;
-        Figure figureData; // Store the complete figure structure
-        
-        // Constructor with reserved capacity to prevent reallocations
-        FigureDownloadTracker() { 
-            trackPaths.reserve(20); // Reserve space for typical track count
-            totalTracks = 0;
-            tracksReady = 0;
-            tracksFailed = 0;
-            completed = false;
-        }
-        
-        // Move semantics for better memory management
-        FigureDownloadTracker(FigureDownloadTracker&& other) noexcept = default;
-        FigureDownloadTracker& operator=(FigureDownloadTracker&& other) noexcept = default;
-        FigureDownloadTracker(const FigureDownloadTracker& other) = default;
-        FigureDownloadTracker& operator=(const FigureDownloadTracker& other) = default;
+        bool completed = false;
+        Figure figureData;     // Store the complete figure structure
     };
     
     std::vector<FigureDownloadTracker> activeDownloads;

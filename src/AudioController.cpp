@@ -5,7 +5,7 @@
 #include <SD_MMC.h>
     
 #include "AudioFileSourceBuffer.h"
-#include "AudioGeneratorWAV.h"
+#include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
 
 // Initialize static members
@@ -72,14 +72,14 @@ const int AudioController::VOLUME_STEP;
 AudioController::AudioController() :
     audioFile(nullptr),
     audioBuffer(nullptr),
-    audioWAV(nullptr),
+    audioMP3(nullptr),
     audioOutput(nullptr),
     currentState(STOPPED),
     currentTrackPath(""),
     currentVolume(DEFAULT_VOLUME),
     initialized(false),
-    pausedPosition(0),
-    hasPausedPosition(false),
+    pausedTimeSeconds(0.0f),
+    hasPausedTime(false),
     trackStartTime(0),
     accumulatedPlayTime(0.0f),
     pauseStartTime(0),
@@ -95,6 +95,13 @@ AudioController::AudioController() :
     // Ensure the volume ceiling is within valid range
     volumeCeiling = min(volumeCeiling, MAX_VOLUME);
     volumeCeiling = max(volumeCeiling, MIN_VOLUME);
+    
+    // Load saved volume from NVS, default to DEFAULT_VOLUME if not set
+    currentVolume = config.getInt("audio_volume", DEFAULT_VOLUME);
+    
+    // Ensure saved volume is within valid range and ceiling
+    currentVolume = min(currentVolume, volumeCeiling);
+    currentVolume = max(currentVolume, MIN_VOLUME);
 }
 
 AudioController::~AudioController() {
@@ -253,25 +260,35 @@ bool AudioController::play(const String& filePath) {
         return false;
     }
     
-    audioBuffer = new AudioFileSourceBuffer(audioFile, 2048); // Using smaller buffer like example
+    // Larger buffer (8KB) for faster MP3 frame sync and reduced I/O during initialization
+    uint32_t spiBufferSize = 8192;
+    byte *spiBuffer = (byte *)ps_malloc(spiBufferSize);
+    if (!spiBuffer) {
+        Serial.println("AudioController: Failed to allocate PSRAM buffer");
+        delete audioFile;
+        audioFile = nullptr;
+        return false;
+    }
+    audioBuffer = new AudioFileSourceBuffer(audioFile, spiBuffer, spiBufferSize);
     if (!audioBuffer) {
         Serial.println("AudioController: Failed to create AudioFileSourceBuffer");
+        free(spiBuffer);
         delete audioFile;
         audioFile = nullptr;
         return false;
     }
     
-    audioWAV = new AudioGeneratorWAV();
-    if (!audioWAV) {
-        Serial.println("AudioController: Failed to create AudioGeneratorWAV");
+    audioMP3 = new AudioGeneratorMP3();
+    if (!audioMP3) {
+        Serial.println("AudioController: Failed to create AudioGeneratorMP3");
         cleanupAudioComponents();
         return false;
     }
 
     // Start playback (following working example)
-    Serial.println("AudioController: Starting WAV playback");
-    if (!audioWAV->begin(audioBuffer, audioOutput)) {
-        Serial.println("AudioController: Failed to start WAV playback");
+    Serial.println("AudioController: Starting MP3 playback");
+    if (!audioMP3->begin(audioBuffer, audioOutput)) {
+        Serial.println("AudioController: Failed to start MP3 playback");
         cleanupAudioComponents();
         return false;
     }
@@ -292,21 +309,22 @@ bool AudioController::pause() {
         return false;
     }
 
-    if (audioWAV && audioWAV->isRunning()) {
-        // Save current position before stopping
-        if (audioFile) {
-            pausedPosition = audioFile->getPos();
-            hasPausedPosition = true;
-        }
-        
-        // Accumulate play time before pausing
+    if (audioMP3 && audioMP3->isRunning()) {
+        // Calculate and save current playback time in seconds
         if (trackStartTime > 0) {
-            accumulatedPlayTime += (millis() - trackStartTime) / 1000.0f;
+            float currentPlayTime = accumulatedPlayTime + ((millis() - trackStartTime) / 1000.0f);
+            pausedTimeSeconds = currentPlayTime;
+            hasPausedTime = true;
+            
+            Serial.printf("AudioController: Paused at %.2f seconds\n", pausedTimeSeconds);
+            
+            // Update accumulated time
+            accumulatedPlayTime = currentPlayTime;
             pauseStartTime = millis();
         }
         
         // Stop the audio playback
-        audioWAV->stop();
+        audioMP3->stop();
         currentState = PAUSED;
         return true;
     }
@@ -323,13 +341,13 @@ bool AudioController::resume() {
         // Clean up current audio components
         cleanupAudioComponents();
         
-        // Create fresh WAV generator for resume
-        audioWAV = new AudioGeneratorWAV();
-        if (!audioWAV) {
-            Serial.println("AudioController: Failed to create WAV generator for resume");
+        // Create fresh MP3 generator for resume
+        audioMP3 = new AudioGeneratorMP3();
+        if (!audioMP3) {
+            Serial.println("AudioController: Failed to create MP3 generator for resume");
             currentState = STOPPED;
             currentTrackPath = "";
-            hasPausedPosition = false;
+            hasPausedTime = false;
             return false;
         }
         
@@ -340,7 +358,7 @@ bool AudioController::resume() {
             cleanupAudioComponents();
             currentState = STOPPED;
             currentTrackPath = "";
-            hasPausedPosition = false;
+            hasPausedTime = false;
             return false;
         }
         
@@ -349,49 +367,124 @@ bool AudioController::resume() {
             Serial.printf("AudioController: Failed to open audio file for resume: %s\n", currentTrackPath.c_str());
             delete audioFile;
             audioFile = nullptr;
-            delete audioWAV;
-            audioWAV = nullptr;
+            delete audioMP3;
+            audioMP3 = nullptr;
             currentState = STOPPED;
             currentTrackPath = "";
-            hasPausedPosition = false;
+            hasPausedTime = false;
             return false;
         }
 
-        // Create buffer (file pointer is still at beginning)
-        audioBuffer = new AudioFileSourceBuffer(audioFile, 2048);
+        // Create buffer - larger buffer for faster decoding during fast-forward
+        uint32_t resumeBufferSize = 8192;
+        byte *resumeBuffer = (byte *)ps_malloc(resumeBufferSize);
+        if (!resumeBuffer) {
+            Serial.printf("AudioController: Failed to allocate PSRAM buffer for resume\n");
+            cleanupAudioComponents();
+            currentState = STOPPED;
+            currentTrackPath = "";
+            hasPausedTime = false;
+            return false;
+        }
+        audioBuffer = new AudioFileSourceBuffer(audioFile, resumeBuffer, resumeBufferSize);
         if (!audioBuffer) {
             Serial.printf("AudioController: Failed to create audio buffer\n");
+            free(resumeBuffer);
             cleanupAudioComponents();
             currentState = STOPPED;
             currentTrackPath = "";
+            hasPausedTime = false;
             return false;
         }
 
-        // Start playback - this will read the WAV header first
-        if (!audioWAV->begin(audioBuffer, audioOutput)) {
-            Serial.printf("AudioController: Failed to start WAV playback\n");
+        // Start playback from the beginning
+        if (!audioMP3->begin(audioBuffer, audioOutput)) {
+            Serial.printf("AudioController: Failed to start MP3 playback\n");
             cleanupAudioComponents();
             currentState = STOPPED;
             currentTrackPath = "";
+            hasPausedTime = false;
             return false;
         }
 
-        // AFTER initialization is complete, seek to the paused position if we have one
-        if (hasPausedPosition) {
-            if (audioFile->seek(pausedPosition, SEEK_SET)) {
-                Serial.printf("AudioController: Resumed from position %u\n", pausedPosition);
-            } else {
-                Serial.printf("AudioController: Failed to seek to position %u, starting from beginning\n", pausedPosition);
+        // If we have a paused time, fast-forward through the decoder to reach it
+        // Since all MP3s are CBR at 96kbps (from ffmpeg), we can calculate precise byte position
+        if (hasPausedTime && pausedTimeSeconds > 0.1f) {
+            Serial.printf("AudioController: Fast-forwarding to %.2f seconds...\n", pausedTimeSeconds);
+            
+            // For CBR MP3 at 96kbps (12,000 bytes/sec), calculate target byte position
+            // 96kbps = 96000 bits/sec = 12000 bytes/sec
+            const uint32_t BYTES_PER_SECOND = 12000; // 96kbps / 8
+            
+            // Calculate target byte position
+            uint32_t targetBytePosition = (uint32_t)(pausedTimeSeconds * BYTES_PER_SECOND);
+            
+            // Add a small offset to account for MP3 headers/metadata at the start
+            // Typical MP3 has ~417 bytes of ID3v2 header, but we'll be conservative
+            const uint32_t HEADER_OFFSET = 512;
+            targetBytePosition += HEADER_OFFSET;
+            
+            // Ensure we don't seek past the file
+            uint32_t fileSize = audioFile->getSize();
+            if (targetBytePosition > fileSize) {
+                targetBytePosition = fileSize - 1024; // Back off a bit from the end
             }
-            hasPausedPosition = false;
+            
+            Serial.printf("AudioController: Calculated byte position: %u (file size: %u)\n", 
+                         targetBytePosition, fileSize);
+            
+            // Temporarily mute during seeking to avoid audio glitches
+            float savedGain = currentVolume / 100.0f;
+            if (audioOutput) {
+                audioOutput->SetGain(0.0f);
+            }
+            
+            // Seek to the calculated position
+            if (audioFile->seek(targetBytePosition, SEEK_SET)) {
+                Serial.printf("AudioController: Seeked to byte %u\n", targetBytePosition);
+                
+                // Now do a short fast-forward (just a few frames) to sync to the next valid MP3 frame
+                // This is much faster than fast-forwarding from the beginning
+                unsigned long startTime = millis();
+                int loopCount = 0;
+                const int MAX_SYNC_LOOPS = 50; // Should only need a few loops to find frame sync
+                
+                while (audioMP3->isRunning() && loopCount < MAX_SYNC_LOOPS) {
+                    if (!audioMP3->loop()) {
+                        // Reached end of file
+                        Serial.println("AudioController: Reached EOF during frame sync");
+                        break;
+                    }
+                    loopCount++;
+                    
+                    // Small yield every few iterations
+                    if ((loopCount % 5) == 0) {
+                        yield();
+                    }
+                }
+                
+                unsigned long syncTime = millis() - startTime;
+                Serial.printf("AudioController: Frame sync complete after %d loops (%lu ms)\n", 
+                             loopCount, syncTime);
+            } else {
+                Serial.printf("AudioController: Seek failed, starting from beginning\n");
+            }
+            
+            // Restore volume
+            if (audioOutput) {
+                audioOutput->SetGain(savedGain);
+            }
+            
+            hasPausedTime = false;
         }
         
         currentState = PLAYING;
         
-        // Restart timing for resumed playback
+        // Reset timing - we're starting fresh from the paused position
         trackStartTime = millis();
+        accumulatedPlayTime = pausedTimeSeconds; // Keep the accumulated time
         
-        Serial.println("AudioController: Resumed successfully");
+        Serial.printf("AudioController: Resumed successfully from %.2f seconds\n", pausedTimeSeconds);
         return true;
     }
 
@@ -403,8 +496,8 @@ bool AudioController::stop() {
         return false;
     }
 
-    if (audioWAV && audioWAV->isRunning()) {
-        audioWAV->stop();
+    if (audioMP3 && audioMP3->isRunning()) {
+        audioMP3->stop();
         delay(10);
     }
 
@@ -412,12 +505,177 @@ bool AudioController::stop() {
     
     currentState = STOPPED;
     currentTrackPath = "";
-    pausedPosition = 0;
-    hasPausedPosition = false;
+    pausedTimeSeconds = 0.0f;
+    hasPausedTime = false;
     trackStartTime = 0;
     accumulatedPlayTime = 0.0f;
     pauseStartTime = 0;
     
+    return true;
+}
+
+bool AudioController::seekTo(float seconds) {
+    if (!initialized) {
+        Serial.println("AudioController: Cannot seek - not initialized");
+        return false;
+    }
+
+    // Can only seek if we have a track loaded (playing or paused)
+    if (currentState == STOPPED || currentTrackPath.isEmpty()) {
+        Serial.println("AudioController: Cannot seek - no track loaded");
+        return false;
+    }
+
+    // Validate seek position
+    if (seconds < 0) {
+        Serial.println("AudioController: Invalid seek position - negative time");
+        return false;
+    }
+
+    Serial.printf("AudioController: Seeking to %.2f seconds\n", seconds);
+
+    // Remember the current state so we can restore it after seeking
+    AudioState previousState = currentState;
+    String trackPath = currentTrackPath;
+
+    // Stop current playback
+    if (audioMP3 && audioMP3->isRunning()) {
+        audioMP3->stop();
+        delay(10);
+    }
+
+    // Clean up audio components
+    cleanupAudioComponents();
+
+    // Create fresh MP3 generator
+    audioMP3 = new AudioGeneratorMP3();
+    if (!audioMP3) {
+        Serial.println("AudioController: Failed to create MP3 generator for seek");
+        currentState = STOPPED;
+        currentTrackPath = "";
+        return false;
+    }
+
+    // Create new audio file source
+    audioFile = new AudioFileSourceFS(SD_MMC);
+    if (!audioFile) {
+        Serial.println("AudioController: Failed to create AudioFileSourceFS for seek");
+        cleanupAudioComponents();
+        currentState = STOPPED;
+        currentTrackPath = "";
+        return false;
+    }
+
+    // Open the file
+    if (!audioFile->open(trackPath.c_str())) {
+        Serial.printf("AudioController: Failed to open audio file for seek: %s\n", trackPath.c_str());
+        cleanupAudioComponents();
+        currentState = STOPPED;
+        currentTrackPath = "";
+        return false;
+    }
+
+    // Create buffer
+    uint32_t seekBufferSize = 8192;
+    byte *seekBuffer = (byte *)ps_malloc(seekBufferSize);
+    if (!seekBuffer) {
+        Serial.println("AudioController: Failed to allocate PSRAM buffer for seek");
+        cleanupAudioComponents();
+        currentState = STOPPED;
+        currentTrackPath = "";
+        return false;
+    }
+    audioBuffer = new AudioFileSourceBuffer(audioFile, seekBuffer, seekBufferSize);
+    if (!audioBuffer) {
+        Serial.println("AudioController: Failed to create audio buffer for seek");
+        free(seekBuffer);
+        cleanupAudioComponents();
+        currentState = STOPPED;
+        currentTrackPath = "";
+        return false;
+    }
+
+    // Start playback from the beginning
+    if (!audioMP3->begin(audioBuffer, audioOutput)) {
+        Serial.println("AudioController: Failed to start MP3 playback for seek");
+        cleanupAudioComponents();
+        currentState = STOPPED;
+        currentTrackPath = "";
+        return false;
+    }
+
+    // Seek to the target position using CBR calculation
+    if (seconds > 0.1f) {
+        // For CBR MP3 at 96kbps (12,000 bytes/sec), calculate target byte position
+        const uint32_t BYTES_PER_SECOND = 12000; // 96kbps / 8
+        uint32_t targetBytePosition = (uint32_t)(seconds * BYTES_PER_SECOND);
+        
+        // Add header offset
+        const uint32_t HEADER_OFFSET = 512;
+        targetBytePosition += HEADER_OFFSET;
+        
+        // Ensure we don't seek past the file
+        uint32_t fileSize = audioFile->getSize();
+        if (targetBytePosition > fileSize) {
+            targetBytePosition = fileSize - 1024;
+        }
+        
+        Serial.printf("AudioController: Seeking to byte position: %u\n", targetBytePosition);
+        
+        // Temporarily mute during seeking
+        float savedGain = currentVolume / 100.0f;
+        if (audioOutput) {
+            audioOutput->SetGain(0.0f);
+        }
+        
+        // Seek to the calculated position
+        if (audioFile->seek(targetBytePosition, SEEK_SET)) {
+            // Do a short fast-forward to sync to the next valid MP3 frame
+            int loopCount = 0;
+            const int MAX_SYNC_LOOPS = 50;
+            
+            while (audioMP3->isRunning() && loopCount < MAX_SYNC_LOOPS) {
+                if (!audioMP3->loop()) {
+                    Serial.println("AudioController: Reached EOF during seek frame sync");
+                    break;
+                }
+                loopCount++;
+                if ((loopCount % 5) == 0) {
+                    yield();
+                }
+            }
+            
+            Serial.printf("AudioController: Seek frame sync complete after %d loops\n", loopCount);
+        } else {
+            Serial.println("AudioController: Seek failed");
+        }
+        
+        // Restore volume
+        if (audioOutput) {
+            audioOutput->SetGain(savedGain);
+        }
+    }
+
+    // Restore the track path
+    currentTrackPath = trackPath;
+
+    // Restore the appropriate state
+    if (previousState == PLAYING) {
+        // Continue playing from the new position
+        currentState = PLAYING;
+        trackStartTime = millis();
+        accumulatedPlayTime = seconds; // Start accumulating from the seek position
+        Serial.printf("AudioController: Seek complete, resuming playback from %.2f seconds\n", seconds);
+    } else if (previousState == PAUSED) {
+        // Pause at the new position
+        audioMP3->stop();
+        currentState = PAUSED;
+        pausedTimeSeconds = seconds;
+        hasPausedTime = true;
+        accumulatedPlayTime = seconds;
+        Serial.printf("AudioController: Seek complete, paused at %.2f seconds\n", seconds);
+    }
+
     return true;
 }
 
@@ -466,6 +724,12 @@ bool AudioController::setVolume(int volume, bool initialize /* = false */) {
 
     Serial.printf("AudioController: Setting volume from %d%% to %d%%\n", currentVolume, volume);
     currentVolume = volume;
+    
+    // Save volume to NVS for persistence across sleep/wake
+    if (!initialize) {
+        ConfigManager& config = ConfigManager::getInstance();
+        config.storeInt("audio_volume", currentVolume);
+    }
 
     // Set audio output gain
     if (audioOutput) {
@@ -577,6 +841,18 @@ bool AudioController::prevTrack() {
         clearPlaylist();
         return false;
     }
+
+    //if a track is currently playing or paused and has played for more than 3 seconds, restart it
+    if ((currentState == PLAYING || currentState == PAUSED) && (getCurrentTrackSeconds() > 3.0f)) {
+        Serial.println("AudioController: Restarting current track");
+        //seek to beginning
+        seekTo(0.0f);
+        //if paused, start playing
+        if (currentState == PAUSED) {
+            resume();
+        }
+        return true; // Don't fall through to previous track navigation
+    }
     
     // If playlist finished or at first track, go to last track
     if (playlistFinished || currentPlaylistIndex <= 0) {
@@ -590,6 +866,36 @@ bool AudioController::prevTrack() {
     return play(); // Call play() without parameters to use playlist
 }
 
+bool AudioController::playTrack(const String& trackId) {
+    if (!hasPlaylist()) {
+        Serial.println("AudioController: No playlist available");
+        return false;
+    }
+    
+    // Check if NFC session is still active
+    if (!isNfcSessionActive(playlistFigureUid)) {
+        Serial.println("AudioController: Figure not present or different figure detected, clearing playlist");
+        clearPlaylist();
+        return false;
+    }
+    
+    // Search for the track ID in the playlist
+    // Playlist paths follow the format: /figures/{figureId}/{episodeId}/{trackId}.mp3
+    String suffix = "/" + trackId + ".mp3";
+    
+    for (int i = 0; i < playlist.size(); i++) {
+        if (playlist[i].endsWith(suffix)) {
+            Serial.printf("AudioController: Found track ID %s at playlist index %d\n", trackId.c_str(), i);
+            currentPlaylistIndex = i;
+            playlistFinished = false;
+            return play(); // Play the matched track
+        }
+    }
+    
+    Serial.printf("AudioController: Track ID %s not found in current playlist\n", trackId.c_str());
+    return false;
+}
+
 void AudioController::update() {
     if (!initialized) {
         return;
@@ -597,8 +903,8 @@ void AudioController::update() {
 
     // Update audio processing only if playing
     if (currentState == PLAYING) {
-        if (audioWAV && audioWAV->isRunning()) {
-            if (!audioWAV->loop()) {
+        if (audioMP3 && audioMP3->isRunning()) {
+            if (!audioMP3->loop()) {
                 // Track finished
                 stop();
                 
@@ -613,7 +919,7 @@ void AudioController::update() {
             stop();
         }
     }
-    // For PAUSED state, we don't call audioWAV->loop() so playback remains stopped
+    // For PAUSED state, we don't call audioMP3->loop() so playback remains stopped
     // For STOPPED state, there's nothing to update
 }
 
@@ -623,8 +929,8 @@ void AudioController::volumeBeep() {
         return;
     }
     
-    // Play the beep.wav file instead of generating a tone
-    const String beepPath = "/sounds/beep.wav";
+    // Play the beep.mp3 file instead of generating a tone
+    const String beepPath = "/sounds/beep.mp3";
     
     // Check if beep file exists
     if (!fileManager.fileExists(beepPath)) {
@@ -881,21 +1187,21 @@ float AudioController::getCurrentTrackSeconds() const {
 }
 
 bool AudioController::isValidAudioFile(const String& filePath) {
-    // Check file extension - now only supporting WAV files
+    // Check file extension - now only supporting MP3 files
     String lowerPath = filePath;
     lowerPath.toLowerCase();
     
-    return lowerPath.endsWith(".wav");
+    return lowerPath.endsWith(".mp3");
 }
 
 void AudioController::cleanupAudioComponents() {
     // Following the working example pattern - stop and free components
-    if (audioWAV) {
-        if (audioWAV->isRunning()) {
-            audioWAV->stop();
+    if (audioMP3) {
+        if (audioMP3->isRunning()) {
+            audioMP3->stop();
         }
-        delete audioWAV;
-        audioWAV = nullptr;
+        delete audioMP3;
+        audioMP3 = nullptr;
     }
     
     if (audioBuffer) {
