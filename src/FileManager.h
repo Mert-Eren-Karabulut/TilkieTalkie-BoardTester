@@ -35,9 +35,9 @@ private:
 
     // SD Card pin definitions (4-bit SDMMC mode)
     static const int SD_CLK_PIN = 48; // SD_CLK
-    static const int SD_CMD_PIN = 47; // SD_CMD
-    static const int SD_D0_PIN = 42;  // SD_D0 
-    static const int SD_D1_PIN = 38;  // SD_D1
+    static const int SD_CMD_PIN = 38; // SD_CMD
+    static const int SD_D0_PIN = 42;  // SD_D0
+    static const int SD_D1_PIN = 47;  // SD_D1
     static const int SD_D2_PIN = 39;  // SD_D2
     static const int SD_D3_PIN = 40;  // SD_D3
 
@@ -218,6 +218,7 @@ public:
 
     // Required files management
     bool addRequiredFile(const String &localPath, const String &url, const String &checksum = "");
+    bool removeRequiredFile(const String &localPath);
     void checkRequiredFiles();
     std::vector<String> getRequiredFilesByPattern(const String &pattern); // Get required files matching pattern
 

@@ -48,6 +48,27 @@ const bool DEBUG = true; // Set to false to disable debug prints
 const size_t CRITICAL_HEAP_THRESHOLD = 15000; // 15KB critical threshold
 const size_t WARNING_HEAP_THRESHOLD = 25000;  // 25KB warning threshold
 
+String getDeviceEfuseMacDecimal()
+{
+    char deviceId[21];
+    snprintf(deviceId, sizeof(deviceId), "%llu", ESP.getEfuseMac());
+    return String(deviceId);
+}
+
+String getDeviceEfuseMacHex()
+{
+    uint64_t mac = ESP.getEfuseMac();
+    char macHex[18];
+    snprintf(macHex, sizeof(macHex), "%02X:%02X:%02X:%02X:%02X:%02X",
+             (uint8_t)(mac >> 40),
+             (uint8_t)(mac >> 32),
+             (uint8_t)(mac >> 24),
+             (uint8_t)(mac >> 16),
+             (uint8_t)(mac >> 8),
+             (uint8_t)mac);
+    return String(macHex);
+}
+
 // +++ Reverb WebSocket Callback Function +++
 void handleChatMessage(const String &message)
 {
@@ -83,16 +104,24 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
             // Pulse LED green to indicate success
             // ledController.pulseRapid(0x00FF00, 2); // Green color, 2 rapid pulses
 
-            // Create playlist from the figure structure
+            // Create the playback order from manifest contents first, then append custom tracks.
             std::vector<String> playlist;
-            for (const auto &episode : figure.episodes)
+            for (const auto &content : figure.contents)
             {
-                for (const auto &track : episode.tracks)
+                for (const auto &episode : content.episodes)
                 {
-                    // Path is already in correct format for SD_MMC
-                    playlist.push_back(track.localPath);
-                    ESP_LOGI(TAG, "Added to playlist: %s (%s)", track.localPath.c_str(), track.name.c_str());
+                    for (const auto &track : episode.tracks)
+                    {
+                        playlist.push_back(track.localPath);
+                        ESP_LOGI(TAG, "Added content track: %s (%s)", track.localPath.c_str(), track.name.c_str());
+                    }
                 }
+            }
+
+            for (const auto &track : figure.customTracks)
+            {
+                playlist.push_back(track.localPath);
+                ESP_LOGI(TAG, "Added custom track: %s (%s)", track.localPath.c_str(), track.name.c_str());
             }
 
             if (!playlist.empty())
@@ -170,7 +199,7 @@ void setup()
     ESP_LOGI(TAG, "=== TilkieTalkie Board Tester ===");
     ESP_LOGI(TAG, "Initializing system...");
 
-    // Enable peripheral power (IO17) - CRITICAL for SD card and other peripherals
+    // Enable the shared 4V5 peripheral rail on GPIO4 before SD/NFC/audio init.
     ESP_LOGI(TAG, "Enabling peripheral power...");
     pinMode(4, OUTPUT);
     digitalWrite(4, HIGH); // Enable power to peripherals
@@ -242,7 +271,7 @@ void setup()
         const String token = config.getJWTToken();
 
         // Generate a unique device ID from the ESP32's MAC address
-        String deviceId = String(ESP.getEfuseMac());
+        String deviceId = getDeviceEfuseMacDecimal();
 
         reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId.c_str());
 
@@ -403,8 +432,8 @@ void setup()
     ESP_LOGI(TAG, "Initializing Sleep Controller...");
     sleepController.begin();
 
-    // Set inactivity timeout to 5 minutes (300000 ms)
-    sleepController.setInactivityTimeout(300000);
+    // Set inactivity timeout to 5 minutes
+    sleepController.setInactivityTimeout(300000); // 5 minutes
  
     // Optional: Set a sleep callback to be called before entering sleep
     sleepController.onSleep([]()
@@ -412,6 +441,7 @@ void setup()
                                 ESP_LOGI(TAG, "Device is about to enter deep sleep...");
                                 ledController.pulseRapid(0xFFFF00, 3); // Yellow pulse before sleep
                                 delay(1000);                           // Give time for LED animation
+                                battery.prepareForDeepSleep();
                             });
 
     ESP_LOGI(TAG, "Sleep Controller initialized successfully!");
@@ -467,12 +497,21 @@ void loop()
             ESP_LOGI(TAG, "  restart - Restart the device");
             ESP_LOGI(TAG, "  config  - Show all configuration");
             ESP_LOGI(TAG, "  debug   - Show debug information");
+            ESP_LOGI(TAG, "  efusemac - Show device efuse MAC in decimal and hex");
             ESP_LOGI(TAG, "  heap    - Show detailed heap information");
             ESP_LOGI(TAG, "  stack   - Show stack usage information");
             ESP_LOGI(TAG, "  factory - Factory reset (erase all data)");
             ESP_LOGI(TAG, "  speedtest - Test network download speed (AsyncTCP Module)");
             ESP_LOGI(TAG, "Battery Commands:");
             ESP_LOGI(TAG, "  battery - Show battery status");
+            ESP_LOGI(TAG, "  battscan - Scan the battery I2C bus for responding devices");
+            ESP_LOGI(TAG, "  batterycfg - Reapply 4V5 rail and charger defaults");
+            ESP_LOGI(TAG, "  batteryclearflags - Clear latched BQ25792 charger/fault flags");
+            ESP_LOGI(TAG, "  chargekick - Toggle BQ25792 EN_CHG off/on to restart charging");
+            ESP_LOGI(TAG, "  gaugefets - Re-enable gauge FET control if it is disabled");
+            ESP_LOGI(TAG, "  gauge1s - Clear BQ28 DA Configuration CC0 to force 1-cell mode");
+            ESP_LOGI(TAG, "  gaugeprog - Force generic gauge provisioning");
+            ESP_LOGI(TAG, "  gaugeresetlearn - Reset BQ28 learning state to a fresh relearn baseline");
             ESP_LOGI(TAG, "File Manager Commands:");
             ESP_LOGI(TAG, "  sdtree  - Check SD card file tree");
             ESP_LOGI(TAG, "  sdformat- Format SD card as FAT32");
@@ -572,17 +611,26 @@ void loop()
                 constexpr char APP_KEY[] = "erko2001";
 
                 const String token = config.getJWTToken();
-                uint64_t chipid = ESP.getEfuseMac();
-                char deviceId[14];
-                snprintf(deviceId, sizeof(deviceId), "%llu", chipid);
+                const String deviceId = getDeviceEfuseMacDecimal();
 
-                reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId);
+                reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId.c_str());
                 reverb.onChatMessage(handleChatMessage);
             }
             else
             {
                 ESP_LOGW(TAG, "Cannot start Reverb - WiFi not connected");
             }
+        }
+        else if (command == "efusemac" || command == "hubid")
+        {
+            const String deviceId = getDeviceEfuseMacDecimal();
+            const String deviceMacHex = getDeviceEfuseMacHex();
+
+            ESP_LOGI(TAG, "--- Device Identity ---");
+            ESP_LOGI(TAG, "Hub UUID / efuse MAC (decimal): %s", deviceId.c_str());
+            ESP_LOGI(TAG, "Base MAC (hex): %s", deviceMacHex.c_str());
+            ESP_LOGI(TAG, "Backend token endpoint: /api/hubs/%s/token", deviceId.c_str());
+            ESP_LOGI(TAG, "Create or bind a Hub with uuid='%s' to your user.", deviceId.c_str());
         }
         else if (command == "testauth")
         {
@@ -1100,8 +1148,8 @@ void loop()
         // Power control commands
         else if (command == "power")
         {
-            bool powerState = digitalRead(17);
-            ESP_LOGI(TAG, "Peripheral power (IO17): %s", powerState ? "ENABLED" : "DISABLED");
+            bool powerState = digitalRead(4);
+            ESP_LOGI(TAG, "Peripheral power (GPIO4): %s", powerState ? "ENABLED" : "DISABLED");
             ESP_LOGI(TAG, "Pin state: %s", powerState ? "HIGH" : "LOW");
             if (!powerState)
             {
@@ -1112,7 +1160,7 @@ void loop()
         else if (command == "poweron")
         {
             ESP_LOGI(TAG, "Enabling peripheral power...");
-            digitalWrite(17, HIGH);
+            digitalWrite(4, HIGH);
             delay(100);
             ESP_LOGI(TAG, "Peripheral power ENABLED");
             ESP_LOGI(TAG, "You may need to reinitialize modules (restart recommended)");
@@ -1131,7 +1179,7 @@ void loop()
 
             if (confirmation == "yes")
             {
-                digitalWrite(17, LOW);
+                digitalWrite(4, LOW);
                 ESP_LOGI(TAG, "Peripheral power DISABLED");
             }
             else
@@ -1220,7 +1268,7 @@ void loop()
         {
             ESP_LOGI(TAG, "--- NFC Controller Status ---");
             ESP_LOGI(TAG, "NFC Ready: %s", nfcController.isNFCReady() ? "Yes" : "No");
-            ESP_LOGI(TAG, "Reed Switch Active: %s", nfcController.isReedSwitchActive() ? "Yes" : "No");
+            ESP_LOGI(TAG, "Pogo Switch Active: %s", nfcController.isPogoSwitchActive() ? "Yes" : "No");
             ESP_LOGI(TAG, "Card Present: %s", nfcController.isCardPresent() ? "Yes" : "No");
             ESP_LOGI(TAG, "-----------------------------");
         }
@@ -1240,12 +1288,12 @@ void loop()
             }
             ESP_LOGI(TAG, "----------------------------------");
         }
-        else if (command == "nfcreed")
+        else if (command == "nfcpogo" || command == "nfcreed")
         {
-            bool rawReedState = digitalRead(REED_SWITCH_PIN);
-            ESP_LOGI(TAG, "--- Reed Switch Status ---");
-            ESP_LOGI(TAG, "Raw Pin State (GPIO4): %s", rawReedState ? "HIGH" : "LOW");
-            ESP_LOGI(TAG, "Debounced Controller State: %s", nfcController.isReedSwitchActive() ? "Active" : "Inactive");
+            bool rawPogoState = digitalRead(POGO_SWITCH_PIN);
+            ESP_LOGI(TAG, "--- Pogo Switch Status ---");
+            ESP_LOGI(TAG, "Raw Pin State (GPIO6): %s", rawPogoState ? "HIGH" : "LOW");
+            ESP_LOGI(TAG, "Debounced Controller State: %s", nfcController.isPogoSwitchActive() ? "Active" : "Inactive");
             ESP_LOGI(TAG, "-------------------------");
         }
         else if (command == "nfcdiag")
@@ -1256,6 +1304,52 @@ void loop()
         // Battery commands
         else if (command == "battery")
         {
+            battery.printBatteryInfo();
+        }
+        else if (command == "battscan")
+        {
+            battery.printBusScan();
+        }
+        else if (command == "batterycfg")
+        {
+            bool success = battery.reconfigure(false);
+            ESP_LOGI(TAG, "Battery bring-up reapply: %s", success ? "OK" : "FAILED");
+            battery.printBatteryInfo();
+        }
+        else if (command == "batteryclearflags")
+        {
+            bool success = battery.clearChargerFaultHistory();
+            ESP_LOGI(TAG, "Charger fault history clear: %s", success ? "OK" : "FAILED");
+            battery.printBatteryInfo();
+        }
+        else if (command == "chargekick")
+        {
+            bool success = battery.restartChargeCycle();
+            ESP_LOGI(TAG, "Charge cycle restart: %s", success ? "OK" : "FAILED");
+            battery.printBatteryInfo();
+        }
+        else if (command == "gaugefets")
+        {
+            bool success = battery.restoreGaugeFetControl();
+            ESP_LOGI(TAG, "Gauge FET control restore: %s", success ? "OK" : "FAILED");
+            battery.printBatteryInfo();
+        }
+        else if (command == "gauge1s")
+        {
+            bool success = battery.setGaugeSingleCellMode();
+            ESP_LOGI(TAG, "Gauge single-cell configuration: %s", success ? "OK" : "FAILED");
+            battery.printBatteryInfo();
+        }
+        else if (command == "gaugeprog")
+        {
+            bool success = battery.forceGaugeProvisioning();
+            ESP_LOGI(TAG, "Gauge provisioning: %s", success ? "OK" : "FAILED");
+            battery.printBatteryInfo();
+        }
+        else if (command == "gaugeresetlearn")
+        {
+            bool success = battery.resetGaugeLearningState();
+            ESP_LOGI(TAG, "Gauge learning reset: %s", success ? "OK" : "FAILED");
             battery.printBatteryInfo();
         }
         // System commands
@@ -1535,4 +1629,6 @@ void loop()
 
     // Update Sleep controller (handles inactivity timeout and sleep scheduling)
     sleepController.update();
+
+    delay(1);
 }

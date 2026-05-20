@@ -4,8 +4,7 @@
 			"path": "."
 		},
 		{
-			"name": "test",
-			"path": "../test"
+			"path": "../../../../Herd/portal.tilkietalkie.com"
 		}
 	],
 	"settings": {

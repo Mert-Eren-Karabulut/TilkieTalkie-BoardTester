@@ -28,7 +28,7 @@ SleepController::SleepController() :
     sleepScheduled(false),
     scheduledSleepTime(0),
     lastActivityTime(0),
-    inactivityTimeout(60000), // Default 60 seconds inactivity
+    inactivityTimeout(30000), // Default 30 seconds inactivity
     wokenFromSleep(false),
     sleepCallback(nullptr),
     conditionsMetForSleep(false),

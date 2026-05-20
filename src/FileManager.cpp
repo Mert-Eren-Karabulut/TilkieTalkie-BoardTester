@@ -220,31 +220,29 @@ bool FileManager::initializeSDCard() {
     Serial.printf("FileManager: Using SDMMC pins - CLK:%d, CMD:%d, D0:%d, D1:%d, D2:%d, D3:%d\n", 
                   SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN);
     
-    // Try multiple initialization attempts
-    bool sdInitialized = false;
-    
-    for (int attempt = 1; attempt <= 3 && !sdInitialized; attempt++) {
-        Serial.printf("FileManager: SD card initialization attempt %d/3\n", attempt);
-        
-        // Initialize SD_MMC with 4-bit mode at 40MHz (SDMMC_FREQ_HIGHSPEED)
-        // Parameters: mountpoint, mode1bit (false for 4-bit), format_if_mount_failed, frequency
-        SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN);
-        sdInitialized = SD_MMC.begin("/sd", false, false, BOARD_MAX_SDMMC_FREQ);
-        
-        if (!sdInitialized) {
-            Serial.printf("FileManager: Attempt %d failed, retrying...\n", attempt);
-            SD_MMC.end();
-            delay(500);
-        }
-    }
+    // A failed SDMMC begin can leave the peripheral in a bad state on this board,
+    // especially while WiFi/BLE provisioning is active. Try the normal 4-bit path first,
+    // then fall back to 1-bit/default-speed to distinguish marginal data lines from a dead card.
+    Serial.println("FileManager: SD card initialization attempt 1/2 (4-bit)");
+    SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN);
+    bool sdInitialized = SD_MMC.begin("/sd", false, false, BOARD_MAX_SDMMC_FREQ);
     
     if (!sdInitialized) {
-        Serial.println("FileManager: SD card initialization failed after 3 attempts");
+        SD_MMC.end();
+        Serial.println("FileManager: 4-bit SDMMC init failed, retrying in 1-bit mode at default speed");
+        Serial.println("FileManager: SD card initialization attempt 2/2 (1-bit fallback)");
+        sdInitialized = SD_MMC.begin("/sd", true, false, SDMMC_FREQ_DEFAULT);
+    }
+
+    if (!sdInitialized) {
+        SD_MMC.end();
+        Serial.println("FileManager: SD card initialization failed in both 4-bit and 1-bit modes");
         Serial.println("FileManager: Please check:");
         Serial.println("  1. SD card is properly inserted");
         Serial.println("  2. Wiring connections are correct");
         Serial.println("  3. SD card is formatted as FAT32");
-        Serial.println("  4. Power supply is adequate");
+        Serial.println("  4. CMD/D0 pull-ups are present and stable");
+        Serial.println("  5. Power supply is adequate");
         return false;
     }
     
@@ -283,6 +281,9 @@ bool FileManager::initializeSDCard() {
     createDirectory("/logs");
     createDirectory("/images");
     createDirectory("/figures");
+    createDirectory("/assets");
+    createDirectory("/assets/contents");
+    createDirectory("/assets/custom_tracks");
     
     return true;
 }
@@ -816,10 +817,27 @@ void FileManager::processDownloadQueue() {
 }
 
 bool FileManager::addRequiredFile(const String& localPath, const String& url, const String& checksum) {
-    // Check if already in list
-    for (const auto& file : requiredFiles) {
+    for (auto& file : requiredFiles) {
         if (file.path == localPath) {
-            Serial.printf("FileManager: File already in required list: %s\n", localPath.c_str());
+            bool changed = false;
+
+            if (file.url != url) {
+                file.url = url;
+                changed = true;
+            }
+
+            if (file.checksum != checksum) {
+                file.checksum = checksum;
+                changed = true;
+            }
+
+            if (changed) {
+                saveRequiredFiles();
+                Serial.printf("FileManager: Updated required file metadata: %s\n", localPath.c_str());
+            } else {
+                Serial.printf("FileManager: File already in required list: %s\n", localPath.c_str());
+            }
+
             return true;
         }
     }
@@ -834,6 +852,22 @@ bool FileManager::addRequiredFile(const String& localPath, const String& url, co
     saveRequiredFiles();
     
     Serial.printf("FileManager: Added required file: %s\n", localPath.c_str());
+    return true;
+}
+
+bool FileManager::removeRequiredFile(const String& localPath) {
+    auto it = std::remove_if(requiredFiles.begin(), requiredFiles.end(),
+        [&localPath](const FileEntry& entry) {
+            return entry.path == localPath;
+        });
+
+    if (it == requiredFiles.end()) {
+        return false;
+    }
+
+    requiredFiles.erase(it, requiredFiles.end());
+    saveRequiredFiles();
+    Serial.printf("FileManager: Removed required file: %s\n", localPath.c_str());
     return true;
 }
 

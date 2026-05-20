@@ -4,6 +4,46 @@
 // Initialize static members
 const char* RequestManager::NVS_NAMESPACE = "requestmgr";
 const char* RequestManager::NVS_UID_MAPPING_KEY = "uid_mappings";
+const char* RequestManager::SD_DATA_DIR = "/.requestmanager";
+const char* RequestManager::SD_MANIFEST_DIR = "/.requestmanager/manifests";
+const char* RequestManager::SD_PENDING_MANIFEST_DIR = "/.requestmanager/pending_manifests";
+
+namespace {
+String jsonValueToString(JsonVariantConst value)
+{
+    if (value.isNull()) {
+        return String();
+    }
+
+    if (value.is<const char*>()) {
+        return value.as<String>();
+    }
+
+    if (value.is<String>()) {
+        return value.as<String>();
+    }
+
+    if (value.is<int>()) {
+        return String(value.as<int>());
+    }
+
+    if (value.is<long>()) {
+        return String(value.as<long>());
+    }
+
+    if (value.is<unsigned int>()) {
+        return String(value.as<unsigned int>());
+    }
+
+    if (value.is<unsigned long>()) {
+        return String(value.as<unsigned long>());
+    }
+
+    String serialized;
+    serializeJson(value, serialized);
+    return serialized;
+}
+}
 
 // Singleton instance getter
 RequestManager &RequestManager::getInstance(const String &baseUrl)
@@ -53,6 +93,9 @@ bool RequestManager::begin()
     loadUidMappings();
     
     FileManager &fileManager = FileManager::getInstance();
+    fileManager.createDirectory(SD_DATA_DIR);
+    fileManager.createDirectory(SD_MANIFEST_DIR);
+    fileManager.createDirectory(SD_PENDING_MANIFEST_DIR);
     fileManager.setDownloadCompleteCallback(staticFileDownloadCallback);
 
     initConnection();
@@ -314,14 +357,7 @@ void RequestManager::processOnlineFigureRequest(const String &uid)
         return;
     }
 
-    FileManager &fileManager = FileManager::getInstance();
-    
-    // Try to find figure data in response
     JsonObject figure = doc["figure"].as<JsonObject>();
-    if (figure.isNull()) {
-        figure = doc["data"].isNull() ? doc["unit"].as<JsonObject>() : doc["data"].as<JsonObject>();
-    }
-    
     if (figure.isNull()) {
         if (figureDownloadCompleteCallback) {
             Figure emptyFigure;
@@ -329,100 +365,119 @@ void RequestManager::processOnlineFigureRequest(const String &uid)
         }
         return;
     }
-    
-    String figureId = String(figure["id"].as<int>());
+
+    FileManager &fileManager = FileManager::getInstance();
+    String figureId = jsonValueToString(figure["id"]);
     String figureName = figure["name"].as<String>();
-    JsonArray episodes = figure["episodes"].as<JsonArray>();
+    JsonArray assetManifest = doc["asset_manifest"].as<JsonArray>();
+    if (assetManifest.isNull()) {
+        if (figureDownloadCompleteCallback) {
+            Figure emptyFigure;
+            figureDownloadCompleteCallback(uid, figureName, false, "Manifest is missing asset_manifest", emptyFigure);
+        }
+        return;
+    }
     
     storeUidToFigureIdMapping(uid, figureId);
-    
-    Figure figureData;
-    figureData.id = figureId;
-    figureData.name = figureName;
-    figureData.description = figure["description"].as<String>();
-    
-    std::vector<String> trackPaths;
-    int tracksToDownload = 0;
-    int tracksAlreadyExist = 0;
-    
-    for (JsonVariant episodeVar : episodes) {
-        JsonObject episodeObj = episodeVar.as<JsonObject>();
-        Episode episode;
-        episode.id = String(episodeObj["id"].as<int>());
-        episode.name = episodeObj["name"].as<String>();
-        episode.description = episodeObj["description"].as<String>();
-        
-        JsonArray tracks = episodeObj["tracks"].as<JsonArray>();
-        
-        for (JsonVariant trackVar : tracks) {
-            JsonObject trackObj = trackVar.as<JsonObject>();
-            Track track;
-            track.id = String(trackObj["id"].as<int>());
-            track.name = trackObj["name"].as<String>();
-            track.description = trackObj["description"].as<String>();
-            track.audioUrl = trackObj["audio_url"].as<String>();
-            track.duration = trackObj["duration"].as<int>();
-            track.localPath = "/figures/" + figureId + "/" + episode.id + "/" + track.id + ".mp3";
-            
-            trackPaths.push_back(track.localPath);
-            
-            if (track.audioUrl.length() > 0) {
-                fileManager.addRequiredFile(track.localPath, track.audioUrl);
-                
-                if (!fileManager.fileExists(track.localPath)) {
-                    fileManager.scheduleDownload(track.audioUrl, track.localPath);
-                    tracksToDownload++;
-                } else {
-                    tracksAlreadyExist++;
-                }
-            }
-            
-            episode.tracks.push_back(track);
+
+    JsonDocument previousManifest;
+    String previousManifestJson;
+    if (loadUnitManifest(uid, previousManifest)) {
+        serializeJson(previousManifest, previousManifestJson);
+    }
+
+    if (!savePendingUnitManifest(uid, doc)) {
+        if (figureDownloadCompleteCallback) {
+            Figure emptyFigure;
+            figureDownloadCompleteCallback(uid, figureName, false, "Failed to cache pending manifest", emptyFigure);
         }
-        
-        figureData.episodes.push_back(episode);
+        return;
     }
-    
-    startTrackingFigure(uid, figureName, figureId, trackPaths, figureData);
-    
-    if (tracksToDownload > 0) {
-        Serial.printf("Starting %d downloads for: %s\n", tracksToDownload, figureName.c_str());
+
+    std::vector<String> trackPaths;
+    int assetsToDownload = 0;
+    int assetsAlreadyCached = 0;
+
+    for (JsonVariant assetVar : assetManifest) {
+        JsonObject asset = assetVar.as<JsonObject>();
+        String storagePath = normalizeStoragePath(asset["storage_path"].as<String>());
+        String url = asset["url"].as<String>();
+        String checksum = asset["checksum"].as<String>();
+
+        if (storagePath.isEmpty()) {
+            continue;
+        }
+
+        trackPaths.push_back(storagePath);
+        fileManager.addRequiredFile(storagePath, url, checksum);
+
+        bool needsDownload = !fileManager.fileExists(storagePath);
+        if (!needsDownload && !checksum.isEmpty()) {
+            String currentChecksum = fileManager.calculateFileChecksum(storagePath);
+            if (currentChecksum != checksum) {
+                Serial.printf("RequestManager: Checksum mismatch, refreshing asset: %s\n", storagePath.c_str());
+                fileManager.deleteFile(storagePath);
+                needsDownload = true;
+            }
+        }
+
+        if (needsDownload && url.length() > 0) {
+            fileManager.scheduleDownload(url, storagePath, checksum);
+            assetsToDownload++;
+        } else if (!needsDownload) {
+            assetsAlreadyCached++;
+        }
     }
-    if (tracksAlreadyExist > 0) {
-        Serial.printf("%d tracks cached for: %s\n", tracksAlreadyExist, figureName.c_str());
+
+    Figure figureData = buildFigureFromManifest(doc);
+    
+    startTrackingFigure(uid, figureName, figureId, trackPaths, figureData, true, previousManifestJson);
+    
+    if (assetsToDownload > 0) {
+        Serial.printf("RequestManager: Starting %d asset downloads for %s\n", assetsToDownload, figureName.c_str());
+    }
+    if (assetsAlreadyCached > 0) {
+        Serial.printf("RequestManager: %d assets already cached for %s\n", assetsAlreadyCached, figureName.c_str());
     }
 }
 
 void RequestManager::processOfflineFigureRequest(const String &uid)
 {
     Serial.println(F("RequestManager: Processing offline figure request"));
-    
-    String figureId = getFigureIdFromUid(uid);
-    if (figureId.isEmpty()) {
+
+    JsonDocument manifest;
+    if (!loadUnitManifest(uid, manifest)) {
         if (figureDownloadCompleteCallback) {
             Figure emptyFigure;
             figureDownloadCompleteCallback(uid, "Unknown", false, "No offline data available", emptyFigure);
         }
         return;
     }
-    
-    Figure figureData = constructFigureFromLocalFiles(uid, figureId);
-    
-    if (figureData.episodes.empty()) {
+
+    Figure figureData = buildFigureFromManifest(manifest, true);
+
+    std::vector<String> trackPaths;
+    for (const auto& content : figureData.contents) {
+        for (const auto& episode : content.episodes) {
+            for (const auto& track : episode.tracks) {
+                trackPaths.push_back(track.localPath);
+            }
+        }
+    }
+
+    for (const auto& customTrack : figureData.customTracks) {
+        trackPaths.push_back(customTrack.localPath);
+    }
+
+    if (trackPaths.empty()) {
         if (figureDownloadCompleteCallback) {
             figureDownloadCompleteCallback(uid, figureData.name.isEmpty() ? "Unknown" : figureData.name, 
                                          false, "No local tracks available", figureData);
         }
         return;
     }
-    
-    std::vector<String> trackPaths;
-    for (const auto& episode : figureData.episodes) {
-        for (const auto& track : episode.tracks) {
-            trackPaths.push_back(track.localPath);
-        }
-    }
-    
+
+    String figureId = figureData.id.isEmpty() ? getFigureIdFromUid(uid) : figureData.id;
     startTrackingFigure(uid, figureData.name, figureId, trackPaths, figureData);
 }
 
@@ -432,7 +487,8 @@ void RequestManager::setFigureDownloadCompleteCallback(FigureDownloadCompleteCal
 }
 
 void RequestManager::startTrackingFigure(const String &uid, const String &figureName, const String &figureId, 
-                                          const std::vector<String> &trackPaths, const Figure &figureData)
+                                          const std::vector<String> &trackPaths, const Figure &figureData,
+                                          bool hasPendingManifest, const String &previousManifestJson)
 {
     // Remove completed trackers
     activeDownloads.erase(
@@ -455,6 +511,8 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     tracker.totalTracks = trackPaths.size();
     tracker.trackPaths = trackPaths;
     tracker.figureData = figureData;
+    tracker.hasPendingManifest = hasPendingManifest;
+    tracker.previousManifestJson = previousManifestJson;
     
     FileManager &fileManager = FileManager::getInstance();
     for (const String &path : trackPaths) {
@@ -467,6 +525,7 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     
     if (allReady) {
         tracker.completed = true;
+        finalizeTrackedManifest(tracker, true);
         if (figureDownloadCompleteCallback) {
             figureDownloadCompleteCallback(uid, figureName, true, "", figureData);
         }
@@ -482,6 +541,7 @@ void RequestManager::checkFigureDownloadStatus(const String &uid)
             if (tracker.tracksReady + tracker.tracksFailed >= tracker.totalTracks) {
                 tracker.completed = true;
                 bool success = (tracker.tracksReady > 0) && (tracker.tracksFailed == 0);
+                finalizeTrackedManifest(tracker, success);
                 
                 if (figureDownloadCompleteCallback) {
                     figureDownloadCompleteCallback(uid, tracker.figureName, success, 
@@ -603,58 +663,353 @@ bool RequestManager::loadUidMappings()
     return true;
 }
 
-RequestManager::Figure RequestManager::constructFigureFromLocalFiles(const String &uid, const String &figureId)
+bool RequestManager::saveUnitManifest(const String &uid, const JsonDocument &manifest)
+{
+    FileManager &fileManager = FileManager::getInstance();
+    fileManager.createDirectory(SD_DATA_DIR);
+    fileManager.createDirectory(SD_MANIFEST_DIR);
+
+    String manifestPath = getUnitManifestPath(uid);
+    if (SD_MMC.exists(manifestPath)) {
+        SD_MMC.remove(manifestPath);
+    }
+
+    File file = SD_MMC.open(manifestPath, FILE_WRITE);
+    if (!file) {
+        Serial.printf("RequestManager: Failed to open manifest for writing: %s\n", uid.c_str());
+        return false;
+    }
+
+    if (serializeJson(manifest, file) == 0) {
+        file.close();
+        Serial.printf("RequestManager: Failed to serialize manifest for unit: %s\n", uid.c_str());
+        return false;
+    }
+
+    file.close();
+    Serial.printf("RequestManager: Saved manifest for unit: %s\n", uid.c_str());
+    return true;
+}
+
+bool RequestManager::savePendingUnitManifest(const String &uid, const JsonDocument &manifest)
+{
+    FileManager &fileManager = FileManager::getInstance();
+    fileManager.createDirectory(SD_DATA_DIR);
+    fileManager.createDirectory(SD_PENDING_MANIFEST_DIR);
+
+    String manifestPath = getPendingUnitManifestPath(uid);
+    if (SD_MMC.exists(manifestPath)) {
+        SD_MMC.remove(manifestPath);
+    }
+
+    File file = SD_MMC.open(manifestPath, FILE_WRITE);
+    if (!file) {
+        Serial.printf("RequestManager: Failed to open pending manifest for writing: %s\n", uid.c_str());
+        return false;
+    }
+
+    if (serializeJson(manifest, file) == 0) {
+        file.close();
+        Serial.printf("RequestManager: Failed to serialize pending manifest for unit: %s\n", uid.c_str());
+        return false;
+    }
+
+    file.close();
+    Serial.printf("RequestManager: Saved pending manifest for unit: %s\n", uid.c_str());
+    return true;
+}
+
+bool RequestManager::loadUnitManifest(const String &uid, JsonDocument &manifest)
+{
+    File file = SD_MMC.open(getUnitManifestPath(uid), FILE_READ);
+    if (!file) {
+        return false;
+    }
+
+    DeserializationError error = deserializeJson(manifest, file);
+    file.close();
+
+    if (error) {
+        Serial.printf("RequestManager: Failed to parse cached manifest for %s: %s\n", uid.c_str(), error.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool RequestManager::deletePendingUnitManifest(const String &uid)
+{
+    String pendingManifestPath = getPendingUnitManifestPath(uid);
+    if (!SD_MMC.exists(pendingManifestPath)) {
+        return true;
+    }
+
+    bool deleted = SD_MMC.remove(pendingManifestPath);
+    if (!deleted) {
+        Serial.printf("RequestManager: Failed to delete pending manifest for unit: %s\n", uid.c_str());
+    }
+
+    return deleted;
+}
+
+bool RequestManager::loadPendingUnitManifest(const String &uid, JsonDocument &manifest)
+{
+    File file = SD_MMC.open(getPendingUnitManifestPath(uid), FILE_READ);
+    if (!file) {
+        return false;
+    }
+
+    DeserializationError error = deserializeJson(manifest, file);
+    file.close();
+
+    if (error) {
+        Serial.printf("RequestManager: Failed to parse pending manifest for %s: %s\n", uid.c_str(), error.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+String RequestManager::getUnitManifestPath(const String &uid) const
+{
+    return String(SD_MANIFEST_DIR) + "/" + uid + ".json";
+}
+
+String RequestManager::getPendingUnitManifestPath(const String &uid) const
+{
+    return String(SD_PENDING_MANIFEST_DIR) + "/" + uid + ".json";
+}
+
+String RequestManager::normalizeStoragePath(const String &path) const
+{
+    if (path.isEmpty()) {
+        return String();
+    }
+
+    return path.startsWith("/") ? path : "/" + path;
+}
+
+void RequestManager::finalizeTrackedManifest(FigureDownloadTracker &tracker, bool success)
+{
+    if (!tracker.hasPendingManifest) {
+        return;
+    }
+
+    if (!success) {
+        deletePendingUnitManifest(tracker.uid);
+        tracker.hasPendingManifest = false;
+        tracker.previousManifestJson = String();
+        return;
+    }
+
+    JsonDocument pendingManifest;
+    if (!loadPendingUnitManifest(tracker.uid, pendingManifest)) {
+        Serial.printf("RequestManager: Missing pending manifest while finalizing unit %s\n", tracker.uid.c_str());
+        tracker.hasPendingManifest = false;
+        tracker.previousManifestJson = String();
+        return;
+    }
+
+    JsonDocument previousManifest;
+    JsonDocument* previousManifestPtr = nullptr;
+    if (!tracker.previousManifestJson.isEmpty()) {
+        if (!deserializeJson(previousManifest, tracker.previousManifestJson)) {
+            previousManifestPtr = &previousManifest;
+        }
+    }
+
+    removeStaleAssets(tracker.uid, pendingManifest, previousManifestPtr);
+
+    if (saveUnitManifest(tracker.uid, pendingManifest)) {
+        deletePendingUnitManifest(tracker.uid);
+    }
+
+    tracker.hasPendingManifest = false;
+    tracker.previousManifestJson = String();
+}
+
+RequestManager::Figure RequestManager::buildFigureFromManifest(const JsonDocument &manifest, bool existingFilesOnly) const
 {
     Figure figure;
-    figure.id = figureId;
-    figure.name = "Local Figure";
-    figure.description = "Offline figure data";
-    
-    std::vector<String> figurePaths = getRequiredFilesForFigure(figureId);
-    if (figurePaths.empty()) return figure;
-    
-    std::map<String, std::vector<String>> episodeTrackMap;
+    JsonObjectConst figureObject = manifest["figure"].as<JsonObjectConst>();
+
+    figure.id = jsonValueToString(figureObject["id"]);
+    figure.name = figureObject["name"].as<String>();
+    figure.description = figureObject["description"].as<String>();
+    figure.type = figureObject["type"].as<String>();
+    figure.manifestChecksum = manifest["manifest_checksum"].as<String>();
+
     FileManager &fileManager = FileManager::getInstance();
-    String prefix = "/figures/" + figureId + "/";
-    
-    for (const String& path : figurePaths) {
-        if (!fileManager.fileExists(path)) continue;
-        if (!path.startsWith(prefix)) continue;
-        
-        int episodeEnd = path.indexOf('/', prefix.length());
-        if (episodeEnd > (int)prefix.length()) {
-            String episodeId = path.substring(prefix.length(), episodeEnd);
-            episodeTrackMap[episodeId].push_back(path);
+
+    JsonArrayConst contents = manifest["contents"].as<JsonArrayConst>();
+    for (JsonVariantConst contentVariant : contents) {
+        JsonObjectConst contentObject = contentVariant.as<JsonObjectConst>();
+        Content content;
+        content.id = jsonValueToString(contentObject["id"]);
+        content.name = contentObject["name"].as<String>();
+        content.description = contentObject["description"].as<String>();
+        content.type = contentObject["type"].as<String>();
+        content.sortOrder = contentObject["sort_order"] | 0;
+
+        JsonArrayConst episodes = contentObject["episodes"].as<JsonArrayConst>();
+        for (JsonVariantConst episodeVariant : episodes) {
+            JsonObjectConst episodeObject = episodeVariant.as<JsonObjectConst>();
+            Episode episode;
+            episode.id = jsonValueToString(episodeObject["id"]);
+            episode.name = episodeObject["name"].as<String>();
+            episode.description = episodeObject["description"].as<String>();
+            episode.sortOrder = episodeObject["sort_order"] | 0;
+
+            JsonArrayConst tracks = episodeObject["tracks"].as<JsonArrayConst>();
+            for (JsonVariantConst trackVariant : tracks) {
+                JsonObjectConst trackObject = trackVariant.as<JsonObjectConst>();
+                Track track;
+                track.id = jsonValueToString(trackObject["id"]);
+                track.name = trackObject["name"].as<String>();
+                track.description = trackObject["description"].as<String>();
+                track.audioUrl = trackObject["audio_url"].as<String>();
+                track.duration = trackObject["duration"] | 0;
+                track.sortOrder = trackObject["sort_order"] | 0;
+                track.checksum = trackObject["checksum"].as<String>();
+                track.localPath = normalizeStoragePath(trackObject["storage_path"].as<String>());
+
+                if (existingFilesOnly && !fileManager.fileExists(track.localPath)) {
+                    continue;
+                }
+
+                episode.tracks.push_back(track);
+            }
+
+            if (!episode.tracks.empty()) {
+                content.episodes.push_back(episode);
+            }
+        }
+
+        if (!content.episodes.empty()) {
+            figure.contents.push_back(content);
         }
     }
-    
-    for (const auto& episodePair : episodeTrackMap) {
-        Episode episode;
-        episode.id = episodePair.first;
-        episode.name = "Episode " + episodePair.first;
-        
-        for (const String& trackPath : episodePair.second) {
-            String filename = trackPath.substring(trackPath.lastIndexOf('/') + 1);
-            String trackId = filename.substring(0, filename.lastIndexOf('.'));
-            
-            Track track;
-            track.id = trackId;
-            track.name = "Track " + trackId;
-            track.localPath = trackPath;
-            
-            episode.tracks.push_back(track);
+
+    JsonArrayConst customTracks = manifest["custom_tracks"].as<JsonArrayConst>();
+    for (JsonVariantConst customTrackVariant : customTracks) {
+        JsonObjectConst customTrackObject = customTrackVariant.as<JsonObjectConst>();
+        Track track;
+        track.id = jsonValueToString(customTrackObject["id"]);
+        track.name = customTrackObject["name"].as<String>();
+        track.description = customTrackObject["description"].as<String>();
+        track.audioUrl = customTrackObject["audio_url"].as<String>();
+        track.duration = customTrackObject["duration"] | 0;
+        track.sortOrder = customTrackObject["sort_order"] | 0;
+        track.checksum = customTrackObject["checksum"].as<String>();
+        track.localPath = normalizeStoragePath(customTrackObject["storage_path"].as<String>());
+
+        if (existingFilesOnly && !fileManager.fileExists(track.localPath)) {
+            continue;
         }
-        
-        if (!episode.tracks.empty()) {
-            figure.episodes.push_back(episode);
-        }
+
+        figure.customTracks.push_back(track);
     }
-    
+
     return figure;
 }
 
-std::vector<String> RequestManager::getRequiredFilesForFigure(const String &figureId)
+std::vector<String> RequestManager::extractAssetPaths(const JsonDocument &manifest) const
 {
+    std::vector<String> paths;
+
+    JsonArrayConst assetManifest = manifest["asset_manifest"].as<JsonArrayConst>();
+    if (!assetManifest.isNull()) {
+        for (JsonVariantConst assetVariant : assetManifest) {
+            String normalizedPath = normalizeStoragePath(assetVariant["storage_path"].as<String>());
+            if (!normalizedPath.isEmpty()) {
+                paths.push_back(normalizedPath);
+            }
+        }
+        return paths;
+    }
+
+    JsonArrayConst contents = manifest["contents"].as<JsonArrayConst>();
+    for (JsonVariantConst contentVariant : contents) {
+        JsonArrayConst episodes = contentVariant["episodes"].as<JsonArrayConst>();
+        for (JsonVariantConst episodeVariant : episodes) {
+            JsonArrayConst tracks = episodeVariant["tracks"].as<JsonArrayConst>();
+            for (JsonVariantConst trackVariant : tracks) {
+                String normalizedPath = normalizeStoragePath(trackVariant["storage_path"].as<String>());
+                if (!normalizedPath.isEmpty()) {
+                    paths.push_back(normalizedPath);
+                }
+            }
+        }
+    }
+
+    JsonArrayConst customTracks = manifest["custom_tracks"].as<JsonArrayConst>();
+    for (JsonVariantConst customTrackVariant : customTracks) {
+        String normalizedPath = normalizeStoragePath(customTrackVariant["storage_path"].as<String>());
+        if (!normalizedPath.isEmpty()) {
+            paths.push_back(normalizedPath);
+        }
+    }
+
+    return paths;
+}
+
+bool RequestManager::isAssetReferencedByOtherUnit(const String &assetPath, const String &currentUid) const
+{
+    File manifestDir = SD_MMC.open(SD_MANIFEST_DIR);
+    if (!manifestDir || !manifestDir.isDirectory()) {
+        return false;
+    }
+
+    String currentManifestFile = currentUid + ".json";
+    File entry = manifestDir.openNextFile();
+    while (entry) {
+        String entryName = String(entry.name());
+        if (!entry.isDirectory() && entryName != currentManifestFile) {
+            JsonDocument manifest;
+            DeserializationError error = deserializeJson(manifest, entry);
+            entry.close();
+
+            if (!error) {
+                std::vector<String> assetPaths = extractAssetPaths(manifest);
+                if (std::find(assetPaths.begin(), assetPaths.end(), assetPath) != assetPaths.end()) {
+                    manifestDir.close();
+                    return true;
+                }
+            }
+        } else {
+            entry.close();
+        }
+
+        entry = manifestDir.openNextFile();
+    }
+
+    manifestDir.close();
+    return false;
+}
+
+void RequestManager::removeStaleAssets(const String &uid, const JsonDocument &currentManifest, const JsonDocument *previousManifest)
+{
+    if (previousManifest == nullptr) {
+        return;
+    }
+
     FileManager &fileManager = FileManager::getInstance();
-    return fileManager.getRequiredFilesByPattern("/figures/" + figureId + "/");
+    std::vector<String> currentPaths = extractAssetPaths(currentManifest);
+    std::vector<String> previousPaths = extractAssetPaths(*previousManifest);
+
+    for (const String &oldPath : previousPaths) {
+        if (std::find(currentPaths.begin(), currentPaths.end(), oldPath) != currentPaths.end()) {
+            continue;
+        }
+
+        if (isAssetReferencedByOtherUnit(oldPath, uid)) {
+            continue;
+        }
+
+        fileManager.removeRequiredFile(oldPath);
+        if (fileManager.fileExists(oldPath)) {
+            fileManager.deleteFile(oldPath);
+        }
+        Serial.printf("RequestManager: Removed stale asset: %s\n", oldPath.c_str());
+    }
 }

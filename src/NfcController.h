@@ -7,11 +7,11 @@
 #include <functional>
 
 // Pin definitions based on the working example sketch
-#define REED_SWITCH_PIN 6     // ESP32-S3
+#define POGO_SWITCH_PIN 6     // ESP32-S3
 #define NFC_SDA_PIN 16        // ESP32-S3
 #define NFC_SCL_PIN 15        // ESP32-S3
-#define NFC_IRQ_PIN 49        // Not used
-#define NFC_RESET_PIN 49      // Not used
+#define NFC_IRQ_PIN -1        // No IRQ pin wired for PN532 on this board
+#define NFC_RESET_PIN -1      // No reset pin wired for PN532 on this board
 
 // Constants for NFC operations
 #define MAX_UID_LENGTH 7
@@ -53,7 +53,7 @@ public:
 
     // Getters for status
     bool isNFCReady() const;
-    bool isReedSwitchActive() const;
+    bool isPogoSwitchActive() const;
     bool isCardPresent() const;
     NFCData currentNFCData() const;
 
@@ -72,15 +72,15 @@ private:
 
     // State variables
     bool nfcReady;
-    bool reedActive;
+    bool pogoActive;
     bool cardPresent;
     bool cardReadInSession;
     String lastReadUID;
     NFCData dockedCardData;
 
-    // Debouncing for the reed switch
+    // Debouncing for the pogo switch sense line
     unsigned long lastDebounceTime;
-    bool lastReedState;
+    bool lastPogoState;
 
     // NFC reading timing control
     unsigned long lastNFCReadAttempt;
@@ -94,7 +94,7 @@ private:
     std::function<void()> afterDetachNFCCallback;
 
     // Internal helper methods
-    void handleReedSwitch();
+    void handlePogoSwitch();
     void handleNFCReading();
 };
 

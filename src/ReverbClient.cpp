@@ -404,7 +404,7 @@ void ReverbClient::sendDeviceReport()
     String wifiSSID = config.getWiFiSSID();
     int wifiRSSI = WiFi.RSSI();
     int audioState = audio.getState(); // Use int instead of enum
-    bool isReedActive = nfc.isReedSwitchActive();
+    bool isPogoActive = nfc.isPogoSwitchActive();
     bool isCardPresent = nfc.isCardPresent();
 
     // Pre-build channel name
@@ -435,7 +435,7 @@ void ReverbClient::sendDeviceReport()
 
     // Get NFC card ID
     String nfcCardId = "";
-    if (isReedActive && isCardPresent)
+    if (isPogoActive && isCardPresent)
     {
         nfcCardId = nfc.currentNFCData().uidString;
     }
@@ -489,7 +489,7 @@ void ReverbClient::sendDeviceReport()
                            currentSecond,
                            currentVolume,
                            volumeCeiling,
-                           isReedActive ? "present" : "empty",
+                           isPogoActive ? "present" : "empty",
                            nfcCardId.length() > 0 ? ",\"docked_card_id\":\"" : "",
                            nfcCardId.c_str(),
                            nfcCardId.length() > 0 ? "\"" : "");

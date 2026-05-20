@@ -24,6 +24,9 @@ private:
     
     // Response handling
     static constexpr size_t MAX_RESPONSE_SIZE = 16384; // 16KB max response
+    static const char* SD_DATA_DIR;
+    static const char* SD_MANIFEST_DIR;
+    static const char* SD_PENDING_MANIFEST_DIR;
     
     // Private helper methods
     bool isNetworkReady();
@@ -77,20 +80,35 @@ public:
         String audioUrl;
         String localPath;  // Local file path after download
         int duration = 0;
+        int sortOrder = 0;
+        String checksum;
     };
     
     struct Episode {
         String id;
         String name;
         String description;
+        int sortOrder = 0;
         std::vector<Track> tracks;
+    };
+
+    struct Content {
+        String id;
+        String name;
+        String description;
+        String type;
+        int sortOrder = 0;
+        std::vector<Episode> episodes;
     };
     
     struct Figure {
         String id;
         String name;
         String description;
-        std::vector<Episode> episodes;
+        String type;
+        String manifestChecksum;
+        std::vector<Content> contents;
+        std::vector<Track> customTracks;
     };
 
     // Figure download callback system
@@ -122,6 +140,8 @@ private:
         std::vector<String> trackPaths;
         bool completed = false;
         Figure figureData;     // Store the complete figure structure
+        bool hasPendingManifest = false;
+        String previousManifestJson;
     };
     
     std::vector<FigureDownloadTracker> activeDownloads;
@@ -130,7 +150,7 @@ private:
     std::map<String, String> uidToFigureIdMap;
     
     // Helper methods for tracking
-    void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData);
+    void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData, bool hasPendingManifest = false, const String &previousManifestJson = String());
     void checkFigureDownloadStatus(const String &uid);
     void onTrackDownloadComplete(const String &path, bool success);
     void storeUidToFigureIdMapping(const String &uid, const String &figureId);
@@ -142,8 +162,19 @@ private:
     bool loadUidMappings();
     
     // Offline mode methods
-    Figure constructFigureFromLocalFiles(const String &uid, const String &figureId);
-    std::vector<String> getRequiredFilesForFigure(const String &figureId);
+    bool saveUnitManifest(const String &uid, const JsonDocument &manifest);
+    bool loadUnitManifest(const String &uid, JsonDocument &manifest);
+    String getUnitManifestPath(const String &uid) const;
+    bool savePendingUnitManifest(const String &uid, const JsonDocument &manifest);
+    bool deletePendingUnitManifest(const String &uid);
+    bool loadPendingUnitManifest(const String &uid, JsonDocument &manifest);
+    String getPendingUnitManifestPath(const String &uid) const;
+    String normalizeStoragePath(const String &path) const;
+    void finalizeTrackedManifest(FigureDownloadTracker &tracker, bool success);
+    Figure buildFigureFromManifest(const JsonDocument &manifest, bool existingFilesOnly = false) const;
+    std::vector<String> extractAssetPaths(const JsonDocument &manifest) const;
+    bool isAssetReferencedByOtherUnit(const String &assetPath, const String &currentUid) const;
+    void removeStaleAssets(const String &uid, const JsonDocument &currentManifest, const JsonDocument *previousManifest);
     void processOnlineFigureRequest(const String &uid);
     void processOfflineFigureRequest(const String &uid);
 };

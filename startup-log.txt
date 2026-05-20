@@ -1,0 +1,390 @@
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0xc (RTC_SW_CPU_RST),boot:0xb (SPI_FAST_FLASH_BOOT)
+Saved PC:0x40384322
+  #0  0x40384322 in esp_cpu_wait_for_intr at /Users/mert/.platformio/packages/framework-espidf/components/esp_hw_support/cpu.c:64
+
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce2820,len:0x2494
+load:0x403c8700,len:0x114c
+load:0x403cb700,len:0x36e0
+entry 0x403c89b8
+I (25) boot: ESP-IDF 5.5.0 2nd stage bootloader
+I (25) boot: compile time Dec  3 2025 02:17:40
+I (25) boot: Multicore bootloader
+D (25) bootloader_flash: non-XMC chip detected by SFDP Read (46), skip.
+D (31) bootloader_flash: mmu set block paddr=0x00000000 (was 0xffffffff)
+D (38) bootloader_flash: mmu set block paddr=0x00000000 (was 0xffffffff)
+D (44) bootloader_flash: mmu set block paddr=0x00000000 (was 0xffffffff)
+D (50) bootloader_flash: mmu set block paddr=0x00000000 (was 0xffffffff)
+D (57) bootloader_flash: mmu set block paddr=0x00000000 (was 0xffffffff)
+D (63) bootloader_flash: mmu set block paddr=0x00000000 (was 0xffffffff)
+I (70) boot: chip revision: v0.2
+I (73) boot: efuse block revision: v1.4
+D (76) qio_mode: Probing for QIO mode enable...
+D (80) qio_mode: Raw SPI flash chip id 0x464018
+D (85) qio_mode: Manufacturer ID 0x46 chip ID 0x4018
+I (89) qio_mode: Enabling default flash chip QIO
+D (94) qio_mode: Initial flash chip status 0x2
+D (98) qio_mode: QIO mode already enabled in flash
+D (102) qio_mode: Enabling QIO mode...
+D (106) boot.esp32s3: magic e9
+D (109) boot.esp32s3: segments 03
+D (112) boot.esp32s3: spi_mode 02
+D (115) boot.esp32s3: spi_speed 0f
+D (118) boot.esp32s3: spi_size 04
+I (121) boot.esp32s3: Boot SPI Speed : 80MHz
+I (125) boot.esp32s3: SPI Mode       : QIO
+I (129) boot.esp32s3: SPI Flash Size : 16MB
+D (133) boot: Enabling RTCWDT(9000 ms)
+I (136) boot: Enabling RNG early entropy source...
+D (141) bootloader_flash: rodata starts from paddr=0x00008000, size=0xc00, will be mapped to vaddr=0x3c000000
+V (150) bootloader_flash: after mapping, starting from paddr=0x00000000 and vaddr=0x3c000000, 0x10000 bytes are mapped
+D (161) boot: mapped partition table 0x8000 at 0x3c008000
+D (166) flash_parts: partition table verified, 7 entries
+I (171) boot: Partition Table:
+I (174) boot: ## Label            Usage          Type ST Offset   Length
+D (180) boot: load partition table entry 0x3c008000
+D (185) boot: type=1 subtype=2
+I (187) boot:  0 nvs              WiFi data        01 02 00009000 00005000
+D (194) boot: load partition table entry 0x3c008020
+D (199) boot: type=1 subtype=0
+I (201) boot:  1 otadata          OTA data         01 00 0000e000 00002000
+D (208) boot: load partition table entry 0x3c008040
+D (212) boot: type=0 subtype=10
+I (215) boot:  2 app0             OTA app          00 10 00010000 00640000
+D (222) boot: load partition table entry 0x3c008060
+D (227) boot: type=0 subtype=11
+I (229) boot:  3 app1             OTA app          00 11 00650000 00640000
+D (236) boot: load partition table entry 0x3c008080
+D (241) boot: type=1 subtype=82
+I (243) boot:  4 spiffs           Unknown data     01 82 00c90000 00350000
+D (250) boot: load partition table entry 0x3c0080a0
+D (255) boot: type=1 subtype=3
+I (257) boot:  5 coredump         Unknown data     01 03 00fe0000 00010000
+I (264) boot: End of partition table
+D (267) boot: OTA data offset 0xe000
+D (271) bootloader_flash: rodata starts from paddr=0x0000e000, size=0x2000, will be mapped to vaddr=0x3c000000
+V (280) bootloader_flash: after mapping, starting from paddr=0x00000000 and vaddr=0x3c000000, 0x10000 bytes are mapped
+D (291) boot: otadata[0]: sequence values 0x00000001
+D (295) boot: otadata[1]: sequence values 0x00000000
+D (300) boot_comm: Both OTA copies are valid
+D (304) boot: Active otadata[0]
+D (307) boot: Mapping seq 0 -> OTA slot 0
+D (311) boot: Trying partition index 0 offs 0x10000 size 0x640000
+D (317) esp_image: reading image header @ 0x10000
+D (321) bootloader_flash: mmu set block paddr=0x00010000 (was 0xffffffff)
+D (328) bootloader_flash: mmu set block paddr=0x00010000 (was 0xffffffff)
+D (334) bootloader_flash: mmu set block paddr=0x00010000 (was 0xffffffff)
+D (341) bootloader_flash: mmu set block paddr=0x00010000 (was 0xffffffff)
+D (347) bootloader_flash: mmu set block paddr=0x00010000 (was 0xffffffff)
+D (354) bootloader_flash: mmu set block paddr=0x00010000 (was 0xffffffff)
+D (360) esp_image: image header: 0xe9 0x07 0x02 0x04 4037b9ec
+V (366) esp_image: loading segment header 0 at offset 0x10018
+D (371) bootloader_flash: mmu set block paddr=0x00010000 (was 0xffffffff)
+D (377) bootloader_flash: mmu set block paddr=0x00010000 (was 0xffffffff)
+V (384) esp_image: segment data length 0x801d8 data starts 0x10020
+V (390) esp_image: MMU page size 0x10000
+V (394) esp_image: segment 0 map_segment 1 segment_data_offs 0x10020 load_addr 0x3c160020
+  #0  0x3c160020 in ?? at /Users/mert/.platformio/packages/framework-espidf/components/esp_app_format/esp_app_desc.c:26
+
+I (401) esp_image: segment 0: paddr=00010020 vaddr=3c160020 size=801d8h (524760) map
+D (409) esp_image: free data page_count 0x00000200
+D (413) bootloader_flash: rodata starts from paddr=0x00010020, size=0x801d8, will be mapped to vaddr=0x3c000000
+V (423) bootloader_flash: after mapping, starting from paddr=0x00010000 and vaddr=0x3c000000, 0x90000 bytes are mapped
+V (512) esp_image: loading segment header 1 at offset 0x901f8
+D (512) bootloader_flash: mmu set block paddr=0x00090000 (was 0xffffffff)
+D (513) bootloader_flash: mmu set block paddr=0x00090000 (was 0xffffffff)
+V (519) esp_image: segment data length 0x5990 data starts 0x90200
+V (525) esp_image: MMU page size 0x10000
+V (529) esp_image: segment 1 map_segment 0 segment_data_offs 0x90200 load_addr 0x3fcab200
+  #0  0x3fcab200 in ?? at src/ConfigManager.cpp:11
+
+I (537) esp_image: segment 1: paddr=00090200 vaddr=3fcab200 size=05990h ( 22928) load
+D (544) esp_image: free data page_count 0x00000200
+D (549) bootloader_flash: rodata starts from paddr=0x00090200, size=0x5990, will be mapped to vaddr=0x3c000000
+V (558) bootloader_flash: after mapping, starting from paddr=0x00090000 and vaddr=0x3c000000, 0x10000 bytes are mapped
+V (573) esp_image: loading segment header 2 at offset 0x95b90
+D (574) bootloader_flash: mmu set block paddr=0x00090000 (was 0xffffffff)
+D (581) bootloader_flash: mmu set block paddr=0x00090000 (was 0xffffffff)
+V (587) esp_image: segment data length 0xa480 data starts 0x95b98
+V (593) esp_image: MMU page size 0x10000
+V (597) esp_image: segment 2 map_segment 0 segment_data_offs 0x95b98 load_addr 0x40378000
+  #0  0x40378000 in _WindowOverflow4 at /Users/mert/.platformio/packages/framework-espidf/components/xtensa/xtensa_vectors.S:2027
+
+I (605) esp_image: segment 2: paddr=00095b98 vaddr=40378000 size=0a480h ( 42112) load
+D (612) esp_image: free data page_count 0x00000200
+D (617) bootloader_flash: rodata starts from paddr=0x00095b98, size=0xa480, will be mapped to vaddr=0x3c000000
+V (626) bootloader_flash: after mapping, starting from paddr=0x00090000 and vaddr=0x3c000000, 0x20000 bytes are mapped
+V (645) esp_image: loading segment header 3 at offset 0xa0018
+D (645) bootloader_flash: mmu set block paddr=0x000a0000 (was 0xffffffff)
+D (649) bootloader_flash: mmu set block paddr=0x000a0000 (was 0xffffffff)
+V (655) esp_image: segment data length 0x159c90 data starts 0xa0020
+V (661) esp_image: MMU page size 0x10000
+V (665) esp_image: segment 3 map_segment 1 segment_data_offs 0xa0020 load_addr 0x42000020
+  #0  0x42000020 in _stext at ??:?
+
+I (673) esp_image: segment 3: paddr=000a0020 vaddr=42000020 size=159c90h (1416336) map
+D (681) esp_image: free data page_count 0x00000200
+D (685) bootloader_flash: rodata starts from paddr=0x000a0020, size=0x159c90, will be mapped to vaddr=0x3c000000
+V (695) bootloader_flash: after mapping, starting from paddr=0x000a0000 and vaddr=0x3c000000, 0x160000 bytes are mapped
+V (917) esp_image: loading segment header 4 at offset 0x1f9cb0
+D (917) bootloader_flash: mmu set block paddr=0x001f0000 (was 0xffffffff)
+D (917) bootloader_flash: mmu set block paddr=0x001f0000 (was 0xffffffff)
+V (924) esp_image: segment data length 0x18d1c data starts 0x1f9cb8
+V (930) esp_image: MMU page size 0x10000
+V (934) esp_image: segment 4 map_segment 0 segment_data_offs 0x1f9cb8 load_addr 0x40382480
+  #0  0x40382480 in ram_chip_i2c_writeReg at ??:?
+
+I (942) esp_image: segment 4: paddr=001f9cb8 vaddr=40382480 size=18d1ch (101660) load
+D (949) esp_image: free data page_count 0x00000200
+D (954) bootloader_flash: rodata starts from paddr=0x001f9cb8, size=0x18d1c, will be mapped to vaddr=0x3c000000
+V (963) bootloader_flash: after mapping, starting from paddr=0x001f0000 and vaddr=0x3c000000, 0x30000 bytes are mapped
+V (993) esp_image: loading segment header 5 at offset 0x2129d4
+D (994) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (994) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+V (1001) esp_image: segment data length 0x8 data starts 0x2129dc
+V (1006) esp_image: MMU page size 0x10000
+V (1010) esp_image: segment 5 map_segment 0 segment_data_offs 0x2129dc load_addr 0x50000000
+  #0  0x50000000 in ?? at src/SleepController.cpp:14
+
+I (1018) esp_image: segment 5: paddr=002129dc vaddr=50000000 size=00008h (     8) load
+D (1026) esp_image: free data page_count 0x00000200
+D (1031) bootloader_flash: rodata starts from paddr=0x002129dc, size=0x8, will be mapped to vaddr=0x3c000000
+V (1040) bootloader_flash: after mapping, starting from paddr=0x00210000 and vaddr=0x3c000000, 0x10000 bytes are mapped
+V (1051) esp_image: loading segment header 6 at offset 0x2129e4
+D (1056) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1063) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+V (1069) esp_image: segment data length 0x8c data starts 0x2129ec
+V (1075) esp_image: MMU page size 0x10000
+V (1079) esp_image: segment 6 map_segment 0 segment_data_offs 0x2129ec load_addr 0x600fe000
+  #0  0x600fe000 in _rtc_code_start at :?
+
+I (1087) esp_image: segment 6: paddr=002129ec vaddr=600fe000 size=0008ch (   140) load
+D (1095) esp_image: free data page_count 0x00000200
+D (1099) bootloader_flash: rodata starts from paddr=0x002129ec, size=0x8c, will be mapped to vaddr=0x3c000000
+V (1109) bootloader_flash: after mapping, starting from paddr=0x00210000 and vaddr=0x3c000000, 0x10000 bytes are mapped
+V (1119) esp_image: image start 0x00010000 end of last section 0x00212a78
+D (1126) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1133) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1139) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1146) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1152) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1159) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1165) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1172) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1179) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1185) bootloader_flash: mmu set block paddr=0x00210000 (was 0xffffffff)
+D (1192) boot: Calculated hash: ff7c8860bb057bab3442bbd2044f5afbedc252daa742162cdac240a5df2769a1
+I (1213) boot: Loaded app from partition at offset 0x10000
+I (1214) boot: Disabling RNG early entropy source...
+D (1214) boot: Mapping segment 0 as DROM
+D (1216) boot: Mapping segment 3 as IROM
+D (1219) boot: calling set_cache_and_start_app
+D (1224) boot: configure drom and irom and start
+V (1228) boot: rodata starts from paddr=0x00010020, vaddr=0x3c160020, size=0x801d8
+V (1235) boot: after mapping rodata, starting from paddr=0x00010000 and vaddr=0x3c160000, 0x90000 bytes are mapped
+V (1245) boot: mapped one page of the rodata, from paddr=0x00010000 and vaddr=0x3dff0000, 0x10000 bytes are mapped
+V (1255) boot: text starts from paddr=0x000a0020, vaddr=0x42000020, size=0x159c90
+V (1263) boot: after mapping text, starting from paddr=0x000a0000 and vaddr=0x42000000, 0x160000 bytes are mapped
+D (1273) boot: start: 0x4037b9ec
+  #0  0x4037b9ec in call_start_cpu0 at /Users/mert/.platformio/packages/framework-espidf/components/esp_system/port/cpu_start.c:357
+
+I (1287) octal_psram: vendor id    : 0x0d (AP)
+I (1287) octal_psram: dev id       : 0x02 (generation 3)
+I (1288) octal_psram: density      : 0x03 (64 Mbit)
+I (1290) octal_psram: good-die     : 0x01 (Pass)
+I (1294) octal_psram: Latency      : 0x01 (Fixed)
+I (1299) octal_psram: VCC          : 0x01 (3V)
+I (1303) octal_psram: SRF          : 0x01 (Fast Refresh)
+I (1308) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+I (1313) octal_psram: BurstLen     : 0x01 (32 Byte)
+I (1317) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+I (1323) octal_psram: DriveStrength: 0x00 (1/1)
+I (1328) MSPI Timing: PSRAM timing tuning index: 5
+I (1331) esp_psram: Found 8MB PSRAM device
+I (1335) esp_psram: Speed: 80MHz
+I (1338) cpu_start: Multicore app
+I (1774) esp_psram: SPI SRAM memory test OK
+I (1782) cpu_start: Pro cpu start user code
+I (1782) cpu_start: cpu freq: 240000000 Hz
+I (1782) app_init: Application information:
+I (1783) app_init: Project name:     TilkieTalkie-BoardTester
+I (1788) app_init: App version:      8d58cb4-dirty
+I (1793) app_init: Compile time:     Dec  3 2025 02:16:54
+I (1798) app_init: ELF file SHA256:  ef32f2ec4...
+I (1802) app_init: ESP-IDF:          5.5.0
+I (1806) efuse_init: Min chip rev:     v0.0
+I (1810) efuse_init: Max chip rev:     v0.99 
+I (1814) efuse_init: Chip rev:         v0.2
+I (1818) heap_init: Initializing. RAM available for dynamic allocation:
+I (1824) heap_init: At 3FCB9FC8 len 0002F748 (189 KiB): RAM
+I (1830) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (1835) heap_init: At 600FE08C len 00001F5C (7 KiB): RTCRAM
+I (1840) esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator
+I (1847) spi_flash: detected chip: generic
+I (1851) spi_flash: flash io: qio
+W (1854) i2s(legacy): legacy i2s driver is deprecated, please migrate to use driver/i2s_std.h, driver/i2s_pdm.h or driver/i2s_tdm.h
+[    35][E][Preferences.cpp:47] begin(): nvs_open failed: NOT_FOUND
+[    42][E][Preferences.cpp:47] begin(): nvs_open failed: NOT_FOUND
+[    48][E][Preferences.cpp:47] begin(): nvs_open failed: NOT_FOUND
+I (1895) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (1895) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (1897) coexist: coex firmware version: 831ec70
+I (1901) coexist: coexist rom version e7ae62f
+I (1905) main_task: Started on CPU0
+I (1908) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (1916) main_task: Calling app_main()
+I (1919) main_task: Returned from app_main()
+[  1080][I][main.cpp:178] setup(): [MAIN] === TilkieTalkie Board Tester ===
+[  1086][I][main.cpp:179] setup(): [MAIN] Initializing system...
+[  1092][I][main.cpp:182] setup(): [MAIN] Enabling peripheral power...
+[  1599][I][main.cpp:193] setup(): [MAIN] Initializing WiFi...
+I (3445) pp: pp rom version: e7ae62f
+I (3446) net80211: net80211 rom version: e7ae62f
+I (3447) wifi:wifi driver task: 3fcee978, prio:23, stack:6656, core=0
+I (3455) wifi:wifi firmware version: f3dbad7
+I (3456) wifi:wifi certification version: v7.0
+I (3456) wifi:config NVS flash: enabled
+I (3460) wifi:config nano formatting: disabled
+I (3464) wifi:Init data frame dynamic rx buffer num: 32
+I (3469) wifi:Init static rx mgmt buffer num: 5
+I (3473) wifi:Init management short buffer num: 32
+I (3478) wifi:Init dynamic tx buffer num: 32
+I (3482) wifi:Init tx cache buffer num: 4
+I (3486) wifi:Init static tx FG buffer num: 2
+I (3490) wifi:Init static rx buffer size: 1600
+I (3494) wifi:Init static rx buffer num: 4
+I (3498) wifi:Init dynamic rx buffer num: 32
+I (3502) wifi_init: rx ba win: 16
+I (3505) wifi_init: accept mbox: 6
+I (3508) wifi_init: tcpip mbox: 32
+I (3511) wifi_init: udp mbox: 6
+I (3514) wifi_init: tcp mbox: 64
+I (3517) wifi_init: tcp tx win: 65535
+I (3520) wifi_init: tcp rx win: 65535
+I (3524) wifi_init: tcp mss: 1440
+I (3527) wifi_init: WiFi/LWIP prefer SPIRAM
+I (3531) wifi_init: WiFi IRAM OP enabled
+I (3534) wifi_init: WiFi RX IRAM OP enabled
+I (3538) wifi_init: LWIP IRAM OP enabled
+I (3543) phy_init: phy_version 701,f4f1da3a,Mar  3 2025,15:50:10
+I (3579) wifi:mode : sta (44:1b:f6:8b:0e:e8)
+I (3579) wifi:enable tsf
+I (3581) wifi:Set ps type: 1, coexist: 0
+
+I (3680) wifi_prov_scheme_ble: BT memory released
+WiFi Provisioning Manager initialized successfully
+Free heap after init: 157871 bytes
+Provisioning status check: PROVISIONED
+Device is already provisioned - attempting WiFi connection...
+Found stored SSID: Tosbikler_2.4GHz
+Synced WiFi credentials with ConfigManager
+....I (6089) wifi:new:<1,0>, old:<1,0>, ap:<255,255>, sta:<1,0>, prof:1, snd_ch_cfg:0x0
+I (6090) wifi:state: init -> auth (0xb0)
+I (6103) wifi:state: auth -> assoc (0x0)
+I (6121) wifi:state: assoc -> run (0x10)
+I (6128) wifi:connected with Tosbikler_2.4GHz, aid = 4, channel 1, BW20, bssid = 90:6a:94:12:a6:27
+I (6129) wifi:security: WPA2-PSK, phy: bgn, rssi: -44
+I (6133) wifi:pm start, type: 1
+
+I (6134) wifi:dp: 1, bi: 102400, li: 3, scale listen interval from 307200 us to 307200 us
+I (6142) wifi:set rx beacon pti, rx_bcn_pti: 14, bcn_timeout: 25000, mt_pti: 14, mt_time: 10000
+I (6199) wifi:dp: 2, bi: 102400, li: 4, scale listen interval from 3.07200 us to 409600 us
+I (6199) wifi:AP's beacon interval = 102400 us, DTIM period = 2
+..I (7658) esp_netif_handlers: sta ip: 192.168.2.110, mask: 255.255.255.0, gw: 192.168.2.1
+
+✅ WiFi Connected! IP address: 192.168.2.110
+Retrieving and storing WiFi credentials...
+Connected SSID: Tosbikler_2.4GHz
+Password length: 10 characters
+✅ WiFi credentials stored in ConfigManager
+Free heap after WiFi connection: 157131 bytes
+.
+✅ Connected to WiFi with stored credentials!
+IP Address: 192.168.2.110
+SSID: Tosbikler_2.4GHz
+Signal strength: -43 dBm
+Free heap: 157327 bytes
+I (7686) wifi_prov_scheme_ble: BTDM memory released
+Provisioning manager deinitialized - memory freed for HTTPS/WebSocket
+FileManager: Initializing...
+FileManager: Pre-allocating download buffers from internal SRAM...
+FileManager: ✓ Pre-allocated 2x32KB DMA-aligned buffers from internal SRAM (will never be freed)
+FileManager: Initializing SD card...
+FileManager: Using SDMMC pins - CLK:48, CMD:47, D0:42, D1:38, D2:39, D3:40
+FileManager: SD card initialization attempt 1/1
+E (7716) sdmmc_common: sdmmc_init_ocr: send_op_cond (1) returned 0x107
+E (7716) vfs_fat_sdmmc: sdmmc_card_init failed (0x107).
+[  5876][E][SD_MMC.cpp:295] begin(): Failed to initialize the card (0x107). Make sure SD card lines have pull-up resistors in place.
+FileManager: SD card initialization failed
+FileManager: Please check:
+  1. SD card is properly inserted
+  2. Wiring connections are correct
+  3. SD card is formatted as FAT32
+  4. Power supply is adequate
+FileManager: Failed to initialize SD card
+[  5898][W][main.cpp:197] setup(): [MAIN] File Manager initialization failed!
+[  5905][W][main.cpp:198] setup(): [MAIN] SD card functionality will not be available.
+Initializing Battery Manager...
+Battery Manager initialized successfully
+
+--- Battery Information ---
+Voltage: 4.911V
+Percentage: 100.0%
+Charging: Yes
+Status: Full
+ADC Raw: 3046
+Charging Pin State: 1
+---------------------------
+
+AudioController: Beginning initialization...
+[  6014][I][esp32-hal-i2c-ng.c:112] i2cInit(): Initializing I2C Master: num=0 sda=17 scl=18 freq=100000
+AudioController: I2S configured - BCLK:7, LRCK:8, DOUT:10, MCLK:11
+AudioController: Initializing ES8388...
+AudioController: ES8388 verification - DACPOWER: 0x30, DACCONTROL3: 0x20
+AudioController: ES8388 initialized and verified
+AudioController: Setting volume from 75% to 75%
+AudioController: Set AudioOutput gain to 0.75
+AudioController: Volume set to 75%
+AudioController: Initialization complete - ready for playback
+[  6305][I][main.cpp:214] setup(): [MAIN] Initializing LED Controller...
+I (8152) strip_rmt: Created LED strip object with RMT backend
+[  6312][I][main.cpp:216] setup(): [MAIN] LED Controller initialized successfully!
+[  6325][I][main.cpp:219] setup(): [MAIN] Initializing Reverb WebSocket Client...
+[  6332][I][main.cpp:228] setup(): [MAIN] 
+[  6336][I][main.cpp:232] setup(): [MAIN] WiFi is connected. Initializing network services...
+RequestManager: Initializing...
+RequestManager: Requesting JWT token from endpoint: /hubs/255149175348036/token
+I (8223) wifi:<ba-add>idx:0 (ifx:0, 90:6a:94:12:a6:27), tid:0, ssn:1, winSize:64
+RequestManager: GET /hubs/255149175348036/token -> 404
+RequestManager: Response body: {"token":null,"status":"error","message":"No user is bound to this hub."}
+RequestManager: No token available
+[  6538][W][main.cpp:237] setup(): [MAIN] Request Manager initialization failed!
+[  6545][W][main.cpp:238] setup(): [MAIN] API functionality may be limited.
+ReverbClient: Initialized, will connect when WiFi is available
+ReverbClient: Chat message callback registered
+[  6553][I][main.cpp:267] setup(): [MAIN] Initializing NFC Controller...
+[  6559][I][main.cpp:272] setup(): [MAIN] Network available, waiting for Reverb to connect...
+ReverbClient: Starting WebSocket connection
+ReverbClient: WebSocket connected to: /app/erko2001?protocol=7&client=esp32-client&version=1.0
+ReverbClient: Connected with socket ID: 894774047.749717897
+ReverbClient: Failed to subscribe to private channel
+[ 16623][W][main.cpp:286] setup(): [MAIN] Reverb connection timeout, proceeding anyway
+[ 16631][I][esp32-hal-i2c-ng.c:112] i2cInit(): Initializing I2C Master: num=1 sda=16 scl=15 freq=100000
+[ 16741][W][Wire.cpp:300] begin(): Bus already started in Master Mode.
+Found chip PN51.6
+[ 16824][I][main.cpp:292] setup(): [MAIN] NFC Controller initialized successfully!
+[ 16831][I][main.cpp:298] setup(): [MAIN] NFC callbacks configured.
+[ 16837][I][main.cpp:312] setup(): [MAIN] Initializing Button Controller...
+[BUTTONS] Button controller initialized (polling mode)
+[ 16844][I][main.cpp:408] setup(): [MAIN] Button Controller initialized successfully!
+[ 16852][I][main.cpp:411] setup(): [MAIN] Initializing Sleep Controller...
+[ 16859][I][SleepController.cpp:51] begin(): [SLEEP] Initializing Sleep Controller...
+[ 16866][I][SleepController.cpp:173] enablePeripheralPower(): [SLEEP] Enabling peripheral power (GPIO 4)...
+[ 17376][I][SleepController.cpp:92] configureWakeupSources(): [SLEEP] Configured wake-up sources: Buttons (GPIO 12, 13, 14, 21)
+[ 17387][I][SleepController.cpp:73] begin(): [SLEEP] Sleep Controller initialized
+[ 17394][I][SleepController.cpp:269] setInactivityTimeout(): [SLEEP] Inactivity timeout set to 300000 ms
+[ 17404][I][main.cpp:425] setup(): [MAIN] Sleep Controller initialized successfully!
+[ 18413][I][SleepController.cpp:246] update(): [SLEEP] Sleep conditions met. Device will sleep in 299 seconds if no activity occurs.

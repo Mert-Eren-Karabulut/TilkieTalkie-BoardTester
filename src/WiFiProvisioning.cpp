@@ -111,8 +111,14 @@ void WiFiProvisioningManager::begin() {
             Serial.println("2. Credentials are corrupted");
             Serial.println("3. Router settings changed");
             Serial.println("Will continue retrying in background. Use 'reset' command to reprovision.");
+
+            // We already know the device is provisioned, so the provisioning manager
+            // no longer needs to stay active while background reconnects use WiFi.begin().
+            wifi_prov_mgr_deinit();
+            provisioningManagerInitialized = false;
+            Serial.println("Provisioning manager deinitialized after failed initial connect.");
         }
-        
+
         // Deinitialize manager if connected (saves memory)
         if (WiFi.isConnected()) {
             wifi_prov_mgr_deinit();
@@ -281,7 +287,7 @@ void WiFiProvisioningManager::reset() {
 
 void WiFiProvisioningManager::handleBackgroundReconnection() {
     // Only attempt reconnection if we're provisioned but not connected
-    if (!isProvisioned() || isConnected() || provisioningManagerInitialized) {
+    if (isConnected() || provisioningManagerInitialized || !isProvisioned()) {
         return;
     }
     

@@ -1,6 +1,6 @@
 #include "NfcController.h"
 
-// Debounce delay for the reed switch
+// Debounce delay for the pogo switch sense line
 #define DEBOUNCE_DELAY 50
 
 // Constructor: Initialize the TwoWire object for I2C bus 1 (Wire1)
@@ -8,11 +8,11 @@
 NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
                                  nfc(NFC_IRQ_PIN, NFC_RESET_PIN, &I2C_NFC),
                                  nfcReady(false),
-                                 reedActive(false),
+                                 pogoActive(false),
                                  cardPresent(false),
                                  cardReadInSession(false),
                                  lastDebounceTime(0),
-                                 lastReedState(false),
+                                 lastPogoState(false),
                                  lastNFCReadAttempt(0),
                                  lastSuccessfulNFCRead(0),
                                  consecutiveFailures(0)
@@ -22,9 +22,9 @@ NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
 
 bool NfcController::begin()
 {
-    // Configure the reed switch pin as an input
-    pinMode(REED_SWITCH_PIN, INPUT);
-    lastReedState = digitalRead(REED_SWITCH_PIN);
+    // Configure the pogo sense pin.
+    pinMode(POGO_SWITCH_PIN, INPUT);
+    lastPogoState = digitalRead(POGO_SWITCH_PIN);
 
     // Initialize our dedicated I2C bus with custom pins
     I2C_NFC.begin(NFC_SDA_PIN, NFC_SCL_PIN);
@@ -58,7 +58,8 @@ bool NfcController::begin()
         delay(100);
     }
 
-    Serial.println("ERROR: PN532 not found on Wire1 after 3 attempts! Check wiring on SDA=22, SCL=21, RST=17.");
+    Serial.printf("ERROR: PN532 not found on Wire1 after 3 attempts! Check wiring on SDA=%d, SCL=%d, reset GPIO=%d.\n",
+                  NFC_SDA_PIN, NFC_SCL_PIN, NFC_RESET_PIN);
     nfcReady = false;
     return false;
 }
@@ -69,21 +70,21 @@ void NfcController::update()
     {
         return;
     }
-    handleReedSwitch();
+    handlePogoSwitch();
     
-    // Only attempt NFC reading when reed switch is active AND no card has been read yet
-    if (reedActive && !cardReadInSession)
+    // Only attempt NFC reading while the pogo contacts are shorted.
+    if (pogoActive && !cardReadInSession)
     {
         handleNFCReading();
     }
 }
 
-void NfcController::handleReedSwitch()
+void NfcController::handlePogoSwitch()
 {
-    bool currentReedState = !digitalRead(REED_SWITCH_PIN);
+    bool currentPogoState = digitalRead(POGO_SWITCH_PIN);
 
     // Check if the state has changed
-    if (currentReedState != lastReedState)
+    if (currentPogoState != lastPogoState)
     {
         lastDebounceTime = millis();
     }
@@ -92,13 +93,13 @@ void NfcController::handleReedSwitch()
     if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY)
     {
         // If the state has truly changed
-        if (currentReedState != reedActive)
+        if (currentPogoState != pogoActive)
         {
-            reedActive = currentReedState;
-            if (reedActive)
+            pogoActive = currentPogoState;
+            if (pogoActive)
             {
                 // New session starts
-                Serial.println("Reed switch activated. NFC session started.");
+                Serial.println("Pogo switch engaged. NFC session started.");
                 cardReadInSession = false; // Reset session flag
                 lastReadUID = "";          // Clear last read UID for the new session
                 consecutiveFailures = 0;   // Reset failure count for fresh start
@@ -106,7 +107,7 @@ void NfcController::handleReedSwitch()
             else
             {
                 // Session ends
-                Serial.println("Reed switch deactivated. NFC session ended.");
+                Serial.println("Pogo switch released. NFC session ended.");
                 if (cardReadInSession && afterDetachNFCCallback)
                 {
                     // Only call the detach hook if a card was actually read
@@ -119,7 +120,7 @@ void NfcController::handleReedSwitch()
         }
     }
 
-    lastReedState = currentReedState;
+    lastPogoState = currentPogoState;
 }
 
 void NfcController::handleNFCReading()
@@ -245,14 +246,14 @@ bool NfcController::isNFCReady() const
     return nfcReady;
 }
 
-bool NfcController::isReedSwitchActive() const
+bool NfcController::isPogoSwitchActive() const
 {
-    return reedActive;
+    return pogoActive;
 }
 
 bool NfcController::isCardPresent() const
 {
-    return cardPresent && reedActive;
+    return cardPresent && pogoActive;
 }
 
 NFCData NfcController::currentNFCData() const
