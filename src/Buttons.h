@@ -54,7 +54,7 @@ public:
     void onHoldContinuous(HoldCallback callback);
     void onHoldEnd(HoldCallback callback);
     void onComboHold(ComboCallback callback);
-    void onComboHold2(ComboCallback callback); // Button 2 + 4 combo
+    void onComboHold2(ComboCallback callback); // Button 2 + 3 combo
 
     // Configuration
     void setDebounceTime(unsigned long debounceMs);
@@ -92,12 +92,12 @@ private:
 
     ButtonState buttons[MAX_BUTTONS];
     
-    // Combo state (Button 1 + 3)
+    // Combo state (Button 1 + 4)
     bool comboActive = false;
     unsigned long comboStartTime = 0;
     bool comboProcessed = false;
 
-    // Combo2 state (Button 2 + 4)
+    // Combo2 state (Button 2 + 3)
     bool combo2Active = false;
     unsigned long combo2StartTime = 0;
     bool combo2Processed = false;

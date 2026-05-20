@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <SD_MMC.h>
 #include <WiFi.h>
+#include <Client.h>
 #include <vector>
 #include <map>
 #include <esp_vfs_fat.h>  // For explicit VFS unmount to fix ESP_ERR_INVALID_STATE
@@ -74,6 +75,8 @@ private:
         int flushCount;
         int writeCount;
         int lastReportedProgress;
+        char headerBuffer[1024];
+        size_t headerBufferUsed;
         
         // Double buffer system
         uint8_t* bufferA;  // Network receive buffer
@@ -104,6 +107,8 @@ private:
             flushCount = 0;
             writeCount = 0;
             lastReportedProgress = 0;
+            headerBuffer[0] = '\0';
+            headerBufferUsed = 0;
             bufferA = nullptr;
             bufferB = nullptr;
             bufferSize = 0;
@@ -176,8 +181,9 @@ private:
     
     // Async download helpers
     void cleanupAsyncDownload(bool success, const String& errorMsg);
+    bool fetchRemainingTail(const String &url, size_t offset, size_t expectedTotal, String &errorMsg);
     static void sdWriteTask(void* parameter);
-    void swapBuffers();
+    bool swapBuffers();
 
 
     // File operations

@@ -70,6 +70,7 @@ private:
 
     // Button pins for wake-up (from Buttons.h)
     static const gpio_num_t WAKEUP_BUTTON_PINS[4];
+    static const gpio_num_t WAKEUP_POGO_PIN;
     
     // Helper methods
     void configureWakeupSources();

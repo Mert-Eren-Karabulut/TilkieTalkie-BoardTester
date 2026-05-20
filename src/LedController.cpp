@@ -15,6 +15,10 @@ LedController::LedController() {
     pulseRapidColor = 0;
     pulseDirection = 1;
     currentBrightness = 0;
+    operatingAnimationEnabled = true;
+    operatingLastUpdate = 0;
+    operatingPosition = 0.0f;
+    operatingDirection = 1;
     
     // Load maxBrightness from NVS, default to LED_MAX_POWER if not set
     ConfigManager& config = ConfigManager::getInstance();
@@ -30,14 +34,16 @@ void LedController::begin() {
     FastLED.setBrightness(255);
     FastLED.clear();
     FastLED.show();
+    operatingLastUpdate = millis();
 }
 
 void LedController::update() {
     if (pulseActive) {
         updatePulse();
-    }
-    if (pulseRapidActive) {
+    } else if (pulseRapidActive) {
         updatePulseRapid();
+    } else if (operatingAnimationEnabled) {
+        updateOperatingAnimation();
     }
 }
 
@@ -45,13 +51,14 @@ void LedController::simpleLed(uint32_t hexColor, int intensity) {
     // Stop any active effects
     pulseActive = false;
     pulseRapidActive = false;
+    operatingAnimationEnabled = false;
     
     // Clamp intensity to maxBrightness
     intensity = min(intensity, maxBrightness);
     intensity = max(intensity, 0);
     
     CRGB color = hexToRgb(hexColor);
-    leds[0] = scaleColor(color, intensity);
+    fill_solid(leds, NUM_LEDS, scaleColor(color, intensity));
     
     FastLED.show();
 }
@@ -81,13 +88,14 @@ void LedController::pulseRapid(uint32_t hexColor, int count) {
     
     // Turn on LED immediately
     CRGB color = hexToRgb(hexColor);
-    leds[0] = scaleColor(color, maxBrightness);
+    fill_solid(leds, NUM_LEDS, scaleColor(color, maxBrightness));
     FastLED.show();
 }
 
 void LedController::turnOff() {
     pulseActive = false;
     pulseRapidActive = false;
+    operatingAnimationEnabled = false;
     
     FastLED.clear();
     FastLED.show();
@@ -101,6 +109,13 @@ void LedController::setMaxBrightness(int brightness) {
     // Store the value in NVS
     ConfigManager& config = ConfigManager::getInstance();
     config.storeInt("max_brightness", maxBrightness);
+}
+
+void LedController::enableOperatingAnimation(bool enable) {
+    operatingAnimationEnabled = enable;
+    if (enable) {
+        operatingLastUpdate = millis();
+    }
 }
 
 CRGB LedController::hexToRgb(uint32_t hexColor) {
@@ -140,7 +155,7 @@ void LedController::updatePulse() {
         
         // Update LED
         CRGB color = hexToRgb(pulseColor);
-        leds[0] = scaleColor(color, currentBrightness);
+        fill_solid(leds, NUM_LEDS, scaleColor(color, currentBrightness));
         FastLED.show();
     }
 }
@@ -165,11 +180,48 @@ void LedController::updatePulseRapid() {
     if (timeInCycle < 200) {
         // LED on for first 200ms
         CRGB color = hexToRgb(pulseRapidColor);
-        leds[0] = scaleColor(color, maxBrightness);
+        fill_solid(leds, NUM_LEDS, scaleColor(color, maxBrightness));
     } else {
         // LED off for remaining 100ms
-        leds[0] = CRGB::Black;
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
     }
     
     FastLED.show();
+}
+
+void LedController::updateOperatingAnimation() {
+    const unsigned long currentTime = millis();
+    const unsigned long frameIntervalMs = 35;
+    const float positionStep = 0.14f;
+    const int operatingBrightness = min(maxBrightness, (LED_MAX_POWER * 35) / 100);
+    const CRGB baseColor = hexToRgb(0x00C8FF);
+
+    if (currentTime - operatingLastUpdate < frameIntervalMs) {
+        return;
+    }
+
+    operatingLastUpdate = currentTime;
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+
+    for (int index = 0; index < NUM_LEDS; ++index) {
+        float distance = fabsf(index - operatingPosition);
+        float falloff = 1.0f - (distance / 1.4f);
+        if (falloff <= 0.0f) {
+            continue;
+        }
+
+        int ledBrightness = (int)(operatingBrightness * falloff);
+        leds[index] = scaleColor(baseColor, ledBrightness);
+    }
+
+    FastLED.show();
+
+    operatingPosition += positionStep * operatingDirection;
+    if (operatingPosition >= (NUM_LEDS - 1)) {
+        operatingPosition = NUM_LEDS - 1;
+        operatingDirection = -1;
+    } else if (operatingPosition <= 0.0f) {
+        operatingPosition = 0.0f;
+        operatingDirection = 1;
+    }
 }

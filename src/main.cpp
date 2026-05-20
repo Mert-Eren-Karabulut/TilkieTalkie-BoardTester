@@ -340,41 +340,22 @@ void setup()
         sleepController.resetActivity();
         
         ESP_LOGI(TAG, "Single click on button %d", button + 1);
-        // Example: Different actions for different buttons
         switch(button) {
             case ButtonController::BUTTON_1:
-                // Button 1: Toggle playback
-                ESP_LOGI(TAG, "Button 1: Toggle playback");
-                ledController.pulseLed(0x0000FF); // Blue pulse
-                if (audioController.isPlaying()) {
-                    audioController.pause();
-                } else if (audioController.isPaused()) {
-                    audioController.resume();
-                } else if (audioController.isStopped()) {
-                    //check if there is a playlist set
-                    if (audioController.hasPlaylist()) {
-                        audioController.play(); // Start playing the first track
-                    } else {
-                        audioController.stop(); // Stop playback if no playlist is set
-                    }
-                }
+                    ESP_LOGI(TAG, "Button 1: Volume up");
+                    audioController.volumeUp();
                 break;
             case ButtonController::BUTTON_2:
-                // Button 2: Next track
                 ESP_LOGI(TAG, "Button 2: Next track");
-                ledController.pulseLed(0x00FF00); // Green pulse
                 audioController.nextTrack();
                 break;
             case ButtonController::BUTTON_3:
-                // Button 3: Previous track
                 ESP_LOGI(TAG, "Button 3: Previous track");
-                ledController.pulseLed(0xFFFF00); // Yellow pulse
                 audioController.prevTrack();
                 break;
             case ButtonController::BUTTON_4:
-                // Button 4: Menu/Settings
-                ESP_LOGI(TAG, "Button 4: Menu/Settings");
-                ledController.pulseLed(0xFF00FF); // Magenta pulse
+                    ESP_LOGI(TAG, "Button 4: Volume down");
+                    audioController.volumeDown();
                 break;
         } });
 
@@ -384,33 +365,28 @@ void setup()
         sleepController.resetActivity();
         
         ESP_LOGI(TAG, "Hold started on button %d (duration: %lu ms)", button + 1, duration);
-        // Example: Volume control setup
-        if (button == ButtonController::BUTTON_2 || button == ButtonController::BUTTON_4) {
-            ESP_LOGI(TAG, "Starting volume %s", (button == ButtonController::BUTTON_2) ? "up" : "down");
+            if (button == ButtonController::BUTTON_1 || button == ButtonController::BUTTON_4) {
+                ESP_LOGI(TAG, "Starting volume %s", (button == ButtonController::BUTTON_1) ? "up" : "down");
         } });
 
     buttonController.onHoldContinuous([](ButtonController::ButtonId button, unsigned long duration)
                                       {
-        // Example: Continuous volume adjustment
-        if (button == ButtonController::BUTTON_2) {
-            // Volume up - called every 100ms while holding
+            if (button == ButtonController::BUTTON_1) {
             ESP_LOGI(TAG, "Volume up (held for %lu ms)", duration);
-            audioController.volumeUp(); // Increase volume by 1 step
+                audioController.volumeUp();
         } else if (button == ButtonController::BUTTON_4) {
-            // Volume down - called every 100ms while holding
             ESP_LOGI(TAG, "Volume down (held for %lu ms)", duration);
-            audioController.volumeDown(); // Decrease by 1 step
+                audioController.volumeDown();
         } });
 
     buttonController.onHoldEnd([](ButtonController::ButtonId button, unsigned long duration)
                                {
                                    ESP_LOGI(TAG, "Hold ended on button %d (total duration: %lu ms)", button + 1, duration);
-                                   // Volume adjustment finished
                                });
 
     buttonController.onComboHold([]()
                                  {
-                                     ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (1+3) - RESTARTING DEVICE!");
+                                         ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (1+4) - RESTARTING DEVICE!");
                                      ledController.pulseRapid(0xFF0000, 5); // Rapid red pulse
                                      delay(2000);                           // Give time for LED animation
                                      ESP.restart();                         // Restart the device
@@ -418,7 +394,7 @@ void setup()
 
     buttonController.onComboHold2([]()
                                   {
-                                      ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (2+4) - RESETTING WIFI & RESTARTING!");
+                                          ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (2+3) - RESETTING WIFI & RESTARTING!");
                                       ledController.pulseRapid(0xFF00FF, 5); // Rapid magenta pulse
                                       delay(1000);                           // Give time for LED animation
                                       wifiProv.reset();                      // Reset WiFi provisioning
@@ -433,7 +409,7 @@ void setup()
     sleepController.begin();
 
     // Set inactivity timeout to 5 minutes
-    sleepController.setInactivityTimeout(300000); // 5 minutes
+    sleepController.setInactivityTimeout(30000); // 5 minutes
  
     // Optional: Set a sleep callback to be called before entering sleep
     sleepController.onSleep([]()
@@ -1626,6 +1602,9 @@ void loop()
 
     // Update NFC controller (handles reed switch monitoring and NFC reading)
     nfcController.update();
+
+    // Deliver deferred figure completion callbacks after NFC state is refreshed.
+    requestManager.update();
 
     // Update Sleep controller (handles inactivity timeout and sleep scheduling)
     sleepController.update();

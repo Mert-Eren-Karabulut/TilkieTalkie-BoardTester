@@ -50,7 +50,7 @@ void ButtonController::update() {
         }
     }
     
-    // Check combo hold completion (Button 1 + 3)
+    // Check combo hold completion (Button 1 + 4)
     if (comboActive && !comboProcessed) {
         if (currentTime - comboStartTime >= comboHoldTime) {
             comboProcessed = true;
@@ -60,7 +60,7 @@ void ButtonController::update() {
         }
     }
     
-    // Check combo2 hold completion (Button 2 + 4)
+    // Check combo2 hold completion (Button 2 + 3)
     if (combo2Active && !combo2Processed) {
         if (currentTime - combo2StartTime >= comboHoldTime) {
             combo2Processed = true;
@@ -140,23 +140,23 @@ void ButtonController::handleButtonRelease(ButtonId button) {
     
     btn.singleClickPending = false;
     
-    // Check if this release affects combo state (Button 1 + 3)
-    if (comboActive && (button == BUTTON_1 || button == BUTTON_3)) {
+    // Check if this release affects combo state (Button 1 + 4)
+    if (comboActive && (button == BUTTON_1 || button == BUTTON_4)) {
         bool button1Pressed = buttons[BUTTON_1].currentState;
-        bool button3Pressed = buttons[BUTTON_3].currentState;
+        bool button4Pressed = buttons[BUTTON_4].currentState;
         
-        if (!button1Pressed && !button3Pressed) {
+        if (!button1Pressed && !button4Pressed) {
             // Both combo buttons released
             resetCombo();
         }
     }
     
-    // Check if this release affects combo2 state (Button 1 + 2)
-    if (combo2Active && (button == BUTTON_1 || button == BUTTON_2)) {
-        bool button1Pressed = buttons[BUTTON_1].currentState;
+    // Check if this release affects combo2 state (Button 2 + 3)
+    if (combo2Active && (button == BUTTON_2 || button == BUTTON_3)) {
         bool button2Pressed = buttons[BUTTON_2].currentState;
+        bool button3Pressed = buttons[BUTTON_3].currentState;
         
-        if (!button1Pressed && !button2Pressed) {
+        if (!button2Pressed && !button3Pressed) {
             // Both combo2 buttons released
             resetCombo2();
         }
@@ -173,49 +173,50 @@ void ButtonController::updateCombo() {
     unsigned long currentTime = millis();
     bool button1Pressed = buttons[BUTTON_1].currentState;
     bool button3Pressed = buttons[BUTTON_3].currentState;
+    bool button4Pressed = buttons[BUTTON_4].currentState;
     
     // Check for combo start
-    if (!comboActive && button1Pressed && button3Pressed) {
+    if (!comboActive && button1Pressed && button4Pressed) {
         // Both buttons pressed, check if they were pressed recently
         unsigned long btn1PressTime = buttons[BUTTON_1].pressStartTime;
-        unsigned long btn3PressTime = buttons[BUTTON_3].pressStartTime;
+        unsigned long btn4PressTime = buttons[BUTTON_4].pressStartTime;
         
         // Allow some tolerance for simultaneous press (within 200ms)
-        if (abs((long)(btn1PressTime - btn3PressTime)) <= 200) {
+        if (abs((long)(btn1PressTime - btn4PressTime)) <= 200) {
             comboActive = true;
-            comboStartTime = max(btn1PressTime, btn3PressTime);
+            comboStartTime = max(btn1PressTime, btn4PressTime);
             comboProcessed = false;
             
             // Cancel individual button events
             buttons[BUTTON_1].singleClickPending = false;
-            buttons[BUTTON_3].singleClickPending = false;
+            buttons[BUTTON_4].singleClickPending = false;
             buttons[BUTTON_1].processed = true;
-            buttons[BUTTON_3].processed = true;
+            buttons[BUTTON_4].processed = true;
             
-            Serial.println("[BUTTONS] Combo hold started (Button 1 + 3)");
+            Serial.println("[BUTTONS] Combo hold started (Button 1 + 4)");
         }
     }
     
-    // Check for combo2 start (Button 1 + 2)
+    // Check for combo2 start (Button 2 + 3)
     bool button2Pressed = buttons[BUTTON_2].currentState;
     
-    if (!combo2Active && button1Pressed && button2Pressed) {
-        unsigned long btn1PressTime = buttons[BUTTON_1].pressStartTime;
+    if (!combo2Active && button2Pressed && button3Pressed) {
         unsigned long btn2PressTime = buttons[BUTTON_2].pressStartTime;
+        unsigned long btn3PressTime = buttons[BUTTON_3].pressStartTime;
         
         // Allow some tolerance for simultaneous press (within 200ms)
-        if (abs((long)(btn1PressTime - btn2PressTime)) <= 200) {
+        if (abs((long)(btn2PressTime - btn3PressTime)) <= 200) {
             combo2Active = true;
-            combo2StartTime = max(btn1PressTime, btn2PressTime);
+            combo2StartTime = max(btn2PressTime, btn3PressTime);
             combo2Processed = false;
             
             // Cancel individual button events
-            buttons[BUTTON_1].singleClickPending = false;
             buttons[BUTTON_2].singleClickPending = false;
-            buttons[BUTTON_1].processed = true;
+            buttons[BUTTON_3].singleClickPending = false;
             buttons[BUTTON_2].processed = true;
+            buttons[BUTTON_3].processed = true;
             
-            Serial.println("[BUTTONS] Combo2 hold started (Button 1 + 2)");
+            Serial.println("[BUTTONS] Combo2 hold started (Button 2 + 3)");
         }
     }
     
@@ -255,7 +256,7 @@ void ButtonController::resetCombo() {
         
         // Reset combo buttons
         resetButton(BUTTON_1);
-        resetButton(BUTTON_3);
+        resetButton(BUTTON_4);
     }
 }
 
@@ -266,8 +267,8 @@ void ButtonController::resetCombo2() {
         combo2Processed = false;
         
         // Reset combo2 buttons
-        resetButton(BUTTON_1);
         resetButton(BUTTON_2);
+        resetButton(BUTTON_3);
         
     }
 }

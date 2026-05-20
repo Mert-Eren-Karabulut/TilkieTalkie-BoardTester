@@ -69,6 +69,7 @@ public:
     String getJWTToken();
     bool validateToken(const String& token);
     void initConnection();
+    void update();
 
     void getCheckFigureTracks(const String &uid); // Method to fetch figure tracks
 
@@ -141,18 +142,29 @@ private:
         bool completed = false;
         Figure figureData;     // Store the complete figure structure
         bool hasPendingManifest = false;
+        String pendingManifestJson;
         String previousManifestJson;
+    };
+
+    struct PendingFigureCompletion {
+        String uid;
+        String figureName;
+        bool success = false;
+        String error;
+        Figure figureData;
     };
     
     std::vector<FigureDownloadTracker> activeDownloads;
+    std::vector<PendingFigureCompletion> pendingCompletions;
     
     // UID to Figure ID mapping for deletion purposes
     std::map<String, String> uidToFigureIdMap;
     
     // Helper methods for tracking
-    void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData, bool hasPendingManifest = false, const String &previousManifestJson = String());
+    void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData, bool hasPendingManifest = false, const String &pendingManifestJson = String(), const String &previousManifestJson = String());
     void checkFigureDownloadStatus(const String &uid);
     void onTrackDownloadComplete(const String &path, bool success);
+    void queueFigureDownloadCompletion(const String &uid, const String &figureName, bool success, const String &error, const Figure &figureData);
     void storeUidToFigureIdMapping(const String &uid, const String &figureId);
     static void staticFileDownloadCallback(const String& url, const String& path, bool success, const String& error);
     

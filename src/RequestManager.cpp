@@ -124,6 +124,23 @@ void RequestManager::setTimeout(int timeoutMs)
     this->timeout = timeoutMs;
 }
 
+void RequestManager::update()
+{
+    if (!figureDownloadCompleteCallback || pendingCompletions.empty()) {
+        return;
+    }
+
+    PendingFigureCompletion completion = pendingCompletions.front();
+    pendingCompletions.erase(pendingCompletions.begin());
+    figureDownloadCompleteCallback(
+        completion.uid,
+        completion.figureName,
+        completion.success,
+        completion.error,
+        completion.figureData
+    );
+}
+
 // Consolidated network check
 bool RequestManager::isNetworkReady()
 {
@@ -386,6 +403,9 @@ void RequestManager::processOnlineFigureRequest(const String &uid)
         serializeJson(previousManifest, previousManifestJson);
     }
 
+    String pendingManifestJson;
+    serializeJson(doc, pendingManifestJson);
+
     if (!savePendingUnitManifest(uid, doc)) {
         if (figureDownloadCompleteCallback) {
             Figure emptyFigure;
@@ -431,7 +451,7 @@ void RequestManager::processOnlineFigureRequest(const String &uid)
 
     Figure figureData = buildFigureFromManifest(doc);
     
-    startTrackingFigure(uid, figureName, figureId, trackPaths, figureData, true, previousManifestJson);
+    startTrackingFigure(uid, figureName, figureId, trackPaths, figureData, true, pendingManifestJson, previousManifestJson);
     
     if (assetsToDownload > 0) {
         Serial.printf("RequestManager: Starting %d asset downloads for %s\n", assetsToDownload, figureName.c_str());
@@ -486,9 +506,21 @@ void RequestManager::setFigureDownloadCompleteCallback(FigureDownloadCompleteCal
     this->figureDownloadCompleteCallback = callback;
 }
 
+void RequestManager::queueFigureDownloadCompletion(const String &uid, const String &figureName, bool success, const String &error, const Figure &figureData)
+{
+    PendingFigureCompletion completion;
+    completion.uid = uid;
+    completion.figureName = figureName;
+    completion.success = success;
+    completion.error = error;
+    completion.figureData = figureData;
+    pendingCompletions.push_back(completion);
+}
+
 void RequestManager::startTrackingFigure(const String &uid, const String &figureName, const String &figureId, 
                                           const std::vector<String> &trackPaths, const Figure &figureData,
-                                          bool hasPendingManifest, const String &previousManifestJson)
+                                          bool hasPendingManifest, const String &pendingManifestJson,
+                                          const String &previousManifestJson)
 {
     // Remove completed trackers
     activeDownloads.erase(
@@ -512,6 +544,7 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     tracker.trackPaths = trackPaths;
     tracker.figureData = figureData;
     tracker.hasPendingManifest = hasPendingManifest;
+    tracker.pendingManifestJson = pendingManifestJson;
     tracker.previousManifestJson = previousManifestJson;
     
     FileManager &fileManager = FileManager::getInstance();
@@ -526,9 +559,7 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     if (allReady) {
         tracker.completed = true;
         finalizeTrackedManifest(tracker, true);
-        if (figureDownloadCompleteCallback) {
-            figureDownloadCompleteCallback(uid, figureName, true, "", figureData);
-        }
+        queueFigureDownloadCompletion(uid, figureName, true, "", figureData);
     }
     
     activeDownloads.push_back(tracker);
@@ -542,11 +573,9 @@ void RequestManager::checkFigureDownloadStatus(const String &uid)
                 tracker.completed = true;
                 bool success = (tracker.tracksReady > 0) && (tracker.tracksFailed == 0);
                 finalizeTrackedManifest(tracker, success);
-                
-                if (figureDownloadCompleteCallback) {
-                    figureDownloadCompleteCallback(uid, tracker.figureName, success, 
-                        success ? "" : "Some tracks failed", tracker.figureData);
-                }
+
+                queueFigureDownloadCompletion(uid, tracker.figureName, success,
+                    success ? "" : "Some tracks failed", tracker.figureData);
             }
             break;
         }
@@ -798,14 +827,27 @@ void RequestManager::finalizeTrackedManifest(FigureDownloadTracker &tracker, boo
     if (!success) {
         deletePendingUnitManifest(tracker.uid);
         tracker.hasPendingManifest = false;
+        tracker.pendingManifestJson = String();
         tracker.previousManifestJson = String();
         return;
     }
 
     JsonDocument pendingManifest;
-    if (!loadPendingUnitManifest(tracker.uid, pendingManifest)) {
+    bool hasPendingManifestData = false;
+
+    if (!tracker.pendingManifestJson.isEmpty()) {
+        DeserializationError pendingError = deserializeJson(pendingManifest, tracker.pendingManifestJson);
+        if (pendingError) {
+            Serial.printf("RequestManager: Failed to parse in-memory pending manifest for %s: %s\n", tracker.uid.c_str(), pendingError.c_str());
+        } else {
+            hasPendingManifestData = true;
+        }
+    }
+
+    if (!hasPendingManifestData && !loadPendingUnitManifest(tracker.uid, pendingManifest)) {
         Serial.printf("RequestManager: Missing pending manifest while finalizing unit %s\n", tracker.uid.c_str());
         tracker.hasPendingManifest = false;
+        tracker.pendingManifestJson = String();
         tracker.previousManifestJson = String();
         return;
     }
@@ -825,6 +867,7 @@ void RequestManager::finalizeTrackedManifest(FigureDownloadTracker &tracker, boo
     }
 
     tracker.hasPendingManifest = false;
+    tracker.pendingManifestJson = String();
     tracker.previousManifestJson = String();
 }
 

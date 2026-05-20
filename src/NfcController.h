@@ -17,6 +17,9 @@
 #define MAX_UID_LENGTH 7
 #define NFC_READ_TIMEOUT_MS 50
 
+static const unsigned long POGO_ENGAGE_DEBOUNCE_MS = 50;
+static const unsigned long POGO_RELEASE_DEBOUNCE_MS = 250;
+
 // Data structure to hold NFC card information
 struct NFCData
 {
@@ -81,6 +84,7 @@ private:
     // Debouncing for the pogo switch sense line
     unsigned long lastDebounceTime;
     bool lastPogoState;
+    bool pendingPogoState;
 
     // NFC reading timing control
     unsigned long lastNFCReadAttempt;

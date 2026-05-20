@@ -1,7 +1,6 @@
 #include "SleepController.h"
 #include "AudioController.h"
 #include "FileManager.h"
-#include "ConfigManager.h"
 #include "Buttons.h"
 #include <esp_log.h>
 
@@ -23,6 +22,8 @@ const gpio_num_t SleepController::WAKEUP_BUTTON_PINS[4] = {
     GPIO_NUM_14,
     GPIO_NUM_21
 };
+
+const gpio_num_t SleepController::WAKEUP_POGO_PIN = GPIO_NUM_6;
 
 SleepController::SleepController() :
     sleepScheduled(false),
@@ -79,17 +80,19 @@ void SleepController::end() {
 }
 
 void SleepController::configureWakeupSources() {
-    // Configure ext1 wake-up for multiple GPIO pins (any button press)
+    // Configure ext1 wake-up for multiple GPIO pins (any button press or pogo engage)
     // Use ESP_EXT1_WAKEUP_ANY_HIGH because buttons read HIGH when pressed
     uint64_t buttonMask = 0;
     
     for (int i = 0; i < 4; i++) {
         buttonMask |= (1ULL << WAKEUP_BUTTON_PINS[i]);
     }
+
+    buttonMask |= (1ULL << WAKEUP_POGO_PIN);
     
     esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ANY_HIGH);
     
-    ESP_LOGI(TAG, "Configured wake-up sources: Buttons (GPIO 12, 13, 14, 21)");
+    ESP_LOGI(TAG, "Configured wake-up sources: Buttons (GPIO 12, 13, 14, 21) and pogo switch (GPIO %d)", WAKEUP_POGO_PIN);
 }
 
 bool SleepController::canEnterSleep() {
@@ -107,13 +110,6 @@ bool SleepController::canEnterSleep() {
     
     FileManager& fileManager = FileManager::getInstance();
     AudioController& audio = AudioController::getInstance();
-    ConfigManager& config = ConfigManager::getInstance();
-    
-    // Check if WiFi is provisioned
-    if (!config.hasWiFiCredentials()) {
-        lastCheckResult = false;
-        return false;
-    }
     
     // Check if file sync is in progress
     if (fileManager.getPendingDownloadsCount() > 0) {
@@ -160,7 +156,7 @@ void SleepController::enterDeepSleep() {
     configureWakeupSources();
     
     ESP_LOGI(TAG, "Entering deep sleep mode...");
-    ESP_LOGI(TAG, "Device will wake on any button press");
+    ESP_LOGI(TAG, "Device will wake on any button press or pogo engage");
     
     // Small delay to let serial output finish
     delay(100);
@@ -293,6 +289,11 @@ void SleepController::printWakeupReason() {
                 if (wakeup_pin_mask != 0) {
                     int pin = __builtin_ffsll(wakeup_pin_mask) - 1;
                     ESP_LOGI(TAG, "Wake-up button: GPIO %d", pin);
+
+                    if (pin == WAKEUP_POGO_PIN) {
+                        ESP_LOGI(TAG, "Wake-up source: figure mount / pogo switch engage");
+                        break;
+                    }
                     
                     // Map to button number
                     for (int i = 0; i < 4; i++) {

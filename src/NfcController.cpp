@@ -1,8 +1,5 @@
 #include "NfcController.h"
 
-// Debounce delay for the pogo switch sense line
-#define DEBOUNCE_DELAY 50
-
 // Constructor: Initialize the TwoWire object for I2C bus 1 (Wire1)
 // and pass its address to the Adafruit_PN532 constructor.
 NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
@@ -13,6 +10,7 @@ NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
                                  cardReadInSession(false),
                                  lastDebounceTime(0),
                                  lastPogoState(false),
+                                 pendingPogoState(false),
                                  lastNFCReadAttempt(0),
                                  lastSuccessfulNFCRead(0),
                                  consecutiveFailures(0)
@@ -25,6 +23,7 @@ bool NfcController::begin()
     // Configure the pogo sense pin.
     pinMode(POGO_SWITCH_PIN, INPUT);
     lastPogoState = digitalRead(POGO_SWITCH_PIN);
+    pendingPogoState = lastPogoState;
 
     // Initialize our dedicated I2C bus with custom pins
     I2C_NFC.begin(NFC_SDA_PIN, NFC_SCL_PIN);
@@ -83,19 +82,21 @@ void NfcController::handlePogoSwitch()
 {
     bool currentPogoState = digitalRead(POGO_SWITCH_PIN);
 
-    // Check if the state has changed
-    if (currentPogoState != lastPogoState)
+    if (currentPogoState != pendingPogoState)
     {
+        pendingPogoState = currentPogoState;
         lastDebounceTime = millis();
     }
 
-    // If the state has been stable for longer than the debounce delay
-    if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY)
+    unsigned long debounceDelay = pendingPogoState ?
+        POGO_ENGAGE_DEBOUNCE_MS :
+        POGO_RELEASE_DEBOUNCE_MS;
+
+    if ((millis() - lastDebounceTime) > debounceDelay)
     {
-        // If the state has truly changed
-        if (currentPogoState != pogoActive)
+        if (pendingPogoState != pogoActive)
         {
-            pogoActive = currentPogoState;
+            pogoActive = pendingPogoState;
             if (pogoActive)
             {
                 // New session starts
