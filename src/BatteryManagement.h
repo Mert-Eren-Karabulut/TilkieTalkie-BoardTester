@@ -34,9 +34,11 @@ private:
     static const uint8_t BQ25792_CHARGE_CURRENT_REGISTER = 0x03;
     static const uint8_t BQ25792_INPUT_CURRENT_REGISTER = 0x06;
     static const uint8_t BQ25792_RECHARGE_CONTROL_REGISTER = 0x0A;
+    static const uint8_t BQ25792_INPUT_VOLTAGE_REGISTER = 0x05; // VINDPM, 100mV/LSB
     static const uint8_t BQ25792_CHARGER_CONTROL_0_REGISTER = 0x0F;
     static const uint8_t BQ25792_CHARGER_CONTROL_1_REGISTER = 0x10;
     static const uint8_t BQ25792_CHARGER_CONTROL_2_REGISTER = 0x11;
+    static const uint8_t BQ25792_CHARGER_CONTROL_5_REGISTER = 0x14;
     static const uint8_t BQ25792_NTC_CONTROL_1_REGISTER = 0x18;
     static const uint8_t BQ25792_STATUS_0_REGISTER = 0x1B;
     static const uint8_t BQ25792_STATUS_1_REGISTER = 0x1C;
@@ -52,8 +54,19 @@ private:
     static const uint8_t BQ25792_FAULT_FLAG_0_REGISTER = 0x26;
     static const uint8_t BQ25792_FAULT_FLAG_1_REGISTER = 0x27;
     static const uint8_t BQ25792_IBAT_ADC_REGISTER = 0x33;
+    static const uint8_t BQ25792_VBUS_ADC_REGISTER = 0x35;
     static const uint8_t BQ25792_VBAT_ADC_REGISTER = 0x3B;
     static const uint8_t BQ25792_VSYS_ADC_REGISTER = 0x3D;
+
+    // CH224Q USB-PD sink controller (U28). Lives on the battery I2C bus per WCH's
+    // reference design (single-resistor 9V request on CFG1 + I2C auto-enabled on
+    // CFG2/SCL, CFG3/SDA). Powered from VHV = VBUS, so it only answers while USB is
+    // plugged. 7-bit address is 0x22 or 0x23 depending on chip batch.
+    static const uint8_t CH224Q_ADDRESS_A = 0x22;
+    static const uint8_t CH224Q_ADDRESS_B = 0x23;
+    static const uint8_t CH224Q_STATUS_REGISTER = 0x09;          // protocol handshake bits
+    static const uint8_t CH224Q_VOLTAGE_CONTROL_REGISTER = 0x0A; // 0=5V 1=9V 2=12V 3=15V 4=20V
+    static const uint8_t CH224Q_CURRENT_REGISTER = 0x50;         // granted current, 50mA units (PD only)
 
     // BQ28Z610 standard commands
     static const uint8_t BQ28Z610_TEMPERATURE_REGISTER = 0x06;
@@ -208,6 +221,7 @@ private:
     float currentPercentage;
     float currentTemperatureCelsius;
     float currentSystemVoltage;
+    float currentVbusVoltage;
     int currentBatteryCurrentMilliAmps;
     uint16_t currentRemainingCapacityMilliAmpHours;
     uint16_t currentFullChargeCapacityMilliAmpHours;
@@ -382,10 +396,26 @@ public:
     // immediately; wake is USB plug-in only (QON is not wired on this board). Writing it
     // with VBUS present is safely ignored by the charger.
     bool enterShipMode();
-    // Reprograms VSYSMIN (REG00, 250mV steps from 2500mV). Dead-cell recovery raises it
-    // for brownout headroom; configureChargerDefaults() restores the default on the next
-    // normal boot.
-    bool setMinimumSystemVoltage(uint16_t millivolts);
+    // Reads the CH224Q PD-sink status: which fast-charge handshake succeeded (register
+    // 0x09: BC1.2/QC2/QC3/PD/EPR bits) and the PD-granted current budget. Only works
+    // while VBUS is present (the chip is VBUS-powered). Returns false if it never ACKs.
+    bool readUsbPdStatus(uint8_t &status, uint16_t &grantedMilliAmps);
+    // Requests a different PD voltage gear via the CH224Q (0=5V 1=9V 2=12V 3=15V 4=20V).
+    // Bench/diagnostic use — the resistor-strap default is 9V.
+    bool setUsbPdVoltageGear(uint8_t gear);
+    // Actual negotiated VBUS voltage from the charger's ADC (volts; 0 when unplugged).
+    float getVbusVoltage() const { return currentVbusVoltage; }
+    // Cell temperature from the gauge's TS1 thermistor (°C) — drives the charge-current
+    // temperature guard (datasheet charge window 0-60°C).
+    float getTemperatureC() const { return currentTemperatureCelsius; }
+    // Input current limit (IINDPM, REG06). 0 = clear override, restore the default and
+    // let ICO adapt. Sticky against the periodic charger reconfiguration.
+    bool setInputCurrentLimit(uint16_t milliAmps);
+    // Input Current Optimizer on/off (REG0F EN_ICO), sticky. Disabled while a PD
+    // contract declares the budget — ICO otherwise re-detects (blindly, since the
+    // charger's D+/D- are unconnected on this board) and overwrites IINDPM with a
+    // legacy ~1.5A guess, under-running the contract.
+    bool setIcoEnabled(bool enable);
     // EN_CHG register bit (REG0F). Dead-cell recovery pauses charging while the ESP is
     // awake (the charger's charge-attempt faults on a sub-CUV pack collapse SYS under
     // the awake ESP's load) and re-enables it as the last instruction before deep sleep.
@@ -403,6 +433,10 @@ public:
     
     // Getter methods
     float getBatteryVoltage() const { return currentVoltage; }
+    // Gauge RemainingCapacity — the coulomb counter used as the "ammeter" for the
+    // gauge-based sleep-current measurement (`sleeptest`), since a series DMM in the
+    // cell path corrupts the gauge's impedance tracking.
+    uint16_t getRemainingCapacityMilliAmpHours() const { return currentRemainingCapacityMilliAmpHours; }
     float getBatteryPercentage() const { return currentPercentage; }
     bool getChargingStatus() const { return isCharging; }
     bool hasTelemetry() const { return telemetryValid; }

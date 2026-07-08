@@ -46,6 +46,11 @@ public:
     // Peripheral power control pin
     static const int PERIPHERAL_POWER_PIN = 4;
 
+    // 4V5 rail control (GPIO4 + deep-sleep latch). Public: used by the power serial
+    // commands and by the gauge-based sleep-current measurement (`sleeptest`).
+    void disablePeripheralPower();
+    void enablePeripheralPower();
+
 private:
     // Singleton instance
     static SleepController* instance;
@@ -77,8 +82,6 @@ private:
     void configureWakeupSources();
     bool canEnterSleep();
     void enterDeepSleep();
-    void disablePeripheralPower();
-    void enablePeripheralPower();
 };
 
 #endif // SLEEPCONTROLLER_H

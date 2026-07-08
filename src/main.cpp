@@ -3,6 +3,7 @@
 #include <esp_private/brownout.h> // esp_brownout_disable() for the dead-cell recovery hold
 #include <esp_sleep.h>
 #include <esp_wifi.h>
+#include <sys/time.h> // gettimeofday: system time survives deep sleep (sleeptest elapsed)
 #include <esp_log.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -111,11 +112,187 @@ static const float SYSTEM_START_V = 3.10f;            // cell must reach this to
 static const uint32_t SYSTEM_MONITOR_LED = 0x0000FF;  // blue breathing while warming up / charging
 void startFullSystem();
 
-// True once the cell can buffer RF inrush (above the LFP knee). Until then the heavy
-// subsystems stay deferred so a depleted cell charges instead of brown-out looping.
-bool batteryReadyForFullSystem()
+// --- Gauge-based sleep-current measurement (`sleeptest`) ---
+// The cell path cannot be measured with a series DMM (the burden resistance corrupts
+// the gauge's impedance tracking), so the gauge itself is the ammeter: it stays awake
+// through deep sleep and coulomb-counts everything the cell sources. A test records
+// RemainingCapacity + wall time into RTC memory, deep-sleeps for N minutes on a timer
+// (VBUS wake stub suppressed so it cannot hijack the timer), and the wake boot prints
+// delta-mAh -> average mA. Variant flags isolate suspects against the baseline
+// production sleep. Battery only (charging makes the coulomb delta meaningless);
+// prefer >= 30 minute runs — RemCap has 1mAh resolution and IT applies corrections.
+struct SleepTestState
 {
-    return battery.hasTelemetry() && battery.getBatteryVoltage() >= SYSTEM_START_V;
+    uint32_t magic;
+    uint64_t startEpochUs;
+    uint16_t startRemainingMAh;
+    uint16_t startMillivolts;
+    uint8_t railOn;
+    uint8_t nfcAwake;
+    uint8_t holdPads;
+};
+static RTC_DATA_ATTR SleepTestState gSleepTest = {};
+static const uint32_t SLEEP_TEST_MAGIC = 0x51EE7E57; // "SLEEpTESt"
+
+static uint64_t epochMicros()
+{
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+// Prints the result of a pending sleep test on the wake boot. Called right after
+// battery.begin() so the gauge readings are fresh.
+static void reportSleepTestIfAny()
+{
+    if (gSleepTest.magic != SLEEP_TEST_MAGIC)
+    {
+        return;
+    }
+    gSleepTest.magic = 0;
+
+    const float hours = (epochMicros() - gSleepTest.startEpochUs) / 3600.0e6f;
+    if (!battery.hasTelemetry() || hours <= 0.0f)
+    {
+        ESP_LOGE(TAG, "SLEEPTEST: woke without usable telemetry — result discarded.");
+        return;
+    }
+    const int endRemainingMAh = battery.getRemainingCapacityMilliAmpHours();
+    const int deltaMAh = (int)gSleepTest.startRemainingMAh - endRemainingMAh;
+    const int endMillivolts = (int)(battery.getBatteryVoltage() * 1000.0f);
+
+    ESP_LOGW(TAG, "================= SLEEP TEST RESULT =================");
+    ESP_LOGW(TAG, "Variant: rail=%s, NFC=%s, pad-hold=%s",
+             gSleepTest.railOn ? "ON" : "off",
+             gSleepTest.nfcAwake ? "AWAKE" : "powered-down",
+             gSleepTest.holdPads ? "ARMED" : "off");
+    ESP_LOGW(TAG, "Slept %.1f min: RemCap %u -> %d mAh (delta %d mAh), %u -> %d mV",
+             hours * 60.0f, gSleepTest.startRemainingMAh, endRemainingMAh,
+             deltaMAh, gSleepTest.startMillivolts, endMillivolts);
+    ESP_LOGW(TAG, "AVERAGE SLEEP CURRENT ~= %.1f mA", deltaMAh / hours);
+    ESP_LOGW(TAG, "(1mAh resolution + IT corrections: compare variants relatively, >=30min runs)");
+    ESP_LOGW(TAG, "=====================================================");
+}
+
+// Runs one sleep-current measurement. Replicates the production battery-sleep
+// preparation, with knobs to leave individual suspects powered for A/B isolation.
+static void runSleepTest(uint32_t minutes, bool railOn, bool nfcAwake, bool holdPads)
+{
+    if (battery.isVbusPresent())
+    {
+        ESP_LOGE(TAG, "SLEEPTEST: unplug USB first — a charging cell makes the delta meaningless.");
+        return;
+    }
+    if (!battery.hasTelemetry())
+    {
+        ESP_LOGE(TAG, "SLEEPTEST: no battery telemetry available.");
+        return;
+    }
+
+    gSleepTest.magic = SLEEP_TEST_MAGIC;
+    gSleepTest.startEpochUs = epochMicros();
+    gSleepTest.startRemainingMAh = battery.getRemainingCapacityMilliAmpHours();
+    gSleepTest.startMillivolts = (uint16_t)(battery.getBatteryVoltage() * 1000.0f);
+    gSleepTest.railOn = railOn;
+    gSleepTest.nfcAwake = nfcAwake;
+    gSleepTest.holdPads = holdPads;
+
+    ESP_LOGW(TAG, "SLEEPTEST: %lu min, rail=%s, NFC=%s, pad-hold=%s — start RemCap %umAh @ %umV.",
+             (unsigned long)minutes, railOn ? "ON" : "off", nfcAwake ? "AWAKE" : "powered-down",
+             holdPads ? "ARMED" : "off", gSleepTest.startRemainingMAh, gSleepTest.startMillivolts);
+    ESP_LOGW(TAG, "SLEEPTEST: result prints on the wake boot. A button press ends the run early");
+    ESP_LOGW(TAG, "(still valid — real elapsed time is recorded).");
+
+    if (!nfcAwake)
+    {
+        // Same PN532 power-down + bus parking as the production sleep path.
+        nfcController.powerDown();
+        pinMode(NFC_SDA_PIN, OUTPUT);
+        digitalWrite(NFC_SDA_PIN, HIGH);
+        gpio_hold_en((gpio_num_t)NFC_SDA_PIN);
+        pinMode(NFC_SCL_PIN, OUTPUT);
+        digitalWrite(NFC_SCL_PIN, HIGH);
+        gpio_hold_en((gpio_num_t)NFC_SCL_PIN);
+    }
+    battery.prepareForDeepSleep();
+    if (railOn)
+    {
+        // Keep the 4V5 rail energized through the sleep (GPIO4 is already high).
+        gpio_hold_en(GPIO_NUM_4);
+    }
+    else
+    {
+        sleepController.disablePeripheralPower(); // drives GPIO4 low + latches it
+    }
+    if (holdPads)
+    {
+        gpio_deep_sleep_hold_en(); // the global digital-pad hold under test (~13mA suspect)
+    }
+
+    // Timer wake for the measurement window; buttons/pogo stay armed as an abort path.
+    // The VBUS wake stub must NOT run here — it would re-arm a 20s timer and hijack
+    // the measurement window.
+    esp_set_deep_sleep_wake_stub(NULL);
+    esp_sleep_enable_timer_wakeup((uint64_t)minutes * 60ULL * 1000000ULL);
+    const uint64_t wakeMask = (1ULL << 12) | (1ULL << 13) | (1ULL << 14) | (1ULL << 21) | (1ULL << 6);
+    esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_HIGH);
+    Serial.flush();
+    delay(100);
+    esp_deep_sleep_start(); // does not return; reportSleepTestIfAny() runs on the wake boot
+}
+
+// Docked user feedback: while USB is present, show the 5-segment charge bar on the
+// LEDs (one segment per 20% SOC, the filling segment breathing while current flows).
+// Runs in both monitor and full-run phases. Deliberately stands down for every LED
+// owner with higher claim: first-boot bring-up (owns the LED legend), the learning
+// discharge (uses the LEDs as its load), and transient pulseRapid event feedback
+// (plays over the bar, which resumes by itself). Read-only towards the charging
+// state machine — supervisor, PD negotiation, recovery and bring-up are untouched.
+static void updateChargingUx()
+{
+    static bool wasShowingCharge = false;
+    const bool showCharge = battery.isVbusPresent() &&
+                            gBringupPhase == BRINGUP_INACTIVE &&
+                            !gLearnDischarge &&
+                            battery.hasTelemetry();
+    if (showCharge)
+    {
+        // Spike filter: a glitched gauge read once flashed the bar full for a frame.
+        // The displayed percent only follows a >20-point jump if it persists for 2.5s
+        // (several 1s gauge refresh cycles); real SOC re-seeds still get through.
+        static int shownPercent = -1;
+        static unsigned long jumpSince = 0;
+        const int fresh = (int)battery.getBatteryPercentage();
+        if (shownPercent < 0 || abs(fresh - shownPercent) <= 20)
+        {
+            shownPercent = fresh;
+            jumpSince = 0;
+        }
+        else if (jumpSince == 0)
+        {
+            jumpSince = millis();
+        }
+        else if (millis() - jumpSince > 2500)
+        {
+            shownPercent = fresh;
+            jumpSince = 0;
+        }
+        ledController.showChargeLevel((uint8_t)shownPercent, battery.getChargingStatus());
+        wasShowingCharge = true;
+    }
+    else if (wasShowingCharge)
+    {
+        wasShowingCharge = false;
+        ledController.stopChargeDisplay();
+        if (gSystemPhase == PHASE_MONITOR)
+        {
+            ledController.pulseLed(SYSTEM_MONITOR_LED); // restore monitor breathing
+        }
+        else
+        {
+            ledController.enableOperatingAnimation(true); // restore the idle sweep
+        }
+    }
 }
 
 // Drives the first-boot bring-up state machine. Called from loop() until complete.
@@ -457,41 +634,139 @@ static void runDeadCellRecoveryHold()
     esp_deep_sleep_start();         // does not return; wakes into a fresh boot -> re-evaluates here
 }
 
-// Keeps the charger healthy whenever USB is present, in EVERY phase: a brownout or load
-// transient can latch it off (the VBAT OVP edge) and it then sits "Not charging" with a
-// starving cell forever unless kicked. Also matches the charge current to the cell:
-// gentle while it is weak/high-ESR (the BAT node must not overshoot VBAT OVP), full once
-// recovered. Skipped while first-boot bring-up owns the charge current, and during the
-// learning discharge (HIZ is intentional there).
+// Keeps the charger healthy whenever USB is present, in EVERY phase, and implements the
+// battery-side half of dynamic charging (the input side is silicon: ICO probes the
+// source's real capability, IINDPM/VINDPM throttle charge current when input headroom
+// runs out). Battery datasheet (4000mAh LFP): 0.2C=800mA recommended, 0.5C=2000mA
+// "Rapid", charge window 0-60°C. Tiers: 300mA weak-cell OVP guard below 3.05V, 0.5C
+// above 3.15V, derated to 0.2C near the temperature edges, suspended outside the
+// window. A PD source's declared current budget (CH224Q reg 0x50) is applied as the
+// input limit; non-PD sources rely on ICO. Also kicks the charger out of latched fault
+// states ("Not charging" with a starving cell). Skipped while first-boot bring-up owns
+// the charge current (300mA until current-sense calibration) and during the learning
+// discharge (HIZ intentional there).
 static void superviseChargerOnUsb()
 {
-    if (gBringupPhase != BRINGUP_INACTIVE || gLearnDischarge ||
-        !battery.isVbusPresent() || !battery.hasTelemetry())
+    static uint8_t pdBudgetChecksLeft = 0;
+    static unsigned long lastPdBudgetCheck = 0;
+    static unsigned long lastChargeKick = 0;
+    static uint16_t requestedChargeCurrentMa = 0;
+    static bool wasVbusPresent = false;
+    static bool chargeSuspendedByTemp = false;
+    static bool tempDerated = false;
+
+    if (!battery.isVbusPresent())
+    {
+        if (wasVbusPresent)
+        {
+            // Session ended: drop any PD-budget input limit and re-enable ICO so the
+            // next (possibly weaker, non-PD) source starts from default + adaptation.
+            wasVbusPresent = false;
+            battery.setInputCurrentLimit(0);
+            battery.setIcoEnabled(true);
+        }
+        return;
+    }
+    if (!wasVbusPresent)
+    {
+        // New VBUS session: give the CH224Q a few polls to finish its handshake.
+        wasVbusPresent = true;
+        pdBudgetChecksLeft = 5;
+        lastPdBudgetCheck = 0;
+    }
+
+    if (gBringupPhase != BRINGUP_INACTIVE || gLearnDischarge || !battery.hasTelemetry())
     {
         return;
     }
 
-    static unsigned long lastChargeKick = 0;
-    static uint16_t requestedChargeCurrentMa = 0;
     const float v = battery.getBatteryVoltage();
+    const float t = battery.getTemperatureC();
+
+    // Hard temperature window (datasheet: charge 0..60°C), 2°C re-entry hysteresis.
+    if (chargeSuspendedByTemp)
+    {
+        if (t >= 2.0f && t <= 58.0f)
+        {
+            chargeSuspendedByTemp = false;
+            battery.setChargeEnabled(true);
+            ESP_LOGW(TAG, "CHARGER: %.1fC back inside the charge window — charging re-enabled.", t);
+        }
+        else
+        {
+            return; // stay suspended; no tier management or kicking
+        }
+    }
+    else if (t < 0.0f || t > 60.0f)
+    {
+        chargeSuspendedByTemp = true;
+        battery.setChargeEnabled(false);
+        ESP_LOGW(TAG, "CHARGER: %.1fC outside the 0-60C charge window — charging suspended.", t);
+        return;
+    }
+
+    // Derate to the 0.2C recommended rate near the temperature edges (hysteresis so a
+    // hovering reading doesn't flap the tier).
+    if (tempDerated)
+    {
+        if (t >= 7.0f && t <= 43.0f)
+        {
+            tempDerated = false;
+        }
+    }
+    else if (t < 5.0f || t > 45.0f)
+    {
+        tempDerated = true;
+    }
+
+    // Battery-side ceiling with hysteresis on the voltage boundary (3.05/3.15 keeps
+    // the previous tier in between).
     uint16_t wanted = requestedChargeCurrentMa;
     if (v < 3.05f)
     {
-        wanted = 300;
+        wanted = 300;  // weak/high-ESR cell: the BAT node must not overshoot VBAT OVP
     }
     else if (v > 3.15f)
     {
-        wanted = 1000;
+        wanted = 2000; // datasheet 0.5C "Rapid Charging Current"
     }
     if (wanted == 0)
     {
         wanted = 300;
     }
+    if (tempDerated && wanted > 800)
+    {
+        wanted = 800;  // datasheet 0.2C recommended rate near the temperature edges
+    }
     if (wanted != requestedChargeCurrentMa && battery.setChargeCurrent(wanted))
     {
-        ESP_LOGI(TAG, "CHARGER: charge current -> %umA (%.3fV)", wanted, v);
+        ESP_LOGI(TAG, "CHARGER: charge current -> %umA (%.3fV, %.1fC)", wanted, v, t);
         requestedChargeCurrentMa = wanted;
     }
+
+    // Apply a PD source's declared current budget as the input limit (deterministic,
+    // straight from the source's contract). Non-PD or unreadable: default + ICO.
+    if (pdBudgetChecksLeft > 0 && millis() - lastPdBudgetCheck > 2000)
+    {
+        lastPdBudgetCheck = millis();
+        pdBudgetChecksLeft--;
+        uint8_t pdStatus = 0;
+        uint16_t grantedMa = 0;
+        if (battery.readUsbPdStatus(pdStatus, grantedMa) && (pdStatus & 0x08) && grantedMa >= 500)
+        {
+            const uint16_t limit = grantedMa < 3000 ? grantedMa : 3000;
+            // The PD contract IS the input budget: ICO must not "re-detect" it (with
+            // the charger's D+/D- unconnected it guesses a legacy ~1.5A and overwrites
+            // IINDPM — observed under-running a valid 3A contract).
+            if (battery.setInputCurrentLimit(limit) && battery.setIcoEnabled(false))
+            {
+                ESP_LOGI(TAG, "CHARGER: PD source grants %umA — input limit %umA, ICO off.",
+                         grantedMa, limit);
+            }
+            pdBudgetChecksLeft = 0;
+        }
+    }
+
     if (!battery.getChargingStatus() && millis() - lastChargeKick > 10000)
     {
         lastChargeKick = millis();
@@ -516,6 +791,9 @@ void setup()
     // the inrush/transient current from WiFi/BLE/Reverb. With the FETs open the cell is
     // isolated, the board runs unbuffered off USB, and it browns out during bring-up.
     battery.begin();
+
+    // If this boot is the timer wake of a sleep-current measurement, print its result.
+    reportSleepTestIfAny();
 
     // Deeply discharged cell on USB: charge at minimal load instead of boot-looping.
     // Does not return until the cell recovers (restarts) or USB is pulled (ship mode).
@@ -619,8 +897,9 @@ void setup()
     {
         gSystemPhase = PHASE_MONITOR;
         ledController.pulseLed(SYSTEM_MONITOR_LED); // blue breathing = warming up / charging
-        ESP_LOGW(TAG, "Battery not ready (%.3fV < %.2fV) — deferring full system; monitoring until it recovers.",
-                 battery.hasTelemetry() ? battery.getBatteryVoltage() : 0.0f, SYSTEM_START_IMMEDIATE_V);
+        ESP_LOGW(TAG, "Battery %.3fV: below the %.2fV instant-start — monitoring (full system once >=%.2fV holds for %lus).",
+                 battery.hasTelemetry() ? battery.getBatteryVoltage() : 0.0f,
+                 SYSTEM_START_IMMEDIATE_V, SYSTEM_START_V, SYSTEM_START_HOLD_MS / 1000UL);
     }
 }
 
@@ -894,6 +1173,10 @@ void loop()
             ESP_LOGI(TAG, "  learndis - Learning: DISCHARGE phase (charger HIZ on, no sleep)");
             ESP_LOGI(TAG, "  learnrest - Learning: REST phase (deep sleep for OCV reading)");
             ESP_LOGI(TAG, "  learnchg - Learning: CHARGE phase (exit HIZ, fast charge)");
+            ESP_LOGI(TAG, "  sleeptest <min> [railon] [nfcawake] [hold] - measure sleep current via gauge");
+            ESP_LOGI(TAG, "            (battery only; result prints on the wake boot after <min> minutes)");
+            ESP_LOGI(TAG, "  pdstatus - decode CH224Q handshake (BC/QC/PD) + actual VBUS voltage");
+            ESP_LOGI(TAG, "  pdvolt <5|9|12|15|20> - request a different USB-PD voltage gear");
             ESP_LOGI(TAG, "File Manager Commands:");
             ESP_LOGI(TAG, "  sdtree  - Check SD card file tree");
             ESP_LOGI(TAG, "  sdformat- Format SD card as FAT32");
@@ -929,8 +1212,8 @@ void loop()
             ESP_LOGI(TAG, "  nfcsleep  - PN532 software power-down (bench: watch gauge current drop)");
             ESP_LOGI(TAG, "Power Commands:");
             ESP_LOGI(TAG, "  power   - Show peripheral power status");
-            ESP_LOGI(TAG, "  poweron - Enable peripheral power (IO17)");
-            ESP_LOGI(TAG, "  poweroff- Disable peripheral power (IO17)");
+            ESP_LOGI(TAG, "  poweron - Enable peripheral power (GPIO4 / 4V5 rail)");
+            ESP_LOGI(TAG, "  poweroff- Disable peripheral power (GPIO4 / 4V5 rail)");
             ESP_LOGI(TAG, "Sleep Commands:");
             ESP_LOGI(TAG, "  sleep   - Enter deep sleep immediately");
             ESP_LOGI(TAG, "  sleepafter <ms> - Schedule sleep after specified milliseconds");
@@ -1683,6 +1966,73 @@ void loop()
         {
             nfcController.diagnostics();
         }
+        else if (command == "pdstatus")
+        {
+            // What did the CH224Q negotiate with this USB source? Decodes its status
+            // register (which handshake succeeded) plus the charger's VBUS ADC (the
+            // voltage actually delivered). Diagnoses source-compatibility problems
+            // (e.g. power banks that refuse or drop the 9V request).
+            ESP_LOGI(TAG, "--- USB-PD Sink Status (CH224Q) ---");
+            ESP_LOGI(TAG, "VBUS present: %s, VBUS = %.3fV",
+                     battery.isVbusPresent() ? "yes" : "no", battery.getVbusVoltage());
+            uint8_t status = 0;
+            uint16_t grantedMa = 0;
+            if (!battery.readUsbPdStatus(status, grantedMa))
+            {
+                ESP_LOGW(TAG, "CH224Q not answering (it is VBUS-powered — is USB plugged?).");
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Status 0x%02X: BC1.2=%d QC2=%d QC3=%d PD=%d EPR-act=%d EPR-cap=%d AVS-cap=%d",
+                         status, (status >> 0) & 1, (status >> 1) & 1, (status >> 2) & 1,
+                         (status >> 3) & 1, (status >> 4) & 1, (status >> 5) & 1, (status >> 6) & 1);
+                if ((status >> 3) & 1)
+                {
+                    ESP_LOGI(TAG, "PD granted current budget: %umA", grantedMa);
+                }
+            }
+            ESP_LOGI(TAG, "-----------------------------------");
+        }
+        else if (command.startsWith("pdvolt "))
+        {
+            // pdvolt <5|9|12|15|20> — bench experiment: change the requested PD gear.
+            const long volts = command.substring(7).toInt();
+            int8_t gear = -1;
+            switch (volts)
+            {
+            case 5:  gear = 0; break;
+            case 9:  gear = 1; break;
+            case 12: gear = 2; break;
+            case 15: gear = 3; break;
+            case 20: gear = 4; break;
+            }
+            if (gear < 0)
+            {
+                ESP_LOGI(TAG, "Usage: pdvolt <5|9|12|15|20>");
+            }
+            else if (battery.setUsbPdVoltageGear((uint8_t)gear))
+            {
+                ESP_LOGI(TAG, "Requested %ldV from the source — check 'pdstatus' / VBUS in a few seconds.", volts);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "CH224Q not answering (VBUS-powered — is USB plugged?).");
+            }
+        }
+        else if (command.startsWith("sleeptest"))
+        {
+            // sleeptest <minutes> [railon] [nfcawake] [hold]
+            long minutes = command.substring(9).toInt(); // toInt skips leading whitespace
+            if (minutes <= 0)
+            {
+                minutes = 30;
+            }
+            const bool railOn = command.indexOf("railon") > 0;
+            const bool nfcAwake = command.indexOf("nfcawake") > 0;
+            const bool holdPads = command.indexOf(" hold") > 0;
+            runSleepTest((uint32_t)minutes, railOn, nfcAwake, holdPads);
+            // Only returns on a refused start (USB present / no telemetry).
+        }
         else if (command == "nfcsleep")
         {
             ESP_LOGI(TAG, "Sending PN532 PowerDown — compare 'battery' current before/after (expect ~30-40mA drop).");
@@ -2207,6 +2557,7 @@ void loop()
                          (int)battery.getChargingStatus());
             }
         }
+        updateChargingUx();     // charge bar while docked (bring-up still owns its LED)
         ledController.update(); // animate the monitor / bring-up LED
         delay(5);
         return;
@@ -2260,8 +2611,22 @@ void loop()
         requestManager.update();
     }
 
-    // Update Sleep controller (handles inactivity timeout and sleep scheduling)
-    sleepController.update();
+    // Charge bar while docked (transient NFC/audio pulses play over it and it resumes).
+    updateChargingUx();
+
+    // No sleeping while docked: charging is the toy's "plugged in" UX. resetActivity()
+    // keeps the inactivity countdown cleared (silent no-op once clear), so after unplug
+    // the full timeout starts fresh instead of sleeping instantly. Manual `sleep`
+    // (forceSleep) still works, and the VBUS wake stub covers the inverse case of
+    // docking a device that is already asleep on battery.
+    if (battery.isVbusPresent())
+    {
+        sleepController.resetActivity();
+    }
+    else
+    {
+        sleepController.update();
+    }
 
     delay(1);
 }

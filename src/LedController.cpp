@@ -19,6 +19,10 @@ LedController::LedController() {
     operatingLastUpdate = 0;
     operatingPosition = 0.0f;
     operatingDirection = 1;
+    chargeDisplayActive = false;
+    chargePercent = 0;
+    chargeIsCharging = false;
+    chargeLastUpdate = 0;
     
     // Load maxBrightness from NVS, default to LED_MAX_POWER if not set
     ConfigManager& config = ConfigManager::getInstance();
@@ -42,6 +46,8 @@ void LedController::update() {
         updatePulse();
     } else if (pulseRapidActive) {
         updatePulseRapid();
+    } else if (chargeDisplayActive) {
+        updateChargeDisplay();
     } else if (operatingAnimationEnabled) {
         updateOperatingAnimation();
     }
@@ -116,6 +122,62 @@ void LedController::enableOperatingAnimation(bool enable) {
     if (enable) {
         operatingLastUpdate = millis();
     }
+}
+
+void LedController::showChargeLevel(uint8_t percent, bool charging) {
+    // Take over from the persistent modes (a monitor breathing pulse, the idle sweep)
+    // but NOT from pulseRapid: transient event feedback plays out on top and the bar
+    // resumes automatically from update()'s priority chain.
+    pulseActive = false;
+    operatingAnimationEnabled = false;
+    chargeDisplayActive = true;
+    chargePercent = percent > 100 ? 100 : percent;
+    chargeIsCharging = charging;
+}
+
+void LedController::stopChargeDisplay() {
+    if (chargeDisplayActive) {
+        chargeDisplayActive = false;
+        FastLED.clear();
+        FastLED.show();
+    }
+}
+
+void LedController::updateChargeDisplay() {
+    const unsigned long now = millis();
+    if (now - chargeLastUpdate < 30) {
+        return;
+    }
+    chargeLastUpdate = now;
+
+    // Gentle bar: solid segments at ~30% of max so a bedside toy isn't a floodlight.
+    const int solidBrightness = min(maxBrightness, (LED_MAX_POWER * 30) / 100);
+    const CRGB green = hexToRgb(0x00FF00);
+
+    int filled = (chargePercent * NUM_LEDS) / 100; // one LED per 20% SOC
+    if (filled > NUM_LEDS) {
+        filled = NUM_LEDS;
+    }
+
+    // While charging, all yet-to-be-reached segments breathe together through the full
+    // 0..bar-brightness range on a slow 3s sine. Time-based (phase from millis, not an
+    // incremental step) so a stalled loop skips ahead smoothly instead of freezing the
+    // animation state and accumulating lag.
+    int breath = 0;
+    if (chargeIsCharging) {
+        const float phase = (float)(now % 3000UL) / 3000.0f * TWO_PI;
+        breath = (int)((sinf(phase - HALF_PI) + 1.0f) * 0.5f * (float)solidBrightness);
+    }
+
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    for (int i = 0; i < NUM_LEDS; i++) {
+        if (i < filled) {
+            leds[i] = scaleColor(green, solidBrightness);
+        } else if (chargeIsCharging) {
+            leds[i] = scaleColor(green, breath);
+        }
+    }
+    FastLED.show();
 }
 
 CRGB LedController::hexToRgb(uint32_t hexColor) {

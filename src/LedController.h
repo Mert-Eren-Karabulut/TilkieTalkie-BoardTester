@@ -30,13 +30,18 @@ private:
     unsigned long operatingLastUpdate;
     float operatingPosition;
     int operatingDirection;
-    
+    bool chargeDisplayActive;
+    uint8_t chargePercent;
+    bool chargeIsCharging;
+    unsigned long chargeLastUpdate;
+
     // Helper functions
     CRGB hexToRgb(uint32_t hexColor);
     CRGB scaleColor(CRGB color, int intensity);
     void updatePulse();
     void updatePulseRapid();
     void updateOperatingAnimation();
+    void updateChargeDisplay();
     
 public:
     LedController();
@@ -51,6 +56,13 @@ public:
     void setMaxBrightness(int brightness);  // Set max brightness (0-255)
     int getMaxBrightness() const { return maxBrightness; }
     void enableOperatingAnimation(bool enable = true);
+
+    // Docked charging feedback: a 5-segment green SOC bar (one LED per 20%), with the
+    // currently-filling segment breathing while charge current flows and the bar solid
+    // when full/terminated. Low priority: transient pulseRapid feedback plays over it
+    // and the bar resumes automatically. Call every loop with fresh values while docked.
+    void showChargeLevel(uint8_t percent, bool charging);
+    void stopChargeDisplay();
 };
 
 #endif // LED_CONTROLLER_H

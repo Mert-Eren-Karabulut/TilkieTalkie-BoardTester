@@ -8,14 +8,33 @@ namespace {
 // every 5 seconds. 0 = no override, use the default.
 uint16_t gRequestedChargeCurrentMa = 0;
 
-// Same sticky-override pattern for VSYSMIN: the dead-cell recovery hold raises it to
-// 3.5V for brownout headroom, and without this latch the 5-second charger reconfig
-// silently reverted it to the 3.0V default. 0 = no override.
-uint16_t gRequestedVsysMinMv = 0;
+// Same sticky-override pattern for the input current limit: set from the PD-granted
+// budget (CH224Q register 0x50) when a PD source declares itself; 0 = use the default
+// (and let ICO trim it for non-PD sources).
+uint16_t gRequestedInputLimitMa = 0;
+
+// Sticky charge-inhibit: while true (temperature outside the datasheet charge window,
+// or the recovery hold's fault-clock pause), the periodic charger reconfiguration must
+// NOT re-assert EN_CHG — without this it silently re-enabled charging within 5s.
+bool gChargeInhibited = false;
+
+// Sticky ICO-inhibit: while a PD contract declares the input budget, ICO must stay off
+// or it re-detects (blindly — the charger's own D+/D- are unconnected) and overwrites
+// IINDPM with a legacy ~1.5A guess (observed: PD 3000mA contract, REG06 back at 1560).
+bool gIcoInhibited = false;
 
 constexpr uint8_t kBq25792AdcEnableMask = 0x80;
-constexpr uint8_t kBq25792AdcContinuousMask = 0x40;
-constexpr uint8_t kBq25792ChargeEnableMask = 0x10;
+// REG2E bit6 = ADC_RATE, and SETTING it selects ONE-SHOT conversion (after which
+// ADC_EN self-clears — boot dumps read REG2E as 0x70). This keeps the charger at its
+// 21µA battery-only quiescent; readings stay fresh because applyPowerConfiguration()
+// re-triggers a conversion on every device rescan.
+constexpr uint8_t kBq25792AdcOneShotMask = 0x40;
+// REG0F Charger Control 0 bit map (datasheet): bit5 = EN_CHG, bit4 = EN_ICO. The old
+// single 0x10 mask was EN_ICO mislabeled as charge-enable — charging only worked
+// because EN_CHG's POR default is 1, and chargekick / the recovery charge-pause were
+// actually toggling ICO. Both bits are handled explicitly now.
+constexpr uint8_t kBq25792ChargeEnableMask = 0x20;
+constexpr uint8_t kBq25792IcoEnableMask = 0x10;
 constexpr uint8_t kBq25792WatchdogMask = 0x07;
 constexpr uint8_t kBq25792TsIgnoreMask = 0x01;
 constexpr uint16_t kGaugeSecurityMask = 0x0300;
@@ -192,6 +211,7 @@ BatteryManager::BatteryManager()
     , currentPercentage(0.0)
     , currentTemperatureCelsius(0.0)
     , currentSystemVoltage(0.0)
+    , currentVbusVoltage(0.0)
     , currentBatteryCurrentMilliAmps(0)
     , currentRemainingCapacityMilliAmpHours(0)
     , currentFullChargeCapacityMilliAmpHours(0)
@@ -531,7 +551,10 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
         ok = chargerConfigured && chargerAdcEnabled && ok;
     }
 
-    if (gaugePresent) {
+    // Skip all gauge data-flash work while the gauge is still in ROM mode (fallback
+    // address 0x0B for ~15s after a deep-discharge reset): DF reads/writes only fail
+    // and spam errors there. The periodic device rescan retries once it answers at 0x55.
+    if (gaugePresent && gaugeAddress == BQ28Z610_PRIMARY_ADDRESS) {
         // BQ28Z610 data-flash provisioning is persistent, but boards for this product are always 1S
         // and may ship with FET control disabled.
         bool provisioned = ensureGaugeProvisioned(forceGaugeProvision);
@@ -706,6 +729,7 @@ void BatteryManager::printBatteryInfo() const {
         }
     }
     Serial.println("System Voltage: " + String(currentSystemVoltage, 3) + "V");
+    Serial.println("VBUS Voltage: " + String(currentVbusVoltage, 3) + "V");
     Serial.println("Charging: " + String(isCharging ? "Yes" : "No"));
     Serial.println("Charger Config REG00/01/03/06: 0x" + String(chargerMinimumSystemVoltageRegister, HEX)
         + " / 0x" + String(chargerChargeVoltageRegister, HEX)
@@ -834,9 +858,7 @@ bool BatteryManager::configureRt6160For4V5() {
 }
 
 bool BatteryManager::configureChargerDefaults() {
-    const uint16_t vsysMinMv =
-        gRequestedVsysMinMv != 0 ? gRequestedVsysMinMv : DEFAULT_MIN_SYSTEM_VOLTAGE_MV;
-    const uint8_t minimumSystemVoltageSetting = static_cast<uint8_t>((vsysMinMv - 2500) / 250);
+    const uint8_t minimumSystemVoltageSetting = static_cast<uint8_t>((DEFAULT_MIN_SYSTEM_VOLTAGE_MV - 2500) / 250);
 
     uint8_t rechargeControl = 0;
     uint8_t ntcControl1 = 0;
@@ -849,13 +871,51 @@ bool BatteryManager::configureChargerDefaults() {
     const uint16_t chargeCurrentMa =
         gRequestedChargeCurrentMa != 0 ? gRequestedChargeCurrentMa : DEFAULT_CHARGE_CURRENT_MA;
     ok = writeRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_CURRENT_REGISTER, chargeCurrentMa / 10) && ok;
-    ok = writeRegister16BE(BQ25792_ADDRESS, BQ25792_INPUT_CURRENT_REGISTER, DEFAULT_INPUT_CURRENT_LIMIT_MA / 10) && ok;
+    const uint16_t inputLimitMa =
+        gRequestedInputLimitMa != 0 ? gRequestedInputLimitMa : DEFAULT_INPUT_CURRENT_LIMIT_MA;
+    ok = writeRegister16BE(BQ25792_ADDRESS, BQ25792_INPUT_CURRENT_REGISTER, inputLimitMa / 10) && ok;
 
     uint8_t control0 = 0;
     uint8_t control1 = 0;
 
+    // Explicit input-voltage floor for 5V sources (VINDPM 4.4V; higher-voltage sources
+    // are protected by IINDPM/ICO). The POR default is 3.6V, which lets a sagging 5V
+    // source be dragged far too low before the input loop backs off.
+    ok = writeRegister8(BQ25792_ADDRESS, BQ25792_INPUT_VOLTAGE_REGISTER, 4400 / 100) && ok;
+
+    // The charger's own D+/D- pins are UNCONNECTED on this board (the CH224Q owns the
+    // USB data lines), so its automatic input detection can only misclassify sources —
+    // it was seeding legacy ~1.5A limits under a valid PD 3A contract. Disable
+    // FORCE_INDET (bit7) and AUTO_INDET_EN (bit6); preserve the SDRV ship-control bits.
+    uint8_t control2 = 0;
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, control2) && ok;
+    control2 = static_cast<uint8_t>(control2 & ~0xC0);
+    ok = writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, control2) && ok;
+
+    // Release the ILIM_HIZ pin clamp (EN_EXTILIM, REG14 bit1, default 1): the R185
+    // 100Ω strap hardware-clamps IINDPM to ~1.56A and silently rewrites every host
+    // value above it — this was the constant REG06=0x9c across all sources/sessions.
+    // With it released, the input limit is governed by the IINDPM register (3A default
+    // / PD-declared budget), protected by VINDPM 4.4V and ICO on non-PD sources.
+    uint8_t control5 = 0;
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_5_REGISTER, control5) && ok;
+    control5 = static_cast<uint8_t>(control5 & ~0x02);
+    ok = writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_5_REGISTER, control5) && ok;
+
     ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0) && ok;
-    control0 |= kBq25792ChargeEnableMask;
+    // EN_CHG and EN_ICO both follow their sticky inhibits so a temperature suspension,
+    // the recovery hold's charge pause, or a PD-declared input budget survives this
+    // periodic reconfiguration.
+    if (gIcoInhibited) {
+        control0 = static_cast<uint8_t>(control0 & ~kBq25792IcoEnableMask);
+    } else {
+        control0 |= kBq25792IcoEnableMask;
+    }
+    if (gChargeInhibited) {
+        control0 = static_cast<uint8_t>(control0 & ~kBq25792ChargeEnableMask);
+    } else {
+        control0 |= kBq25792ChargeEnableMask;
+    }
     ok = writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0) && ok;
 
     ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_1_REGISTER, control1) && ok;
@@ -1018,33 +1078,6 @@ bool BatteryManager::enterShipMode() {
     return writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, control2);
 }
 
-bool BatteryManager::setMinimumSystemVoltage(uint16_t millivolts) {
-    if (!chargerPresent) {
-        refreshDevicePresence();
-        if (!chargerPresent) {
-            return false;
-        }
-    }
-    if (millivolts < 2500) {
-        millivolts = 2500;
-    }
-    const uint8_t setting = static_cast<uint8_t>((millivolts - 2500) / 250);
-    if (!writeRegister8(BQ25792_ADDRESS, BQ25792_MIN_SYSTEM_VOLTAGE_REGISTER, setting)) {
-        return false;
-    }
-    uint8_t verify = 0;
-    if (!readRegister8(BQ25792_ADDRESS, BQ25792_MIN_SYSTEM_VOLTAGE_REGISTER, verify)) {
-        return false;
-    }
-    chargerMinimumSystemVoltageRegister = verify;
-    if (verify == setting) {
-        // Keep the periodic charger reconfiguration from silently reverting this.
-        gRequestedVsysMinMv = millivolts;
-        return true;
-    }
-    return false;
-}
-
 bool BatteryManager::ensureGaugeSleepConfig() {
     if (!gaugePresent) {
         refreshDevicePresence();
@@ -1090,7 +1123,7 @@ bool BatteryManager::enableChargerAdc() {
         return false;
     }
 
-    adcControl |= kBq25792AdcEnableMask | kBq25792AdcContinuousMask;
+    adcControl |= kBq25792AdcEnableMask | kBq25792AdcOneShotMask;
     if (!writeRegister8(BQ25792_ADDRESS, BQ25792_ADC_CONTROL_REGISTER, adcControl)) {
         return false;
     }
@@ -1100,8 +1133,8 @@ bool BatteryManager::enableChargerAdc() {
         return false;
     }
 
-    return (verify & (kBq25792AdcEnableMask | kBq25792AdcContinuousMask))
-        == (kBq25792AdcEnableMask | kBq25792AdcContinuousMask);
+    return (verify & (kBq25792AdcEnableMask | kBq25792AdcOneShotMask))
+        == (kBq25792AdcEnableMask | kBq25792AdcOneShotMask);
 }
 
 bool BatteryManager::ensureGaugeProvisioned(bool force) {
@@ -1497,6 +1530,73 @@ bool BatteryManager::setGaugeSingleCellMode() {
     return ok && ((gaugeDaConfiguration & 0x01) == 0);
 }
 
+bool BatteryManager::setIcoEnabled(bool enable) {
+    if (!chargerPresent) {
+        refreshDevicePresence();
+        if (!chargerPresent) {
+            return false;
+        }
+    }
+    uint8_t control0 = 0;
+    if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
+        return false;
+    }
+    if (enable) {
+        control0 |= kBq25792IcoEnableMask;
+    } else {
+        control0 = static_cast<uint8_t>(control0 & ~kBq25792IcoEnableMask);
+    }
+    if (!writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
+        return false;
+    }
+    gIcoInhibited = !enable; // keep the periodic reconfiguration from undoing this
+    return true;
+}
+
+bool BatteryManager::setInputCurrentLimit(uint16_t milliAmps) {
+    if (!chargerPresent) {
+        refreshDevicePresence();
+        if (!chargerPresent) {
+            return false;
+        }
+    }
+    // 0 = clear the override and restore the default (ICO then adapts to the source).
+    const uint16_t target = milliAmps != 0 ? milliAmps : DEFAULT_INPUT_CURRENT_LIMIT_MA;
+    if (!writeRegister16BE(BQ25792_ADDRESS, BQ25792_INPUT_CURRENT_REGISTER, target / 10)) {
+        return false;
+    }
+    chargerInputCurrentRegister = target / 10;
+    gRequestedInputLimitMa = milliAmps; // keep the periodic reconfig from reverting it
+    return true;
+}
+
+bool BatteryManager::readUsbPdStatus(uint8_t &status, uint16_t &grantedMilliAmps) {
+    // The CH224Q is VBUS-powered; try both possible addresses (batch-dependent).
+    const uint8_t addresses[2] = {CH224Q_ADDRESS_A, CH224Q_ADDRESS_B};
+    for (uint8_t address : addresses) {
+        uint8_t raw = 0;
+        if (readRegister8(address, CH224Q_STATUS_REGISTER, status) &&
+            readRegister8(address, CH224Q_CURRENT_REGISTER, raw)) {
+            grantedMilliAmps = static_cast<uint16_t>(raw) * 50U; // 50mA/LSB, PD only
+            return true;
+        }
+    }
+    return false;
+}
+
+bool BatteryManager::setUsbPdVoltageGear(uint8_t gear) {
+    const uint8_t addresses[2] = {CH224Q_ADDRESS_A, CH224Q_ADDRESS_B};
+    for (uint8_t address : addresses) {
+        // Probe with the (readable) status register first so the write targets the
+        // address that actually ACKs.
+        uint8_t probe = 0;
+        if (readRegister8(address, CH224Q_STATUS_REGISTER, probe)) {
+            return writeRegister8(address, CH224Q_VOLTAGE_CONTROL_REGISTER, gear);
+        }
+    }
+    return false;
+}
+
 bool BatteryManager::setChargeEnabled(bool enable) {
     if (!chargerPresent) {
         return false;
@@ -1510,7 +1610,11 @@ bool BatteryManager::setChargeEnabled(bool enable) {
     } else {
         control0 = static_cast<uint8_t>(control0 & ~kBq25792ChargeEnableMask);
     }
-    return writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0);
+    if (!writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
+        return false;
+    }
+    gChargeInhibited = !enable; // keep the periodic reconfiguration from undoing this
+    return true;
 }
 
 bool BatteryManager::restartChargeCycle() {
@@ -1603,11 +1707,13 @@ bool BatteryManager::updateChargerMeasurements() {
 
     uint16_t vbatMillivolts = 0;
     uint16_t vsysMillivolts = 0;
+    uint16_t vbusMillivolts = 0;
     uint16_t ibatMilliamps = 0;
 
     if (chargerAdcEnabled) {
         ok = readRegister16BE(BQ25792_ADDRESS, BQ25792_VBAT_ADC_REGISTER, vbatMillivolts) && ok;
         ok = readRegister16BE(BQ25792_ADDRESS, BQ25792_VSYS_ADC_REGISTER, vsysMillivolts) && ok;
+        ok = readRegister16BE(BQ25792_ADDRESS, BQ25792_VBUS_ADC_REGISTER, vbusMillivolts) && ok;
         ok = readRegister16BESigned(BQ25792_ADDRESS, BQ25792_IBAT_ADC_REGISTER, reinterpret_cast<int16_t&>(ibatMilliamps)) && ok;
     }
 
@@ -1627,6 +1733,7 @@ bool BatteryManager::updateChargerMeasurements() {
     }
 
     currentSystemVoltage = vsysMillivolts / 1000.0f;
+    currentVbusVoltage = vbusMillivolts / 1000.0f;
     if (!gaugePresent) {
         currentBatteryCurrentMilliAmps = static_cast<int>(ibatMilliamps);
     }
