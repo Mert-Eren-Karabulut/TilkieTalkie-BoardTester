@@ -20,6 +20,7 @@
 #include "Buttons.h"
 #include "AsyncSpeedTest.h"
 #include "SleepController.h"
+#include "rtc_wake_stub_vbus.h"
 
 // The espidf CMake build compiles every file in src/ regardless of build_src_filter,
 // so the sleep-probe build (env:sleepprobe, -DSLEEP_PROBE_BUILD) excludes this whole
@@ -445,6 +446,10 @@ static void runDeadCellRecoveryHold()
 
     battery.prepareForDeepSleep(); // asserts CE low + gpio_hold_en on GPIO44
     gpio_deep_sleep_hold_en();     // digital pads (incl. GPIO44/CE) stay held through this sleep
+    // Clear any VBUS wake stub left in RTC memory by a previous battery sleep: the pad
+    // hold above freezes GPIO1/2, the stub's bit-banged I2C would fail, and it would
+    // then re-sleep forever instead of letting these recovery re-check boots happen.
+    esp_set_deep_sleep_wake_stub(NULL);
     esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
     Serial.flush();
     delay(50);
@@ -580,6 +585,16 @@ void setup()
                                 if (battery.isVbusPresent())
                                 {
                                     gpio_deep_sleep_hold_en();
+                                }
+                                else
+                                {
+                                    // Battery sleep: no pad hold (see above) — instead arm the
+                                    // VBUS wake stub, which polls the charger from RTC memory
+                                    // every ~20s (~µA average) and only boots when USB appears,
+                                    // so a docked sleeping toy starts charging within seconds.
+                                    // Never armed together with the hold: frozen pads would
+                                    // break the stub's bit-banged I2C.
+                                    wakeStubVbusArm();
                                 }
                             });
 
