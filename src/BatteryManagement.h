@@ -36,6 +36,7 @@ private:
     static const uint8_t BQ25792_RECHARGE_CONTROL_REGISTER = 0x0A;
     static const uint8_t BQ25792_CHARGER_CONTROL_0_REGISTER = 0x0F;
     static const uint8_t BQ25792_CHARGER_CONTROL_1_REGISTER = 0x10;
+    static const uint8_t BQ25792_CHARGER_CONTROL_2_REGISTER = 0x11;
     static const uint8_t BQ25792_NTC_CONTROL_1_REGISTER = 0x18;
     static const uint8_t BQ25792_STATUS_0_REGISTER = 0x1B;
     static const uint8_t BQ25792_STATUS_1_REGISTER = 0x1C;
@@ -78,10 +79,16 @@ private:
     static const uint16_t BQ28Z610_SEAL_COMMAND = 0x0030;
     static const uint16_t BQ28Z610_DEFAULT_UNSEAL_KEY_1 = 0x0414;
     static const uint16_t BQ28Z610_DEFAULT_UNSEAL_KEY_2 = 0x3672;
+    // Data-flash addresses verified against datasheet sluua65 DF map (2026-06-26).
+    // Several were previously wrong (term voltage collided with SOC Flag Config A;
+    // taper current/voltage hit the Charging Voltage Hysteresis field) — corrected.
+    static const uint16_t BQ28Z610_CC_GAIN_ADDRESS = 0x4006;       // F4 (IEEE-754 LE float)
+    static const uint16_t BQ28Z610_CAPACITY_GAIN_ADDRESS = 0x400A; // F4; = CC Gain * 298261.6178
+    static constexpr float BQ28Z610_DEFAULT_CC_GAIN = 3.58422f;    // factory default (uncalibrated)
     static const uint16_t BQ28Z610_CHEM_ID_ADDRESS = 0x4628;
     static const uint16_t BQ28Z610_DESIGN_CAPACITY_ADDRESS = 0x462A;
     static const uint16_t BQ28Z610_DESIGN_ENERGY_ADDRESS = 0x462C;
-    static const uint16_t BQ28Z610_TERMINATE_VOLTAGE_ADDRESS = 0x4632;
+    static const uint16_t BQ28Z610_TERMINATE_VOLTAGE_ADDRESS = 0x45BE; // was 0x4632 (=SOC Flag Config A!)
     static const uint16_t BQ28Z610_FET_OPTIONS_ADDRESS = 0x4600;
     static const uint16_t BQ28Z610_I2C_GAUGING_CONFIGURATION_ADDRESS = 0x4601;
     static const uint16_t BQ28Z610_I2C_CONFIGURATION_ADDRESS = 0x4602;
@@ -95,45 +102,94 @@ private:
     static const uint16_t BQ28Z610_IT_GAUGING_CONFIGURATION_ADDRESS = 0x464D;
     static const uint16_t BQ28Z610_CHARGING_CONFIGURATION_ADDRESS = 0x465E;
     static const uint16_t BQ28Z610_TEMPERATURE_ENABLE_ADDRESS = 0x469A;
-    static const uint16_t BQ28Z610_CHARGING_VOLTAGE_ADDRESS = 0x4682;
-    static const uint16_t BQ28Z610_TAPER_CURRENT_ADDRESS = 0x4692;
-    static const uint16_t BQ28Z610_TAPER_VOLTAGE_ADDRESS = 0x4694;
+    // Charging Voltage is per JEITA temperature zone (Low/Med/High); set all for 1S LFP.
+    static const uint16_t BQ28Z610_CHARGING_VOLTAGE_LOW_ADDRESS = 0x468C;
+    static const uint16_t BQ28Z610_CHARGING_VOLTAGE_MED_ADDRESS = 0x468E;
+    static const uint16_t BQ28Z610_CHARGING_VOLTAGE_HIGH_ADDRESS = 0x4690;
+    static const uint16_t BQ28Z610_TAPER_CURRENT_ADDRESS = 0x4693; // was 0x4692 (=Charging Voltage Hysteresis)
     static const uint16_t BQ28Z610_DA_CONFIGURATION_ADDRESS = 0x469B;
+    // Current Thresholds (Gas Gauging) — required for learning-cycle relax/charge/discharge
+    // detection. Relationship: Taper > Dsg/Chg threshold > Quit; Quit < C/20.
+    static const uint16_t BQ28Z610_DSG_CURRENT_THRESHOLD_ADDRESS = 0x46A6;
+    static const uint16_t BQ28Z610_CHG_CURRENT_THRESHOLD_ADDRESS = 0x46A8;
+    static const uint16_t BQ28Z610_QUIT_CURRENT_ADDRESS = 0x46AA;
     static const uint16_t BQ28Z610_BALANCING_CONFIGURATION_ADDRESS = 0x470A;
+    // Protection (Settings:Protection) — read-back for diagnosing over-discharge behaviour.
+    static const uint16_t BQ28Z610_PROTECTION_CONFIG_ADDRESS = 0x46AE;     // bit1 CUV_RECOV_CHG
+    static const uint16_t BQ28Z610_ENABLED_PROTECTIONS_A_ADDRESS = 0x46AF; // bit0 CUV, bit1 COV, bit2 OCC
+    static const uint16_t BQ28Z610_ENABLED_PROTECTIONS_B_ADDRESS = 0x46B0;
+    static const uint16_t BQ28Z610_CUV_THRESHOLD_ADDRESS = 0x46B3; // mV (default 2500)
+    static const uint16_t BQ28Z610_CUV_DELAY_ADDRESS = 0x46B5;     // s  (default 2)
+    static const uint16_t BQ28Z610_CUV_RECOVERY_ADDRESS = 0x46B6;  // mV (default 3000)
 
     // Generic bring-up defaults. These are intentionally centralized so they can
     // be replaced with production-cell values later without changing control flow.
-    static const uint16_t DEFAULT_MIN_SYSTEM_VOLTAGE_MV = 3500;
-    static const uint16_t DEFAULT_CHARGE_VOLTAGE_MV = 4180;
+    // VSYSMIN must sit BELOW the LFP cell's operating range. The LiFePO4 1S cell
+    // rests ~3.2V; with the old 3.5V VSYSMIN the charger had to boost SYS above the
+    // cell AND it was only 100mV below VREG (3.6V) — that inverted/tight spacing made
+    // the buck-boost loop oscillate (SYS collapsed to ~2.6V, false VBAT OVP, pulsing
+    // rail). 3.0V lets the system run straight off the cell; the ESP 3.3V rail is a
+    // buck-boost (RT6160 U34) that works from SYS down to ~2V, so it doesn't need 3.5V.
+    static const uint16_t DEFAULT_MIN_SYSTEM_VOLTAGE_MV = 3000;
+    // LiFePO4 1S: charge (CV) target 3.6V. NEVER raise toward Li-ion 4.2V — that
+    // would overcharge and damage the cell.
+    static const uint16_t DEFAULT_CHARGE_VOLTAGE_MV = 3600;
+    // Charge current 1A (~C/4). After current calibration (gaugecalcurrent) the gauge no
+    // longer over-reads, so OCC won't false-trip. 1A fits the ICO-limited USB input
+    // (~1A×3.1V charge + ~3W system < ~7.5W) so it won't starve SYS even at low SOC.
+    // Could go to 2A with a stronger (PD 9V) input. NOTE: requires the gauge to be
+    // current-calibrated first — on an uncalibrated gauge use 300mA (it over-reads ~4.5x).
     static const uint16_t DEFAULT_CHARGE_CURRENT_MA = 1000;
-    static const uint16_t DEFAULT_INPUT_CURRENT_LIMIT_MA = 1000;
-    static const uint16_t DEFAULT_GAUGE_DESIGN_CAPACITY_MAH = 2500;
-    static const uint16_t DEFAULT_GAUGE_DESIGN_ENERGY_MWH = 925;
+    static const uint16_t DEFAULT_INPUT_CURRENT_LIMIT_MA = 3000;
+    // 4000mAh LiFePO4 1S cell. Design Energy is in 10mWh units (capacity_mAh ×
+    // nominal_3.2V / 10 = 4000 × 3.2 / 10 = 1280).
+    static const uint16_t DEFAULT_GAUGE_DESIGN_CAPACITY_MAH = 4000;
+    static const uint16_t DEFAULT_GAUGE_DESIGN_ENERGY_MWH = 1280;
     static const uint8_t DEFAULT_GAUGE_FET_OPTIONS = 0x20;
     static const uint8_t DEFAULT_GAUGE_I2C_GAUGING_CONFIGURATION = 0x04;
     static const uint8_t DEFAULT_GAUGE_I2C_CONFIGURATION = 0x01;
     static const uint8_t DEFAULT_GAUGE_POWER_CONFIG = 0x00;
     static const uint16_t DEFAULT_GAUGE_SOC_FLAG_CONFIG_A = 0x0C8C;
     static const uint8_t DEFAULT_GAUGE_SOC_FLAG_CONFIG_B = 0x8C;
-    static const uint16_t DEFAULT_GAUGE_QMAX_CELL_1_MAH = 2500;
+    static const uint16_t DEFAULT_GAUGE_QMAX_CELL_1_MAH = 4000;
     static const uint16_t DEFAULT_GAUGE_QMAX_CELL_2_MAH = 0;
-    static const uint16_t DEFAULT_GAUGE_QMAX_PACK_MAH = 2500;
+    static const uint16_t DEFAULT_GAUGE_QMAX_PACK_MAH = 4000;
+    // 0x04 = IT enabled, learning (gauge will learn QMax/Ra during a learning cycle and
+    // advance this to 0x05 -> 0x06). Start a fresh gauge in learning mode and run the
+    // SLUA777 learning cycle to populate Qmax/Ra properly.
     static const uint8_t DEFAULT_GAUGE_UPDATE_STATUS = 0x04;
     static const uint16_t DEFAULT_GAUGE_IT_GAUGING_CONFIGURATION = 0x14CE;
     static const uint8_t DEFAULT_GAUGE_CHARGING_CONFIGURATION = 0x00;
     static const uint8_t DEFAULT_GAUGE_TEMPERATURE_ENABLE = 0x03;
-    static const uint16_t DEFAULT_GAUGE_TERMINATE_VOLTAGE_MV = 3200;
-    static const uint16_t DEFAULT_GAUGE_CHARGING_VOLTAGE_MV = 4200;
-    static const uint16_t DEFAULT_GAUGE_TAPER_CURRENT_MA = 100;
-    static const uint16_t DEFAULT_GAUGE_TAPER_VOLTAGE_MV = 100;
-    static const uint16_t DEFAULT_GAUGE_CHEM_ID = 0;
-    static const uint8_t DEFAULT_GAUGE_DA_CONFIGURATION = 0x10;
+    static const uint16_t DEFAULT_GAUGE_TERMINATE_VOLTAGE_MV = 2500; // LiFePO4 EDV / discharge cutoff (cell min)
+    static const uint16_t DEFAULT_GAUGE_CHARGING_VOLTAGE_MV = 3600;  // LiFePO4 1S charge voltage (all temp zones)
+    // SLUA777 §3 relationship: Taper > Dsg/Chg current threshold > Quit; Quit < C/20.
+    // 4000mAh: C/10=400, C/20=200. Taper 200mA, Dsg 100, Chg 75, Quit 40.
+    static const uint16_t DEFAULT_GAUGE_TAPER_CURRENT_MA = 200;
+    static const uint16_t DEFAULT_GAUGE_DSG_CURRENT_THRESHOLD_MA = 100;
+    static const uint16_t DEFAULT_GAUGE_CHG_CURRENT_THRESHOLD_MA = 75;
+    static const uint16_t DEFAULT_GAUGE_QUIT_CURRENT_MA = 40;
+    // Generic LiFePO4 chemistry. TI E2E confirms the BQ28z610 supports LFP (config
+    // same as any Li-ion, just complete a learning cycle). 0x0418 is the generic LFP
+    // Chem ID. We write it to the Chem ID data-flash field; verify on the bench that
+    // it reads back and that gauging behaves (a vendor-matched GPCCHEM ID could refine
+    // accuracy later, but generic LFP + a learning cycle is the standard approach).
+    static const uint16_t DEFAULT_GAUGE_CHEM_ID = 0x0418;
+    // DA Configuration: bit0 CC0=0 (1S pack), bit4 SLEEP=1, bit3 IN_SYSTEM_SLEEP=1.
+    // IN_SYSTEM_SLEEP is required on this board: without it the gauge's SLEEP entry
+    // needs the I2C bus held LOW, but our bus idles HIGH on pullups, so the gauge
+    // never sleeps and burns ~0.4mA from the cell 24/7 (sluua65 §5.3).
+    static const uint8_t DEFAULT_GAUGE_DA_CONFIGURATION = 0x18;
     static const uint8_t DEFAULT_GAUGE_BALANCING_CONFIGURATION = 0x01;
-    
-    // Battery voltage constants (for single cell Li-ion/Li-Po)
-    static constexpr float BATTERY_MIN_VOLTAGE = 3.0;    // Minimum safe voltage
-    static constexpr float BATTERY_MAX_VOLTAGE = 4.2;    // Maximum charge voltage
-    static constexpr float BATTERY_NOMINAL_VOLTAGE = 3.7; // Nominal voltage
+    // NOTE: CUV/COV (Protections-class) thresholds are intentionally left at gauge
+    // defaults. This gauge rejects Protections-class DF writes (verified by readback),
+    // and they aren't needed: the BQ25792 caps charge at 3.6V (no overcharge) and the
+    // default CUV (trip 2500 / recovery 3000mV) is fine for normal LFP use.
+
+    // Battery voltage constants (single cell LiFePO4 / LFP)
+    static constexpr float BATTERY_MIN_VOLTAGE = 2.5;    // Discharge cutoff
+    static constexpr float BATTERY_MAX_VOLTAGE = 3.6;    // Maximum charge voltage
+    static constexpr float BATTERY_NOMINAL_VOLTAGE = 3.2; // Nominal voltage
     
     // Smoothing and calibration
     static constexpr int SMOOTHING_SAMPLES = 10;
@@ -269,6 +325,8 @@ private:
     bool sealGauge();
     bool readGaugeDataFlashByte(uint16_t address, uint8_t &value);
     bool readGaugeDataFlashWord(uint16_t address, uint16_t &value);
+    bool readGaugeDataFlashFloat(uint16_t address, float &value);
+    bool writeGaugeDataFlashFloat(uint16_t address, float value);
     bool writeGaugeDataFlashByte(uint16_t address, uint8_t value);
     bool writeGaugeDataFlashWord(uint16_t address, uint16_t value);
     static const char* chargerStateToString(uint8_t state);
@@ -283,11 +341,63 @@ public:
     bool forceGaugeProvisioning();
     bool resetGaugeLearningState();
     void prepareForDeepSleep();
-    
+
+    // Charger HIZ control (BQ25792 REG0F[EN_HIZ]). HIZ makes the charger ignore the
+    // USB input so the system runs off the battery — used to force a controlled
+    // DISCHARGE during a gauge learning cycle while USB stays connected for serial.
+    bool setHizMode(bool enable);
+    bool isHizMode();
+
+    // Runtime charge-current limit (BQ25792 REG03). Bring-up uses 300mA before the gauge
+    // is current-calibrated (uncalibrated gauge over-reads -> OCC trips), then raises it.
+    bool setChargeCurrent(uint16_t milliAmps);
+
+    // Non-destructive bring-up checks (no DF writes / no DEVICE_RESET). Used by the
+    // first-boot bring-up to skip provisioning/calibration when they are already done,
+    // avoiding a gauge reset that would open the FETs and brown out the system.
+    bool isGaugeProvisioned();        // chem/1S/design-capacity look correct
+    bool isCurrentSenseCalibrated();  // CC Gain has moved away from the factory default
+    // Re-probes the gauge address and returns true only when it is responding at its normal
+    // operating address (not ROM mode 0x0B) AND looks provisioned. The bq28z610 boots in ROM
+    // mode for several seconds after a low-cell reset, so bring-up must wait on this.
+    bool gaugeAliveAndProvisioned();
+    // Re-probes and returns true once the gauge answers at its normal operating address
+    // (0x55), regardless of provisioning. False while it is still in ROM mode (0x0B).
+    bool isGaugeAlive();
+    // Ensures CUV protection latches until charging (Protection Configuration bit1
+    // CUV_RECOV_CHG). Without it CUV auto-recovers when the unloaded cell relaxes, the load
+    // reconnects, and the cell over-discharges. Writes 0x46AE and verifies; returns true if
+    // the latch is enabled (already-set or write stuck).
+    bool ensureGaugeCuvLatch();
+    // Ensures DA Configuration has SLEEP (bit4) + IN_SYSTEM_SLEEP (bit3) set so the gauge
+    // can enter its SLEEP mode with the I2C bus idling high (embedded pack). Targeted
+    // non-destructive DF write, no DEVICE_RESET; returns true if the bits are set.
+    bool ensureGaugeSleepConfig();
+    // True while the charger reports a live VBUS (USB attached). The low-battery cutoff
+    // must never force sleep in this state: with an adapter present the NVDC power path
+    // runs SYS from VBUS regardless of the cell, and sleeping just abandons recovery.
+    bool isVbusPresent() const;
+    // BQ25792 ship mode (REG11 SDRV_CTRL=10b): opens the internal BATFET, disconnecting
+    // the cell from SYS (~µA cell drain). On battery power this kills the system
+    // immediately; wake is USB plug-in only (QON is not wired on this board). Writing it
+    // with VBUS present is safely ignored by the charger.
+    bool enterShipMode();
+    // Reprograms VSYSMIN (REG00, 250mV steps from 2500mV). Dead-cell recovery raises it
+    // for brownout headroom; configureChargerDefaults() restores the default on the next
+    // normal boot.
+    bool setMinimumSystemVoltage(uint16_t millivolts);
+    // EN_CHG register bit (REG0F). Dead-cell recovery pauses charging while the ESP is
+    // awake (the charger's charge-attempt faults on a sub-CUV pack collapse SYS under
+    // the awake ESP's load) and re-enables it as the last instruction before deep sleep.
+    bool setChargeEnabled(bool enable);
+
     // Main update method (call regularly in loop)
     void update();
     bool restoreGaugeFetControl();
     bool setGaugeSingleCellMode();
+    // Calibrate the gauge current sense (CC Gain) against the BQ25792's IBAT ADC.
+    // Requires a steady current flowing (e.g. charging). Fixes the ~4.5x over-read.
+    bool calibrateCurrentSense();
     bool restartChargeCycle();
     bool clearChargerFaultHistory();
     
@@ -296,7 +406,18 @@ public:
     float getBatteryPercentage() const { return currentPercentage; }
     bool getChargingStatus() const { return isCharging; }
     bool hasTelemetry() const { return telemetryValid; }
+    bool isGaugePresent() const { return gaugePresent; }
     
+    // True when the cell can actually SOURCE current into the system (and thus
+    // buffer RF transients) — i.e. the charger sees VBAT present, or the gauge's
+    // discharge (DSG) FET is on. NOTE: gauge cell voltage is NOT a valid signal
+    // here — the gauge measures the cell even when its protection FETs are open
+    // (e.g. latched off by a CUV fault), so the cell reads ~3V while delivering
+    // no power. Used at boot to decide whether it is safe to bring up WiFi/BLE.
+    bool isBatteryConnected() const {
+        return (chargerStatus2 & 0x01) != 0 || (gaugeOperationStatus & 0x0002) != 0;
+    }
+
     // Battery status methods
     bool isBatteryLow() const { return telemetryValid && currentPercentage < 15.0; }
     bool isBatteryCritical() const { return telemetryValid && currentPercentage < 5.0; }
@@ -305,6 +426,9 @@ public:
     // Utility methods
     String getBatteryStatusString() const;
     void printBatteryInfo() const;
+    // Reads back and decodes the gauge's actual protection config (CUV enable/latch/
+    // thresholds, COV/OCC) for diagnosing over-discharge behaviour.
+    void printProtectionConfig();
     void printBusScan();
     
     // Calibration methods

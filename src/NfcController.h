@@ -49,6 +49,7 @@ public:
     bool begin();
     void update();
     void diagnostics();
+    bool powerDown();
 
     // Callback setters
     void setAfterNFCReadCallback(std::function<void(const NFCData &)> cb);

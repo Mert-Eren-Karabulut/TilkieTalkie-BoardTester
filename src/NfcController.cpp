@@ -1,4 +1,5 @@
 #include "NfcController.h"
+#include <driver/gpio.h>
 
 // Constructor: Initialize the TwoWire object for I2C bus 1 (Wire1)
 // and pass its address to the Adafruit_PN532 constructor.
@@ -20,6 +21,12 @@ NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
 
 bool NfcController::begin()
 {
+    // Release the deep-sleep latch on the I2C lines (parked high by the sleep path so
+    // the powered-down PN532 doesn't see a floating bus). Without this the pins stay
+    // frozen and the bus is dead after a wake.
+    gpio_hold_dis((gpio_num_t)NFC_SDA_PIN);
+    gpio_hold_dis((gpio_num_t)NFC_SCL_PIN);
+
     // Configure the pogo sense pin.
     pinMode(POGO_SWITCH_PIN, INPUT);
     lastPogoState = digitalRead(POGO_SWITCH_PIN);
@@ -230,6 +237,45 @@ void NfcController::handleNFCReading()
         }
     }
     // Note: No need for card removal detection here since reed switch handles that
+}
+
+bool NfcController::powerDown()
+{
+    // Put the PN532 into its software Power Down state (~µA), wake on I2C activity.
+    // Board constraint (Adem v7): the PN532's VBAT/PVDD sit on the ALWAYS-ON 3.3V rail
+    // and RSTPD_N is pulled high on the top PCB, so dropping GPIO4 does not de-power it.
+    // Left alone it idles at ~30-45mA through deep sleep and drains the cell — this
+    // command is the only off switch firmware has. Must work even when begin() never
+    // ran (battery-monitor phase), so it brings the I2C bus up on demand.
+    // Release any deep-sleep latch first (a monitor-phase wake never runs begin()).
+    gpio_hold_dis((gpio_num_t)NFC_SDA_PIN);
+    gpio_hold_dis((gpio_num_t)NFC_SCL_PIN);
+    if (!nfcReady)
+    {
+        I2C_NFC.begin(NFC_SDA_PIN, NFC_SCL_PIN);
+        nfc.begin();
+        delay(10);
+    }
+
+    // PowerDown (0x16), WakeUpEnable 0x80 = wake on I2C address match (UM0701-02 §7.2.11).
+    uint8_t cmd[2] = {0x16, 0x80};
+    bool acked = false;
+    for (int attempt = 0; attempt < 3 && !acked; ++attempt)
+    {
+        acked = nfc.sendCommandCheckAck(cmd, sizeof(cmd), 250);
+        if (!acked)
+        {
+            delay(20);
+        }
+    }
+
+    if (acked)
+    {
+        delay(3);         // PN532 needs ~1ms after the response to actually power down
+        nfcReady = false; // any further NFC use requires begin() again
+    }
+    Serial.printf("NfcController: PN532 power-down %s\n", acked ? "OK" : "FAILED");
+    return acked;
 }
 
 void NfcController::setAfterNFCReadCallback(std::function<void(const NFCData &)> cb)

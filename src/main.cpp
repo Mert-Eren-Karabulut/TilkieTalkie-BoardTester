@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <driver/gpio.h>
+#include <esp_private/brownout.h> // esp_brownout_disable() for the dead-cell recovery hold
+#include <esp_sleep.h>
 #include <esp_wifi.h>
 #include <esp_log.h>
 #include <HTTPClient.h>
@@ -17,6 +20,11 @@
 #include "Buttons.h"
 #include "AsyncSpeedTest.h"
 #include "SleepController.h"
+
+// The espidf CMake build compiles every file in src/ regardless of build_src_filter,
+// so the sleep-probe build (env:sleepprobe, -DSLEEP_PROBE_BUILD) excludes this whole
+// application via this guard and provides its own setup()/loop() in sleepprobe_main.cpp.
+#ifndef SLEEP_PROBE_BUILD
 
 static const char *TAG = "MAIN";
 
@@ -43,6 +51,208 @@ ButtonController &buttonController = ButtonController::getInstance();
 SleepController &sleepController = SleepController::getInstance();
 
 const bool DEBUG = true; // Set to false to disable debug prints
+
+// Gauge learning-cycle discharge state. When active (learndis), the board runs off the
+// battery (charger HIZ) to drain it. loop() enforces a hard floor so the discharge
+// never drives the LFP cell into the CUV protection trip.
+static bool gLearnDischarge = false;
+static const float LEARN_DISCHARGE_FLOOR_V = 2.90f; // stop discharge at/below this (loaded)
+
+// Low-battery cutoff: when running on battery (not charging), force deep sleep before the
+// LFP cell can over-discharge. Sits well above the gauge CUV (~2.5V) so the firmware, not
+// the protection IC, is what stops the drain. Debounced to ignore momentary load sag.
+static const float LOW_BATTERY_CUTOFF_V = 3.00f;
+static const unsigned long LOW_BATTERY_CUTOFF_DEBOUNCE_MS = 5000;
+
+// Deep-discharge recovery thresholds. Battery-only below SHIP_MODE_CUTOFF_V the cell is
+// disconnected outright (BQ25792 ship mode, ~µA drain, wake = USB plug-in — QON is not
+// wired on this board). On USB below DEAD_CELL_RECOVERY_ENTER_V the boot charges with
+// the ESP parked in deep sleep (see runDeadCellRecoveryHold), re-checking each minute.
+static const float SHIP_MODE_CUTOFF_V = 2.85f;
+static const float DEAD_CELL_RECOVERY_ENTER_V = 2.85f;
+// A rested near-empty cell can read above SYSTEM_START_V for a single sample and then
+// collapse under WiFi load, so the full system starts only on a clearly-healthy voltage
+// immediately, or on SYSTEM_START_V sustained for SYSTEM_START_HOLD_MS.
+static const float SYSTEM_START_IMMEDIATE_V = 3.20f;
+static const unsigned long SYSTEM_START_HOLD_MS = 10000;
+
+// --- First-boot bring-up: auto gauge provisioning + current-sense calibration ---
+// Runs once per board (gated by an NVS flag). LED indicates the phase (see FACTORY_BRINGUP.md).
+enum BringupPhase
+{
+    BRINGUP_INACTIVE,    // already done (NVS flag set) or finished -> normal operation
+    BRINGUP_PROVISION,   // write the LiFePO4 gauge config (1S, chem, capacity, thresholds)
+    BRINGUP_WAIT_CHARGE, // wait for a steady charge current (technician: ensure USB power)
+    BRINGUP_CALIBRATE,   // calibrate current sense against the charger IBAT ADC
+    BRINGUP_COMPLETE,    // mark done in NVS, raise charge current, show success
+    BRINGUP_FAILED       // hardware fault (e.g. gauge not detected)
+};
+static BringupPhase gBringupPhase = BRINGUP_INACTIVE;
+static const char *BRINGUP_NVS_KEY = "bringup_v1";
+// Bring-up LED phase colors (documented in FACTORY_BRINGUP.md):
+static const uint32_t BRINGUP_LED_PROVISION = 0x0000FF; // solid BLUE   - provisioning
+static const uint32_t BRINGUP_LED_WAIT = 0xFF6000;      // pulsing AMBER - waiting for charge
+static const uint32_t BRINGUP_LED_CALIBRATE = 0x00FFFF; // solid CYAN   - calibrating
+static const uint32_t BRINGUP_LED_SUCCESS = 0x00FF00;   // solid GREEN  - complete
+static const uint32_t BRINGUP_LED_FAIL = 0xFF0000;      // pulsing RED  - failed
+
+// --- Deferred system bring-up ---
+// On boot the device starts in a minimal battery-monitor mode and only brings up the heavy
+// subsystems (SD, WiFi, audio, NFC, buttons) once the cell can support them without
+// brown-out looping. A depleted board charges in monitor mode instead of crashing.
+enum SystemPhase
+{
+    PHASE_MONITOR, // minimal: battery + bring-up + LED only, waiting for a healthy cell
+    PHASE_RUNNING  // full system started
+};
+static SystemPhase gSystemPhase = PHASE_MONITOR;
+static const float SYSTEM_START_V = 3.10f;            // cell must reach this to start full system
+static const uint32_t SYSTEM_MONITOR_LED = 0x0000FF;  // blue breathing while warming up / charging
+void startFullSystem();
+
+// True once the cell can buffer RF inrush (above the LFP knee). Until then the heavy
+// subsystems stay deferred so a depleted cell charges instead of brown-out looping.
+bool batteryReadyForFullSystem()
+{
+    return battery.hasTelemetry() && battery.getBatteryVoltage() >= SYSTEM_START_V;
+}
+
+// Drives the first-boot bring-up state machine. Called from loop() until complete.
+void updateBringup()
+{
+    if (gBringupPhase == BRINGUP_INACTIVE)
+    {
+        return;
+    }
+
+    static unsigned long lastTick = 0;
+    static int calAttempts = 0;
+    static int provisionAttempts = 0;
+    unsigned long now = millis();
+
+    switch (gBringupPhase)
+    {
+    case BRINGUP_PROVISION:
+        ledController.setMaxBrightness(255);
+        ledController.simpleLed(BRINGUP_LED_PROVISION, 255); // solid blue
+        // The gauge boots in ROM mode (0x0B) for several seconds (longer after a deep
+        // discharge) and only answers at 0x55 once the cell has charged a little. While it
+        // is not yet alive we WAIT INDEFINITELY — this is a charging/recovery situation
+        // (USB present), not a fault. The full system is independently gated on a healthy
+        // cell, so a truly dead gauge never boots the system regardless. No false failure.
+        if (!battery.isGaugeAlive())
+        {
+            if (now - lastTick > 2000)
+            {
+                lastTick = now;
+                ESP_LOGW(TAG, "BRINGUP: waiting for gauge to come up (charging / recovery)...");
+            }
+            break;
+        }
+        // Gauge answers at 0x55. If it is blank (e.g. begin() ran while it was still in ROM
+        // mode, or a genuinely fresh gauge), provision it now — safe here because we are in
+        // monitor mode (minimal load), so the provisioning DEVICE_RESET won't brown out.
+        if (!battery.isGaugeProvisioned())
+        {
+            if (++provisionAttempts > 5)
+            {
+                ESP_LOGE(TAG, "BRINGUP: gauge alive but provisioning won't stick — hardware fault.");
+                gBringupPhase = BRINGUP_FAILED;
+                ledController.pulseLed(BRINGUP_LED_FAIL);
+                lastTick = now;
+                break;
+            }
+            ESP_LOGW(TAG, "BRINGUP: gauge unprovisioned — provisioning now (attempt %d)...", provisionAttempts);
+            battery.forceGaugeProvisioning();
+            battery.update();
+            lastTick = now;
+            break; // re-check next tick (gauge may briefly re-enter ROM mode after the reset)
+        }
+        // Gauge is alive and provisioned. Ensure CUV latches until charge so the cell can't
+        // over-discharge by CUV auto-recovery (non-destructive DF byte write, no reset).
+        battery.ensureGaugeCuvLatch();
+        if (battery.isCurrentSenseCalibrated())
+        {
+            ESP_LOGI(TAG, "BRINGUP: gauge already provisioned + current-calibrated — finishing.");
+            gBringupPhase = BRINGUP_COMPLETE;
+            break;
+        }
+        // Fresh board: current calibration is still needed. It resets the gauge, so it runs
+        // here in monitor mode (minimal load, before WiFi/BLE) and only while charging.
+        ESP_LOGI(TAG, "BRINGUP: gauge provisioned; current calibration required.");
+        battery.setChargeCurrent(300); // safe while the gauge is still uncalibrated
+        calAttempts = 0;
+        lastTick = now;
+        gBringupPhase = BRINGUP_WAIT_CHARGE;
+        ledController.pulseLed(BRINGUP_LED_WAIT); // amber pulse = needs charge current
+        ESP_LOGW(TAG, "BRINGUP: waiting for charge current — ensure USB-C power, cell not full.");
+        break;
+
+    case BRINGUP_WAIT_CHARGE:
+        if (now - lastTick < 1500)
+        {
+            break;
+        }
+        lastTick = now;
+        ledController.pulseLed(BRINGUP_LED_WAIT); // re-assert amber
+        if (battery.getChargingStatus())
+        {
+            gBringupPhase = BRINGUP_CALIBRATE;
+        }
+        else
+        {
+            ESP_LOGW(TAG, "BRINGUP: waiting for charge — connect USB-C power.");
+        }
+        break;
+
+    case BRINGUP_CALIBRATE:
+        ledController.simpleLed(BRINGUP_LED_CALIBRATE, 255); // solid cyan
+        ESP_LOGI(TAG, "BRINGUP: calibrating current sense vs charger IBAT...");
+        if (battery.calibrateCurrentSense())
+        {
+            gBringupPhase = BRINGUP_COMPLETE;
+        }
+        else if (++calAttempts >= 5)
+        {
+            ESP_LOGE(TAG, "BRINGUP: current calibration failed repeatedly.");
+            gBringupPhase = BRINGUP_FAILED;
+            ledController.pulseLed(BRINGUP_LED_FAIL);
+            lastTick = now;
+        }
+        else
+        {
+            ESP_LOGW(TAG, "BRINGUP: calibration not ready (current not steady), waiting...");
+            gBringupPhase = BRINGUP_WAIT_CHARGE;
+            ledController.pulseLed(BRINGUP_LED_WAIT);
+            lastTick = now;
+        }
+        break;
+
+    case BRINGUP_COMPLETE:
+        config.storeInt(BRINGUP_NVS_KEY, 1);
+        battery.setChargeCurrent(1000); // calibrated now -> safe to raise
+        sleepController.setInactivityTimeout(30000); // restore normal sleep
+        sleepController.resetActivity();
+        ledController.setMaxBrightness(255);
+        ledController.simpleLed(BRINGUP_LED_SUCCESS, 255); // solid green
+        ESP_LOGI(TAG, "BRINGUP: COMPLETE — gauge provisioned + current calibrated. Starting system.");
+        gBringupPhase = BRINGUP_INACTIVE;
+        break;
+
+    case BRINGUP_FAILED:
+        // Reason was logged once at the transition. Just keep the red LED pulsing; don't
+        // spam the log. Full system is still allowed to start (bring-up is terminal).
+        if (now - lastTick > 5000)
+        {
+            lastTick = now;
+            ledController.pulseLed(BRINGUP_LED_FAIL);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
 
 // Heap monitoring constants
 const size_t CRITICAL_HEAP_THRESHOLD = 15000; // 15KB critical threshold
@@ -189,6 +399,103 @@ void afterDetachNFC()
     ESP_LOGI(TAG, "==========================");
 }
 
+// Dead-cell recovery. ROOT CAUSE of the recovery bootloop (2026-07-08, nailed by the
+// observation that the device is rock-stable while FLASHING — i.e. whenever CE floats
+// and charging is OFF): attempting to charge a sub-CUV pack makes the BQ25792 fault
+// periodically (VBAT OVP into the near-open cell) and restart its converter; during
+// those ms-long faults nothing feeds SYS, and the awake ESP's ~50mA drains the SYS
+// capacitors (~1.7V/ms) below U34's UVLO -> hard POR. No awake-firmware trick survives
+// an actual rail collapse (BOD-off didn't). But the LOAD is ours: asleep, total SYS
+// draw is ~2mA and the same converter faults barely dent SYS. So the recovery keeps
+// charging ENABLED and parks the ESP in deep sleep, with CE latched low through the
+// sleep via the global digital-pad hold — its flash/PSRAM standby cost is irrelevant
+// here because this path only ever runs on USB power. Wakes each minute; every wake is
+// a fresh boot in which battery.begin() releases and re-asserts CE seamlessly, then
+// this gate either sleeps again or lets the normal boot continue. The charger STAT LED
+// (red) staying lit through the sleep gaps is the visible proof of progress.
+// NOTE: no setCpuFrequencyMhz() here — EVER, anywhere in this firmware: octal PSRAM at
+// 80MHz uses boot-time MSPI timing calibration; dynamic frequency switching crashes it.
+static void runDeadCellRecoveryHold()
+{
+    if (!battery.isVbusPresent())
+    {
+        return;
+    }
+    const float v = battery.getBatteryVoltage();
+    if (v >= DEAD_CELL_RECOVERY_ENTER_V)
+    {
+        return;
+    }
+
+    esp_brownout_disable(); // don't let a survivable dip reset us before we reach sleep
+
+    // Stop the fault clock FIRST: the SYS-collapsing charger faults only occur while
+    // charge is ENABLED, and begin() enabled it ~1.2s ago — the observed fault arrives
+    // ~1.2-1.8s after enable, which is why every previous hold variant lost the race to
+    // sleep (the absent NFC module's ~0.6s of I2C retry timeouts sealed it last time —
+    // no PN532 power-down here, its ~1mA is irrelevant on USB). With charging paused
+    // the rail is provably rock-stable (the flashing observation), so the rest of this
+    // function is under no time pressure. Charging is re-enabled as the very last
+    // instruction before deep sleep: the first fault can only ever land on a sleeping
+    // ESP (~2mA SYS load), which rides it through.
+    battery.setChargeEnabled(false);
+
+    ESP_LOGW(TAG, "DEAD-CELL RECOVERY: %.3fV on USB — charging in deep sleep (STAT LED red), re-check in 60s.", v);
+    battery.setChargeCurrent(300); // gentle: a weak/high-ESR cell must not overshoot VBAT OVP
+
+    battery.prepareForDeepSleep(); // asserts CE low + gpio_hold_en on GPIO44
+    gpio_deep_sleep_hold_en();     // digital pads (incl. GPIO44/CE) stay held through this sleep
+    esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
+    Serial.flush();
+    delay(50);
+    battery.setChargeEnabled(true); // last action awake — fault clock restarts as we sleep
+    esp_deep_sleep_start();         // does not return; wakes into a fresh boot -> re-evaluates here
+}
+
+// Keeps the charger healthy whenever USB is present, in EVERY phase: a brownout or load
+// transient can latch it off (the VBAT OVP edge) and it then sits "Not charging" with a
+// starving cell forever unless kicked. Also matches the charge current to the cell:
+// gentle while it is weak/high-ESR (the BAT node must not overshoot VBAT OVP), full once
+// recovered. Skipped while first-boot bring-up owns the charge current, and during the
+// learning discharge (HIZ is intentional there).
+static void superviseChargerOnUsb()
+{
+    if (gBringupPhase != BRINGUP_INACTIVE || gLearnDischarge ||
+        !battery.isVbusPresent() || !battery.hasTelemetry())
+    {
+        return;
+    }
+
+    static unsigned long lastChargeKick = 0;
+    static uint16_t requestedChargeCurrentMa = 0;
+    const float v = battery.getBatteryVoltage();
+    uint16_t wanted = requestedChargeCurrentMa;
+    if (v < 3.05f)
+    {
+        wanted = 300;
+    }
+    else if (v > 3.15f)
+    {
+        wanted = 1000;
+    }
+    if (wanted == 0)
+    {
+        wanted = 300;
+    }
+    if (wanted != requestedChargeCurrentMa && battery.setChargeCurrent(wanted))
+    {
+        ESP_LOGI(TAG, "CHARGER: charge current -> %umA (%.3fV)", wanted, v);
+        requestedChargeCurrentMa = wanted;
+    }
+    if (!battery.getChargingStatus() && millis() - lastChargeKick > 10000)
+    {
+        lastChargeKick = millis();
+        ESP_LOGW(TAG, "CHARGER: USB present but not charging — clearing faults + kicking charger.");
+        battery.clearChargerFaultHistory();
+        battery.restartChargeCycle();
+    }
+}
+
 void setup()
 {
     if (DEBUG)
@@ -199,20 +506,122 @@ void setup()
     ESP_LOGI(TAG, "=== TilkieTalkie Board Tester ===");
     ESP_LOGI(TAG, "Initializing system...");
 
-    // Enable the shared 4V5 peripheral rail on GPIO4 before SD/NFC/audio init.
+    // Initialize battery management FIRST — its I2C bus is independent of the 4V5 rail.
+    // This restores the gauge protection FETs so the cell is connected and can buffer
+    // the inrush/transient current from WiFi/BLE/Reverb. With the FETs open the cell is
+    // isolated, the board runs unbuffered off USB, and it browns out during bring-up.
+    battery.begin();
+
+    // Deeply discharged cell on USB: charge at minimal load instead of boot-looping.
+    // Does not return until the cell recovers (restarts) or USB is pulled (ship mode).
+    runDeadCellRecoveryHold();
+
+    // Enable the shared 4V5 peripheral rail on GPIO4 before SD/NFC/audio/LED init.
     ESP_LOGI(TAG, "Enabling peripheral power...");
     pinMode(4, OUTPUT);
     digitalWrite(4, HIGH); // Enable power to peripherals
-    // Initialize file manager
-    delay(500); // Give peripherals time to power up
+    delay(500);            // Give peripherals time to power up
 
-    // // Initialize configuration (this will also initialize NVS)
-    // ESP_LOGI(TAG, "Loading configuration...");
-    // config.printAllSettings();
+    // First-boot bring-up: if this board has never been provisioned + current-calibrated,
+    // run the auto bring-up (LED-guided) and hold the charge current at a safe 300mA until
+    // the gauge current sense is calibrated (an uncalibrated gauge over-reads and trips OCC).
+    const bool bringupDone = config.getInt(BRINGUP_NVS_KEY, 0) != 0;
+    if (!bringupDone)
+    {
+        battery.setChargeCurrent(300);
+        gBringupPhase = BRINGUP_PROVISION;
+        ESP_LOGW(TAG, "FIRST BOOT: gauge bring-up required — running auto provision+calibration.");
+        ESP_LOGW(TAG, "Watch the LED (blue=provision, amber=needs charge, cyan=calibrate, green=done).");
+    }
 
-    // Initialize WiFi provisioning
-    ESP_LOGI(TAG, "Initializing WiFi...");
-    wifiProv.begin();
+    // --- Minimal subsystems only: battery (above) + LED + sleep. The heavy subsystems
+    // (SD, WiFi, audio, NFC, buttons) are deferred to startFullSystem() until the cell can
+    // support them, so a depleted board stays in battery-monitor mode and charges instead
+    // of brown-out looping at WiFi bring-up. ---
+    ESP_LOGI(TAG, "Initializing LED Controller...");
+    ledController.begin();
+
+    ESP_LOGI(TAG, "Initializing Sleep Controller...");
+    sleepController.begin();
+    // Inactivity timeout (disabled during first-boot bring-up so it stays awake to
+    // provision + calibrate and survive gauge resets).
+    sleepController.setInactivityTimeout(gBringupPhase == BRINGUP_INACTIVE ? (5 * 60 * 1000) : 0xFFFFFFFF);
+    sleepController.onSleep([]()
+                            {
+                                ESP_LOGI(TAG, "Device is about to enter deep sleep...");
+                                ledController.pulseRapid(0xFFFF00, 3); // Yellow pulse before sleep
+                                delay(1000);                           // Give time for LED animation
+                                // The PN532 sits on the always-on 3.3V rail with RSTPD_N pulled
+                                // high in hardware, so GPIO4 can't de-power it. Without this
+                                // command it idles ~40mA through deep sleep (5-day depletion
+                                // incident) — software power-down is the only off switch.
+                                nfcController.powerDown();
+                                // Park the NFC I2C lines high and latch them through deep sleep.
+                                // The pads get isolated in sleep and the pullups are internal-only,
+                                // so the bus would float — which the powered PN532 reads as endless
+                                // phantom traffic (its wake source is I2C activity), defeating the
+                                // power-down. Idle-high bus keeps it asleep. Released in
+                                // NfcController::begin()/powerDown().
+                                pinMode(NFC_SDA_PIN, OUTPUT);
+                                digitalWrite(NFC_SDA_PIN, HIGH);
+                                gpio_hold_en((gpio_num_t)NFC_SDA_PIN);
+                                pinMode(NFC_SCL_PIN, OUTPUT);
+                                digitalWrite(NFC_SCL_PIN, HIGH);
+                                gpio_hold_en((gpio_num_t)NFC_SCL_PIN);
+                                battery.prepareForDeepSleep();
+                                // Keep charging through deep sleep when docked: CE (GPIO44) is a
+                                // digital pad, so it only stays low across deep sleep if the global
+                                // pad hold is armed — without it CE floats up the 2MΩ pull-up and
+                                // the charger STOPS the moment the ESP sleeps (observed: STAT LED
+                                // going dark on sleep entry). The hold's flash/PSRAM standby cost
+                                // (~13mA) comes out of VBUS here, not the cell. On battery we skip
+                                // it: CE is irrelevant without an adapter, and the lower sleep
+                                // floor matters.
+                                if (battery.isVbusPresent())
+                                {
+                                    gpio_deep_sleep_hold_en();
+                                }
+                            });
+
+    // Decide whether to start the full system now. Defer (stay in battery-monitor mode) if
+    // either (a) the cell can't yet support the heavy load, or (b) first-boot bring-up is
+    // still pending — bring-up's calibration resets the gauge (briefly opening the FETs),
+    // which must happen at minimal load, before WiFi/BLE come up.
+    battery.update();
+    if (gBringupPhase != BRINGUP_INACTIVE)
+    {
+        gSystemPhase = PHASE_MONITOR;
+        ledController.pulseLed(SYSTEM_MONITOR_LED);
+        ESP_LOGW(TAG, "Bring-up pending — deferring full system until it completes.");
+    }
+    else if (battery.hasTelemetry() && battery.getBatteryVoltage() >= SYSTEM_START_IMMEDIATE_V)
+    {
+        // Clearly healthy cell (on or above the LFP plateau): start right away. Anything
+        // lower must prove itself in monitor mode first (sustained-voltage gate in loop).
+        startFullSystem();
+    }
+    else
+    {
+        gSystemPhase = PHASE_MONITOR;
+        ledController.pulseLed(SYSTEM_MONITOR_LED); // blue breathing = warming up / charging
+        ESP_LOGW(TAG, "Battery not ready (%.3fV < %.2fV) — deferring full system; monitoring until it recovers.",
+                 battery.hasTelemetry() ? battery.getBatteryVoltage() : 0.0f, SYSTEM_START_IMMEDIATE_V);
+    }
+}
+
+// Brings up the heavy subsystems (SD, WiFi, audio, Reverb, NFC, buttons). Called once the
+// battery can support them — immediately from setup() on a healthy cell, or later from
+// loop() once a depleted cell has charged back above SYSTEM_START_V.
+void startFullSystem()
+{
+    if (gSystemPhase == PHASE_RUNNING)
+    {
+        return; // already started
+    }
+    gSystemPhase = PHASE_RUNNING;
+    ESP_LOGI(TAG, "Battery ready (%.3fV) — starting full system.",
+             battery.hasTelemetry() ? battery.getBatteryVoltage() : 0.0f);
+
     if (!fileManager.begin())
     {
         ESP_LOGW(TAG, "File Manager initialization failed!");
@@ -221,8 +630,9 @@ void setup()
     // Set up figure download complete callback (before WiFi connection)
     requestManager.setFigureDownloadCompleteCallback(onFigureDownloadComplete);
 
-    // Initialize battery management
-    battery.begin();
+    // Initialize WiFi provisioning (the battery is verified able to buffer RF inrush).
+    ESP_LOGI(TAG, "Initializing WiFi...");
+    wifiProv.begin();
 
     // Initialize audio controller
     if (!audioController.begin())
@@ -231,12 +641,7 @@ void setup()
         ESP_LOGW(TAG, "Audio functionality will not be available.");
     }
 
-    // Initialize LED controller
-    ESP_LOGI(TAG, "Initializing LED Controller...");
-    ledController.begin();
-    ESP_LOGI(TAG, "LED Controller initialized successfully!");
-
-    // --- NEW: Initialize Reverb Client ---
+    // --- Initialize Reverb Client ---
     ESP_LOGI(TAG, "Initializing Reverb WebSocket Client...");
 
     // Wait for WiFi to connect before starting Reverb client
@@ -404,26 +809,9 @@ void setup()
 
     ESP_LOGI(TAG, "Button Controller initialized successfully!");
 
-    // Initialize Sleep Controller
-    ESP_LOGI(TAG, "Initializing Sleep Controller...");
-    sleepController.begin();
-
-    // Set inactivity timeout to 5 minutes
-    sleepController.setInactivityTimeout(30000); // 5 minutes
- 
-    // Optional: Set a sleep callback to be called before entering sleep
-    sleepController.onSleep([]()
-                            {
-                                ESP_LOGI(TAG, "Device is about to enter deep sleep...");
-                                ledController.pulseRapid(0xFFFF00, 3); // Yellow pulse before sleep
-                                delay(1000);                           // Give time for LED animation
-                                battery.prepareForDeepSleep();
-                            });
-
-    ESP_LOGI(TAG, "Sleep Controller initialized successfully!");
-
     // rapid pulse LED to indicate system is ready
     ledController.pulseRapid(0x00FF00, 3); // Rapid pulse green
+    ESP_LOGI(TAG, "Full system started.");
     // audioController.play("/sounds/12.mp3"); // Play startup sound
 }
 static unsigned long lastFreeCall = 0;
@@ -488,6 +876,9 @@ void loop()
             ESP_LOGI(TAG, "  gauge1s - Clear BQ28 DA Configuration CC0 to force 1-cell mode");
             ESP_LOGI(TAG, "  gaugeprog - Force generic gauge provisioning");
             ESP_LOGI(TAG, "  gaugeresetlearn - Reset BQ28 learning state to a fresh relearn baseline");
+            ESP_LOGI(TAG, "  learndis - Learning: DISCHARGE phase (charger HIZ on, no sleep)");
+            ESP_LOGI(TAG, "  learnrest - Learning: REST phase (deep sleep for OCV reading)");
+            ESP_LOGI(TAG, "  learnchg - Learning: CHARGE phase (exit HIZ, fast charge)");
             ESP_LOGI(TAG, "File Manager Commands:");
             ESP_LOGI(TAG, "  sdtree  - Check SD card file tree");
             ESP_LOGI(TAG, "  sdformat- Format SD card as FAT32");
@@ -520,6 +911,7 @@ void loop()
             ESP_LOGI(TAG, "  nfcdata   - Show current NFC card data");
             ESP_LOGI(TAG, "  nfcreed   - Show reed switch status");
             ESP_LOGI(TAG, "  nfcdiag   - Run NFC diagnostics");
+            ESP_LOGI(TAG, "  nfcsleep  - PN532 software power-down (bench: watch gauge current drop)");
             ESP_LOGI(TAG, "Power Commands:");
             ESP_LOGI(TAG, "  power   - Show peripheral power status");
             ESP_LOGI(TAG, "  poweron - Enable peripheral power (IO17)");
@@ -1276,6 +1668,12 @@ void loop()
         {
             nfcController.diagnostics();
         }
+        else if (command == "nfcsleep")
+        {
+            ESP_LOGI(TAG, "Sending PN532 PowerDown — compare 'battery' current before/after (expect ~30-40mA drop).");
+            nfcController.powerDown();
+            ESP_LOGI(TAG, "PN532 stays down until 'restart' (or next NFC begin()).");
+        }
 
         // Battery commands
         else if (command == "battery")
@@ -1326,6 +1724,111 @@ void loop()
         {
             bool success = battery.resetGaugeLearningState();
             ESP_LOGI(TAG, "Gauge learning reset: %s", success ? "OK" : "FAILED");
+            battery.printBatteryInfo();
+        }
+        // gaugecalcurrent: calibrate the gauge current sense (CC Gain) against the
+        // BQ25792 IBAT ADC. Must be run WHILE a steady current flows — keep USB plugged
+        // and the cell charging (~300mA stopgap) so charger IBAT and gauge current are
+        // both >150mA. Fixes the ~4.5x over-read that trips OCC.
+        else if (command == "gaugecalcurrent")
+        {
+            ESP_LOGI(TAG, "Calibrating gauge current sense vs charger IBAT...");
+            bool success = battery.calibrateCurrentSense();
+            ESP_LOGI(TAG, "Current calibration: %s", success ? "OK" : "FAILED");
+            battery.printBatteryInfo();
+        }
+        // gaugeprot: read back and decode the gauge's actual protection config (CUV
+        // enable/latch/threshold, COV/OCC) to diagnose the over-discharge behaviour.
+        else if (command == "gaugeprot")
+        {
+            battery.printProtectionConfig();
+        }
+        // gaugecuvfix: enable the CUV latch (Protection Config bit1 CUV_RECOV_CHG) so the
+        // cell can't over-discharge by CUV auto-recovery. Reports if the write sticks.
+        else if (command == "gaugecuvfix")
+        {
+            battery.ensureGaugeCuvLatch();
+            battery.printProtectionConfig();
+        }
+        // startsystem: force the full system to start even if the battery-ready gate
+        // hasn't passed (bench/debug, e.g. running on USB without a healthy cell).
+        else if (command == "startsystem")
+        {
+            ESP_LOGW(TAG, "Forcing full system start (bypassing battery-ready gate)...");
+            startFullSystem();
+        }
+        // bringupreset: clear the first-boot bring-up flag and restart the auto
+        // provision+calibration sequence (for re-testing or refurbishing a board).
+        else if (command == "bringupreset")
+        {
+            config.storeInt(BRINGUP_NVS_KEY, 0);
+            battery.setChargeCurrent(300);
+            sleepController.setInactivityTimeout(0xFFFFFFFF);
+            gBringupPhase = BRINGUP_PROVISION;
+            ESP_LOGW(TAG, "BRINGUP flag cleared — re-running auto bring-up. Watch the LED.");
+        }
+        // gaugelearned: Path B - stabilize the rail (HIZ stops the charge oscillation so
+        // SYS doesn't collapse and glitch I2C writes), then mark the gauge "learned"
+        // (Update Status 0x06 + reseed QMax) so it computes FCC from QMax + chem Ra.
+        // Pre-req: cell already charged to ~3.3V so the battery holds SYS up in HIZ.
+        else if (command == "gaugelearned")
+        {
+            ESP_LOGI(TAG, "LEARN: stabilizing rail (HIZ) then marking gauge learned...");
+            battery.setHizMode(true);
+            delay(400); // let SYS settle off the battery
+            bool success = battery.resetGaugeLearningState(); // writes Update Status 0x06 + QMax
+            delay(100);
+            battery.setHizMode(false); // restore charger input
+            ESP_LOGI(TAG, "Gauge mark-learned: %s", success ? "OK" : "FAILED");
+            battery.printBatteryInfo();
+        }
+        // --- Gauge learning-cycle helpers ---
+        // learndis: DISCHARGE phase. Charger -> HIZ (ignore USB so the system runs
+        // off the battery and it drains) and disable inactivity sleep so it stays
+        // awake/loaded. USB stays connected for monitoring. Run until cell ~2.8-3.0V
+        // and GaugingStatus shows FD, then 'learnrest'.
+        else if (command == "learndis")
+        {
+            bool hiz = battery.setHizMode(true);
+            sleepController.setInactivityTimeout(0xFFFFFFFF); // effectively disable auto-sleep
+            sleepController.resetActivity();
+            // Max out the LEDs (full-white, max brightness) to add ~300mA load and
+            // speed up the discharge. Turned off again in 'learnchg'/sleep.
+            ledController.setMaxBrightness(255);
+            ledController.simpleLed(0xFFFFFF, 255);
+            gLearnDischarge = true; // loop() enforces the LEARN_DISCHARGE_FLOOR_V hard floor
+            ESP_LOGI(TAG, "LEARN: discharge mode %s (charger HIZ=%s, auto-sleep disabled, LEDs full)",
+                     hiz ? "ON" : "FAILED", hiz ? "on" : "?");
+            ESP_LOGW(TAG, "Draining cell; auto-stops at %.2fV to stay clear of CUV. Then 'learnrest'.",
+                     LEARN_DISCHARGE_FLOOR_V);
+        }
+        // learnrest: REST phase. Keep charger in HIZ (no charge current to corrupt the
+        // OCV), let the device deep-sleep so cell current drops to ~uA. The gauge
+        // takes its OCV reading during the rest. Wake (button/pogo) after ~15-30 min,
+        // then check 'battery' for VOK set / RDIS cleared / FCC nonzero.
+        else if (command == "learnrest")
+        {
+            gLearnDischarge = false;
+            battery.setHizMode(true); // ensure no charging during the rest/OCV
+            ESP_LOGI(TAG, "LEARN: entering rest. Device will deep-sleep for OCV.");
+            ESP_LOGW(TAG, "Leave it ~15-30 min, then wake (button/pogo) and run 'battery'.");
+            ESP_LOGW(TAG, "Look for GaugingStatus VOK set, RDIS gone, FCC nonzero.");
+            delay(500);
+            sleepController.checkAndSleep(); // enter deep sleep now (OCV taken while resting)
+        }
+        // learnchg: CHARGE phase. Exit HIZ so the BQ25792 fast-charges to 3.6V, restore
+        // normal auto-sleep. Run until ChargingStatus VCT + BatteryStatus FC (full).
+        else if (command == "learnchg")
+        {
+            gLearnDischarge = false;
+            bool hiz = battery.setHizMode(false);
+            sleepController.setInactivityTimeout(30000); // restore normal 30s timeout
+            sleepController.resetActivity();
+            ledController.turnOff(); // drop the discharge load
+            ESP_LOGI(TAG, "LEARN: charge mode (charger HIZ=%s, auto-sleep restored, LEDs off)",
+                     hiz ? "off" : "FAILED-to-clear");
+            ESP_LOGW(TAG, "Watch 'battery' until Charge State stays Fast charge then taper to");
+            ESP_LOGW(TAG, "VCT/FC, cell ~3.6V. Then 'learnrest' again to anchor the full OCV.");
             battery.printBatteryInfo();
         }
         // System commands
@@ -1579,6 +2082,139 @@ void loop()
     // Update battery management
     battery.update();
 
+    // Low-battery cutoff: BATTERY-ONLY. With VBUS present this must never fire — the NVDC
+    // power path runs SYS from USB regardless of the cell, and force-sleeping on USB is
+    // what abandoned charger recovery (the "sleep with charger attached" bootloop). Two
+    // tiers on battery: at LOW_BATTERY_CUTOFF_V deep sleep (buttons still wake); at
+    // SHIP_MODE_CUTOFF_V disconnect the cell entirely (ship mode, wake = USB plug-in).
+    {
+        static unsigned long lowBattSince = 0;
+        if (!gLearnDischarge && !battery.isVbusPresent() &&
+            !battery.getChargingStatus() && battery.hasTelemetry())
+        {
+            float v = battery.getBatteryVoltage();
+            if (v > 0.5f && v <= LOW_BATTERY_CUTOFF_V) // ignore obviously bogus reads
+            {
+                if (lowBattSince == 0)
+                {
+                    lowBattSince = millis();
+                }
+                else if (millis() - lowBattSince >= LOW_BATTERY_CUTOFF_DEBOUNCE_MS)
+                {
+                    ESP_LOGW(TAG, "LOW BATTERY %.3fV (<= %.2fV), on battery — protecting the cell.",
+                             v, LOW_BATTERY_CUTOFF_V);
+                    ledController.setMaxBrightness(255);
+                    ledController.simpleLed(0xFF0000, 255); // brief red = empty
+                    delay(800);
+                    ledController.turnOff();
+                    // INTERIM POLICY (until the ~33mA standby phantom drain is fixed):
+                    // go STRAIGHT to ship mode at the cutoff instead of deep sleep.
+                    // Deep-sleeping at 3.0V with the phantom drain kills the cell within
+                    // hours — asleep, nothing re-evaluates the voltage (no periodic
+                    // wakes by design), so the 2.85V ship tier is never reached and the
+                    // cell slides through CUV to ~0.3V (overnight incident, 2026-07-08).
+                    // Cost: an empty toy doesn't respond to buttons, only to USB —
+                    // acceptable "battery dead" UX. Once standby is sub-mA, restore the
+                    // two-tier (deep sleep at 3.00V, ship only at 2.85V) so button-wake
+                    // survives at empty.
+                    ESP_LOGW(TAG, "Disconnecting cell (ship mode) — plug USB to wake.");
+                    nfcController.powerDown();   // PN532 is on the always-on rail
+                    battery.enterShipMode();     // on battery power this does not return
+                    delay(1000);
+                    sleepController.forceSleep(); // fallback if the ship-mode write failed
+                }
+            }
+            else
+            {
+                lowBattSince = 0;
+            }
+        }
+        else
+        {
+            lowBattSince = 0;
+        }
+    }
+
+    // Battery-monitor mode: until the cell can support the full system, keep only the
+    // battery + bring-up + LED alive, then start the full system once it recovers. This
+    // prevents the brown-out/reboot loop a depleted cell causes during WiFi bring-up.
+    // Charger supervision runs in every phase (monitor AND full-run) while USB is present.
+    superviseChargerOnUsb();
+
+    if (gSystemPhase == PHASE_MONITOR)
+    {
+        updateBringup(); // gauge calibration (if needed) runs here at minimal load
+
+        // Start the full system only once bring-up is terminal (done or failed) AND the
+        // cell has PROVEN it can support the load: clearly-healthy voltage immediately,
+        // or SYSTEM_START_V sustained for SYSTEM_START_HOLD_MS (a rested near-empty cell
+        // reads above the bare threshold for a moment and then collapses under WiFi).
+        const bool bringupTerminal =
+            (gBringupPhase == BRINGUP_INACTIVE || gBringupPhase == BRINGUP_FAILED);
+        static unsigned long readySince = 0;
+        bool batteryProven = false;
+        if (battery.hasTelemetry())
+        {
+            const float v = battery.getBatteryVoltage();
+            if (v >= SYSTEM_START_IMMEDIATE_V)
+            {
+                batteryProven = true;
+            }
+            else if (v >= SYSTEM_START_V)
+            {
+                if (readySince == 0)
+                {
+                    readySince = millis();
+                }
+                batteryProven = (millis() - readySince) >= SYSTEM_START_HOLD_MS;
+            }
+            else
+            {
+                readySince = 0;
+            }
+        }
+        else
+        {
+            readySince = 0;
+        }
+        if (bringupTerminal && batteryProven)
+        {
+            startFullSystem();
+        }
+        else
+        {
+            static unsigned long lastMonLog = 0;
+            if (millis() - lastMonLog > 5000)
+            {
+                lastMonLog = millis();
+                ESP_LOGW(TAG, "MONITOR: waiting (bringup=%d, %.3fV, charging=%d) before full start.",
+                         (int)gBringupPhase, battery.hasTelemetry() ? battery.getBatteryVoltage() : 0.0f,
+                         (int)battery.getChargingStatus());
+            }
+        }
+        ledController.update(); // animate the monitor / bring-up LED
+        delay(5);
+        return;
+    }
+
+    // Learning-cycle discharge floor: never let the controlled drain push the LFP cell
+    // into the CUV protection trip. Stop the discharge at LEARN_DISCHARGE_FLOOR_V.
+    if (gLearnDischarge && battery.hasTelemetry() &&
+        battery.getBatteryVoltage() <= LEARN_DISCHARGE_FLOOR_V)
+    {
+        gLearnDischarge = false;
+        battery.setHizMode(false);                   // re-enable the input
+        ledController.turnOff();                      // drop the discharge load
+        sleepController.setInactivityTimeout(30000);  // restore normal sleep
+        sleepController.resetActivity();
+        ESP_LOGW(TAG, "LEARN: discharge floor %.2fV reached at %.3fV - stopped.",
+                 LEARN_DISCHARGE_FLOOR_V, battery.getBatteryVoltage());
+        ESP_LOGW(TAG, "Run 'learnrest' now to take the empty-point OCV.");
+    }
+
+    // First-boot bring-up state machine (owns the LED until complete).
+    updateBringup();
+
     // Update file manager
     fileManager.update();
 
@@ -1600,14 +2236,18 @@ void loop()
     // Update Button controller (handles button state changes and callbacks)
     buttonController.update();
 
-    // Update NFC controller (handles reed switch monitoring and NFC reading)
-    nfcController.update();
-
-    // Deliver deferred figure completion callbacks after NFC state is refreshed.
-    requestManager.update();
+    // Update NFC controller — skipped during first-boot bring-up so figure events don't
+    // fight the bring-up LED indication.
+    if (gBringupPhase == BRINGUP_INACTIVE)
+    {
+        nfcController.update();
+        // Deliver deferred figure completion callbacks after NFC state is refreshed.
+        requestManager.update();
+    }
 
     // Update Sleep controller (handles inactivity timeout and sleep scheduling)
     sleepController.update();
 
     delay(1);
 }
+#endif // SLEEP_PROBE_BUILD

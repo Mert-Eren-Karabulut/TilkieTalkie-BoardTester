@@ -1,6 +1,18 @@
 #include "BatteryManagement.h"
 
 namespace {
+// Charge-current limit currently requested by the system (bring-up / deep-discharge
+// recovery). configureChargerDefaults() reapplies the charger config on every device
+// rescan (DEVICE_RESCAN_INTERVAL), so it must honor this instead of unconditionally
+// restoring DEFAULT_CHARGE_CURRENT_MA — which silently undid a 300mA recovery limit
+// every 5 seconds. 0 = no override, use the default.
+uint16_t gRequestedChargeCurrentMa = 0;
+
+// Same sticky-override pattern for VSYSMIN: the dead-cell recovery hold raises it to
+// 3.5V for brownout headroom, and without this latch the 5-second charger reconfig
+// silently reverted it to the 3.0V default. 0 = no override.
+uint16_t gRequestedVsysMinMv = 0;
+
 constexpr uint8_t kBq25792AdcEnableMask = 0x80;
 constexpr uint8_t kBq25792AdcContinuousMask = 0x40;
 constexpr uint8_t kBq25792ChargeEnableMask = 0x10;
@@ -13,18 +25,16 @@ bool gaugeConfigurationLooksCorrupted(uint16_t designCapacity,
                                       uint16_t designEnergy,
                                       uint16_t terminateVoltage,
                                       uint16_t chargingVoltage,
-                                      uint16_t taperCurrent,
-                                      uint16_t taperVoltage) {
+                                      uint16_t taperCurrent) {
     return designCapacity < 500
         || designCapacity > 10000
         || designEnergy < 100
         || designEnergy > 5000
-        || terminateVoltage < 2500
+        || terminateVoltage < 2400
         || terminateVoltage > 4500
-        || chargingVoltage < 3500
+        || chargingVoltage < 3400
         || chargingVoltage > 4500
-        || taperCurrent > 2000
-        || taperVoltage > 1000;
+        || taperCurrent > 2000;
 }
 
 void appendFaultLabel(String &faults, const char *label) {
@@ -415,26 +425,37 @@ float BatteryManager::voltageToPercentage(float voltage) {
         return 100.0;
     }
     
-    // Linear interpolation for now (can be made more sophisticated)
-    float percentage = ((voltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE)) * 100.0;
-    
-    // Apply a more realistic discharge curve for Li-ion batteries
-    // This gives a more accurate representation of actual charge levels
-    if (voltage > 3.9) {
-        // Upper 80-100% range (4.2V to 3.9V)
-        percentage = 80.0 + ((voltage - 3.9) / (BATTERY_MAX_VOLTAGE - 3.9)) * 20.0;
-    } else if (voltage > 3.7) {
-        // Middle 30-80% range (3.9V to 3.7V)
-        percentage = 30.0 + ((voltage - 3.7) / (3.9 - 3.7)) * 50.0;
-    } else if (voltage > 3.4) {
-        // Lower 10-30% range (3.7V to 3.4V)
-        percentage = 10.0 + ((voltage - 3.4) / (3.7 - 3.4)) * 20.0;
-    } else {
-        // Critical 0-10% range (3.4V to 3.0V)
-        percentage = ((voltage - BATTERY_MIN_VOLTAGE) / (3.4 - BATTERY_MIN_VOLTAGE)) * 10.0;
+    // LiFePO4 1S has a very flat discharge curve (long ~3.2-3.3V plateau), so
+    // voltage->SOC is only a coarse fallback for when the gauge RSOC is
+    // unavailable. Piecewise-linear interpolation over an approximate LFP curve.
+    struct CurvePoint { float voltage; float percentage; };
+    static const CurvePoint curve[] = {
+        {3.60f, 100.0f},
+        {3.40f,  95.0f},
+        {3.35f,  90.0f},
+        {3.32f,  80.0f},
+        {3.30f,  70.0f},
+        {3.28f,  55.0f},
+        {3.25f,  40.0f},
+        {3.22f,  25.0f},
+        {3.20f,  18.0f},
+        {3.10f,  10.0f},
+        {3.00f,   5.0f},
+        {2.80f,   2.0f},
+        {2.50f,   0.0f},
+    };
+    const int pointCount = sizeof(curve) / sizeof(curve[0]);
+
+    for (int i = 0; i < pointCount - 1; i++) {
+        if (voltage <= curve[i].voltage && voltage >= curve[i + 1].voltage) {
+            float span = curve[i].voltage - curve[i + 1].voltage;
+            float t = span > 0.0f ? (voltage - curve[i + 1].voltage) / span : 0.0f;
+            float percentage = curve[i + 1].percentage + t * (curve[i].percentage - curve[i + 1].percentage);
+            return constrain(percentage, 0.0f, 100.0f);
+        }
     }
-    
-    return constrain(percentage, 0.0, 100.0);
+
+    return 0.0f;
 }
 
 void BatteryManager::refreshBatteryState() {
@@ -512,16 +533,35 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
 
     if (gaugePresent) {
         // BQ28Z610 data-flash provisioning is persistent, but boards for this product are always 1S
-        // and may ship with FET control disabled. Ensure both are corrected whenever the gauge is awake.
-        gaugeConfigured = ensureGaugeProvisioned(forceGaugeProvision);
-        ok = gaugeConfigured && ok;
+        // and may ship with FET control disabled.
+        bool provisioned = ensureGaugeProvisioned(forceGaugeProvision);
 
-        if (gaugeConfigured) {
-            bool singleCellReady = setGaugeSingleCellMode();
-            bool fetControlReady = restoreGaugeFetControl();
-            gaugeConfigured = singleCellReady && fetControlReady;
-            ok = gaugeConfigured && ok;
-        }
+        // NOTE: CUV protection thresholds are NOT written here. The Protections-class
+        // data flash silently rejects writes via the working MAC method (confirmed by
+        // readback), and the default CUV (trip 2500 / recovery 3000mV) is fine for LFP:
+        // recovery is reachable because the charger goes to 3.6V — provided charge isn't
+        // blocked. Deep-discharge recovery therefore depends on a valid FCC (a properly
+        // provisioned gauge keeps charge enabled at low SOC), NOT on editing CUV.
+
+        // Single-cell mode and FET control must be restored even when data-flash
+        // provisioning has NOT fully verified (e.g. a fresh/unprovisioned gauge).
+        // Otherwise the gauge leaves its CHG/DSG FETs open, isolating the cell, and
+        // the device runs unbuffered off USB and browns out during network bring-up.
+        bool singleCellReady = setGaugeSingleCellMode();
+        bool fetControlReady = restoreGaugeFetControl();
+
+        // Ensure CUV latches until charge (Protection Config bit1) on EVERY boot — this is
+        // the only over-discharge protection that runs while the device is off/asleep, and
+        // applying it here (not just in first-boot bring-up) means boards already past
+        // bring-up also get it when they take this firmware. Idempotent, non-destructive.
+        ensureGaugeCuvLatch();
+
+        // Same fleet-wide pattern: let the gauge itself sleep between measurements
+        // (SLEEP + IN_SYSTEM_SLEEP in DA Configuration). Idempotent, non-destructive.
+        ensureGaugeSleepConfig();
+
+        gaugeConfigured = provisioned && singleCellReady && fetControlReady;
+        ok = gaugeConfigured && ok;
     }
 
     return ok;
@@ -554,6 +594,44 @@ String BatteryManager::getBatteryStatusString() const {
     }
     
     return status;
+}
+
+void BatteryManager::printProtectionConfig() {
+    if (!gaugePresent) {
+        refreshDevicePresence();
+        if (!gaugePresent) {
+            Serial.println("Gauge not present — cannot read protection config.");
+            return;
+        }
+    }
+    uint8_t protCfg = 0, enaA = 0, enaB = 0, cuvDelay = 0;
+    uint16_t cuvThr = 0, cuvRec = 0;
+    bool ok = true;
+    ok &= readGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, protCfg);
+    ok &= readGaugeDataFlashByte(BQ28Z610_ENABLED_PROTECTIONS_A_ADDRESS, enaA);
+    ok &= readGaugeDataFlashByte(BQ28Z610_ENABLED_PROTECTIONS_B_ADDRESS, enaB);
+    ok &= readGaugeDataFlashWord(BQ28Z610_CUV_THRESHOLD_ADDRESS, cuvThr);
+    ok &= readGaugeDataFlashByte(BQ28Z610_CUV_DELAY_ADDRESS, cuvDelay);
+    ok &= readGaugeDataFlashWord(BQ28Z610_CUV_RECOVERY_ADDRESS, cuvRec);
+
+    Serial.println("\n--- Gauge Protection Config (read-back) ---");
+    if (!ok) {
+        Serial.println("WARNING: one or more DF reads failed; values may be unreliable.");
+    }
+    Serial.printf("Protection Configuration (0x46AE): 0x%02X  [CUV_RECOV_CHG(bit1)=%d -> %s]\n",
+                  protCfg, (protCfg >> 1) & 1,
+                  ((protCfg >> 1) & 1) ? "latch until charge" : "auto-recover (no charge needed)");
+    Serial.printf("Enabled Protections A    (0x46AF): 0x%02X  [CUV=%d COV=%d OCC=%d OCD1=%d]\n",
+                  enaA, enaA & 1, (enaA >> 1) & 1, (enaA >> 2) & 1, (enaA >> 4) & 1);
+    Serial.printf("Enabled Protections B    (0x46B0): 0x%02X\n", enaB);
+    Serial.printf("CUV Threshold (0x46B3): %u mV   Delay (0x46B5): %u s   Recovery (0x46B6): %u mV\n",
+                  cuvThr, cuvDelay, cuvRec);
+    Serial.println("Defaults expected: ProtCfg=0x03, EnabledA=0x57, CUV 2500/2/3000.");
+    Serial.printf("Live: SafetyStatus=0x%X  OperationStatus=0x%X (XDSG=%d XCHG=%d)  MfgStatus=0x%X (FET_EN=%d)\n",
+                  gaugeSafetyStatus, gaugeOperationStatus,
+                  (gaugeOperationStatus & 0x2000) ? 1 : 0, (gaugeOperationStatus & 0x4000) ? 1 : 0,
+                  gaugeManufacturingStatus, (gaugeManufacturingStatus >> 4) & 1);
+    Serial.println("-------------------------------------------");
 }
 
 void BatteryManager::printBatteryInfo() const {
@@ -604,6 +682,29 @@ void BatteryManager::printBatteryInfo() const {
     Serial.println("Gauge FET Control Enabled: " + String((gaugeManufacturingStatus & 0x0010) ? "Yes" : "No"));
     Serial.println("Gauge CHG/DSG FET Status: " + String((gaugeOperationStatus & 0x0004) ? "On" : "Off")
         + " / " + String((gaugeOperationStatus & 0x0002) ? "On" : "Off"));
+    {
+        // ChargingStatus (MAC 0x0055) tells us WHY charge is enabled/disabled.
+        uint16_t chargingStatus = 0;
+        if (const_cast<BatteryManager *>(this)->readGaugeAltStatus16(0x0055, chargingStatus)) {
+            String flags;
+            if (chargingStatus & 0x8000) flags += "VCT ";   // valid charge termination (full)
+            if (chargingStatus & 0x4000) flags += "MCHG ";  // maintenance charge
+            if (chargingStatus & 0x2000) flags += "SU ";    // suspend
+            if (chargingStatus & 0x1000) flags += "IN ";    // charge inhibit
+            if (chargingStatus & 0x0800) flags += "HV ";
+            if (chargingStatus & 0x0400) flags += "MV ";
+            if (chargingStatus & 0x0200) flags += "LV ";
+            if (chargingStatus & 0x0100) flags += "PV ";
+            if (chargingStatus & 0x0040) flags += "OT ";
+            if (chargingStatus & 0x0020) flags += "HT ";
+            if (chargingStatus & 0x0010) flags += "STH ";
+            if (chargingStatus & 0x0008) flags += "RT ";
+            if (chargingStatus & 0x0004) flags += "STL ";
+            if (chargingStatus & 0x0002) flags += "LT ";
+            if (chargingStatus & 0x0001) flags += "UT ";
+            Serial.println("Gauge ChargingStatus: 0x" + String(chargingStatus, HEX) + " (" + flags + ")");
+        }
+    }
     Serial.println("System Voltage: " + String(currentSystemVoltage, 3) + "V");
     Serial.println("Charging: " + String(isCharging ? "Yes" : "No"));
     Serial.println("Charger Config REG00/01/03/06: 0x" + String(chargerMinimumSystemVoltageRegister, HEX)
@@ -733,7 +834,9 @@ bool BatteryManager::configureRt6160For4V5() {
 }
 
 bool BatteryManager::configureChargerDefaults() {
-    const uint8_t minimumSystemVoltageSetting = static_cast<uint8_t>((DEFAULT_MIN_SYSTEM_VOLTAGE_MV - 2500) / 250);
+    const uint16_t vsysMinMv =
+        gRequestedVsysMinMv != 0 ? gRequestedVsysMinMv : DEFAULT_MIN_SYSTEM_VOLTAGE_MV;
+    const uint8_t minimumSystemVoltageSetting = static_cast<uint8_t>((vsysMinMv - 2500) / 250);
 
     uint8_t rechargeControl = 0;
     uint8_t ntcControl1 = 0;
@@ -743,7 +846,9 @@ bool BatteryManager::configureChargerDefaults() {
     ok = writeRegister8(BQ25792_ADDRESS, BQ25792_RECHARGE_CONTROL_REGISTER, rechargeControl) && ok;
     ok = writeRegister8(BQ25792_ADDRESS, BQ25792_MIN_SYSTEM_VOLTAGE_REGISTER, minimumSystemVoltageSetting) && ok;
     ok = writeRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_VOLTAGE_REGISTER, DEFAULT_CHARGE_VOLTAGE_MV / 10) && ok;
-    ok = writeRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_CURRENT_REGISTER, DEFAULT_CHARGE_CURRENT_MA / 10) && ok;
+    const uint16_t chargeCurrentMa =
+        gRequestedChargeCurrentMa != 0 ? gRequestedChargeCurrentMa : DEFAULT_CHARGE_CURRENT_MA;
+    ok = writeRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_CURRENT_REGISTER, chargeCurrentMa / 10) && ok;
     ok = writeRegister16BE(BQ25792_ADDRESS, BQ25792_INPUT_CURRENT_REGISTER, DEFAULT_INPUT_CURRENT_LIMIT_MA / 10) && ok;
 
     uint8_t control0 = 0;
@@ -762,6 +867,221 @@ bool BatteryManager::configureChargerDefaults() {
     ok = writeRegister8(BQ25792_ADDRESS, BQ25792_NTC_CONTROL_1_REGISTER, ntcControl1) && ok;
 
     return ok;
+}
+
+bool BatteryManager::setHizMode(bool enable) {
+    if (!chargerPresent) {
+        refreshDevicePresence();
+        if (!chargerPresent) {
+            return false;
+        }
+    }
+
+    uint8_t control0 = 0;
+    if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
+        return false;
+    }
+
+    const uint8_t hizMask = 0x04; // REG0F bit2 = EN_HIZ
+    if (enable) {
+        control0 |= hizMask;
+    } else {
+        control0 &= static_cast<uint8_t>(~hizMask);
+    }
+
+    if (!writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
+        return false;
+    }
+
+    uint8_t verify = 0;
+    if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, verify)) {
+        return false;
+    }
+    chargerControl0Register = verify;
+    return ((verify & hizMask) != 0) == enable;
+}
+
+bool BatteryManager::setChargeCurrent(uint16_t milliAmps) {
+    if (!chargerPresent) {
+        refreshDevicePresence();
+        if (!chargerPresent) {
+            return false;
+        }
+    }
+    // REG03 charge current limit, 10mA/LSB, big-endian.
+    if (!writeRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_CURRENT_REGISTER, milliAmps / 10)) {
+        return false;
+    }
+    uint16_t verify = 0;
+    if (!readRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_CURRENT_REGISTER, verify)) {
+        return false;
+    }
+    chargerChargeCurrentRegister = verify;
+    // Keep the periodic charger reconfiguration from silently reverting this limit.
+    gRequestedChargeCurrentMa = milliAmps;
+    return true;
+}
+
+bool BatteryManager::isGaugeProvisioned() {
+    if (!gaugePresent) {
+        refreshDevicePresence();
+        if (!gaugePresent) {
+            return false;
+        }
+    }
+    uint16_t chem = 0, designCap = 0;
+    uint8_t da = 0;
+    if (!readGaugeDataFlashWord(BQ28Z610_CHEM_ID_ADDRESS, chem)) return false;
+    if (!readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, da)) return false;
+    if (!readGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, designCap)) return false;
+
+    const bool chemOk = (DEFAULT_GAUGE_CHEM_ID == 0) || (chem == DEFAULT_GAUGE_CHEM_ID);
+    const bool singleCell = (da & 0x01) == 0;                 // bit0 set => 2S
+    const bool capOk = designCap >= 1000 && designCap <= 8000; // sane LFP design capacity
+    return chemOk && singleCell && capOk;
+}
+
+bool BatteryManager::isCurrentSenseCalibrated() {
+    if (!gaugePresent) {
+        refreshDevicePresence();
+        if (!gaugePresent) {
+            return false;
+        }
+    }
+    float ccGain = 0.0f;
+    if (!readGaugeDataFlashFloat(BQ28Z610_CC_GAIN_ADDRESS, ccGain)) {
+        return false;
+    }
+    // Calibration moves CC Gain well away from the factory default; >2% deviation = calibrated.
+    return fabsf(ccGain - BQ28Z610_DEFAULT_CC_GAIN) > (BQ28Z610_DEFAULT_CC_GAIN * 0.02f);
+}
+
+bool BatteryManager::isGaugeAlive() {
+    // Re-probe: the gauge transitions from ROM mode (0x0B) to its normal address as it boots.
+    refreshDevicePresence();
+    return gaugePresent && gaugeAddress == BQ28Z610_PRIMARY_ADDRESS;
+}
+
+bool BatteryManager::gaugeAliveAndProvisioned() {
+    return isGaugeAlive() && isGaugeProvisioned();
+}
+
+bool BatteryManager::ensureGaugeCuvLatch() {
+    if (!gaugePresent) {
+        refreshDevicePresence();
+        if (!gaugePresent) {
+            return false;
+        }
+    }
+    uint8_t protCfg = 0;
+    if (!readGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, protCfg)) {
+        Serial.println("ensureGaugeCuvLatch: failed to read Protection Configuration");
+        return false;
+    }
+    if (protCfg & 0x02) {
+        return true; // CUV_RECOV_CHG already set -> CUV latches until charge
+    }
+    const uint8_t desired = protCfg | 0x02; // set bit1, leave others
+    writeGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, desired);
+    uint8_t verify = 0;
+    readGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, verify);
+    const bool stuck = (verify & 0x02) != 0;
+    Serial.printf("ensureGaugeCuvLatch: Protection Config 0x%02X -> wrote 0x%02X, read 0x%02X -> CUV latch %s\n",
+                  protCfg, desired, verify,
+                  stuck ? "ENABLED" : "REJECTED (relying on firmware low-battery cutoff)");
+    return stuck;
+}
+
+bool BatteryManager::isVbusPresent() const {
+    return chargerPresent && (chargerStatus0 & 0x01) != 0; // REG1B bit0 VBUS_PRESENT_STAT
+}
+
+bool BatteryManager::enterShipMode() {
+    if (!chargerPresent) {
+        refreshDevicePresence();
+        if (!chargerPresent) {
+            return false;
+        }
+    }
+    uint8_t control2 = 0;
+    if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, control2)) {
+        return false;
+    }
+    // SDRV_CTRL[2:1] = 10b (ship mode: BATFET off, cell disconnected from SYS, charger
+    // I2C stays alive at ~µA). SDRV_DLY (bit0) = 1 -> act immediately, no 10s delay.
+    // Exits on USB plug-in. On battery power this call does not return in any useful
+    // sense: SYS collapses as soon as the BATFET opens.
+    control2 = static_cast<uint8_t>((control2 & ~0x07) | (0x02 << 1) | 0x01);
+    Serial.println("SHIP MODE: disconnecting cell from SYS - plug USB to wake.");
+    Serial.flush();
+    delay(50);
+    return writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, control2);
+}
+
+bool BatteryManager::setMinimumSystemVoltage(uint16_t millivolts) {
+    if (!chargerPresent) {
+        refreshDevicePresence();
+        if (!chargerPresent) {
+            return false;
+        }
+    }
+    if (millivolts < 2500) {
+        millivolts = 2500;
+    }
+    const uint8_t setting = static_cast<uint8_t>((millivolts - 2500) / 250);
+    if (!writeRegister8(BQ25792_ADDRESS, BQ25792_MIN_SYSTEM_VOLTAGE_REGISTER, setting)) {
+        return false;
+    }
+    uint8_t verify = 0;
+    if (!readRegister8(BQ25792_ADDRESS, BQ25792_MIN_SYSTEM_VOLTAGE_REGISTER, verify)) {
+        return false;
+    }
+    chargerMinimumSystemVoltageRegister = verify;
+    if (verify == setting) {
+        // Keep the periodic charger reconfiguration from silently reverting this.
+        gRequestedVsysMinMv = millivolts;
+        return true;
+    }
+    return false;
+}
+
+bool BatteryManager::ensureGaugeSleepConfig() {
+    if (!gaugePresent) {
+        refreshDevicePresence();
+        if (!gaugePresent) {
+            return false;
+        }
+    }
+    uint8_t da = 0;
+    if (!readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, da)) {
+        return false;
+    }
+    // SLEEP (bit4) + IN_SYSTEM_SLEEP (bit3), and keep CC0 (bit0) at 1S. Without
+    // IN_SYSTEM_SLEEP the gauge only sleeps when the I2C bus is held LOW — ours idles
+    // HIGH on pullups, so the gauge sat in NORMAL mode (~0.4mA from the cell) forever.
+    const uint8_t desired = static_cast<uint8_t>((da | 0x18) & ~0x01);
+    if (da == desired) {
+        return true;
+    }
+    writeGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, desired);
+    uint8_t verify = 0;
+    readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, verify);
+    const bool stuck = verify == desired;
+    Serial.printf("ensureGaugeSleepConfig: DA Configuration 0x%02X -> wrote 0x%02X, read 0x%02X -> IN_SYSTEM_SLEEP %s\n",
+                  da, desired, verify, stuck ? "ENABLED" : "REJECTED");
+    if (stuck) {
+        gaugeDaConfiguration = verify;
+    }
+    return stuck;
+}
+
+bool BatteryManager::isHizMode() {
+    uint8_t control0 = 0;
+    if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
+        return false;
+    }
+    chargerControl0Register = control0;
+    return (control0 & 0x04) != 0;
 }
 
 bool BatteryManager::enableChargerAdc() {
@@ -816,7 +1136,9 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
     uint16_t terminateVoltage = 0;
     uint16_t chargingVoltage = 0;
     uint16_t taperCurrent = 0;
-    uint16_t taperVoltage = 0;
+    uint16_t dsgThreshold = 0;
+    uint16_t chgThreshold = 0;
+    uint16_t quitCurrent = 0;
     uint8_t daConfiguration = 0;
     uint8_t balancingConfiguration = 0;
 
@@ -837,9 +1159,11 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
     ok = readGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, designCapacity) && ok;
     ok = readGaugeDataFlashWord(BQ28Z610_DESIGN_ENERGY_ADDRESS, designEnergy) && ok;
     ok = readGaugeDataFlashWord(BQ28Z610_TERMINATE_VOLTAGE_ADDRESS, terminateVoltage) && ok;
-    ok = readGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_ADDRESS, chargingVoltage) && ok;
+    ok = readGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_MED_ADDRESS, chargingVoltage) && ok;
     ok = readGaugeDataFlashWord(BQ28Z610_TAPER_CURRENT_ADDRESS, taperCurrent) && ok;
-    ok = readGaugeDataFlashWord(BQ28Z610_TAPER_VOLTAGE_ADDRESS, taperVoltage) && ok;
+    ok = readGaugeDataFlashWord(BQ28Z610_DSG_CURRENT_THRESHOLD_ADDRESS, dsgThreshold) && ok;
+    ok = readGaugeDataFlashWord(BQ28Z610_CHG_CURRENT_THRESHOLD_ADDRESS, chgThreshold) && ok;
+    ok = readGaugeDataFlashWord(BQ28Z610_QUIT_CURRENT_ADDRESS, quitCurrent) && ok;
     ok = readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, daConfiguration) && ok;
     ok = readGaugeDataFlashByte(BQ28Z610_BALANCING_CONFIGURATION_ADDRESS, balancingConfiguration) && ok;
 
@@ -852,13 +1176,12 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
         || terminateVoltage == 0
         || chargingVoltage == 0
         || taperCurrent == 0
-        || taperVoltage == 0;
+        || quitCurrent == 0;
     const bool looksCorrupted = gaugeConfigurationLooksCorrupted(designCapacity,
                                                                  designEnergy,
                                                                  terminateVoltage,
                                                                  chargingVoltage,
-                                                                 taperCurrent,
-                                                                 taperVoltage);
+                                                                 taperCurrent);
 
     // Production packs can legitimately use non-generic gauge data, so only
     // auto-provision when the data flash looks blank or clearly invalid. Use
@@ -883,9 +1206,13 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
         ok = writeGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, DEFAULT_GAUGE_DESIGN_CAPACITY_MAH) && ok;
         ok = writeGaugeDataFlashWord(BQ28Z610_DESIGN_ENERGY_ADDRESS, DEFAULT_GAUGE_DESIGN_ENERGY_MWH) && ok;
         ok = writeGaugeDataFlashWord(BQ28Z610_TERMINATE_VOLTAGE_ADDRESS, DEFAULT_GAUGE_TERMINATE_VOLTAGE_MV) && ok;
-        ok = writeGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_LOW_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_MED_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_HIGH_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
         ok = writeGaugeDataFlashWord(BQ28Z610_TAPER_CURRENT_ADDRESS, DEFAULT_GAUGE_TAPER_CURRENT_MA) && ok;
-        ok = writeGaugeDataFlashWord(BQ28Z610_TAPER_VOLTAGE_ADDRESS, DEFAULT_GAUGE_TAPER_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_DSG_CURRENT_THRESHOLD_ADDRESS, DEFAULT_GAUGE_DSG_CURRENT_THRESHOLD_MA) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_CHG_CURRENT_THRESHOLD_ADDRESS, DEFAULT_GAUGE_CHG_CURRENT_THRESHOLD_MA) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_QUIT_CURRENT_ADDRESS, DEFAULT_GAUGE_QUIT_CURRENT_MA) && ok;
         ok = writeGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, DEFAULT_GAUGE_DA_CONFIGURATION) && ok;
         ok = writeGaugeDataFlashByte(BQ28Z610_BALANCING_CONFIGURATION_ADDRESS, DEFAULT_GAUGE_BALANCING_CONFIGURATION) && ok;
 
@@ -917,9 +1244,11 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
         ok = readGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, designCapacity) && ok;
         ok = readGaugeDataFlashWord(BQ28Z610_DESIGN_ENERGY_ADDRESS, designEnergy) && ok;
         ok = readGaugeDataFlashWord(BQ28Z610_TERMINATE_VOLTAGE_ADDRESS, terminateVoltage) && ok;
-        ok = readGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_ADDRESS, chargingVoltage) && ok;
+        ok = readGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_MED_ADDRESS, chargingVoltage) && ok;
         ok = readGaugeDataFlashWord(BQ28Z610_TAPER_CURRENT_ADDRESS, taperCurrent) && ok;
-        ok = readGaugeDataFlashWord(BQ28Z610_TAPER_VOLTAGE_ADDRESS, taperVoltage) && ok;
+        ok = readGaugeDataFlashWord(BQ28Z610_DSG_CURRENT_THRESHOLD_ADDRESS, dsgThreshold) && ok;
+        ok = readGaugeDataFlashWord(BQ28Z610_CHG_CURRENT_THRESHOLD_ADDRESS, chgThreshold) && ok;
+        ok = readGaugeDataFlashWord(BQ28Z610_QUIT_CURRENT_ADDRESS, quitCurrent) && ok;
         ok = readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, daConfiguration) && ok;
         ok = readGaugeDataFlashByte(BQ28Z610_BALANCING_CONFIGURATION_ADDRESS, balancingConfiguration) && ok;
 
@@ -938,7 +1267,9 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
         needsWrite = terminateVoltage != DEFAULT_GAUGE_TERMINATE_VOLTAGE_MV || needsWrite;
         needsWrite = chargingVoltage != DEFAULT_GAUGE_CHARGING_VOLTAGE_MV || needsWrite;
         needsWrite = taperCurrent != DEFAULT_GAUGE_TAPER_CURRENT_MA || needsWrite;
-        needsWrite = taperVoltage != DEFAULT_GAUGE_TAPER_VOLTAGE_MV || needsWrite;
+        needsWrite = dsgThreshold != DEFAULT_GAUGE_DSG_CURRENT_THRESHOLD_MA || needsWrite;
+        needsWrite = chgThreshold != DEFAULT_GAUGE_CHG_CURRENT_THRESHOLD_MA || needsWrite;
+        needsWrite = quitCurrent != DEFAULT_GAUGE_QUIT_CURRENT_MA || needsWrite;
         needsWrite = daConfiguration != DEFAULT_GAUGE_DA_CONFIGURATION || needsWrite;
         needsWrite = balancingConfiguration != DEFAULT_GAUGE_BALANCING_CONFIGURATION || needsWrite;
         if (DEFAULT_GAUGE_CHEM_ID != 0) {
@@ -1119,17 +1450,28 @@ bool BatteryManager::setGaugeSingleCellMode() {
     }
 
     uint8_t daConfiguration = 0;
-    bool ok = readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, daConfiguration);
+    bool ok = false;
+    for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+        ok = readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, daConfiguration);
+        if (!ok) {
+            delay(10);
+        }
+    }
     if (ok && (daConfiguration & 0x01) == 0) {
         gaugeDaConfiguration = daConfiguration;
         return updateGaugeMeasurements();
     }
 
     if (ok && (daConfiguration & 0x01) != 0) {
+        // Factory default is 2-cell (CC0=1); switch to 1-cell for this 1S pack.
         daConfiguration &= static_cast<uint8_t>(~0x01);
-        ok = writeGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, daConfiguration) && ok;
+        bool wrote = writeGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, daConfiguration);
+        Serial.printf("setGaugeSingleCellMode: switching gauge to 1S -> %s\n",
+                      wrote ? "OK" : "FAILED");
+        ok = wrote && ok;
         if (ok) {
             delay(10);
+            // Reset so the gauge reinitializes in 1S and re-evaluates the CUV fault.
             ok = writeGaugeAltCommand(BQ28Z610_DEVICE_RESET_COMMAND) && ok;
             delay(50);
         }
@@ -1153,6 +1495,22 @@ bool BatteryManager::setGaugeSingleCellMode() {
     }
 
     return ok && ((gaugeDaConfiguration & 0x01) == 0);
+}
+
+bool BatteryManager::setChargeEnabled(bool enable) {
+    if (!chargerPresent) {
+        return false;
+    }
+    uint8_t control0 = 0;
+    if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
+        return false;
+    }
+    if (enable) {
+        control0 |= kBq25792ChargeEnableMask;
+    } else {
+        control0 = static_cast<uint8_t>(control0 & ~kBq25792ChargeEnableMask);
+    }
+    return writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0);
 }
 
 bool BatteryManager::restartChargeCycle() {
@@ -1294,8 +1652,14 @@ void BatteryManager::assertChargerEnablePin() {
 void BatteryManager::prepareForDeepSleep() {
     const gpio_num_t chargerEnablePin = static_cast<gpio_num_t>(BATTERY_CHARGER_ENABLE_PIN);
     assertChargerEnablePin();
+    // GPIO44 is a digital-only pad: this hold keeps CE low through the sleep transition
+    // but is released once deep sleep actually starts. The global gpio_deep_sleep_hold_en()
+    // that used to arm it is intentionally NOT called — it freezes the flash/octal-PSRAM
+    // pads too, defeating the sleep leakage workarounds and burning ~40mA all night (the
+    // 5-day depletion culprit). Until the board gets a pulldown on BATT_CE, the CE line
+    // floats during deep sleep (datasheet says don't float it — bodge a 100k CE->GND so
+    // charging stays default-enabled with the ESP asleep).
     gpio_hold_en(chargerEnablePin);
-    gpio_deep_sleep_hold_en();
 }
 
 void BatteryManager::releaseSDA() {
@@ -1607,6 +1971,10 @@ bool BatteryManager::readGaugeDataFlashByte(uint16_t address, uint8_t &value) {
 }
 
 bool BatteryManager::unsealGauge() {
+    // SEALED -> UNSEALED. (Data-memory writes succeed in UNSEALED once the write
+    // uses the correct single-block protocol — see writeGaugeDataFlashByte/Word.
+    // Sending the full-access key here corrupted the gauge state machine, so we
+    // stay in UNSEALED.)
     if (!writeGaugeAltCommand(BQ28Z610_DEFAULT_UNSEAL_KEY_1)) {
         return false;
     }
@@ -1622,6 +1990,7 @@ bool BatteryManager::unsealGauge() {
     }
 
     gaugeOperationStatus = status;
+    // SEC[1:0] in OperationStatus bits 9:8 — 0b11 sealed, 0b10 unsealed, 0b01 full access.
     gaugeSealed = ((status >> 8) & 0x03) == 0x03;
     return !gaugeSealed;
 }
@@ -1664,59 +2033,208 @@ bool BatteryManager::readGaugeDataFlashWord(uint16_t address, uint16_t &value) {
 }
 
 bool BatteryManager::writeGaugeDataFlashByte(uint16_t address, uint8_t value) {
-    uint8_t target[2] = {
+    // TI canonical data-memory write: address + data must be written as ONE
+    // contiguous block to AltManufacturerAccess (0x3E). Writing the address alone
+    // (with a STOP) is interpreted as a read request, so a follow-up write to
+    // MACData never commits. The checksum+length word (0x60/0x61) finalizes it.
+    uint8_t block[3] = {
         static_cast<uint8_t>(address & 0xFF),
         static_cast<uint8_t>((address >> 8) & 0xFF),
+        value,
     };
-    uint8_t trailer[2] = {0};
-
-    if (!writeRegisters(gaugeAddress, 0x3E, target, sizeof(target))) {
-        return false;
-    }
-    if (!writeRegisters(gaugeAddress, BQ28Z610_MAC_DATA_START_REGISTER, &value, 1)) {
+    if (!writeRegisters(gaugeAddress, 0x3E, block, sizeof(block))) {
         return false;
     }
 
-    trailer[0] = static_cast<uint8_t>(~(target[0] + target[1] + value));
-    trailer[1] = 0x05;
+    uint8_t trailer[2] = {
+        static_cast<uint8_t>(~(block[0] + block[1] + block[2])), // checksum
+        0x05,                                                    // length: 2 addr + 1 data + 2
+    };
     if (!writeRegisters(gaugeAddress, BQ28Z610_MAC_CHECKSUM_REGISTER, trailer, sizeof(trailer))) {
         return false;
     }
 
-    delay(3);
+    delay(15); // data-flash commit time
 
+    // Some writes (e.g. DA Configuration cell count) make the gauge reconfigure
+    // immediately, so the first readback can transiently fail even though the
+    // value committed. Retry the verify before declaring failure.
     uint8_t verify = 0;
-    return readGaugeDataFlashByte(address, verify) && verify == value;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (readGaugeDataFlashByte(address, verify) && verify == value) {
+            return true;
+        }
+        delay(10);
+    }
+    return false;
 }
 
 bool BatteryManager::writeGaugeDataFlashWord(uint16_t address, uint16_t value) {
-    uint8_t target[2] = {
+    // Single contiguous block (address + data) to 0x3E, then checksum+length.
+    uint8_t block[4] = {
         static_cast<uint8_t>(address & 0xFF),
         static_cast<uint8_t>((address >> 8) & 0xFF),
-    };
-    uint8_t payload[2] = {
         static_cast<uint8_t>(value & 0xFF),
         static_cast<uint8_t>((value >> 8) & 0xFF),
     };
-    uint8_t trailer[2] = {0};
-
-    if (!writeRegisters(gaugeAddress, 0x3E, target, sizeof(target))) {
-        return false;
-    }
-    if (!writeRegisters(gaugeAddress, BQ28Z610_MAC_DATA_START_REGISTER, payload, sizeof(payload))) {
+    if (!writeRegisters(gaugeAddress, 0x3E, block, sizeof(block))) {
         return false;
     }
 
-    trailer[0] = static_cast<uint8_t>(~(target[0] + target[1] + payload[0] + payload[1]));
-    trailer[1] = 0x06;
+    uint8_t trailer[2] = {
+        static_cast<uint8_t>(~(block[0] + block[1] + block[2] + block[3])), // checksum
+        0x06,                                                               // length: 2 addr + 2 data + 2
+    };
     if (!writeRegisters(gaugeAddress, BQ28Z610_MAC_CHECKSUM_REGISTER, trailer, sizeof(trailer))) {
         return false;
     }
 
-    delay(3);
+    delay(15); // data-flash commit time
 
     uint16_t verify = 0;
-    return readGaugeDataFlashWord(address, verify) && verify == value;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (readGaugeDataFlashWord(address, verify) && verify == value) {
+            return true;
+        }
+        delay(10);
+    }
+    return false;
+}
+
+bool BatteryManager::readGaugeDataFlashFloat(uint16_t address, float &value) {
+    // DF floats are IEEE-754 single precision, little-endian (datasheet 13.1.3).
+    uint8_t target[2] = {
+        static_cast<uint8_t>(address & 0xFF),
+        static_cast<uint8_t>((address >> 8) & 0xFF),
+    };
+    uint8_t response[6] = {0}; // 2 addr echo + 4 data
+
+    if (!writeRegisters(gaugeAddress, 0x3E, target, sizeof(target))) {
+        return false;
+    }
+    delay(2);
+    if (!readRegisters(gaugeAddress, 0x3E, response, sizeof(response))) {
+        return false;
+    }
+    if (response[0] != target[0] || response[1] != target[1]) {
+        return false;
+    }
+    uint8_t le[4] = {response[2], response[3], response[4], response[5]};
+    memcpy(&value, le, sizeof(value)); // ESP32 is little-endian
+    return true;
+}
+
+bool BatteryManager::writeGaugeDataFlashFloat(uint16_t address, float value) {
+    uint8_t f[4];
+    memcpy(f, &value, sizeof(f)); // little-endian
+    uint8_t block[6] = {
+        static_cast<uint8_t>(address & 0xFF),
+        static_cast<uint8_t>((address >> 8) & 0xFF),
+        f[0], f[1], f[2], f[3],
+    };
+    if (!writeRegisters(gaugeAddress, 0x3E, block, sizeof(block))) {
+        return false;
+    }
+    uint8_t trailer[2] = {
+        static_cast<uint8_t>(~(block[0] + block[1] + block[2] + block[3] + block[4] + block[5])),
+        0x08, // length: 2 addr + 4 data + 2
+    };
+    if (!writeRegisters(gaugeAddress, BQ28Z610_MAC_CHECKSUM_REGISTER, trailer, sizeof(trailer))) {
+        return false;
+    }
+    delay(15);
+
+    // Relative tolerance: large gains (e.g. Capacity Gain ~2.5e5) have float spacing
+    // far bigger than any fixed absolute epsilon, and the gauge may re-derive the value.
+    float verify = 0.0f;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (readGaugeDataFlashFloat(address, verify) &&
+            fabsf(verify - value) <= (fabsf(value) * 1e-3f + 1e-4f)) {
+            return true;
+        }
+        delay(10);
+    }
+    return false;
+}
+
+bool BatteryManager::calibrateCurrentSense() {
+    if (!gaugePresent || !chargerPresent) {
+        refreshDevicePresence();
+        if (!gaugePresent || !chargerPresent) {
+            Serial.println("calibrateCurrentSense: gauge or charger not present");
+            return false;
+        }
+    }
+
+    // Reference: BQ25792 IBAT ADC (factory-calibrated, 1mA/LSB, 2's complement).
+    uint16_t ibatRaw = 0;
+    if (!readRegister16BE(BQ25792_ADDRESS, BQ25792_IBAT_ADC_REGISTER, ibatRaw)) {
+        Serial.println("calibrateCurrentSense: failed to read charger IBAT");
+        return false;
+    }
+    int chargerCurrent = static_cast<int16_t>(ibatRaw); // mA
+
+    // Gauge reported current (uses the current, miscalibrated CC Gain).
+    updateGaugeMeasurements();
+    int gaugeCurrent = currentBatteryCurrentMilliAmps; // mA
+
+    Serial.printf("calibrateCurrentSense: charger IBAT=%dmA, gauge=%dmA\n",
+                  chargerCurrent, gaugeCurrent);
+
+    // Need a meaningful, same-direction current on both for a clean ratio.
+    if (abs(chargerCurrent) < 150 || abs(gaugeCurrent) < 150) {
+        Serial.println("calibrateCurrentSense: need a steady current >150mA (charge at 300mA). Aborting.");
+        return false;
+    }
+    if ((chargerCurrent > 0) != (gaugeCurrent > 0)) {
+        Serial.println("calibrateCurrentSense: charger/gauge current sign mismatch. Aborting.");
+        return false;
+    }
+
+    float factor = static_cast<float>(chargerCurrent) / static_cast<float>(gaugeCurrent);
+
+    bool wasSealed = gaugeSealed;
+    if (gaugeSealed && !unsealGauge()) {
+        return false;
+    }
+
+    float ccGain = 0.0f;
+    if (!readGaugeDataFlashFloat(BQ28Z610_CC_GAIN_ADDRESS, ccGain)) {
+        Serial.println("calibrateCurrentSense: failed to read CC Gain");
+        if (wasSealed) { sealGauge(); }
+        return false;
+    }
+
+    float newCcGain = ccGain * factor;
+    if (newCcGain < 0.1f) newCcGain = 0.1f;   // datasheet range
+    if (newCcGain > 4.0f) newCcGain = 4.0f;
+    float newCapacityGain = newCcGain * 298261.6178f; // datasheet 11.4.3
+
+    Serial.printf("calibrateCurrentSense: factor=%.4f, CC Gain %.5f -> %.5f\n",
+                  factor, ccGain, newCcGain);
+
+    bool ok = writeGaugeDataFlashFloat(BQ28Z610_CC_GAIN_ADDRESS, newCcGain);
+    ok = writeGaugeDataFlashFloat(BQ28Z610_CAPACITY_GAIN_ADDRESS, newCapacityGain) && ok;
+
+    if (ok) {
+        writeGaugeAltCommand(BQ28Z610_DEVICE_RESET_COMMAND);
+        delay(50);
+        // After reset the gauge needs a measurement cycle (~1s) to report current with
+        // the new gain — wait before the sanity re-check so it isn't stale.
+        for (int i = 0; i < 30; ++i) {
+            updateGaugeMeasurements();
+            delay(100);
+        }
+    }
+
+    if (wasSealed) {
+        sealGauge();
+        gaugeSealed = true;
+    }
+
+    Serial.printf("calibrateCurrentSense: %s. Re-check: charger=%dmA vs gauge=%dmA\n",
+                  ok ? "OK" : "FAILED", chargerCurrent, currentBatteryCurrentMilliAmps);
+    return ok;
 }
 
 const char* BatteryManager::chargerStateToString(uint8_t state) {

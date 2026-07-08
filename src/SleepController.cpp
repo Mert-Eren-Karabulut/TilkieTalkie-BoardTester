@@ -3,6 +3,7 @@
 #include "FileManager.h"
 #include "Buttons.h"
 #include <esp_log.h>
+#include <driver/gpio.h>
 
 static const char* TAG = "SLEEP";
 
@@ -83,15 +84,19 @@ void SleepController::configureWakeupSources() {
     // Configure ext1 wake-up for multiple GPIO pins (any button press or pogo engage)
     // Use ESP_EXT1_WAKEUP_ANY_HIGH because buttons read HIGH when pressed
     uint64_t buttonMask = 0;
-    
+
     for (int i = 0; i < 4; i++) {
         buttonMask |= (1ULL << WAKEUP_BUTTON_PINS[i]);
     }
 
     buttonMask |= (1ULL << WAKEUP_POGO_PIN);
-    
+
     esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ANY_HIGH);
-    
+
+    // Deliberately NO timer wake: a periodic wake to "check the battery" is a brownout
+    // trap on a nearly-dead cell (booting at ~2.8V can fail mid-wake), and cell
+    // protection while asleep belongs in silicon — the gauge's CUV (2.5V trip,
+    // latch-until-charge) covers that with the ESP fully dead.
     ESP_LOGI(TAG, "Configured wake-up sources: Buttons (GPIO 12, 13, 14, 21) and pogo switch (GPIO %d)", WAKEUP_POGO_PIN);
 }
 
@@ -133,8 +138,15 @@ void SleepController::checkAndSleep() {
     if (!canEnterSleep()) {
         return;
     }
-    
+
     ESP_LOGI(TAG, "Sleep conditions met, entering deep sleep...");
+    enterDeepSleep();
+}
+
+void SleepController::forceSleep() {
+    // Unconditional deep sleep (e.g. low-battery cutoff). Skips canEnterSleep() so it
+    // sleeps even while audio is playing — protecting the cell takes priority.
+    ESP_LOGW(TAG, "Forcing deep sleep (bypassing sleep conditions)...");
     enterDeepSleep();
 }
 
@@ -149,12 +161,21 @@ void SleepController::enterDeepSleep() {
     rtcSleepState.hasValidSleep = true;
     rtcSleepState.magic = RTC_MAGIC;
     
-    // Disable peripheral power to save energy
+    // Disable peripheral power to save energy (latches GPIO4 low via gpio_hold_en).
     disablePeripheralPower();
-    
+
+    // Deliberately NO gpio_deep_sleep_hold_en() here: that global hold freezes ALL
+    // digital pads at their functional state through deep sleep — including the
+    // flash/octal-PSRAM SPI pads — which defeats the ESP_SLEEP_PSRAM/FLASH_LEAKAGE
+    // workarounds and leaves the memories half-selected at ~40mA all night (the
+    // 5-day battery-depletion culprit). GPIO4 (and the NFC bus pins) are RTC-capable
+    // pads whose gpio_hold_en persists through deep sleep natively, so the 4.5V rail
+    // still stays off without it. Cost: GPIO44/BATT_CE (digital pad) cannot be held —
+    // the charger CE line needs a board pulldown to stay defined during sleep.
+
     // Configure wake-up sources
     configureWakeupSources();
-    
+
     ESP_LOGI(TAG, "Entering deep sleep mode...");
     ESP_LOGI(TAG, "Device will wake on any button press or pogo engage");
     
@@ -167,6 +188,8 @@ void SleepController::enterDeepSleep() {
 
 void SleepController::enablePeripheralPower() {
     ESP_LOGI(TAG, "Enabling peripheral power (GPIO %d)...", PERIPHERAL_POWER_PIN);
+    // Release any deep-sleep latch from a previous sleep before driving the pin.
+    gpio_hold_dis((gpio_num_t)PERIPHERAL_POWER_PIN);
     pinMode(PERIPHERAL_POWER_PIN, OUTPUT);
     digitalWrite(PERIPHERAL_POWER_PIN, HIGH);
 }
@@ -174,6 +197,12 @@ void SleepController::enablePeripheralPower() {
 void SleepController::disablePeripheralPower() {
     ESP_LOGI(TAG, "Disabling peripheral power (GPIO %d) to save energy...", PERIPHERAL_POWER_PIN);
     digitalWrite(PERIPHERAL_POWER_PIN, LOW);
+    // CRITICAL: latch GPIO4 low so it stays low through deep sleep. Without this the pin
+    // floats once the chip sleeps, the enable nets re-energize, and SD/NFC/audio drain
+    // the cell (caused an overnight over-discharge). GPIO4 is an RTC-capable pad, so
+    // this hold persists through deep sleep on its own — do NOT add the global
+    // gpio_deep_sleep_hold_en() (it freezes the flash/PSRAM pads too; see enterDeepSleep).
+    gpio_hold_en((gpio_num_t)PERIPHERAL_POWER_PIN);
 }
 
 void SleepController::scheduleSleep(unsigned long timeoutMs) {

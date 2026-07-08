@@ -24,6 +24,7 @@ public:
 
     // Sleep management
     void checkAndSleep();            // Check conditions and enter sleep if appropriate
+    void forceSleep();               // Enter deep sleep immediately, bypassing conditions
     void scheduleSleep(unsigned long timeoutMs);
     void cancelSleep();
     void resetActivity();            // Reset inactivity timer
