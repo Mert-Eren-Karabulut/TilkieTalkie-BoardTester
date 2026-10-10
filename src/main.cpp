@@ -1393,6 +1393,29 @@ void loop()
         {
             fileManager.printFileTree();
         }
+        else if (command.startsWith("cat ") && DEBUG)
+        {
+            // cat <path> - print the first 4 KB of a text file on the SD card (bench)
+            String path = command.substring(4);
+            path.trim();
+            File f = SD_MMC.open(path, FILE_READ);
+            if (!f)
+            {
+                ESP_LOGE(TAG, "cat: cannot open %s", path.c_str());
+            }
+            else
+            {
+                size_t shown = 0;
+                while (f.available() && shown < 4096)
+                {
+                    String line = f.readStringUntil('\n');
+                    shown += line.length() + 1;
+                    Serial.println(line);
+                }
+                if (f.available()) Serial.println("... (truncated)");
+                f.close();
+            }
+        }
         else if (command.startsWith("sdwritebench"))
         {
             // sdwritebench [chunkKB] [count]

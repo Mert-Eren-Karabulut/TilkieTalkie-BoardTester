@@ -252,6 +252,9 @@ JsonDocument RequestManager::executeHttpRequest(const String& endpoint, const St
     if (httpResponseCode > 0) {
         String response = http.getString();
         Serial.printf("RequestManager: %s %s -> %d (%u bytes)\n", method.c_str(), endpoint.c_str(), httpResponseCode, (unsigned)response.length());
+        if (response.length() < 600 && !endpoint.endsWith("/token")) {
+            Serial.println("RequestManager: body: " + response); // small bodies only (never the token)
+        }
         http.end();
         return parseResponse(response);
     }
@@ -454,6 +457,8 @@ void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyE
         }
         trackPaths.push_back(storagePath);
         fileManager.addRequiredFile(storagePath, url, checksum);
+        Serial.printf("RequestManager: asset %s (%s) %s\n", storagePath.c_str(), asset["asset_type"].as<const char*>() ? asset["asset_type"].as<const char*>() : "?",
+                      fileManager.fileExists(storagePath) ? "present" : "missing");
         // Existence only: integrity was verified (sha256) when the file was downloaded.
         // Re-hashing every cached track here used to block the loop for tens of seconds.
         if (!fileManager.fileExists(storagePath)) {
@@ -637,6 +642,9 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     }
     
     bool allReady = (tracker.tracksReady >= tracker.totalTracks && tracker.totalTracks > 0);
+    Serial.printf("RequestManager: tracking %s: %d asset(s), %d present, pending manifest %s, announced %s\n",
+                  figureName.c_str(), tracker.totalTracks, tracker.tracksReady,
+                  hasPendingManifest ? "yes" : "no", alreadyEmitted ? "yes" : "no");
     
     if (allReady) {
         tracker.completed = true;
@@ -644,8 +652,14 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
         queueFigureDownloadCompletion(uid, figureName, true, "", figureData, tracker.emittedAny);
         tracker.emittedAny = true;
     } else if (tracker.totalTracks == 0) {
+        // The backend reports no assets for this unit. Deliberately NOT promoted over the
+        // cached manifest (which would also garbage-collect the files): an empty list can be a
+        // revoked binding or a backend hiccup, and wiping a child's figure on a hiccup is worse
+        // than playing stale content. Revisit once the API carries an explicit "revoked" state.
         tracker.completed = true;
         finalizeTrackedManifest(tracker, false);
+        Serial.printf("RequestManager: WARNING backend reports no assets for %s (%s); cached content kept\n",
+                      figureName.c_str(), uid.c_str());
         if (!tracker.emittedAny) {
             queueFigureDownloadCompletion(uid, figureName, false, "Figure has no tracks", figureData);
         }
