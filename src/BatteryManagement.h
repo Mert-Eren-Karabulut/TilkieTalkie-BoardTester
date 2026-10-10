@@ -14,6 +14,10 @@ private:
     static const int BATTERY_I2C_SCL_PIN = 2;
     static const int BATTERY_CHARGER_ENABLE_PIN = 44; // ESP32-S3 RXD0 wired to BQ25792 CE through 390 ohms.
     static constexpr unsigned long I2C_DELAY_US = 8;
+    // TI gauges (bq28z610 / bq27xxx family) need >= 66 us bus-free time between a STOP and the
+    // next START, and after a command write before the read. The old pinMode()-based bit-bang
+    // provided this by accident; the register-driven bus must enforce it explicitly.
+    static constexpr unsigned long I2C_BUS_FREE_US = 80;
     static constexpr unsigned long CLOCK_STRETCH_TIMEOUT_US = 1000;
 
     // Device addresses
@@ -34,6 +38,9 @@ private:
     static const uint8_t BQ25792_CHARGE_CURRENT_REGISTER = 0x03;
     static const uint8_t BQ25792_INPUT_CURRENT_REGISTER = 0x06;
     static const uint8_t BQ25792_RECHARGE_CONTROL_REGISTER = 0x0A;
+    static const uint8_t BQ25792_TERMINATION_CONTROL_REGISTER = 0x09; // bit6 = REG_RST (never write 1), ITERM[4:0] 40mA/LSB
+    static const uint8_t DEFAULT_TERMINATION_CURRENT_CODE = 0x03;    // 120 mA (POR 0x05 = 200 mA)
+    static const uint8_t DEFAULT_RECHARGE_THRESHOLD_CODE = 0x04;     // VREG - 250 mV (POR 0x03 = 200 mV), 50 mV/LSB
     static const uint8_t BQ25792_INPUT_VOLTAGE_REGISTER = 0x05; // VINDPM, 100mV/LSB
     static const uint8_t BQ25792_CHARGER_CONTROL_0_REGISTER = 0x0F;
     static const uint8_t BQ25792_CHARGER_CONTROL_1_REGISTER = 0x10;
@@ -81,6 +88,7 @@ private:
 
     // BQ28Z610 alternate commands and persistent DF addresses
     static const uint16_t BQ28Z610_FET_CONTROL_COMMAND = 0x0022;
+    static const uint16_t BQ28Z610_CHEM_ID_COMMAND = 0x0006;   // AltManufacturerAccess: the real Chemical ID
     static const uint16_t BQ28Z610_GAUGING_COMMAND = 0x0021;
     static const uint16_t BQ28Z610_SAFETY_STATUS_COMMAND = 0x0051;
     static const uint16_t BQ28Z610_OPERATION_STATUS_COMMAND = 0x0054;
@@ -98,7 +106,12 @@ private:
     static const uint16_t BQ28Z610_CC_GAIN_ADDRESS = 0x4006;       // F4 (IEEE-754 LE float)
     static const uint16_t BQ28Z610_CAPACITY_GAIN_ADDRESS = 0x400A; // F4; = CC Gain * 298261.6178
     static constexpr float BQ28Z610_DEFAULT_CC_GAIN = 3.58422f;    // factory default (uncalibrated)
+    // NOTE: 0x4628 is NOT a documented data-flash field (the TRM table goes 0x4626 -> 0x4629).
+    // Earlier firmware wrote 0x0418 here and read it back as a "Chem ID"; the real chemistry
+    // is read with MAC 0x0006 and can only be programmed with bqStudio. Kept for reference.
     static const uint16_t BQ28Z610_CHEM_ID_ADDRESS = 0x4628;
+    static const uint16_t BQ28Z610_BROADCAST_PACING_ADDRESS = 0x4629; // U1, default 15 s (corrupted by the 0x4628 write)
+    static const uint8_t DEFAULT_GAUGE_BROADCAST_PACING_S = 15;
     static const uint16_t BQ28Z610_DESIGN_CAPACITY_ADDRESS = 0x462A;
     static const uint16_t BQ28Z610_DESIGN_ENERGY_ADDRESS = 0x462C;
     static const uint16_t BQ28Z610_TERMINATE_VOLTAGE_ADDRESS = 0x45BE; // was 0x4632 (=SOC Flag Config A!)
@@ -289,6 +302,16 @@ private:
     uint16_t gaugeTrueFullChargeCapacityMilliAmpHours;
     uint8_t gaugeUpdateStatus;
     unsigned long lastDeviceScan;
+    // Reconfigure-on-transition bookkeeping (see refreshBatteryState()).
+    bool prevRt6160Present = false;
+    bool prevChargerPresent = false;
+    bool prevGaugePresent = false;
+    uint8_t prevGaugeAddress = 0;
+    unsigned long lastChargerSanityCheck = 0;
+    static constexpr unsigned long CHARGER_SANITY_INTERVAL = 30000;
+    uint8_t pollCycle = 0;
+    static constexpr uint8_t FULL_POLL_EVERY = 10; // slow diagnostic reads every N telemetry polls
+    bool chargerVoltageVerified = false;
     
     // Constructor (private for singleton)
     BatteryManager();
@@ -301,12 +324,16 @@ private:
     void updateChargingStatus();
     bool applyPowerConfiguration(bool forceGaugeProvision);
     void assertChargerEnablePin();
+    void releaseChargerEnablePin();
+    bool verifyChargerVoltageSetting();
+    bool ensureGaugeBroadcastPacing();
+    bool readGaugeChemId(uint16_t &chemId);
     bool configureRt6160For4V5();
     bool configureChargerDefaults();
     bool enableChargerAdc();
     bool ensureGaugeProvisioned(bool force);
-    bool updateGaugeMeasurements();
-    bool updateChargerMeasurements();
+    bool updateGaugeMeasurements(bool full = true);
+    bool updateChargerMeasurements(bool full = true);
 
     // Bit-banged I2C helpers for the dedicated battery bus.
     void releaseSDA();
@@ -315,6 +342,7 @@ private:
     void driveSCLLow();
     void i2cDelay();
     bool waitForSCLHigh();
+    void i2cBusRecover();
     void i2cStart();
     void i2cStop();
     bool i2cWriteByte(uint8_t value);
@@ -391,6 +419,9 @@ public:
     // must never force sleep in this state: with an adapter present the NVDC power path
     // runs SYS from VBUS regardless of the cell, and sleeping just abandons recovery.
     bool isVbusPresent() const;
+    bool isChargeDone() const;              // BQ25792 CHG_STAT = 111 (charge termination done)
+    bool isChargerVoltageVerified() const { return chargerVoltageVerified; }
+    void refreshDiagnostics();              // force the slow gauge/charger diagnostic reads now
     // BQ25792 ship mode (REG11 SDRV_CTRL=10b): opens the internal BATFET, disconnecting
     // the cell from SYS (~µA cell drain). On battery power this kills the system
     // immediately; wake is USB plug-in only (QON is not wired on this board). Writing it

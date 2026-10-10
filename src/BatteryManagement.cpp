@@ -1,4 +1,5 @@
 #include "BatteryManagement.h"
+#include <driver/gpio.h>
 
 namespace {
 // Charge-current limit currently requested by the system (bring-up / deep-discharge
@@ -192,7 +193,9 @@ String gaugeGaugingStatusToString(uint32_t status) {
     if (status & (1UL << 11)) appendFaultLabel(flags, "VOK");
     if (status & (1UL << 10)) appendFaultLabel(flags, "RDIS");
     if (status & (1UL << 9)) appendFaultLabel(flags, "REST");
-    if (status & (1UL << 2)) appendFaultLabel(flags, "TC");
+    if (status & (1UL << 4)) appendFaultLabel(flags, "BAL_EN");
+    if (status & (1UL << 3)) appendFaultLabel(flags, "TC");
+    if (status & (1UL << 2)) appendFaultLabel(flags, "TD");
     if (status & (1UL << 1)) appendFaultLabel(flags, "FC");
     if (status & (1UL << 0)) appendFaultLabel(flags, "FD");
 
@@ -299,13 +302,20 @@ void BatteryManager::begin() {
 
     gpio_deep_sleep_hold_dis();
     gpio_hold_dis(static_cast<gpio_num_t>(BATTERY_CHARGER_ENABLE_PIN));
-    assertChargerEnablePin();
+    // CE (charge enable, active low) is asserted by applyPowerConfiguration() only after the
+    // 3.6 V LFP charge voltage has been read back from the charger (its POR value is 4.2 V).
+    releaseChargerEnablePin();
 
     releaseSDA();
     releaseSCL();
     busInitialized = true;
+    i2cBusRecover();
 
     refreshDevicePresence();
+    prevRt6160Present = rt6160Present;
+    prevChargerPresent = chargerPresent;
+    prevGaugePresent = gaugePresent;
+    prevGaugeAddress = gaugeAddress;
     applyPowerConfiguration(false);
 
     lastUpdate = millis() - UPDATE_INTERVAL;
@@ -481,14 +491,49 @@ float BatteryManager::voltageToPercentage(float voltage) {
 void BatteryManager::refreshBatteryState() {
     unsigned long now = millis();
 
-    if (now - lastDeviceScan >= DEVICE_RESCAN_INTERVAL || !rt6160Present || !chargerPresent || !gaugePresent) {
-        refreshDevicePresence();
+    // Presence rescan every DEVICE_RESCAN_INTERVAL (four cheap address probes). The full
+    // power configuration (RT6160 rail, charger defaults, ~25 gauge data-flash reads) used
+    // to be re-applied on every rescan, and every second while any device was absent:
+    // ~600 ms of bit-banged I2C on the loop task. It now runs at boot and when a device
+    // (re)appears on the bus; a cheap VREG read-back every CHARGER_SANITY_INTERVAL covers
+    // a charger power-on reset in between.
+    if (now - lastDeviceScan >= DEVICE_RESCAN_INTERVAL) {
         lastDeviceScan = now;
-        applyPowerConfiguration(false);
+        refreshDevicePresence();
+        const bool appeared = (rt6160Present && !prevRt6160Present)
+            || (chargerPresent && !prevChargerPresent)
+            || (gaugePresent && !prevGaugePresent)
+            || (gaugePresent && gaugeAddress != prevGaugeAddress);
+        prevRt6160Present = rt6160Present;
+        prevChargerPresent = chargerPresent;
+        prevGaugePresent = gaugePresent;
+        prevGaugeAddress = gaugeAddress;
+        if (appeared) {
+            Serial.println("BatteryManager: bus device (re)appeared - applying power configuration");
+            applyPowerConfiguration(false);
+        }
     }
 
-    bool gaugeUpdated = updateGaugeMeasurements();
-    bool chargerUpdated = updateChargerMeasurements();
+    if (chargerPresent && now - lastChargerSanityCheck >= CHARGER_SANITY_INTERVAL) {
+        lastChargerSanityCheck = now;
+        if (!verifyChargerVoltageSetting()) {
+            Serial.println("BatteryManager: charger configuration lost (VREG mismatch) - reconfiguring");
+            chargerConfigured = configureChargerDefaults();
+            chargerAdcEnabled = enableChargerAdc();
+            if (verifyChargerVoltageSetting()) {
+                assertChargerEnablePin();
+            } else {
+                releaseChargerEnablePin();
+            }
+        }
+    }
+
+    // Telemetry every second; the slow diagnostic reads (data flash, MAC blocks, charger
+    // configuration registers) only every FULL_POLL_EVERY polls or on demand.
+    pollCycle++;
+    const bool full = (pollCycle % FULL_POLL_EVERY) == 0;
+    bool gaugeUpdated = updateGaugeMeasurements(full);
+    bool chargerUpdated = updateChargerMeasurements(full);
 
     telemetryValid = gaugeUpdated || chargerUpdated;
 
@@ -521,6 +566,12 @@ void BatteryManager::refreshBatteryState() {
 void BatteryManager::refreshDevicePresence() {
     rt6160Present = probeDevice(RT6160_ADDRESS);
     chargerPresent = probeDevice(BQ25792_ADDRESS);
+    if (!chargerPresent && !probeDevice(BQ28Z610_PRIMARY_ADDRESS) && !probeDevice(BQ28Z610_FALLBACK_ADDRESS)) {
+        // Nothing answers: assume a wedged bus rather than three missing chips, recover, retry once.
+        i2cBusRecover();
+        rt6160Present = probeDevice(RT6160_ADDRESS);
+        chargerPresent = probeDevice(BQ25792_ADDRESS);
+    }
 
     gaugePresent = false;
     gaugeAddress = BQ28Z610_PRIMARY_ADDRESS;
@@ -536,8 +587,6 @@ void BatteryManager::refreshDevicePresence() {
 bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
     bool ok = true;
 
-    assertChargerEnablePin();
-
     if (rt6160Present) {
         // RT6160 rail programming is volatile and must be applied on each boot.
         rt6160Configured = configureRt6160For4V5();
@@ -549,6 +598,17 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
         chargerConfigured = configureChargerDefaults();
         chargerAdcEnabled = enableChargerAdc();
         ok = chargerConfigured && chargerAdcEnabled && ok;
+        // SAFETY: the BQ25792 powers up with a 4.2 V Li-ion VREG. Charging (CE low) is only
+        // enabled once the 3.6 V LFP charge voltage has been read back from the charger.
+        if (verifyChargerVoltageSetting()) {
+            assertChargerEnablePin();
+        } else {
+            releaseChargerEnablePin();
+            Serial.println("BatteryManager: SAFETY - charge voltage not verified, charger held disabled (CE high)");
+            ok = false;
+        }
+    } else {
+        releaseChargerEnablePin();
     }
 
     // Skip all gauge data-flash work while the gauge is still in ROM mode (fallback
@@ -582,6 +642,9 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
         // Same fleet-wide pattern: let the gauge itself sleep between measurements
         // (SLEEP + IN_SYSTEM_SLEEP in DA Configuration). Idempotent, non-destructive.
         ensureGaugeSleepConfig();
+
+        // Repair Broadcast Pacing (0x4629), corrupted by the old "Chem ID" write to 0x4628.
+        ensureGaugeBroadcastPacing();
 
         gaugeConfigured = provisioned && singleCellReady && fetControlReady;
         ok = gaugeConfigured && ok;
@@ -670,7 +733,7 @@ void BatteryManager::printBatteryInfo() const {
     Serial.println("BQ28Z610 sealed: " + String(gaugeSealed ? "Yes" : "No"));
     Serial.println("BQ28Z610 active address: 0x" + String(gaugeAddress, HEX));
     Serial.println("RT6160 VOUT1/VOUT2: 0x" + String(rt6160Vout1Value, HEX) + " / 0x" + String(rt6160Vout2Value, HEX));
-    Serial.println("Gauge Chem ID: 0x" + String(gaugeChemId, HEX));
+    Serial.println("Gauge Chem ID (MAC 0x0006): 0x" + String(gaugeChemId, HEX));
     Serial.println("Gauge OperationStatus: 0x" + String(gaugeOperationStatus, HEX));
     Serial.println("Gauge SafetyStatus: 0x" + String(static_cast<unsigned long>(gaugeSafetyStatus), HEX)
         + " (" + gaugeSafetyStatusToString(gaugeSafetyStatus) + ")");
@@ -926,6 +989,77 @@ bool BatteryManager::configureChargerDefaults() {
     ntcControl1 |= kBq25792TsIgnoreMask;
     ok = writeRegister8(BQ25792_ADDRESS, BQ25792_NTC_CONTROL_1_REGISTER, ntcControl1) && ok;
 
+    // Termination current 120 mA (REG09 ITERM[4:0], 40 mA/LSB; POR 200 mA). The gauge can
+    // only qualify end-of-charge if the charger terminates BELOW the gauge Taper Current.
+    // REG09 bit 6 is REG_RST (full register reset) and must never be written as 1.
+    uint8_t termination = 0;
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_TERMINATION_CONTROL_REGISTER, termination) && ok;
+    termination = static_cast<uint8_t>((termination & 0xA0) | DEFAULT_TERMINATION_CURRENT_CODE);
+    ok = writeRegister8(BQ25792_ADDRESS, BQ25792_TERMINATION_CONTROL_REGISTER, termination) && ok;
+
+    // Recharge threshold VREG - 250 mV (REG0A VRECHG[3:0], 50 mV/LSB; POR 200 mV): a docked
+    // LFP cell then rests near 3.35 V instead of being topped up on every 200 mV relaxation.
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_RECHARGE_CONTROL_REGISTER, rechargeControl) && ok;
+    rechargeControl = static_cast<uint8_t>((rechargeControl & 0xF0) | DEFAULT_RECHARGE_THRESHOLD_CODE);
+    ok = writeRegister8(BQ25792_ADDRESS, BQ25792_RECHARGE_CONTROL_REGISTER, rechargeControl) && ok;
+
+    return ok;
+}
+
+bool BatteryManager::verifyChargerVoltageSetting() {
+    uint16_t vreg = 0;
+    if (!readRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_VOLTAGE_REGISTER, vreg)) {
+        chargerVoltageVerified = false;
+        return false;
+    }
+    chargerChargeVoltageRegister = vreg;
+    chargerVoltageVerified = (vreg == DEFAULT_CHARGE_VOLTAGE_MV / 10);
+    return chargerVoltageVerified;
+}
+
+bool BatteryManager::isChargeDone() const {
+    return chargerPresent && ((chargerStatus1 >> 5) & 0x07) == 0x07;
+}
+
+void BatteryManager::refreshDiagnostics() {
+    if (!busInitialized) {
+        return;
+    }
+    updateGaugeMeasurements(true);
+    updateChargerMeasurements(true);
+    updateChargingStatus();
+}
+
+bool BatteryManager::readGaugeChemId(uint16_t &chemId) {
+    return gaugePresent && readGaugeAltStatus16(BQ28Z610_CHEM_ID_COMMAND, chemId);
+}
+
+bool BatteryManager::ensureGaugeBroadcastPacing() {
+    if (!gaugePresent) {
+        return false;
+    }
+    uint8_t pacing = 0;
+    if (!readGaugeDataFlashByte(BQ28Z610_BROADCAST_PACING_ADDRESS, pacing)) {
+        return false;
+    }
+    if (pacing == DEFAULT_GAUGE_BROADCAST_PACING_S) {
+        return true;
+    }
+    Serial.printf("BatteryManager: gauge Broadcast Pacing is %u s (expected %u) - repairing\n",
+                  pacing, DEFAULT_GAUGE_BROADCAST_PACING_S);
+    const bool wasSealed = gaugeSealed;
+    if (gaugeSealed && !unsealGauge()) {
+        return false;
+    }
+    bool ok = writeGaugeDataFlashByte(BQ28Z610_BROADCAST_PACING_ADDRESS, DEFAULT_GAUGE_BROADCAST_PACING_S);
+    uint8_t verify = 0;
+    ok = readGaugeDataFlashByte(BQ28Z610_BROADCAST_PACING_ADDRESS, verify) && ok
+        && verify == DEFAULT_GAUGE_BROADCAST_PACING_S;
+    if (wasSealed) {
+        sealGauge();
+        gaugeSealed = true;
+    }
+    Serial.printf("BatteryManager: Broadcast Pacing repair %s\n", ok ? "OK" : "FAILED");
     return ok;
 }
 
@@ -991,11 +1125,11 @@ bool BatteryManager::isGaugeProvisioned() {
     }
     uint16_t chem = 0, designCap = 0;
     uint8_t da = 0;
-    if (!readGaugeDataFlashWord(BQ28Z610_CHEM_ID_ADDRESS, chem)) return false;
+    readGaugeChemId(chem); // informational only: the chemistry can only be programmed with bqStudio
     if (!readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, da)) return false;
     if (!readGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, designCap)) return false;
 
-    const bool chemOk = (DEFAULT_GAUGE_CHEM_ID == 0) || (chem == DEFAULT_GAUGE_CHEM_ID);
+    const bool chemOk = true;
     const bool singleCell = (da & 0x01) == 0;                 // bit0 set => 2S
     const bool capOk = designCap >= 1000 && designCap <= 8000; // sane LFP design capacity
     return chemOk && singleCell && capOk;
@@ -1175,8 +1309,8 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
     uint8_t daConfiguration = 0;
     uint8_t balancingConfiguration = 0;
 
-    bool ok = readGaugeDataFlashWord(BQ28Z610_CHEM_ID_ADDRESS, gaugeChemId);
-    ok = readGaugeDataFlashByte(BQ28Z610_FET_OPTIONS_ADDRESS, fetOptions) && ok;
+    readGaugeChemId(gaugeChemId); // MAC 0x0006, informational
+    bool ok = readGaugeDataFlashByte(BQ28Z610_FET_OPTIONS_ADDRESS, fetOptions);
     ok = readGaugeDataFlashByte(BQ28Z610_I2C_GAUGING_CONFIGURATION_ADDRESS, i2cGaugingConfiguration) && ok;
     ok = readGaugeDataFlashByte(BQ28Z610_I2C_CONFIGURATION_ADDRESS, i2cConfiguration) && ok;
     ok = readGaugeDataFlashByte(BQ28Z610_POWER_CONFIG_ADDRESS, powerConfig) && ok;
@@ -1249,9 +1383,8 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
         ok = writeGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, DEFAULT_GAUGE_DA_CONFIGURATION) && ok;
         ok = writeGaugeDataFlashByte(BQ28Z610_BALANCING_CONFIGURATION_ADDRESS, DEFAULT_GAUGE_BALANCING_CONFIGURATION) && ok;
 
-        if (DEFAULT_GAUGE_CHEM_ID != 0) {
-            ok = writeGaugeDataFlashWord(BQ28Z610_CHEM_ID_ADDRESS, DEFAULT_GAUGE_CHEM_ID) && ok;
-        }
+        // (The former "Chem ID" write to 0x4628 is gone: that address is undocumented and its
+        // high byte corrupted Broadcast Pacing. Chemistry is programmed with bqStudio only.)
 
         if (!ok) {
             return false;
@@ -1260,7 +1393,7 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
         ok = writeGaugeAltCommand(BQ28Z610_DEVICE_RESET_COMMAND) && ok;
         delay(10);
 
-        ok = readGaugeDataFlashWord(BQ28Z610_CHEM_ID_ADDRESS, gaugeChemId) && ok;
+        readGaugeChemId(gaugeChemId);
         ok = readGaugeDataFlashByte(BQ28Z610_FET_OPTIONS_ADDRESS, fetOptions) && ok;
         ok = readGaugeDataFlashByte(BQ28Z610_I2C_GAUGING_CONFIGURATION_ADDRESS, i2cGaugingConfiguration) && ok;
         ok = readGaugeDataFlashByte(BQ28Z610_I2C_CONFIGURATION_ADDRESS, i2cConfiguration) && ok;
@@ -1305,9 +1438,6 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
         needsWrite = quitCurrent != DEFAULT_GAUGE_QUIT_CURRENT_MA || needsWrite;
         needsWrite = daConfiguration != DEFAULT_GAUGE_DA_CONFIGURATION || needsWrite;
         needsWrite = balancingConfiguration != DEFAULT_GAUGE_BALANCING_CONFIGURATION || needsWrite;
-        if (DEFAULT_GAUGE_CHEM_ID != 0) {
-            needsWrite = gaugeChemId != DEFAULT_GAUGE_CHEM_ID || needsWrite;
-        }
     }
 
     // This product is always a single-cell pack. Fixing CC0 is a targeted persistent remediation and
@@ -1336,45 +1466,27 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
     return ok && !needsWrite;
 }
 
-bool BatteryManager::updateGaugeMeasurements() {
+bool BatteryManager::updateGaugeMeasurements(bool full) {
     if (!gaugePresent) {
         return false;
     }
 
-    uint8_t daStatus1[12] = {0};
-    uint8_t itStatus1[24] = {0};
-    uint32_t safetyStatus = 0;
-    uint32_t gaugingStatus = 0;
-    uint16_t manufacturingStatus = 0;
-    uint8_t daConfiguration = 0;
+    // --- Per-second telemetry: standard commands (fast, sealed-mode safe) + SafetyStatus ---
     uint16_t voltageMillivolts = 0;
     uint16_t relativeStateOfCharge = 0;
     uint16_t temperatureDeciKelvin = 0;
     uint16_t remainingCapacity = 0;
     uint16_t fullChargeCapacity = 0;
-    uint16_t designCapacity = 0;
-    uint16_t qmaxPack = 0;
-    uint8_t updateStatus = 0;
     int16_t batteryCurrent = 0;
-    int16_t trueRemainingCapacity = 0;
-    uint16_t trueFullChargeCapacity = 0;
+    uint32_t safetyStatus = 0;
 
-    bool ok = readGaugeOperationStatus(gaugeOperationStatus);
-    ok = readGaugeAltStatus32(BQ28Z610_SAFETY_STATUS_COMMAND, safetyStatus) && ok;
-    ok = readGaugeAltStatus32(BQ28Z610_GAUGING_STATUS_COMMAND, gaugingStatus) && ok;
-    ok = readGaugeAltStatus16(BQ28Z610_MANUFACTURING_STATUS_COMMAND, manufacturingStatus) && ok;
-    ok = readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, daConfiguration) && ok;
-    ok = readGaugeAltBlock(BQ28Z610_DA_STATUS_1_COMMAND, daStatus1, sizeof(daStatus1)) && ok;
-    ok = readGaugeAltBlock(BQ28Z610_IT_STATUS_1_COMMAND, itStatus1, sizeof(itStatus1)) && ok;
-    ok = readRegister16LE(gaugeAddress, BQ28Z610_VOLTAGE_REGISTER, voltageMillivolts) && ok;
+    bool ok = readRegister16LE(gaugeAddress, BQ28Z610_VOLTAGE_REGISTER, voltageMillivolts);
     ok = readRegister16LE(gaugeAddress, BQ28Z610_RELATIVE_SOC_REGISTER, relativeStateOfCharge) && ok;
     ok = readRegister16LE(gaugeAddress, BQ28Z610_TEMPERATURE_REGISTER, temperatureDeciKelvin) && ok;
     ok = readRegister16LESigned(gaugeAddress, BQ28Z610_CURRENT_REGISTER, batteryCurrent) && ok;
     ok = readRegister16LE(gaugeAddress, BQ28Z610_REMAINING_CAPACITY_REGISTER, remainingCapacity) && ok;
     ok = readRegister16LE(gaugeAddress, BQ28Z610_FULL_CHARGE_CAPACITY_REGISTER, fullChargeCapacity) && ok;
-    ok = readGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, designCapacity) && ok;
-    ok = readGaugeDataFlashWord(BQ28Z610_QMAX_PACK_ADDRESS, qmaxPack) && ok;
-    ok = readGaugeDataFlashByte(BQ28Z610_UPDATE_STATUS_ADDRESS, updateStatus) && ok;
+    ok = readGaugeAltStatus32(BQ28Z610_SAFETY_STATUS_COMMAND, safetyStatus) && ok;
 
     if (!ok) {
         return false;
@@ -1386,21 +1498,51 @@ bool BatteryManager::updateGaugeMeasurements() {
     currentBatteryCurrentMilliAmps = batteryCurrent;
     currentRemainingCapacityMilliAmpHours = remainingCapacity;
     currentFullChargeCapacityMilliAmpHours = fullChargeCapacity;
-    gaugeDesignCapacityMilliAmpHours = designCapacity;
-    gaugeQMaxPackMilliAmpHours = qmaxPack;
-    gaugeUpdateStatus = updateStatus;
     gaugeSafetyStatus = safetyStatus;
-    gaugeGaugingStatus = gaugingStatus;
-    gaugeManufacturingStatus = manufacturingStatus;
-    gaugeDaConfiguration = daConfiguration;
-    trueRemainingCapacity = static_cast<int16_t>(static_cast<uint16_t>(itStatus1[1] << 8) | itStatus1[0]);
-    trueFullChargeCapacity = static_cast<uint16_t>(itStatus1[9] << 8) | itStatus1[8];
-    gaugeTrueRemainingCapacityMilliAmpHours = trueRemainingCapacity;
-    gaugeTrueFullChargeCapacityMilliAmpHours = trueFullChargeCapacity;
-    gaugeCell1VoltageMillivolts = static_cast<uint16_t>(daStatus1[1] << 8) | daStatus1[0];
-    gaugeCell2VoltageMillivolts = static_cast<uint16_t>(daStatus1[3] << 8) | daStatus1[2];
-    gaugeBatVoltageMillivolts = static_cast<uint16_t>(daStatus1[9] << 8) | daStatus1[8];
-    gaugePackVoltageMillivolts = static_cast<uint16_t>(daStatus1[11] << 8) | daStatus1[10];
+
+    if (!full) {
+        return true;
+    }
+
+    // --- Slow diagnostics (data flash + MAC blocks): every FULL_POLL_EVERY polls / on demand ---
+    uint8_t daStatus1[12] = {0};
+    uint8_t itStatus1[24] = {0};
+    uint32_t gaugingStatus = 0;
+    uint16_t manufacturingStatus = 0;
+    uint16_t operationStatus = 0;
+    uint8_t daConfiguration = 0;
+    uint16_t designCapacity = 0;
+    uint16_t qmaxPack = 0;
+    uint8_t updateStatus = 0;
+    uint16_t chemId = 0;
+
+    bool diagOk = readGaugeOperationStatus(operationStatus);
+    diagOk = readGaugeAltStatus32(BQ28Z610_GAUGING_STATUS_COMMAND, gaugingStatus) && diagOk;
+    diagOk = readGaugeAltStatus16(BQ28Z610_MANUFACTURING_STATUS_COMMAND, manufacturingStatus) && diagOk;
+    diagOk = readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, daConfiguration) && diagOk;
+    diagOk = readGaugeAltBlock(BQ28Z610_DA_STATUS_1_COMMAND, daStatus1, sizeof(daStatus1)) && diagOk;
+    diagOk = readGaugeAltBlock(BQ28Z610_IT_STATUS_1_COMMAND, itStatus1, sizeof(itStatus1)) && diagOk;
+    diagOk = readGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, designCapacity) && diagOk;
+    diagOk = readGaugeDataFlashWord(BQ28Z610_QMAX_PACK_ADDRESS, qmaxPack) && diagOk;
+    diagOk = readGaugeDataFlashByte(BQ28Z610_UPDATE_STATUS_ADDRESS, updateStatus) && diagOk;
+    diagOk = readGaugeChemId(chemId) && diagOk;
+
+    if (diagOk) {
+        gaugeOperationStatus = operationStatus;
+        gaugeGaugingStatus = gaugingStatus;
+        gaugeManufacturingStatus = manufacturingStatus;
+        gaugeDaConfiguration = daConfiguration;
+        gaugeDesignCapacityMilliAmpHours = designCapacity;
+        gaugeQMaxPackMilliAmpHours = qmaxPack;
+        gaugeUpdateStatus = updateStatus;
+        gaugeChemId = chemId;
+        gaugeTrueRemainingCapacityMilliAmpHours = static_cast<int16_t>(static_cast<uint16_t>(itStatus1[1] << 8) | itStatus1[0]);
+        gaugeTrueFullChargeCapacityMilliAmpHours = static_cast<uint16_t>(itStatus1[9] << 8) | itStatus1[8];
+        gaugeCell1VoltageMillivolts = static_cast<uint16_t>(daStatus1[1] << 8) | daStatus1[0];
+        gaugeCell2VoltageMillivolts = static_cast<uint16_t>(daStatus1[3] << 8) | daStatus1[2];
+        gaugeBatVoltageMillivolts = static_cast<uint16_t>(daStatus1[9] << 8) | daStatus1[8];
+        gaugePackVoltageMillivolts = static_cast<uint16_t>(daStatus1[11] << 8) | daStatus1[10];
+    }
     return true;
 }
 
@@ -1677,11 +1819,12 @@ bool BatteryManager::clearChargerFaultHistory() {
     return ok;
 }
 
-bool BatteryManager::updateChargerMeasurements() {
+bool BatteryManager::updateChargerMeasurements(bool full) {
     if (!chargerPresent) {
         return false;
     }
 
+    // --- Per-second: live status, faults and ADC results ---
     bool ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_0_REGISTER, chargerStatus0);
     ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_1_REGISTER, chargerStatus1) && ok;
     ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_2_REGISTER, chargerStatus2) && ok;
@@ -1689,21 +1832,25 @@ bool BatteryManager::updateChargerMeasurements() {
     ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_4_REGISTER, chargerStatus4) && ok;
     ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_STATUS_0_REGISTER, chargerFaultStatus0) && ok;
     ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_STATUS_1_REGISTER, chargerFaultStatus1) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_FLAG_0_REGISTER, chargerFlag0) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_FLAG_1_REGISTER, chargerFlag1) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_FLAG_2_REGISTER, chargerFlag2) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_FLAG_3_REGISTER, chargerFlag3) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_FLAG_0_REGISTER, chargerFaultFlag0) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_FLAG_1_REGISTER, chargerFaultFlag1) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_RECHARGE_CONTROL_REGISTER, chargerRechargeControlRegister) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_MIN_SYSTEM_VOLTAGE_REGISTER, chargerMinimumSystemVoltageRegister) && ok;
-    ok = readRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_VOLTAGE_REGISTER, chargerChargeVoltageRegister) && ok;
-    ok = readRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_CURRENT_REGISTER, chargerChargeCurrentRegister) && ok;
-    ok = readRegister16BE(BQ25792_ADDRESS, BQ25792_INPUT_CURRENT_REGISTER, chargerInputCurrentRegister) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, chargerControl0Register) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_1_REGISTER, chargerControl1Register) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_NTC_CONTROL_1_REGISTER, chargerNtcControl1Register) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_ADC_CONTROL_REGISTER, chargerAdcControlRegister) && ok;
+
+    if (full) {
+        // --- Slow: sticky flags (clear-on-read, accumulated into *History) and config registers ---
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_FLAG_0_REGISTER, chargerFlag0) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_FLAG_1_REGISTER, chargerFlag1) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_FLAG_2_REGISTER, chargerFlag2) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_FLAG_3_REGISTER, chargerFlag3) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_FLAG_0_REGISTER, chargerFaultFlag0) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_FLAG_1_REGISTER, chargerFaultFlag1) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_RECHARGE_CONTROL_REGISTER, chargerRechargeControlRegister) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_MIN_SYSTEM_VOLTAGE_REGISTER, chargerMinimumSystemVoltageRegister) && ok;
+        ok = readRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_VOLTAGE_REGISTER, chargerChargeVoltageRegister) && ok;
+        ok = readRegister16BE(BQ25792_ADDRESS, BQ25792_CHARGE_CURRENT_REGISTER, chargerChargeCurrentRegister) && ok;
+        ok = readRegister16BE(BQ25792_ADDRESS, BQ25792_INPUT_CURRENT_REGISTER, chargerInputCurrentRegister) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, chargerControl0Register) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_1_REGISTER, chargerControl1Register) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_NTC_CONTROL_1_REGISTER, chargerNtcControl1Register) && ok;
+        ok = readRegister8(BQ25792_ADDRESS, BQ25792_ADC_CONTROL_REGISTER, chargerAdcControlRegister) && ok;
+    }
 
     uint16_t vbatMillivolts = 0;
     uint16_t vsysMillivolts = 0;
@@ -1756,9 +1903,25 @@ void BatteryManager::assertChargerEnablePin() {
     chargerEnablePinAsserted = true;
 }
 
+void BatteryManager::releaseChargerEnablePin() {
+    // High-Z: the on-board 2 MOhm pull-up takes CE high = charging disabled.
+    gpio_config_t configuration = {};
+    configuration.pin_bit_mask = 1ULL << BATTERY_CHARGER_ENABLE_PIN;
+    configuration.mode = GPIO_MODE_INPUT;
+    configuration.pull_up_en = GPIO_PULLUP_DISABLE;
+    configuration.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    configuration.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&configuration);
+    chargerEnablePinAsserted = false;
+}
+
 void BatteryManager::prepareForDeepSleep() {
     const gpio_num_t chargerEnablePin = static_cast<gpio_num_t>(BATTERY_CHARGER_ENABLE_PIN);
-    assertChargerEnablePin();
+    if (chargerVoltageVerified) {
+        assertChargerEnablePin();
+    } else {
+        releaseChargerEnablePin();
+    }
     // GPIO44 is a digital-only pad: this hold keeps CE low through the sleep transition
     // but is released once deep sleep actually starts. The global gpio_deep_sleep_hold_en()
     // that used to arm it is intentionally NOT called — it freezes the flash/octal-PSRAM
@@ -1769,6 +1932,9 @@ void BatteryManager::prepareForDeepSleep() {
     gpio_hold_en(chargerEnablePin);
 }
 
+// Bit-bang primitives. These use the Arduino pin API on purpose: a register-driven
+// open-drain variant (faster edges) produced corrupted reads from both the charger and the
+// gauge on the bench and was reverted; revisit only with a scope on the bus.
 void BatteryManager::releaseSDA() {
     pinMode(BATTERY_I2C_SDA_PIN, INPUT_PULLUP);
 }
@@ -1787,13 +1953,17 @@ void BatteryManager::driveSCLLow() {
     digitalWrite(BATTERY_I2C_SCL_PIN, LOW);
 }
 
+static inline bool batteryBusPinHigh(int pin) {
+    return digitalRead(pin) != LOW;
+}
+
 void BatteryManager::i2cDelay() {
     delayMicroseconds(I2C_DELAY_US);
 }
 
 bool BatteryManager::waitForSCLHigh() {
     unsigned long start = micros();
-    while (digitalRead(BATTERY_I2C_SCL_PIN) == LOW) {
+    while (!batteryBusPinHigh(BATTERY_I2C_SCL_PIN)) {
         if (micros() - start >= CLOCK_STRETCH_TIMEOUT_US) {
             return false;
         }
@@ -1801,14 +1971,43 @@ bool BatteryManager::waitForSCLHigh() {
     return true;
 }
 
-void BatteryManager::i2cStart() {
+// Standard I2C bus recovery. A slave left mid-transaction (the ESP resets while a poll is in
+// flight, which with a ~100 ms/s poll duty is likely on every reflash) keeps clocking out its
+// current byte and every subsequent read returns 0x7F/0xBF/0xFF patterns until it sees nine
+// clocks with SDA released followed by a STOP. Slaves do not reset with the host.
+void BatteryManager::i2cBusRecover() {
     releaseSDA();
     releaseSCL();
     waitForSCLHigh();
     i2cDelay();
+    for (int i = 0; i < 9; ++i) {
+        driveSCLLow();
+        i2cDelay();
+        releaseSCL();
+        waitForSCLHigh();
+        i2cDelay();
+    }
+    // STOP: SDA low while SCL low, SCL high, then SDA high.
+    driveSCLLow();
+    i2cDelay();
+    driveSDALow();
+    i2cDelay();
+    releaseSCL();
+    waitForSCLHigh();
+    i2cDelay();
+    releaseSDA();
+    delayMicroseconds(I2C_BUS_FREE_US);
+}
+
+void BatteryManager::i2cStart() {
+    releaseSDA();
+    releaseSCL();
+    waitForSCLHigh();
+    delayMicroseconds(I2C_BUS_FREE_US); // tBUF / command-to-read gap required by the gauge
     driveSDALow();
     i2cDelay();
     driveSCLLow();
+    i2cDelay();
 }
 
 void BatteryManager::i2cStop() {
@@ -1845,7 +2044,7 @@ bool BatteryManager::i2cWriteByte(uint8_t value) {
         return false;
     }
 
-    bool acknowledged = digitalRead(BATTERY_I2C_SDA_PIN) == LOW;
+    bool acknowledged = !batteryBusPinHigh(BATTERY_I2C_SDA_PIN);
     i2cDelay();
     driveSCLLow();
     return acknowledged;
@@ -1860,7 +2059,7 @@ uint8_t BatteryManager::i2cReadByte(bool ack) {
         releaseSCL();
         waitForSCLHigh();
         i2cDelay();
-        if (digitalRead(BATTERY_I2C_SDA_PIN)) {
+        if (batteryBusPinHigh(BATTERY_I2C_SDA_PIN)) {
             value |= 0x01;
         }
         driveSCLLow();
@@ -1878,6 +2077,8 @@ uint8_t BatteryManager::i2cReadByte(bool ack) {
     waitForSCLHigh();
     i2cDelay();
     driveSCLLow();
+    i2cDelay(); // SCL low time before the next byte's first clock: without it the gauge misses one
+                // clock per byte (reads come back as 0x7F/0xBF patterns). The charger tolerated it.
     releaseSDA();
     return value;
 }

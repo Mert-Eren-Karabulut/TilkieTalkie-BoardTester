@@ -648,6 +648,7 @@ static void runDeadCellRecoveryHold()
 // discharge (HIZ intentional there).
 static void superviseChargerOnUsb()
 {
+    constexpr uint16_t kFastChargeCurrentMa = 1000;
     static uint8_t pdBudgetChecksLeft = 0;
     static unsigned long lastPdBudgetCheck = 0;
     static unsigned long lastChargeKick = 0;
@@ -729,7 +730,9 @@ static void superviseChargerOnUsb()
     }
     else if (v > 3.15f)
     {
-        wanted = 2000; // datasheet 0.5C "Rapid Charging Current"
+        // Cell allows 0.5C (2 A) but the 1.0 mm-pitch single-contact cell connector (CN33)
+        // and the ~100 mOhm cell-to-PACK path do not: the charger was in CV at 1.4 A anyway.
+        wanted = kFastChargeCurrentMa;
     }
     if (wanted == 0)
     {
@@ -768,7 +771,9 @@ static void superviseChargerOnUsb()
         }
     }
 
-    if (!battery.getChargingStatus() && millis() - lastChargeKick > 10000)
+    // Never "kick" after Charge Done: toggling EN_CHG there starts a fresh CC/CV cycle every
+    // 10 s, so the cell never rests at full (which the gauge needs to learn capacity).
+    if (!battery.getChargingStatus() && !battery.isChargeDone() && millis() - lastChargeKick > 10000)
     {
         lastChargeKick = millis();
         ESP_LOGW(TAG, "CHARGER: USB present but not charging — clearing faults + kicking charger.");
@@ -2051,6 +2056,7 @@ void loop()
         // Battery commands
         else if (command == "battery")
         {
+            battery.refreshDiagnostics(); // the slow gauge/charger reads are no longer polled every second
             battery.printBatteryInfo();
         }
         else if (command == "battscan")
