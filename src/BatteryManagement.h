@@ -422,6 +422,10 @@ public:
     bool isChargeDone() const;              // BQ25792 CHG_STAT = 111 (charge termination done)
     bool isChargerVoltageVerified() const { return chargerVoltageVerified; }
     void refreshDiagnostics();              // force the slow gauge/charger diagnostic reads now
+    // Gauge data-flash access for bench diagnostics (byte-wise, via MAC 0x3E; gauge must be
+    // unsealed - this product's gauges ship in FULL ACCESS).
+    bool readGaugeDataFlash(uint16_t address, uint8_t *buffer, size_t length);
+    bool writeGaugeDataFlash8(uint16_t address, uint8_t value);
     // BQ25792 ship mode (REG11 SDRV_CTRL=10b): opens the internal BATFET, disconnecting
     // the cell from SYS (~µA cell drain). On battery power this kills the system
     // immediately; wake is USB plug-in only (QON is not wired on this board). Writing it

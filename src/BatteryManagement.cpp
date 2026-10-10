@@ -1030,6 +1030,34 @@ void BatteryManager::refreshDiagnostics() {
     updateChargingStatus();
 }
 
+bool BatteryManager::readGaugeDataFlash(uint16_t address, uint8_t *buffer, size_t length) {
+    if (!gaugePresent || !buffer) {
+        return false;
+    }
+    for (size_t i = 0; i < length; ++i) {
+        if (!readGaugeDataFlashByte(static_cast<uint16_t>(address + i), buffer[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool BatteryManager::writeGaugeDataFlash8(uint16_t address, uint8_t value) {
+    if (!gaugePresent) {
+        return false;
+    }
+    const bool wasSealed = gaugeSealed;
+    if (gaugeSealed && !unsealGauge()) {
+        return false;
+    }
+    bool ok = writeGaugeDataFlashByte(address, value);
+    if (wasSealed) {
+        sealGauge();
+        gaugeSealed = true;
+    }
+    return ok;
+}
+
 bool BatteryManager::readGaugeChemId(uint16_t &chemId) {
     return gaugePresent && readGaugeAltStatus16(BQ28Z610_CHEM_ID_COMMAND, chemId);
 }

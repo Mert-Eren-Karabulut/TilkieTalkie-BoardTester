@@ -1175,6 +1175,7 @@ void loop()
             ESP_LOGI(TAG, "  speedtest - Test network download speed (AsyncTCP Module)");
             ESP_LOGI(TAG, "Battery Commands:");
             ESP_LOGI(TAG, "  battery - Show battery status");
+            ESP_LOGI(TAG, "  dfread <hexaddr> [len] / dfwrite8 <hexaddr> <hexval> - gauge data flash (bench)");
             ESP_LOGI(TAG, "  battscan - Scan the battery I2C bus for responding devices");
             ESP_LOGI(TAG, "  batterycfg - Reapply 4V5 rail and charger defaults");
             ESP_LOGI(TAG, "  batteryclearflags - Clear latched BQ25792 charger/fault flags");
@@ -2118,6 +2119,56 @@ void loop()
         }
         // gaugeprot: read back and decode the gauge's actual protection config (CUV
         // enable/latch/threshold, COV/OCC) to diagnose the over-discharge behaviour.
+        else if (command.startsWith("dfread ") && DEBUG)
+        {
+            // dfread <hexaddr> [len]  - dump gauge data flash bytes (bench diagnostics)
+            String args = command.substring(7);
+            args.trim();
+            int sp = args.indexOf(' ');
+            String addrStr = sp > 0 ? args.substring(0, sp) : args;
+            int len = sp > 0 ? args.substring(sp + 1).toInt() : 1;
+            if (len < 1) len = 1;
+            if (len > 32) len = 32;
+            uint16_t addr = static_cast<uint16_t>(strtol(addrStr.c_str(), nullptr, 16));
+            uint8_t buf[32] = {0};
+            if (battery.readGaugeDataFlash(addr, buf, len))
+            {
+                String line = "DF 0x" + String(addr, HEX) + ":";
+                for (int i = 0; i < len; i++)
+                {
+                    char b[6];
+                    snprintf(b, sizeof(b), " %02x", buf[i]);
+                    line += b;
+                }
+                if (len == 2)
+                {
+                    line += "  (u16 LE = " + String(static_cast<uint16_t>(buf[0] | (buf[1] << 8))) + ")";
+                }
+                ESP_LOGI(TAG, "%s", line.c_str());
+            }
+            else
+            {
+                ESP_LOGE(TAG, "dfread failed");
+            }
+        }
+        else if (command.startsWith("dfwrite8 ") && DEBUG)
+        {
+            // dfwrite8 <hexaddr> <hexval> - write one gauge data flash byte (bench diagnostics)
+            String args = command.substring(9);
+            args.trim();
+            int sp = args.indexOf(' ');
+            if (sp <= 0)
+            {
+                ESP_LOGI(TAG, "Usage: dfwrite8 <hexaddr> <hexval>");
+            }
+            else
+            {
+                uint16_t addr = static_cast<uint16_t>(strtol(args.substring(0, sp).c_str(), nullptr, 16));
+                uint8_t val = static_cast<uint8_t>(strtol(args.substring(sp + 1).c_str(), nullptr, 16));
+                bool ok = battery.writeGaugeDataFlash8(addr, val);
+                ESP_LOGI(TAG, "dfwrite8 0x%04x <- 0x%02x : %s", addr, val, ok ? "OK (verified)" : "FAILED");
+            }
+        }
         else if (command == "gaugeprot")
         {
             battery.printProtectionConfig();
