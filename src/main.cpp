@@ -22,6 +22,7 @@
 #include "AsyncSpeedTest.h"
 #include "SleepController.h"
 #include "rtc_wake_stub_vbus.h"
+#include "Diag.h"
 
 // The espidf CMake build compiles every file in src/ regardless of build_src_filter,
 // so the sleep-probe build (env:sleepprobe, -DSLEEP_PROBE_BUILD) excludes this whole
@@ -785,6 +786,7 @@ void setup()
     }
     ESP_LOGI(TAG, "=== TilkieTalkie Board Tester ===");
     ESP_LOGI(TAG, "Initializing system...");
+    Diag::logBootInfo(); // reset reason, heap, stored core dump
 
     // Initialize battery management FIRST — its I2C bus is independent of the 4V5 rail.
     // This restores the gauge protection FETs so the cell is connected and can buffer
@@ -1113,6 +1115,8 @@ static unsigned long lastStackCheck = 0;
 
 void loop()
 {
+    Diag::periodicReport(10000); // loop section timing + heap every 10 s
+
     // Stack monitoring every 10 seconds
     unsigned long now = millis();
     if (now - lastStackCheck > 10000)
@@ -1158,6 +1162,10 @@ void loop()
             ESP_LOGI(TAG, "  efusemac - Show device efuse MAC in decimal and hex");
             ESP_LOGI(TAG, "  heap    - Show detailed heap information");
             ESP_LOGI(TAG, "  stack   - Show stack usage information");
+            ESP_LOGI(TAG, "  timing  - Show loop section timing (max/worst/avg per update())");
+            ESP_LOGI(TAG, "  tasks   - Show FreeRTOS task CPU usage and stacks");
+            ESP_LOGI(TAG, "  coredump - Show summary of a stored crash core dump");
+            ESP_LOGI(TAG, "  coredumperase - Erase the stored core dump");
             ESP_LOGI(TAG, "  factory - Factory reset (erase all data)");
             ESP_LOGI(TAG, "  speedtest - Test network download speed (AsyncTCP Module)");
             ESP_LOGI(TAG, "Battery Commands:");
@@ -2333,6 +2341,22 @@ void loop()
 
             ESP_LOGI(TAG, "----------------------------------");
         }
+        else if (command == "timing")
+        {
+            Diag::printSectionStats(false);
+        }
+        else if (command == "tasks")
+        {
+            Diag::printTaskStats();
+        }
+        else if (command == "coredump")
+        {
+            Diag::printCoreDumpSummary();
+        }
+        else if (command == "coredumperase")
+        {
+            Diag::eraseCoreDump();
+        }
         // Stack monitoring command
         else if (command == "stack")
         {
@@ -2445,7 +2469,7 @@ void loop()
     }
 
     // Update battery management
-    battery.update();
+    TT_TIMED("battery", battery.update());
 
     // Low-battery cutoff: BATTERY-ONLY. With VBUS present this must never fire — the NVDC
     // power path runs SYS from USB regardless of the cell, and force-sleeping on USB is
@@ -2504,7 +2528,7 @@ void loop()
     // battery + bring-up + LED alive, then start the full system once it recovers. This
     // prevents the brown-out/reboot loop a depleted cell causes during WiFi bring-up.
     // Charger supervision runs in every phase (monitor AND full-run) while USB is present.
-    superviseChargerOnUsb();
+    TT_TIMED("charger", superviseChargerOnUsb());
 
     if (gSystemPhase == PHASE_MONITOR)
     {
@@ -2582,37 +2606,37 @@ void loop()
     updateBringup();
 
     // Update file manager
-    fileManager.update();
+    TT_TIMED("files", fileManager.update());
 
     // Update audio controller
-    audioController.update();
+    TT_TIMED("audio", audioController.update());
 
     // Handle WiFi background reconnection (only when credentials exist but not connected)
-    wifiProv.handleBackgroundReconnection();
+    TT_TIMED("wifi", wifiProv.handleBackgroundReconnection());
 
     // Update Reverb client only if WiFi is connected
     if (WiFi.isConnected())
     {
-        reverb.update();
+        TT_TIMED("reverb", reverb.update());
     }
 
     // Update LED controller (handles pulse and pulseRapid animations)
-    ledController.update();
+    TT_TIMED("led", ledController.update());
 
     // Update Button controller (handles button state changes and callbacks)
-    buttonController.update();
+    TT_TIMED("buttons", buttonController.update());
 
     // Update NFC controller — skipped during first-boot bring-up so figure events don't
     // fight the bring-up LED indication.
     if (gBringupPhase == BRINGUP_INACTIVE)
     {
-        nfcController.update();
+        TT_TIMED("nfc", nfcController.update());
         // Deliver deferred figure completion callbacks after NFC state is refreshed.
-        requestManager.update();
+        TT_TIMED("request", requestManager.update());
     }
 
     // Charge bar while docked (transient NFC/audio pulses play over it and it resumes).
-    updateChargingUx();
+    TT_TIMED("chargeux", updateChargingUx());
 
     // No sleeping while docked: charging is the toy's "plugged in" UX. resetActivity()
     // keeps the inactivity countdown cleared (silent no-op once clear), so after unplug
@@ -2625,7 +2649,7 @@ void loop()
     }
     else
     {
-        sleepController.update();
+        TT_TIMED("sleep", sleepController.update());
     }
 
     delay(1);
