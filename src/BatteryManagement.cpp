@@ -646,6 +646,10 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
         // Repair Broadcast Pacing (0x4629), corrupted by the old "Chem ID" write to 0x4628.
         ensureGaugeBroadcastPacing();
 
+        // Idempotent 1S LFP charge profile (charging voltages, range boundaries, termination,
+        // design voltage). Units provisioned by older firmware have the Li-ion defaults here.
+        ensureGaugeLfpChargeProfile();
+
         gaugeConfigured = provisioned && singleCellReady && fetControlReady;
         ok = gaugeConfigured && ok;
     }
@@ -1062,6 +1066,69 @@ bool BatteryManager::readGaugeChemId(uint16_t &chemId) {
     return gaugePresent && readGaugeAltStatus16(BQ28Z610_CHEM_ID_COMMAND, chemId);
 }
 
+bool BatteryManager::ensureGaugeLfpChargeProfile() {
+    if (!gaugePresent || gaugeAddress != BQ28Z610_PRIMARY_ADDRESS) {
+        return false;
+    }
+    struct Field { uint16_t address; uint16_t value; bool isByte; const char *name; };
+    static const Field kProfile[] = {
+        { BQ28Z610_LOW_TEMP_CHARGING_VOLTAGE_ADDRESS,  DEFAULT_GAUGE_CHARGING_VOLTAGE_MV,   false, "Low Temp Charging Voltage" },
+        { BQ28Z610_STD_TEMP_CHARGING_VOLTAGE_ADDRESS,  DEFAULT_GAUGE_CHARGING_VOLTAGE_MV,   false, "Standard Temp Charging Voltage" },
+        { BQ28Z610_HIGH_TEMP_CHARGING_VOLTAGE_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV,   false, "High Temp Charging Voltage" },
+        { BQ28Z610_REC_TEMP_CHARGING_VOLTAGE_ADDRESS,  DEFAULT_GAUGE_CHARGING_VOLTAGE_MV,   false, "Rec Temp Charging Voltage" },
+        { BQ28Z610_VOLTAGE_RANGE_LOW_ADDRESS,          DEFAULT_GAUGE_VOLTAGE_RANGE_LOW_MV,  false, "Charging Voltage Low (range)" },
+        { BQ28Z610_VOLTAGE_RANGE_MED_ADDRESS,          DEFAULT_GAUGE_VOLTAGE_RANGE_MED_MV,  false, "Charging Voltage Med (range)" },
+        { BQ28Z610_VOLTAGE_RANGE_HIGH_ADDRESS,         DEFAULT_GAUGE_VOLTAGE_RANGE_HIGH_MV, false, "Charging Voltage High (range)" },
+        { BQ28Z610_TAPER_CURRENT_ADDRESS,              DEFAULT_GAUGE_TAPER_CURRENT_MA,      false, "Charge Term Taper Current" },
+        { BQ28Z610_CHARGE_TERM_VOLTAGE_ADDRESS,        DEFAULT_GAUGE_CHARGE_TERM_VOLTAGE_MV, false, "Charge Term Voltage" },
+        { BQ28Z610_DESIGN_VOLTAGE_ADDRESS,             DEFAULT_GAUGE_DESIGN_VOLTAGE_MV,     false, "Design Voltage" },
+        { BQ28Z610_REC_TEMP_CHARGING_CURRENT_MED_ADDRESS, DEFAULT_GAUGE_REC_TEMP_CHARGING_CURRENT_MED_MA, false, "Rec Temp Charging Current Med" },
+        { BQ28Z610_I2C_CONFIGURATION_ADDRESS,          DEFAULT_GAUGE_I2C_CONFIGURATION,     true,  "I2C Configuration" },
+    };
+
+    const bool wasSealed = gaugeSealed;
+    bool unsealed = false;
+    bool allOk = true;
+    int fixed = 0;
+    for (const Field &f : kProfile) {
+        uint16_t current = 0;
+        uint8_t currentByte = 0;
+        const bool readOk = f.isByte ? readGaugeDataFlashByte(f.address, currentByte)
+                                     : readGaugeDataFlashWord(f.address, current);
+        if (!readOk) {
+            allOk = false;
+            continue;
+        }
+        const uint16_t have = f.isByte ? currentByte : current;
+        if (have == f.value) {
+            continue;
+        }
+        if (gaugeSealed && !unsealed) {
+            if (!unsealGauge()) {
+                Serial.println("BatteryManager: LFP profile - cannot unseal gauge");
+                return false;
+            }
+            unsealed = true;
+        }
+        const bool wrote = f.isByte ? writeGaugeDataFlashByte(f.address, static_cast<uint8_t>(f.value))
+                                    : writeGaugeDataFlashWord(f.address, f.value);
+        Serial.printf("BatteryManager: LFP profile - %s 0x%04X: %u -> %u %s\n",
+                      f.name, f.address, have, f.value, wrote ? "OK" : "FAILED");
+        allOk = wrote && allOk;
+        if (wrote) {
+            fixed++;
+        }
+    }
+    if (unsealed && wasSealed) {
+        sealGauge();
+        gaugeSealed = true;
+    }
+    if (fixed > 0) {
+        Serial.printf("BatteryManager: LFP profile - %d field(s) corrected\n", fixed);
+    }
+    return allOk;
+}
+
 bool BatteryManager::ensureGaugeBroadcastPacing() {
     if (!gaugePresent) {
         return false;
@@ -1354,7 +1421,7 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
     ok = readGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, designCapacity) && ok;
     ok = readGaugeDataFlashWord(BQ28Z610_DESIGN_ENERGY_ADDRESS, designEnergy) && ok;
     ok = readGaugeDataFlashWord(BQ28Z610_TERMINATE_VOLTAGE_ADDRESS, terminateVoltage) && ok;
-    ok = readGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_MED_ADDRESS, chargingVoltage) && ok;
+    ok = readGaugeDataFlashWord(BQ28Z610_STD_TEMP_CHARGING_VOLTAGE_ADDRESS, chargingVoltage) && ok;
     ok = readGaugeDataFlashWord(BQ28Z610_TAPER_CURRENT_ADDRESS, taperCurrent) && ok;
     ok = readGaugeDataFlashWord(BQ28Z610_DSG_CURRENT_THRESHOLD_ADDRESS, dsgThreshold) && ok;
     ok = readGaugeDataFlashWord(BQ28Z610_CHG_CURRENT_THRESHOLD_ADDRESS, chgThreshold) && ok;
@@ -1401,9 +1468,15 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
         ok = writeGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, DEFAULT_GAUGE_DESIGN_CAPACITY_MAH) && ok;
         ok = writeGaugeDataFlashWord(BQ28Z610_DESIGN_ENERGY_ADDRESS, DEFAULT_GAUGE_DESIGN_ENERGY_MWH) && ok;
         ok = writeGaugeDataFlashWord(BQ28Z610_TERMINATE_VOLTAGE_ADDRESS, DEFAULT_GAUGE_TERMINATE_VOLTAGE_MV) && ok;
-        ok = writeGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_LOW_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
-        ok = writeGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_MED_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
-        ok = writeGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_HIGH_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_LOW_TEMP_CHARGING_VOLTAGE_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_STD_TEMP_CHARGING_VOLTAGE_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_HIGH_TEMP_CHARGING_VOLTAGE_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_REC_TEMP_CHARGING_VOLTAGE_ADDRESS, DEFAULT_GAUGE_CHARGING_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_VOLTAGE_RANGE_LOW_ADDRESS, DEFAULT_GAUGE_VOLTAGE_RANGE_LOW_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_VOLTAGE_RANGE_MED_ADDRESS, DEFAULT_GAUGE_VOLTAGE_RANGE_MED_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_VOLTAGE_RANGE_HIGH_ADDRESS, DEFAULT_GAUGE_VOLTAGE_RANGE_HIGH_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_CHARGE_TERM_VOLTAGE_ADDRESS, DEFAULT_GAUGE_CHARGE_TERM_VOLTAGE_MV) && ok;
+        ok = writeGaugeDataFlashWord(BQ28Z610_DESIGN_VOLTAGE_ADDRESS, DEFAULT_GAUGE_DESIGN_VOLTAGE_MV) && ok;
         ok = writeGaugeDataFlashWord(BQ28Z610_TAPER_CURRENT_ADDRESS, DEFAULT_GAUGE_TAPER_CURRENT_MA) && ok;
         ok = writeGaugeDataFlashWord(BQ28Z610_DSG_CURRENT_THRESHOLD_ADDRESS, DEFAULT_GAUGE_DSG_CURRENT_THRESHOLD_MA) && ok;
         ok = writeGaugeDataFlashWord(BQ28Z610_CHG_CURRENT_THRESHOLD_ADDRESS, DEFAULT_GAUGE_CHG_CURRENT_THRESHOLD_MA) && ok;
@@ -1438,7 +1511,7 @@ bool BatteryManager::ensureGaugeProvisioned(bool force) {
         ok = readGaugeDataFlashWord(BQ28Z610_DESIGN_CAPACITY_ADDRESS, designCapacity) && ok;
         ok = readGaugeDataFlashWord(BQ28Z610_DESIGN_ENERGY_ADDRESS, designEnergy) && ok;
         ok = readGaugeDataFlashWord(BQ28Z610_TERMINATE_VOLTAGE_ADDRESS, terminateVoltage) && ok;
-        ok = readGaugeDataFlashWord(BQ28Z610_CHARGING_VOLTAGE_MED_ADDRESS, chargingVoltage) && ok;
+        ok = readGaugeDataFlashWord(BQ28Z610_STD_TEMP_CHARGING_VOLTAGE_ADDRESS, chargingVoltage) && ok;
         ok = readGaugeDataFlashWord(BQ28Z610_TAPER_CURRENT_ADDRESS, taperCurrent) && ok;
         ok = readGaugeDataFlashWord(BQ28Z610_DSG_CURRENT_THRESHOLD_ADDRESS, dsgThreshold) && ok;
         ok = readGaugeDataFlashWord(BQ28Z610_CHG_CURRENT_THRESHOLD_ADDRESS, chgThreshold) && ok;
@@ -2390,17 +2463,15 @@ bool BatteryManager::writeGaugeDataFlashByte(uint16_t address, uint8_t value) {
         return false;
     }
 
-    delay(15); // data-flash commit time
-
-    // Some writes (e.g. DA Configuration cell count) make the gauge reconfigure
-    // immediately, so the first readback can transiently fail even though the
-    // value committed. Retry the verify before declaring failure.
+    // Data-flash commit time: measured on the bench, a read-back within ~65 ms still returns
+    // the OLD value although the write commits (every write was reported FAILED while the
+    // read-back a second later showed the new value). Poll for up to ~400 ms.
     uint8_t verify = 0;
-    for (int attempt = 0; attempt < 5; ++attempt) {
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        delay(20);
         if (readGaugeDataFlashByte(address, verify) && verify == value) {
             return true;
         }
-        delay(10);
     }
     return false;
 }
@@ -2425,14 +2496,13 @@ bool BatteryManager::writeGaugeDataFlashWord(uint16_t address, uint16_t value) {
         return false;
     }
 
-    delay(15); // data-flash commit time
-
+    // Commit can take well over 65 ms (see writeGaugeDataFlashByte); poll up to ~400 ms.
     uint16_t verify = 0;
-    for (int attempt = 0; attempt < 5; ++attempt) {
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        delay(20);
         if (readGaugeDataFlashWord(address, verify) && verify == value) {
             return true;
         }
-        delay(10);
     }
     return false;
 }

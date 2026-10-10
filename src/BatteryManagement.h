@@ -129,9 +129,20 @@ private:
     static const uint16_t BQ28Z610_CHARGING_CONFIGURATION_ADDRESS = 0x465E;
     static const uint16_t BQ28Z610_TEMPERATURE_ENABLE_ADDRESS = 0x469A;
     // Charging Voltage is per JEITA temperature zone (Low/Med/High); set all for 1S LFP.
-    static const uint16_t BQ28Z610_CHARGING_VOLTAGE_LOW_ADDRESS = 0x468C;
-    static const uint16_t BQ28Z610_CHARGING_VOLTAGE_MED_ADDRESS = 0x468E;
-    static const uint16_t BQ28Z610_CHARGING_VOLTAGE_HIGH_ADDRESS = 0x4690;
+    // Advanced Charge Algorithm. NOTE the naming trap that cost this product its charge
+    // termination: 0x468C/0x468E/0x4690 are the "Voltage Range" BOUNDARIES (Charging Voltage
+    // Low/Med/High, which select the charging-current range); the voltages the gauge expects
+    // the cell to reach are the per-temperature "Charging Voltage" fields below.
+    static const uint16_t BQ28Z610_VOLTAGE_RANGE_LOW_ADDRESS = 0x468C;   // TRM default 2900
+    static const uint16_t BQ28Z610_VOLTAGE_RANGE_MED_ADDRESS = 0x468E;   // TRM default 3600
+    static const uint16_t BQ28Z610_VOLTAGE_RANGE_HIGH_ADDRESS = 0x4690;
+    static const uint16_t BQ28Z610_LOW_TEMP_CHARGING_VOLTAGE_ADDRESS = 0x4666;  // TRM default 4000
+    static const uint16_t BQ28Z610_STD_TEMP_CHARGING_VOLTAGE_ADDRESS = 0x466E;  // TRM default 4200
+    static const uint16_t BQ28Z610_HIGH_TEMP_CHARGING_VOLTAGE_ADDRESS = 0x4676; // TRM default 4000
+    static const uint16_t BQ28Z610_REC_TEMP_CHARGING_VOLTAGE_ADDRESS = 0x467E;  // TRM default 4100
+    static const uint16_t BQ28Z610_REC_TEMP_CHARGING_CURRENT_MED_ADDRESS = 0x4682; // TRM default 4488 (old fw wrote 3600 here)
+    static const uint16_t BQ28Z610_CHARGE_TERM_VOLTAGE_ADDRESS = 0x4695; // I2, TRM default 75 mV (old fw zeroed it)
+    static const uint16_t BQ28Z610_DESIGN_VOLTAGE_ADDRESS = 0x462E;      // I2, TRM default 7200 (2S)
     static const uint16_t BQ28Z610_TAPER_CURRENT_ADDRESS = 0x4693; // was 0x4692 (=Charging Voltage Hysteresis)
     static const uint16_t BQ28Z610_DA_CONFIGURATION_ADDRESS = 0x469B;
     // Current Thresholds (Gas Gauging) — required for learning-cycle relax/charge/discharge
@@ -173,7 +184,8 @@ private:
     static const uint16_t DEFAULT_GAUGE_DESIGN_ENERGY_MWH = 1280;
     static const uint8_t DEFAULT_GAUGE_FET_OPTIONS = 0x20;
     static const uint8_t DEFAULT_GAUGE_I2C_GAUGING_CONFIGURATION = 0x04;
-    static const uint8_t DEFAULT_GAUGE_I2C_CONFIGURATION = 0x01;
+    static const uint8_t DEFAULT_GAUGE_I2C_CONFIGURATION = 0x00; // BCAST off: no smart charger on this bus, and the gauge
+                                                                   // becoming bus master every pacing interval collides with the bit-bang
     static const uint8_t DEFAULT_GAUGE_POWER_CONFIG = 0x00;
     static const uint16_t DEFAULT_GAUGE_SOC_FLAG_CONFIG_A = 0x0C8C;
     static const uint8_t DEFAULT_GAUGE_SOC_FLAG_CONFIG_B = 0x8C;
@@ -191,7 +203,13 @@ private:
     static const uint16_t DEFAULT_GAUGE_CHARGING_VOLTAGE_MV = 3600;  // LiFePO4 1S charge voltage (all temp zones)
     // SLUA777 §3 relationship: Taper > Dsg/Chg current threshold > Quit; Quit < C/20.
     // 4000mAh: C/10=400, C/20=200. Taper 200mA, Dsg 100, Chg 75, Quit 40.
-    static const uint16_t DEFAULT_GAUGE_TAPER_CURRENT_MA = 200;
+    static const uint16_t DEFAULT_GAUGE_TAPER_CURRENT_MA = 250;    // TRM default; must stay above the charger ITERM (120 mA)
+    static const uint16_t DEFAULT_GAUGE_CHARGE_TERM_VOLTAGE_MV = 100; // valid termination needs cell + this >= Charging Voltage
+    static const uint16_t DEFAULT_GAUGE_VOLTAGE_RANGE_LOW_MV = 2900;
+    static const uint16_t DEFAULT_GAUGE_VOLTAGE_RANGE_MED_MV = 3300;
+    static const uint16_t DEFAULT_GAUGE_VOLTAGE_RANGE_HIGH_MV = 3450;
+    static const uint16_t DEFAULT_GAUGE_DESIGN_VOLTAGE_MV = 3200;
+    static const uint16_t DEFAULT_GAUGE_REC_TEMP_CHARGING_CURRENT_MED_MA = 4488; // TI default, restored
     static const uint16_t DEFAULT_GAUGE_DSG_CURRENT_THRESHOLD_MA = 100;
     static const uint16_t DEFAULT_GAUGE_CHG_CURRENT_THRESHOLD_MA = 75;
     static const uint16_t DEFAULT_GAUGE_QUIT_CURRENT_MA = 40;
@@ -327,6 +345,7 @@ private:
     void releaseChargerEnablePin();
     bool verifyChargerVoltageSetting();
     bool ensureGaugeBroadcastPacing();
+    bool ensureGaugeLfpChargeProfile();
     bool readGaugeChemId(uint16_t &chemId);
     bool configureRt6160For4V5();
     bool configureChargerDefaults();
