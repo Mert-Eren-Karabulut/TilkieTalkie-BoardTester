@@ -1139,7 +1139,14 @@ void loop()
     {
         String command = Serial.readStringUntil('\n');
         command.trim();
-        command.toLowerCase();
+        // Lowercase only the command word: URLs, paths and hex arguments are case sensitive
+        // (a lowercased URL used to turn 10MB.zip into 10mb.zip).
+        {
+            int sp = command.indexOf(' ');
+            String word = sp > 0 ? command.substring(0, sp) : command;
+            word.toLowerCase();
+            command = sp > 0 ? word + command.substring(sp) : word;
+        }
 
         // Skip empty commands
         if (command.length() == 0)
@@ -1400,6 +1407,20 @@ void loop()
         else if (command == "sdtree")
         {
             fileManager.printFileTree();
+        }
+        else if (command.startsWith("sdwritebench"))
+        {
+            // sdwritebench [chunkKB] [count]
+            String args = command.substring(12);
+            args.trim();
+            int chunkKb = 32, count = 64;
+            if (args.length() > 0)
+            {
+                int sp = args.indexOf(' ');
+                chunkKb = (sp > 0 ? args.substring(0, sp) : args).toInt();
+                if (sp > 0) count = args.substring(sp + 1).toInt();
+            }
+            fileManager.benchmarkSequentialWrite((size_t)chunkKb * 1024, count);
         }
         else if (command == "sdformat")
         {

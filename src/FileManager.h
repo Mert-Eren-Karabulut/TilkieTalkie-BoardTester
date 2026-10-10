@@ -10,12 +10,14 @@
 #include <esp_vfs_fat.h>  // For explicit VFS unmount to fix ESP_ERR_INVALID_STATE
 #include <AsyncTCP.h>
 #include <ArduinoJson.h>
+#include <mbedtls/sha256.h>
 
 struct DownloadTask
 {
     String url;
     String localPath;
-    int retryCount;           // Simple retry counter
+    int retryCount;            // consecutive failed attempts (drives the backoff; reset on success)
+    int hardFailures;          // size/checksum mismatches (terminal after MAX_HARD_FAILURES)
     unsigned long lastAttempt; // Last attempt timestamp for retry delay
     String checksum;           // Optional for file integrity verification
 };
@@ -43,8 +45,11 @@ private:
     static const int SD_D3_PIN = 40;  // SD_D3
 
     // Download configuration
-    static const int MAX_RETRY_COUNT = 10;                      // Max retries per file before giving up
-    static const unsigned long RETRY_DELAY_MS = 30000;          // 30 seconds between retries
+    static const int MAX_RETRY_COUNT = 10;                      // used for the backoff exponent cap / legacy queue entries
+    static const int MAX_HARD_FAILURES = 3;                     // size/checksum mismatches before a file is dropped
+    static const unsigned long RETRY_DELAY_MS = 30000;          // base retry delay, doubled per consecutive failure
+    static const unsigned long MAX_RETRY_DELAY_MS = 600000;     // 10 minute backoff cap
+    static const unsigned long SD_WRITER_STALL_MS = 3000;       // network side waits this long for the SD writer
     static const size_t DOWNLOAD_BUFFER_SIZE = 32768;           // 32KB internal SRAM (DMA-aligned) - 2x32KB = 64KB total
     static const unsigned long DOWNLOAD_TIMEOUT_MS = 300000;    // 5 minutes per download
 
@@ -54,44 +59,49 @@ private:
     static const char* SD_REQUIRED_FILES_FILE;
     static const char* SD_DOWNLOAD_STATS_FILE;
 
-    // Async download state
+    // Async download state.
+    // Data flow: AsyncTCP onData (core 0) -> PSRAM ring (RING_SIZE) -> SD writer task copies
+    // 32 KB chunks into an internal DMA bounce buffer -> SD. The ring absorbs the card's
+    // multi-second write pauses (observed ~3 s every ~1.8 MB) without blocking the network.
+    static const size_t RING_SIZE = 4 * 1024 * 1024;
     struct AsyncDownloadState {
         AsyncClient* client;
         File file;
         String url;
         String localPath;
         String tempPath;
-        String checksum;
+        String checksum;         // expected sha256 (hex) from the manifest, may be empty
+        String requestPath;      // HTTP request path (built before connect())
+        int httpStatus;
+        uint64_t freeBytesAtStart;
+        volatile bool finishRequested;   // set by callbacks; finalizeAsyncDownload() runs on the loop task
+        volatile bool finishSuccess;
+        volatile bool permanentFailure;
+        char finishError[96];
+        volatile bool writerExited;
+        volatile bool producerDone;      // no more network data: writer flushes the partial tail
+        unsigned long drainStartedMs;    // finalize: when the ring drain began (bounded wait, non-blocking)
+        volatile bool discardRing;       // failure: writer stops without draining
+        mbedtls_sha256_context sha;      // hashed by the SD writer as it writes
+        bool shaActive;
         int contentLength;
-        int totalDownloaded;
+        volatile size_t totalDownloaded;
         bool headersParsed;
         unsigned long startTime;
         unsigned long connectTime;
-        unsigned long headerParseTime;
         unsigned long lastDataTime;
-        unsigned long lastFlushTime;
-        unsigned long totalFlushTime;
         unsigned long totalWriteTime;
-        int flushCount;
         int writeCount;
         int lastReportedProgress;
         char headerBuffer[1024];
         size_t headerBufferUsed;
-        
-        // Double buffer system
-        uint8_t* bufferA;  // Network receive buffer
-        uint8_t* bufferB;  // SD write buffer
-        size_t bufferSize;
-        size_t bufferAUsed;
-        size_t bufferBUsed;
-        
-        // FreeRTOS task coordination
+        // Ring indices: monotonically increasing byte counters (single producer / single consumer).
+        volatile size_t ringHead;
+        volatile size_t ringTail;
         TaskHandle_t writeTaskHandle;
-        SemaphoreHandle_t bufferSwapSemaphore;  // Signals write task to start writing
-        SemaphoreHandle_t writeCompleteSemaphore;  // Signals network that write is done
+        SemaphoreHandle_t dataAvailable;
         volatile bool writeTaskRunning;
-        volatile bool swapRequested;
-        
+
         void reset() {
             client = nullptr;
             contentLength = -1;
@@ -99,30 +109,33 @@ private:
             headersParsed = false;
             startTime = 0;
             connectTime = 0;
-            headerParseTime = 0;
             lastDataTime = 0;
-            lastFlushTime = 0;
-            totalFlushTime = 0;
             totalWriteTime = 0;
-            flushCount = 0;
             writeCount = 0;
             lastReportedProgress = 0;
             headerBuffer[0] = '\0';
             headerBufferUsed = 0;
-            bufferA = nullptr;
-            bufferB = nullptr;
-            bufferSize = 0;
-            bufferAUsed = 0;
-            bufferBUsed = 0;
+            ringHead = 0;
+            ringTail = 0;
             writeTaskHandle = nullptr;
-            bufferSwapSemaphore = nullptr;
-            writeCompleteSemaphore = nullptr;
+            dataAvailable = nullptr;
             writeTaskRunning = false;
-            swapRequested = false;
             url = "";
             localPath = "";
             tempPath = "";
             checksum = "";
+            requestPath = "";
+            httpStatus = 0;
+            freeBytesAtStart = 0;
+            finishRequested = false;
+            finishSuccess = false;
+            permanentFailure = false;
+            finishError[0] = '\0';
+            writerExited = false;
+            producerDone = false;
+            discardRing = false;
+            drainStartedMs = 0;
+            shaActive = false;
         }
     };
 
@@ -133,9 +146,16 @@ private:
     std::vector<DownloadTask> downloadQueue;
     std::vector<FileEntry> requiredFiles;
     
-    // Pre-allocated persistent download buffers (allocated once at startup)
-    uint8_t* persistentBufferA;
-    uint8_t* persistentBufferB;
+    // Cached free-space figure: f_getfree can scan the whole FAT (seconds on a 30 GB card)
+    // while holding the filesystem lock, so it is refreshed only when idle and at most once a minute.
+    uint64_t cachedFreeBytes = 0;
+    unsigned long cachedFreeAt = 0;
+    void refreshFreeSpaceCache();
+
+    // Allocated once at startup: 32 KB internal DMA bounce buffer for SD writes and the
+    // PSRAM ring that decouples the network from the card.
+    uint8_t* persistentBufferA;   // internal, DMA-capable bounce buffer (DOWNLOAD_BUFFER_SIZE)
+    uint8_t* ringBuffer;          // PSRAM, RING_SIZE
     bool buffersAllocated;
 
     // Download statistics
@@ -167,7 +187,12 @@ private:
     bool loadDownloadStats();
 
     // Download operations
-    bool downloadFileFromURL(const String &url, const String &localPath, String &errorMsg);
+    bool downloadFileFromURL(const String &url, const String &localPath, const String &checksum, String &errorMsg);
+    void abortAsyncStart();
+    void requestAsyncFinish(bool success, const char *error, bool permanent = false);
+    void finalizeAsyncDownload();
+    bool writeJsonAtomic(const char *path, const JsonDocument &doc);
+    bool openJsonForRead(const char *path, File &file);
     bool verifyFileIntegrity(const String &filePath, const String &expectedChecksum);
     void processDownloadQueue();
     void addToDownloadQueue(const String &url, const String &localPath, const String &checksum = "");
@@ -180,10 +205,10 @@ private:
     static void onAsyncTimeout(void* arg, AsyncClient* client, uint32_t time);
     
     // Async download helpers
-    void cleanupAsyncDownload(bool success, const String& errorMsg);
-    bool fetchRemainingTail(const String &url, size_t offset, size_t expectedTotal, String &errorMsg);
     static void sdWriteTask(void* parameter);
-    bool swapBuffers();
+    bool ringPush(const uint8_t* data, size_t len);
+    size_t ringAvailable() const { return asyncState.ringHead - asyncState.ringTail; }
+    size_t ringFree() const { return RING_SIZE - ringAvailable() - 1; }
 
 
     // File operations
@@ -214,6 +239,7 @@ public:
     void formatSDCard(); // Format SD card as FAT32
     // SD Card diagnostics
     void benchmarkSDCard();
+    void benchmarkSequentialWrite(size_t chunkBytes, int count); // per-write timing, no network involved
 
     // Download management methods
     bool scheduleDownload(const String &url, const String &localPath, const String &checksum = "");
@@ -221,6 +247,7 @@ public:
     void retryFailedDownloads();
     int getPendingDownloadsCount();
     bool isDownloadInProgress() const { return downloadInProgress; }
+    bool hasActiveDownload() const { return downloadInProgress; } // a transfer is in flight (not merely queued)
 
     // Required files management
     bool addRequiredFile(const String &localPath, const String &url, const String &checksum = "");

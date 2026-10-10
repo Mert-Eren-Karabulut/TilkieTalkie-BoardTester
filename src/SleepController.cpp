@@ -116,8 +116,10 @@ bool SleepController::canEnterSleep() {
     FileManager& fileManager = FileManager::getInstance();
     AudioController& audio = AudioController::getInstance();
     
-    // Check if file sync is in progress
-    if (fileManager.getPendingDownloadsCount() > 0) {
+    // Only an in-flight transfer holds off sleep. A non-empty queue must not: with WiFi down
+    // or the server unreachable it would keep a battery-powered toy awake until the cell
+    // is empty. The queue is persisted and resumes on the next wake with connectivity.
+    if (fileManager.hasActiveDownload()) {
         lastCheckResult = false;
         return false;
     }

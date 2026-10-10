@@ -23,7 +23,7 @@ FileManager::FileManager() :
     downloadCompleteCallback(nullptr),
     fileSystemEventCallback(nullptr),
     persistentBufferA(nullptr),
-    persistentBufferB(nullptr),
+    ringBuffer(nullptr),
     buffersAllocated(false) {
     // Initialize download stats
     downloadStats.totalDownloads = 0;
@@ -42,27 +42,20 @@ FileManager& FileManager::getInstance() {
 bool FileManager::begin() {
     Serial.println("FileManager: Initializing...");
     
-    // Pre-allocate persistent download buffers from internal SRAM
+    // One 32 KB internal DMA bounce buffer (SDMMC cannot DMA from PSRAM) and a 4 MB PSRAM
+    // ring between the network and the card. Allocated once, never freed.
     if (!buffersAllocated) {
-        Serial.println("FileManager: Pre-allocating download buffers from internal SRAM...");
         persistentBufferA = (uint8_t*)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-        persistentBufferB = (uint8_t*)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-        
-        if (!persistentBufferA || !persistentBufferB) {
-            Serial.printf("FileManager: ❌ CRITICAL: Failed to pre-allocate 2x%dKB buffers from internal SRAM\n", DOWNLOAD_BUFFER_SIZE / 1024);
-            Serial.println("FileManager: System cannot perform downloads - insufficient memory");
-            if (persistentBufferA) {
-                free(persistentBufferA);
-                persistentBufferA = nullptr;
-            }
-            if (persistentBufferB) {
-                free(persistentBufferB);
-                persistentBufferB = nullptr;
-            }
+        ringBuffer = (uint8_t*)heap_caps_malloc(RING_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!persistentBufferA || !ringBuffer) {
+            Serial.println("FileManager: CRITICAL: failed to allocate download buffers (32 KB internal + 4 MB PSRAM)");
+            if (persistentBufferA) { free(persistentBufferA); persistentBufferA = nullptr; }
+            if (ringBuffer) { free(ringBuffer); ringBuffer = nullptr; }
             buffersAllocated = false;
         } else {
             buffersAllocated = true;
-            Serial.printf("FileManager: ✓ Pre-allocated 2x%dKB DMA-aligned buffers from internal SRAM (will never be freed)\n", DOWNLOAD_BUFFER_SIZE / 1024);
+            Serial.printf("FileManager: download buffers ready (%u KB internal bounce, %u KB PSRAM ring)\n",
+                          (unsigned)(DOWNLOAD_BUFFER_SIZE / 1024), (unsigned)(RING_SIZE / 1024));
         }
     }
     
@@ -293,57 +286,13 @@ bool FileManager::initializeSDCard() {
 }
 
 bool FileManager::checkConnectivity() {
-    // Check WiFi connection
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("FileManager: WiFi not connected");
-        return false;
-    }
-    
-    // Check internet connectivity by pinging Google's DNS
-    return pingGoogle();
+    // The TCP connect to the asset host is the real connectivity test; a probe to a third
+    // party used to block the loop for up to ~15 s per queued file whenever WAN was down.
+    return WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0);
 }
 
 bool FileManager::pingGoogle() {
-    Serial.println("FileManager: Checking internet connectivity...");
-    
-    // Use WiFiClient for memory efficiency instead of HTTPClient
-    WiFiClient client;
-    client.setTimeout(5000); // 5 second timeout
-    
-    if (!client.connect("www.google.com", 80)) {
-        Serial.printf("FileManager: Internet connectivity: FAILED (connection failed)\n");
-        return false;
-    }
-    
-    // Send simple HTTP HEAD request (lighter than GET)
-    String request = "HEAD / HTTP/1.1\r\n";
-    request += "Host: www.google.com\r\n";
-    request += "Connection: close\r\n";
-    request += "\r\n";
-    
-    client.print(request);
-    
-    // Wait for response with timeout
-    unsigned long startTime = millis();
-    bool responseReceived = false;
-    
-    while (client.connected() && (millis() - startTime < 5000)) {
-        if (client.available()) {
-            String line = client.readStringUntil('\n');
-            if (line.startsWith("HTTP/")) {
-                responseReceived = true;
-                break;
-            }
-        }
-        delay(1);
-    }
-    
-    client.stop();
-    
-    bool connected = responseReceived;
-    Serial.printf("FileManager: Internet connectivity: %s\n", connected ? "OK" : "FAILED");
-    
-    return connected;
+    return checkConnectivity();
 }
 
 bool FileManager::isChargingRequired() {
@@ -355,7 +304,13 @@ void FileManager::update() {
     if (!sdCardInitialized) {
         return;
     }
-    
+
+    // Completion of an in-flight download is handled here, on the loop task (owner of the
+    // queue, the files and the callbacks), never inside the AsyncTCP callbacks.
+    if (downloadInProgress && asyncState.finishRequested) {
+        finalizeAsyncDownload();
+    }
+
     // Process download queue if conditions are met
     if (!downloadInProgress && downloadQueue.size() > 0) {
             processDownloadQueue();
@@ -552,37 +507,34 @@ void FileManager::addToDownloadQueue(const String& url, const String& localPath,
     task.localPath = localPath;
     task.checksum = checksum;
     task.retryCount = 0;
+    task.hardFailures = 0;
     task.lastAttempt = 0;
     
     downloadQueue.push_back(task);
 }
 
-bool FileManager::downloadFileFromURL(const String& url, const String& localPath, String& errorMsg) {
+bool FileManager::downloadFileFromURL(const String& url, const String& localPath, const String& checksum, String& errorMsg) {
     if (downloadInProgress) {
         errorMsg = "Another download is in progress";
         return false;
     }
-    
     if (!sdCardInitialized) {
         errorMsg = "SD card not initialized";
         return false;
     }
-    
-    downloadInProgress = true;
-    
-    // Convert HTTPS to HTTP because AsyncTCP does not handle TLS directly.
+
+    // Media is fetched over plain HTTP by design (AsyncTCP has no TLS); integrity comes from
+    // the sha256 in the manifest, which is verified while writing.
     String httpUrl = url;
     if (httpUrl.startsWith("https://")) {
-        httpUrl.replace("https://", "http://");
+        httpUrl = "http://" + httpUrl.substring(8);
     }
-    
+
     String hostname, path;
     int port = 80;
-    
     if (httpUrl.startsWith("http://")) {
         int hostStart = 7;
         int pathStart = httpUrl.indexOf('/', hostStart);
-        
         if (pathStart == -1) {
             hostname = httpUrl.substring(hostStart);
             path = "/";
@@ -590,7 +542,6 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
             hostname = httpUrl.substring(hostStart, pathStart);
             path = httpUrl.substring(pathStart);
         }
-        
         int portIndex = hostname.indexOf(':');
         if (portIndex != -1) {
             port = hostname.substring(portIndex + 1).toInt();
@@ -598,40 +549,40 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         }
     } else {
         errorMsg = "Invalid URL format (must start with http://)";
-        downloadInProgress = false;
         return false;
     }
 
+    downloadInProgress = true;
     Serial.printf("FileManager: Starting async download: %s -> %s\n", httpUrl.c_str(), localPath.c_str());
-    Serial.printf("FileManager: Connecting to %s:%d\n", hostname.c_str(), port);
-    
-    // Create directory structure
+
     if (!createDirectoryStructure(localPath)) {
         errorMsg = "Failed to create directory structure";
         downloadInProgress = false;
         return false;
     }
-    
-    // Initialize async state
+
     asyncState.reset();
     asyncState.url = httpUrl;
     asyncState.localPath = localPath;
     asyncState.tempPath = localPath + ".tmp";
+    asyncState.checksum = checksum;
+    asyncState.requestPath = path;
     asyncState.startTime = millis();
     asyncState.lastDataTime = millis();
+    if (cachedFreeAt == 0 || millis() - cachedFreeAt > 60000) {
+        refreshFreeSpaceCache();
+    }
+    asyncState.freeBytesAtStart = cachedFreeBytes;
 
-    if (!buffersAllocated || !persistentBufferA) {
+    if (!buffersAllocated || !persistentBufferA || !ringBuffer) {
         errorMsg = "Download buffer not available";
         downloadInProgress = false;
         return false;
     }
-    
-    // Remove any existing temp file
+
     if (SD_MMC.exists(asyncState.tempPath)) {
         SD_MMC.remove(asyncState.tempPath);
     }
-    
-    // Open temp file for writing
     asyncState.file = SD_MMC.open(asyncState.tempPath, FILE_WRITE);
     if (!asyncState.file) {
         errorMsg = "Failed to create temporary file";
@@ -639,166 +590,141 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         return false;
     }
 
-    asyncState.bufferSize = DOWNLOAD_BUFFER_SIZE;
-    asyncState.bufferA = persistentBufferA;
-    asyncState.bufferB = persistentBufferB;
-    asyncState.bufferAUsed = 0;
-    asyncState.bufferBUsed = 0;
+    asyncState.ringHead = 0;
+    asyncState.ringTail = 0;
 
-    Serial.printf("FileManager: ✓ Using pre-allocated 2x%dKB DMA-aligned buffers\n", asyncState.bufferSize / 1024);
+    mbedtls_sha256_init(&asyncState.sha);
+    mbedtls_sha256_starts(&asyncState.sha, 0);
+    asyncState.shaActive = true;
 
-    asyncState.bufferSwapSemaphore = xSemaphoreCreateBinary();
-    asyncState.writeCompleteSemaphore = xSemaphoreCreateBinary();
-
-    if (!asyncState.bufferSwapSemaphore || !asyncState.writeCompleteSemaphore) {
-        errorMsg = "Failed to create buffer semaphores";
-        Serial.println("FileManager: ❌ Failed to create semaphores");
-        if (asyncState.bufferSwapSemaphore) {
-            vSemaphoreDelete(asyncState.bufferSwapSemaphore);
-            asyncState.bufferSwapSemaphore = nullptr;
-        }
-        if (asyncState.writeCompleteSemaphore) {
-            vSemaphoreDelete(asyncState.writeCompleteSemaphore);
-            asyncState.writeCompleteSemaphore = nullptr;
-        }
-        asyncState.file.close();
-        downloadInProgress = false;
+    asyncState.dataAvailable = xSemaphoreCreateBinary();
+    if (!asyncState.dataAvailable) {
+        errorMsg = "Failed to create semaphore";
+        abortAsyncStart();
         return false;
     }
 
-    xSemaphoreGive(asyncState.writeCompleteSemaphore);
-
+    // SD writer: core 0 (away from audio and the loop task), above loop priority so a
+    // ready buffer is written as soon as the card accepts it.
+    asyncState.writerExited = false;
     asyncState.writeTaskRunning = true;
-    BaseType_t taskCreated = xTaskCreatePinnedToCore(
-        sdWriteTask,
-        "SDWriteTask",
-        4096,
-        this,
-        1,
-        &asyncState.writeTaskHandle,
-        1
-    );
-
+    BaseType_t taskCreated = xTaskCreatePinnedToCore(sdWriteTask, "SDWriteTask", 6144, this, 5,
+                                                     &asyncState.writeTaskHandle, 0);
     if (taskCreated != pdPASS) {
         errorMsg = "Failed to create SD write task";
-        Serial.println("FileManager: ❌ Failed to create write task");
-        vSemaphoreDelete(asyncState.bufferSwapSemaphore);
-        vSemaphoreDelete(asyncState.writeCompleteSemaphore);
-        asyncState.bufferSwapSemaphore = nullptr;
-        asyncState.writeCompleteSemaphore = nullptr;
-        asyncState.file.close();
-        downloadInProgress = false;
+        asyncState.writeTaskHandle = nullptr;
+        asyncState.writeTaskRunning = false;
+        abortAsyncStart();
         return false;
     }
-
-    Serial.println("FileManager: ✓ SD write task created on Core 1");
 
     asyncState.client = new AsyncClient();
     if (!asyncState.client) {
         errorMsg = "Failed to create AsyncClient";
-        cleanupAsyncDownload(false, errorMsg);
+        abortAsyncStart();
         return false;
     }
-
     asyncState.client->onConnect(onAsyncConnect, this);
     asyncState.client->onData(onAsyncData, this);
     asyncState.client->onDisconnect(onAsyncDisconnect, this);
     asyncState.client->onError(onAsyncError, this);
     asyncState.client->onTimeout(onAsyncTimeout, this);
-
     asyncState.client->setNoDelay(true);
     asyncState.client->setRxTimeout(60);
     asyncState.client->setAckTimeout(5000);
 
+    Serial.printf("FileManager: Connecting to %s:%d\n", hostname.c_str(), port);
     if (!asyncState.client->connect(hostname.c_str(), port)) {
-        errorMsg = "Failed to connect to server";
-        cleanupAsyncDownload(false, errorMsg);
+        errorMsg = "Failed to start connection";
+        abortAsyncStart();
         return false;
     }
-
-    asyncState.checksum = path;
-
     return true;
+}
+
+// Tear down a download that failed before the network side was live (owner task, no
+// callbacks, no queue changes - the caller decides about retries).
+void FileManager::abortAsyncStart() {
+    if (asyncState.client) {
+        asyncState.client->onConnect(nullptr, nullptr);
+        asyncState.client->onData(nullptr, nullptr);
+        asyncState.client->onDisconnect(nullptr, nullptr);
+        asyncState.client->onError(nullptr, nullptr);
+        asyncState.client->onTimeout(nullptr, nullptr);
+        asyncState.client->close(true);
+        delete asyncState.client;
+        asyncState.client = nullptr;
+    }
+    if (asyncState.writeTaskHandle) {
+        asyncState.discardRing = true;
+        asyncState.writeTaskRunning = false;
+        if (asyncState.dataAvailable) {
+            xSemaphoreGive(asyncState.dataAvailable);
+        }
+        for (int i = 0; i < 300 && !asyncState.writerExited; ++i) {
+            delay(10);
+        }
+        asyncState.writeTaskHandle = nullptr;
+    }
+    if (asyncState.dataAvailable) {
+        vSemaphoreDelete(asyncState.dataAvailable);
+        asyncState.dataAvailable = nullptr;
+    }
+    if (asyncState.shaActive) {
+        mbedtls_sha256_free(&asyncState.sha);
+        asyncState.shaActive = false;
+    }
+    if (asyncState.file) {
+        asyncState.file.close();
+    }
+    if (SD_MMC.exists(asyncState.tempPath)) {
+        SD_MMC.remove(asyncState.tempPath);
+    }
+    downloadInProgress = false;
+    asyncState.reset();
 }
 
 void FileManager::processDownloadQueue() {
     if (downloadQueue.empty() || downloadInProgress) {
         return;
     }
-    
-    // Find the first task that's ready to be processed
-    auto it = downloadQueue.begin();
-    while (it != downloadQueue.end()) {
+    if (!checkConnectivity()) {
+        return; // nothing to do without WiFi; the queue persists and sleep is no longer held off by it
+    }
+
+    for (auto it = downloadQueue.begin(); it != downloadQueue.end(); ++it) {
         DownloadTask& task = *it;
-        
-        // Check if we've exceeded the maximum retries - remove from queue
-        if (task.retryCount >= MAX_RETRY_COUNT) {
-            Serial.printf("FileManager: Download permanently failed after %d retries: %s\n", 
-                         MAX_RETRY_COUNT, task.url.c_str());
-            
-            downloadStats.totalDownloads++;
-            downloadStats.failedDownloads++;
-            
-            if (downloadCompleteCallback) {
-                downloadCompleteCallback(task.url, task.localPath, false, "Max retries exceeded");
-            }
-            
-            it = downloadQueue.erase(it);
-            saveDownloadQueue();
-            continue;
-        }
-        
-        // Check if enough time has passed since last retry
-        if (task.lastAttempt > 0 && (millis() - task.lastAttempt) < RETRY_DELAY_MS) {
-            ++it;
-            continue;
-        }
-        
-        // Check connectivity before attempting download
-        if (!checkConnectivity()) {
-            // Don't increment retry count for connectivity issues
-            ++it;
-            continue;
-        }
-        
-        // Check if file already exists and is valid
-        if (fileExists(task.localPath)) {
-            if (task.checksum.isEmpty() || verifyFileIntegrity(task.localPath, task.checksum)) {
-                Serial.printf("FileManager: File already exists and is valid: %s\n", task.localPath.c_str());
-                it = downloadQueue.erase(it);
-                saveDownloadQueue();
+
+        // Exponential backoff per consecutive failure: 30 s, 60 s, ... capped at 10 min.
+        if (task.lastAttempt > 0) {
+            int exp = task.retryCount > 0 ? task.retryCount - 1 : 0;
+            if (exp > 5) exp = 5;
+            unsigned long wait = RETRY_DELAY_MS << exp;
+            if (wait > MAX_RETRY_DELAY_MS) wait = MAX_RETRY_DELAY_MS;
+            if (millis() - task.lastAttempt < wait) {
                 continue;
-            } else {
-                Serial.printf("FileManager: Existing file failed integrity check, re-downloading: %s\n", task.localPath.c_str());
-                deleteFile(task.localPath);
             }
         }
-        
-        // Process this task
-        String errorMsg;
+
+        // Already present: integrity was verified when it was downloaded; trust it.
+        if (fileExists(task.localPath)) {
+            Serial.printf("FileManager: File already exists: %s\n", task.localPath.c_str());
+            downloadQueue.erase(it);
+            saveDownloadQueue();
+            return;
+        }
+
         task.lastAttempt = millis();
         task.retryCount++;
-        
-        Serial.printf("FileManager: Attempting download (attempt %d/%d): %s\n", 
-                     task.retryCount, MAX_RETRY_COUNT, task.url.c_str());
-        
-        bool downloadStarted = downloadFileFromURL(task.url, task.localPath, errorMsg);
-        
-        if (!downloadStarted) {
-            Serial.printf("FileManager: Download attempt %d/%d failed to start: %s (Error: %s)\n", 
-                         task.retryCount, MAX_RETRY_COUNT, task.url.c_str(), errorMsg.c_str());
-            
-            // Move failed task to end of queue for fair processing
-            if (task.retryCount < MAX_RETRY_COUNT) {
-                DownloadTask failedTask = task;
-                it = downloadQueue.erase(it);
-                downloadQueue.push_back(failedTask);
-                Serial.printf("FileManager: Moved failed download to end of queue: %s\n", failedTask.localPath.c_str());
-            }
+        Serial.printf("FileManager: Attempting download (attempt %d): %s\n", task.retryCount, task.url.c_str());
+
+        String errorMsg;
+        const String url = task.url, localPath = task.localPath, checksum = task.checksum;
+        if (!downloadFileFromURL(url, localPath, checksum, errorMsg)) {
+            Serial.printf("FileManager: Download failed to start: %s (%s)\n", url.c_str(), errorMsg.c_str());
         }
-        
         saveDownloadQueue();
-        return; // Process only one download per call
+        return; // one download at a time
     }
 }
 
@@ -858,13 +784,11 @@ bool FileManager::removeRequiredFile(const String& localPath) {
 }
 
 void FileManager::checkRequiredFiles() {
+    // Existence only. Files are hashed once, while they are downloaded; re-hashing the whole
+    // library every 5 minutes on the loop task froze the device for seconds to minutes.
     for (const auto& file : requiredFiles) {
         if (!fileExists(file.path)) {
             Serial.printf("FileManager: Required file missing, scheduling download: %s\n", file.path.c_str());
-            scheduleDownload(file.url, file.path, file.checksum);
-        } else if (!file.checksum.isEmpty() && !verifyFileIntegrity(file.path, file.checksum)) {
-            Serial.printf("FileManager: Required file failed integrity check, re-downloading: %s\n", file.path.c_str());
-            deleteFile(file.path);
             scheduleDownload(file.url, file.path, file.checksum);
         }
     }
@@ -989,11 +913,34 @@ size_t FileManager::getSDCardUsedSpace() {
     return SD_MMC.usedBytes();
 }
 
+void FileManager::refreshFreeSpaceCache() {
+    if (!sdCardInitialized) {
+        cachedFreeBytes = 0;
+        return;
+    }
+    unsigned long t0 = millis();
+    cachedFreeBytes = SD_MMC.totalBytes() - SD_MMC.usedBytes();
+    cachedFreeAt = millis();
+    if (cachedFreeAt - t0 > 100) {
+        Serial.printf("FileManager: free-space query took %lu ms\n", cachedFreeAt - t0);
+    }
+}
+
 size_t FileManager::getSDCardFreeSpace() {
     if (!sdCardInitialized) {
         return 0;
     }
-    return SD_MMC.cardSize() - SD_MMC.usedBytes();
+    // Never query the FAT while a download is writing (lock contention); otherwise refresh
+    // at most once a minute. Callers only use this for the status report and a sanity check.
+    if (!downloadInProgress && (cachedFreeAt == 0 || millis() - cachedFreeAt > 60000)) {
+        refreshFreeSpaceCache();
+    }
+    uint64_t freeBytes = cachedFreeBytes;
+    if (downloadInProgress && freeBytes > static_cast<uint64_t>(asyncState.totalDownloaded)) {
+        freeBytes -= asyncState.totalDownloaded;
+    }
+    // size_t is 32-bit here; saturate instead of wrapping on cards over 4 GB.
+    return freeBytes > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<size_t>(freeBytes);
 }
 
 String FileManager::getSDCardInfo() {
@@ -1094,26 +1041,54 @@ bool FileManager::saveDownloadQueue() {
         obj["url"] = task.url;
         obj["path"] = task.localPath;
         obj["retries"] = task.retryCount;
+        obj["hard"] = task.hardFailures;
         obj["lastAttempt"] = task.lastAttempt;
         obj["checksum"] = task.checksum;
     }
-    
-    File file = SD_MMC.open(SD_DOWNLOAD_QUEUE_FILE, FILE_WRITE);
+    return writeJsonAtomic(SD_DOWNLOAD_QUEUE_FILE, doc);
+}
+
+// Write-to-temp + rename so a power cut mid-write never leaves an empty/truncated list
+// (an unparseable file used to be loaded as "no files", and the next save made that permanent).
+bool FileManager::writeJsonAtomic(const char *path, const JsonDocument &doc) {
+    String tmp = String(path) + ".tmp";
+    if (SD_MMC.exists(tmp)) {
+        SD_MMC.remove(tmp);
+    }
+    File file = SD_MMC.open(tmp, FILE_WRITE);
     if (!file) {
-        Serial.println("FileManager: Failed to open download queue file for writing");
+        Serial.printf("FileManager: Failed to open %s for writing\n", tmp.c_str());
         return false;
     }
-    
-    serializeJson(doc, file);
+    size_t written = serializeJson(doc, file);
+    file.flush();
     file.close();
-    return true;
+    if (written == 0) {
+        SD_MMC.remove(tmp);
+        return false;
+    }
+    if (SD_MMC.exists(path)) {
+        SD_MMC.remove(path); // FatFs rename does not overwrite
+    }
+    return SD_MMC.rename(tmp, path);
+}
+
+bool FileManager::openJsonForRead(const char *path, File &file) {
+    file = SD_MMC.open(path, FILE_READ);
+    if (file) {
+        return true;
+    }
+    // A crash between remove(path) and rename(tmp) leaves only the temp file: use it.
+    String tmp = String(path) + ".tmp";
+    file = SD_MMC.open(tmp, FILE_READ);
+    return (bool)file;
 }
 
 bool FileManager::loadDownloadQueue() {
     if (!sdCardInitialized) return false;
     
-    File file = SD_MMC.open(SD_DOWNLOAD_QUEUE_FILE, FILE_READ);
-    if (!file) {
+    File file;
+    if (!openJsonForRead(SD_DOWNLOAD_QUEUE_FILE, file)) {
         // No saved queue, start fresh
         return true;
     }
@@ -1134,6 +1109,7 @@ bool FileManager::loadDownloadQueue() {
         task.url = obj["url"].as<String>();
         task.localPath = obj["path"].as<String>();
         task.retryCount = obj["retries"] | 0;
+        task.hardFailures = obj["hard"] | 0;
         task.lastAttempt = obj["lastAttempt"] | 0;
         task.checksum = obj["checksum"].as<String>();
         downloadQueue.push_back(task);
@@ -1156,15 +1132,9 @@ bool FileManager::saveRequiredFiles() {
         obj["checksum"] = entry.checksum;
     }
     
-    File file = SD_MMC.open(SD_REQUIRED_FILES_FILE, FILE_WRITE);
-    if (!file) {
-        Serial.println("FileManager: Failed to open required files file for writing");
+    if (!writeJsonAtomic(SD_REQUIRED_FILES_FILE, doc)) {
         return false;
     }
-    
-    serializeJson(doc, file);
-    file.close();
-    
     Serial.printf("FileManager: Saved %d required files to SD card\n", requiredFiles.size());
     return true;
 }
@@ -1172,8 +1142,8 @@ bool FileManager::saveRequiredFiles() {
 bool FileManager::loadRequiredFiles() {
     if (!sdCardInitialized) return false;
     
-    File file = SD_MMC.open(SD_REQUIRED_FILES_FILE, FILE_READ);
-    if (!file) {
+    File file;
+    if (!openJsonForRead(SD_REQUIRED_FILES_FILE, file)) {
         Serial.println("FileManager: No saved required files found");
         return true;
     }
@@ -1211,15 +1181,7 @@ bool FileManager::saveDownloadStats() {
     doc["failedDownloads"] = downloadStats.failedDownloads;
     doc["totalBytesDownloaded"] = downloadStats.totalBytesDownloaded;
     
-    File file = SD_MMC.open(SD_DOWNLOAD_STATS_FILE, FILE_WRITE);
-    if (!file) {
-        Serial.println("FileManager: Failed to open download stats file for writing");
-        return false;
-    }
-    
-    serializeJson(doc, file);
-    file.close();
-    return true;
+    return writeJsonAtomic(SD_DOWNLOAD_STATS_FILE, doc);
 }
 
 bool FileManager::loadDownloadStats() {
@@ -1492,18 +1454,90 @@ bool FileManager::deleteFigureFiles(const String& figureId) {
     return true;
 }
 
+// Sequential write benchmark with per-write timing. No network involved: isolates the
+// card's own behaviour (e.g. periodic multi-second pauses) from the download pipeline.
+void FileManager::benchmarkSequentialWrite(size_t chunkBytes, int count) {
+    if (!sdCardInitialized || downloadInProgress || !persistentBufferA) {
+        Serial.println("FileManager: bench unavailable (SD not ready or download in progress)");
+        return;
+    }
+    if (chunkBytes == 0 || chunkBytes > DOWNLOAD_BUFFER_SIZE) {
+        chunkBytes = DOWNLOAD_BUFFER_SIZE;
+    }
+    if (count <= 0) {
+        count = 64;
+    }
+    const char* path = "/temp/bench.bin";
+    createDirectory("/temp");
+    if (SD_MMC.exists(path)) {
+        SD_MMC.remove(path);
+    }
+    File f = SD_MMC.open(path, FILE_WRITE);
+    if (!f) {
+        Serial.println("FileManager: bench: cannot open file");
+        return;
+    }
+    for (size_t i = 0; i < chunkBytes; ++i) {
+        persistentBufferA[i] = (uint8_t)(i * 7 + 13);
+    }
+    unsigned long minUs = ~0UL, maxUs = 0, sumUs = 0;
+    int slow = 0;
+    unsigned long t0 = millis();
+    for (int i = 0; i < count; ++i) {
+        unsigned long ws = micros();
+        size_t written = f.write(persistentBufferA, chunkBytes);
+        unsigned long dt = micros() - ws;
+        if (written != chunkBytes) {
+            Serial.printf("FileManager: bench: short write at #%d (%u/%u)\n", i, (unsigned)written, (unsigned)chunkBytes);
+            break;
+        }
+        if (dt < minUs) minUs = dt;
+        if (dt > maxUs) maxUs = dt;
+        sumUs += dt;
+        if (dt > 300000) {
+            slow++;
+            Serial.printf("FileManager: bench: write #%d took %lu ms\n", i, dt / 1000);
+        }
+    }
+    unsigned long fs = micros();
+    f.flush();
+    unsigned long flushUs = micros() - fs;
+    f.close();
+    unsigned long total = millis() - t0;
+    SD_MMC.remove(path);
+    Serial.printf("FileManager: bench: %d x %u KB: min %.1f ms, avg %.1f ms, max %.1f ms, >300ms: %d, flush %lu ms, total %lu ms = %.2f MB/s\n",
+                  count, (unsigned)(chunkBytes / 1024), minUs / 1000.0, (sumUs / 1000.0) / count, maxUs / 1000.0,
+                  slow, flushUs / 1000, total, total > 0 ? (count * (double)chunkBytes) / (total / 1000.0) / 1048576.0 : 0.0);
+}
+
 // ===== Async Download Callbacks =====
+// These run on the async_tcp task (core 0, priority 23). They only parse headers, copy bytes
+// into the double buffer and set flags. Everything slow or state-changing (joining the SD
+// writer, closing/renaming files, hashing, queue and stats persistence, completion callbacks)
+// runs in finalizeAsyncDownload() on the loop task. The AsyncClient is never deleted from
+// inside its own callbacks (that was a use-after-free, and the semaphores it still used were
+// deleted on a 200 ms timer: `assert failed: xQueueGenericSend queue.c:936`, reproducible on
+// every multi-megabyte download).
+
+void FileManager::requestAsyncFinish(bool success, const char *error, bool permanent) {
+    if (asyncState.finishRequested) {
+        return;
+    }
+    asyncState.finishSuccess = success;
+    asyncState.permanentFailure = permanent;
+    strncpy(asyncState.finishError, error ? error : "", sizeof(asyncState.finishError) - 1);
+    asyncState.finishError[sizeof(asyncState.finishError) - 1] = '\0';
+    asyncState.finishRequested = true;
+}
 
 void FileManager::onAsyncConnect(void* arg, AsyncClient* client) {
     FileManager* self = static_cast<FileManager*>(arg);
-    
+    if (self->asyncState.finishRequested) {
+        return;
+    }
     self->asyncState.connectTime = millis() - self->asyncState.startTime;
-    Serial.printf("FileManager: ⚡ Connected in %lu ms\n", self->asyncState.connectTime);
-    
-    // Build HTTP request - path is temporarily stored in checksum field
-    String request = "GET " + self->asyncState.checksum + " HTTP/1.1\r\n";
-    
-    // Extract hostname from URL for Host header
+    Serial.printf("FileManager: Connected in %lu ms\n", self->asyncState.connectTime);
+
     String hostname = self->asyncState.url;
     if (hostname.startsWith("http://")) {
         hostname = hostname.substring(7);
@@ -1512,61 +1546,39 @@ void FileManager::onAsyncConnect(void* arg, AsyncClient* client) {
             hostname = hostname.substring(0, slashPos);
         }
     }
-    
+    String request = "GET " + self->asyncState.requestPath + " HTTP/1.1\r\n";
     request += "Host: " + hostname + "\r\n";
     request += "Connection: close\r\n";
-    request += "User-Agent: ESP32-FileManager-Async/1.0\r\n";
+    request += "Accept-Encoding: identity\r\n";
+    request += "User-Agent: TilkieTalkie/1.0 (ESP32-S3)\r\n";
     request += "\r\n";
-    
-    // Send HTTP request
     client->write(request.c_str(), request.length());
-    
-    // Clear checksum field (was temporary storage for path)
-    self->asyncState.checksum = "";
     self->asyncState.lastDataTime = millis();
 }
 
 void FileManager::onAsyncData(void* arg, AsyncClient* client, void* data, size_t len) {
     FileManager* self = static_cast<FileManager*>(arg);
-    
+    if (self->asyncState.finishRequested) {
+        return; // finishing; ignore whatever else the server sends
+    }
     unsigned long dataCallbackStart = millis();
     self->asyncState.lastDataTime = dataCallbackStart;
-    
+
     auto bufferBodyData = [&](const uint8_t* chunk, size_t chunkLen) -> bool {
-        size_t remaining = chunkLen;
-        size_t offset = 0;
-
-        while (remaining > 0) {
-            size_t spaceLeft = self->asyncState.bufferSize - self->asyncState.bufferAUsed;
-            if (spaceLeft == 0) {
-                if (!self->swapBuffers()) {
-                    self->cleanupAsyncDownload(false, "Timed out waiting for SD writer");
-                    return false;
-                }
-                spaceLeft = self->asyncState.bufferSize - self->asyncState.bufferAUsed;
-            }
-
-            size_t toCopy = remaining < spaceLeft ? remaining : spaceLeft;
-            memcpy(self->asyncState.bufferA + self->asyncState.bufferAUsed, chunk + offset, toCopy);
-            self->asyncState.bufferAUsed += toCopy;
-            self->asyncState.totalDownloaded += toCopy;
-            offset += toCopy;
-            remaining -= toCopy;
+        if (!self->ringPush(chunk, chunkLen)) {
+            self->requestAsyncFinish(false, "SD writer stalled (ring full)");
+            return false;
         }
-
         return true;
     };
 
     if (!self->asyncState.headersParsed) {
-        unsigned long headerParseStart = millis();
         size_t headerCapacity = sizeof(self->asyncState.headerBuffer) - 1;
         size_t previousHeaderBytes = self->asyncState.headerBufferUsed;
         size_t bytesToAppend = len;
-
         if (self->asyncState.headerBufferUsed + bytesToAppend > headerCapacity) {
             bytesToAppend = headerCapacity - self->asyncState.headerBufferUsed;
         }
-
         if (bytesToAppend > 0) {
             memcpy(self->asyncState.headerBuffer + self->asyncState.headerBufferUsed, data, bytesToAppend);
             self->asyncState.headerBufferUsed += bytesToAppend;
@@ -1576,79 +1588,75 @@ void FileManager::onAsyncData(void* arg, AsyncClient* client, void* data, size_t
         char* headerEnd = strstr(self->asyncState.headerBuffer, "\r\n\r\n");
         if (!headerEnd) {
             if (self->asyncState.headerBufferUsed == headerCapacity) {
-                self->cleanupAsyncDownload(false, "HTTP headers too large or incomplete");
+                self->requestAsyncFinish(false, "HTTP headers too large or incomplete");
             }
             return;
         }
 
-        const char* contentLengthPtr = strstr(self->asyncState.headerBuffer, "Content-Length: ");
-        if (!contentLengthPtr) {
-            contentLengthPtr = strstr(self->asyncState.headerBuffer, "content-length: ");
+        // Status line: anything but 200 is a failure (4xx permanently; a 301/302 means the
+        // server now insists on HTTPS or moved the file - the old code saved the HTML page).
+        int status = 0;
+        if (sscanf(self->asyncState.headerBuffer, "HTTP/%*d.%*d %d", &status) != 1) {
+            self->requestAsyncFinish(false, "Malformed HTTP status line");
+            return;
         }
+        self->asyncState.httpStatus = status;
+        if (status != 200) {
+            char msg[48];
+            snprintf(msg, sizeof(msg), "HTTP %d", status);
+            self->requestAsyncFinish(false, msg, status >= 400 && status < 500);
+            return;
+        }
+        if (strcasestr(self->asyncState.headerBuffer, "transfer-encoding: chunked")) {
+            self->requestAsyncFinish(false, "Chunked transfer encoding not supported");
+            return;
+        }
+        const char* contentLengthPtr = strcasestr(self->asyncState.headerBuffer, "content-length:");
         if (contentLengthPtr) {
-            self->asyncState.contentLength = atoi(contentLengthPtr + 16);
+            self->asyncState.contentLength = atoi(contentLengthPtr + 15);
             Serial.printf("FileManager: Content-Length: %d bytes\n", self->asyncState.contentLength);
-
-            size_t freeSpace = self->getSDCardFreeSpace();
-            if (self->asyncState.contentLength > 0 && (size_t)self->asyncState.contentLength > freeSpace) {
-                Serial.println("FileManager: Insufficient SD card space");
-                self->cleanupAsyncDownload(false, "Insufficient SD card space");
+            if (self->asyncState.contentLength > 0 &&
+                static_cast<uint64_t>(self->asyncState.contentLength) + (1024 * 1024) > self->asyncState.freeBytesAtStart) {
+                self->requestAsyncFinish(false, "Insufficient SD card space");
                 return;
             }
         }
 
         self->asyncState.headersParsed = true;
         size_t headerSize = (headerEnd + 4) - self->asyncState.headerBuffer;
-        size_t headerBytesFromCurrentChunk = headerSize > previousHeaderBytes ?
-            (headerSize - previousHeaderBytes) : 0;
-
+        size_t headerBytesFromCurrentChunk = headerSize > previousHeaderBytes ? (headerSize - previousHeaderBytes) : 0;
         if (headerBytesFromCurrentChunk > len) {
-            self->cleanupAsyncDownload(false, "HTTP header accounting error");
+            self->requestAsyncFinish(false, "HTTP header accounting error");
             return;
         }
-
         size_t bodyBytesInCurrentChunk = len - headerBytesFromCurrentChunk;
         if (bodyBytesInCurrentChunk > 0) {
-            if (!bufferBodyData(static_cast<const uint8_t*>(data) + headerBytesFromCurrentChunk,
-                               bodyBytesInCurrentChunk)) {
-                return;
-            }
+            bufferBodyData(static_cast<const uint8_t*>(data) + headerBytesFromCurrentChunk, bodyBytesInCurrentChunk);
         }
-
-        self->asyncState.headerParseTime = millis() - headerParseStart;
-        Serial.printf("FileManager: ⚡ Headers parsed in %lu ms, starting data transfer\n", 
-                     self->asyncState.headerParseTime);
         return;
     }
 
     if (!bufferBodyData(static_cast<const uint8_t*>(data), len)) {
         return;
     }
-    
-    // Calculate callback processing time
+
     unsigned long callbackDuration = millis() - dataCallbackStart;
-    if (callbackDuration > 100) {
-        Serial.printf("⚠️  Slow onData callback: %lu ms (received %d bytes)\n", 
-                     callbackDuration, len);
+    if (callbackDuration > 500) {
+        Serial.printf("FileManager: slow onData callback: %lu ms (%u bytes)\n", callbackDuration, (unsigned)len);
     }
-    
-    // Report progress every 20%
+
     if (self->asyncState.contentLength > 0) {
-        int progress = (self->asyncState.totalDownloaded * 100) / self->asyncState.contentLength;
+        int progress = (int)((uint64_t)self->asyncState.totalDownloaded * 100 / self->asyncState.contentLength);
         if (progress >= self->asyncState.lastReportedProgress + 20) {
             self->asyncState.lastReportedProgress = progress;
-            
             unsigned long elapsed = millis() - self->asyncState.startTime;
-            float currentSpeed = elapsed > 0 ? (self->asyncState.totalDownloaded * 8.0f) / (elapsed / 1000.0f) / 1000.0f : 0;
-            
-            Serial.printf("📥 Progress: %d%% (%d/%d bytes) - %.2f Mbps - %d SD writes\n", 
-                         progress, self->asyncState.totalDownloaded, self->asyncState.contentLength, 
-                         currentSpeed / 1000.0f, self->asyncState.writeCount);
-            
+            float mbps = elapsed > 0 ? (self->asyncState.totalDownloaded * 8.0f) / (elapsed / 1000.0f) / 1e6f : 0;
+            Serial.printf("FileManager: progress %d%% (%d/%d bytes) %.2f Mbps, %d SD writes\n",
+                          progress, self->asyncState.totalDownloaded, self->asyncState.contentLength,
+                          mbps, self->asyncState.writeCount);
             if (self->downloadProgressCallback) {
-                self->downloadProgressCallback(self->asyncState.url, self->asyncState.localPath, 
-                                             progress, self->asyncState.totalDownloaded, 
-                                             self->asyncState.contentLength);
+                self->downloadProgressCallback(self->asyncState.url, self->asyncState.localPath, progress,
+                                               self->asyncState.totalDownloaded, self->asyncState.contentLength);
             }
         }
     }
@@ -1656,403 +1664,277 @@ void FileManager::onAsyncData(void* arg, AsyncClient* client, void* data, size_t
 
 void FileManager::onAsyncDisconnect(void* arg, AsyncClient* client) {
     FileManager* self = static_cast<FileManager*>(arg);
-    bool finalBufferQueued = false;
-    
-    // Final buffer swap to ensure all data is written
-    if (self->asyncState.bufferAUsed > 0) {
-        if (!self->swapBuffers()) {
-            self->cleanupAsyncDownload(false, "Timed out queuing final SD write");
-            return;
-        }
-        finalBufferQueued = true;
-    }
-
-    if (finalBufferQueued) {
-        if (xSemaphoreTake(self->asyncState.writeCompleteSemaphore, pdMS_TO_TICKS(1000)) != pdTRUE) {
-            self->cleanupAsyncDownload(false, "Timed out waiting for final SD write");
-            return;
-        }
-    }
-    
-    // Stop write task
-    if (self->asyncState.writeTaskHandle) {
-        self->asyncState.writeTaskRunning = false;
-        xSemaphoreGive(self->asyncState.bufferSwapSemaphore);  // Wake up task to exit
-        vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to finish
-    }
-
-    size_t actualBytesWritten = self->asyncState.file ? self->asyncState.file.position() : 0;
-    if (actualBytesWritten != static_cast<size_t>(self->asyncState.totalDownloaded)) {
-        Serial.printf("FileManager: Count mismatch after disconnect - received %d bytes, wrote %u bytes\n",
-                     self->asyncState.totalDownloaded,
-                     static_cast<unsigned>(actualBytesWritten));
-    }
-
-    if (actualBytesWritten > 0) {
-        self->asyncState.totalDownloaded = actualBytesWritten;
-    }
-
-    if (self->asyncState.contentLength > 0 &&
-        self->asyncState.totalDownloaded > 0 &&
-        self->asyncState.totalDownloaded < self->asyncState.contentLength) {
-        String tailError;
-        if (!self->fetchRemainingTail(self->asyncState.url,
-                                      self->asyncState.totalDownloaded,
-                                      self->asyncState.contentLength,
-                                      tailError)) {
-            Serial.printf("FileManager: Tail fetch failed: %s\n", tailError.c_str());
-        }
-
-        actualBytesWritten = self->asyncState.file ? self->asyncState.file.position() : 0;
-        if (actualBytesWritten > 0) {
-            self->asyncState.totalDownloaded = actualBytesWritten;
-        }
-    }
-    
-    // Check if download was successful
-    bool success = true;
-    String errorMsg = "";
-    
-    if (self->asyncState.contentLength > 0) {
-        int sizeDiff = abs(self->asyncState.contentLength - self->asyncState.totalDownloaded);
-        if (sizeDiff != 0) {
-            success = false;
-            errorMsg = "Download size mismatch: got " + String(self->asyncState.totalDownloaded) + 
-                      " expected " + String(self->asyncState.contentLength) + 
-                      " (diff: " + String(sizeDiff) + " bytes)";
-            Serial.printf("FileManager: %s\n", errorMsg.c_str());
-        }
-    }
-    
-    if (success && self->asyncState.totalDownloaded > 0) {
-        // Print performance summary
-        unsigned long totalTime = millis() - self->asyncState.startTime;
-        float totalSec = totalTime / 1000.0f;
-        float avgSpeed = totalSec > 0 ? (self->asyncState.totalDownloaded * 8.0f) / (totalSec * 1000.0f) : 0;
-        
-        Serial.println("\n📊 Download Performance Summary:");
-        Serial.printf("   ⏱️  Total: %.2f sec (%.2f Mbps avg)\n", totalSec, avgSpeed / 1000.0f);
-        Serial.printf("   📦 Downloaded: %.2f MB (%d bytes)\n",
-                     self->asyncState.totalDownloaded / 1048576.0f,
-                     self->asyncState.totalDownloaded);
-        Serial.printf("   💾 SD writes: %d writes, %.1f sec total (%.1f%% of time)\n",
-                     self->asyncState.writeCount,
-                     self->asyncState.totalWriteTime / 1000.0f,
-                     (float)self->asyncState.totalWriteTime / totalTime * 100);
-        Serial.printf("   🌐 Network: %.1f sec (%.1f%% of time)\n",
-                     (totalTime - self->asyncState.totalWriteTime) / 1000.0f,
-                     (float)(totalTime - self->asyncState.totalWriteTime) / totalTime * 100);
-        Serial.println();
-        
-        // Close temp file
-        self->asyncState.file.close();
-        
-        // Move temp file to final location
-        if (SD_MMC.exists(self->asyncState.localPath)) {
-            SD_MMC.remove(self->asyncState.localPath);
-        }
-        
-        if (!SD_MMC.rename(self->asyncState.tempPath, self->asyncState.localPath)) {
-            success = false;
-            errorMsg = "Failed to rename temp file";
-        } else if (!SD_MMC.exists(self->asyncState.localPath)) {
-            success = false;
-            errorMsg = "File verification failed";
-        }
-    } else if (self->asyncState.totalDownloaded == 0) {
-        success = false;
-        errorMsg = "No data received";
-    }
-    
-    self->cleanupAsyncDownload(success, errorMsg);
+    // The server closed the connection ("Connection: close"): the data path is complete.
+    // Whether it is a *successful* download (size, checksum) is decided by the owner.
+    self->requestAsyncFinish(true, "");
 }
 
 void FileManager::onAsyncError(void* arg, AsyncClient* client, int8_t error) {
     FileManager* self = static_cast<FileManager*>(arg);
-    
-    String errorMsg = "AsyncTCP error: " + String(error);
-    Serial.println("FileManager: " + errorMsg);
-    
-    self->cleanupAsyncDownload(false, errorMsg);
+    char msg[48];
+    snprintf(msg, sizeof(msg), "AsyncTCP error %d", (int)error);
+    self->requestAsyncFinish(false, msg);
 }
 
 void FileManager::onAsyncTimeout(void* arg, AsyncClient* client, uint32_t time) {
     FileManager* self = static_cast<FileManager*>(arg);
-    
-    Serial.printf("FileManager: Timeout after %u ms\n", time);
-    self->cleanupAsyncDownload(false, "Download timeout");
+    self->requestAsyncFinish(false, "Network timeout");
 }
 
-bool FileManager::fetchRemainingTail(const String& url, size_t offset, size_t expectedTotal, String& errorMsg) {
-    if (offset >= expectedTotal) {
-        return true;
-    }
-
-    if (!asyncState.file) {
-        errorMsg = "Temp file is not open for tail fetch";
-        return false;
-    }
-
-    if (!persistentBufferA) {
-        errorMsg = "Tail fetch buffer unavailable";
-        return false;
-    }
-
-    if (!asyncState.file.seek(offset)) {
-        errorMsg = "Failed to seek temp file for tail fetch";
-        return false;
-    }
-
-    Serial.printf("FileManager: Completing tail via HTTP range from byte %u\n", static_cast<unsigned>(offset));
-
-    auto readTail = [&](HTTPClient &http) -> bool {
-        http.addHeader("Range", "bytes=" + String(offset) + "-");
-        http.addHeader("Connection", "close");
-
-        int httpCode = http.GET();
-        if (httpCode != HTTP_CODE_PARTIAL_CONTENT) {
-            errorMsg = "Tail fetch HTTP error: " + String(httpCode);
-            return false;
-        }
-
-        WiFiClient *stream = http.getStreamPtr();
-        size_t expectedRemaining = expectedTotal - offset;
-        size_t receivedRemaining = 0;
-
-        while (http.connected() && receivedRemaining < expectedRemaining) {
-            size_t available = stream->available();
-            if (available == 0) {
-                delay(1);
-                continue;
-            }
-
-            size_t remaining = expectedRemaining - receivedRemaining;
-            size_t toRead = available < DOWNLOAD_BUFFER_SIZE ? available : DOWNLOAD_BUFFER_SIZE;
-            if (toRead > remaining) {
-                toRead = remaining;
-            }
-
-            int bytesRead = stream->readBytes(persistentBufferA, toRead);
-            if (bytesRead <= 0) {
-                break;
-            }
-
-            size_t written = asyncState.file.write(persistentBufferA, bytesRead);
-            if (written != static_cast<size_t>(bytesRead)) {
-                errorMsg = "Failed writing ranged tail to SD";
+// Hand the full network buffer to the SD writer (called from onAsyncData). Waits for the
+// previous write to finish: a few hundred ms is a normal SD card busy period, so a short
+// timeout here used to abort perfectly good downloads. TCP flow control holds the sender.
+// Producer side (async_tcp task): copy into the PSRAM ring. Only blocks when the ring is
+// completely full, i.e. the card has been paused for RING_SIZE worth of network data.
+bool FileManager::ringPush(const uint8_t* data, size_t len) {
+    unsigned long waitedMs = 0;
+    while (len > 0) {
+        size_t space = ringFree();
+        if (space == 0) {
+            if (waitedMs >= SD_WRITER_STALL_MS) {
                 return false;
             }
-
-            receivedRemaining += bytesRead;
+            vTaskDelay(pdMS_TO_TICKS(20));
+            waitedMs += 20;
+            continue;
         }
-
-        if (receivedRemaining != expectedRemaining) {
-            errorMsg = "Tail fetch incomplete: got " + String(receivedRemaining) +
-                      " expected " + String(expectedRemaining);
-            return false;
+        size_t n = len < space ? len : space;
+        size_t headIdx = asyncState.ringHead % RING_SIZE;
+        size_t first = (RING_SIZE - headIdx) < n ? (RING_SIZE - headIdx) : n;
+        memcpy(ringBuffer + headIdx, data, first);
+        if (n > first) {
+            memcpy(ringBuffer, data + first, n - first);
         }
-
-        return true;
-    };
-
-    bool success = false;
-    if (url.startsWith("https://")) {
-        WiFiClientSecure client;
-        client.setInsecure();
-        HTTPClient http;
-        if (!http.begin(client, url)) {
-            errorMsg = "Failed to initialize HTTPS tail fetch";
-        } else {
-            http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-            http.setTimeout(30000);
-            success = readTail(http);
-            http.end();
-        }
-    } else {
-        WiFiClient client;
-        HTTPClient http;
-        if (!http.begin(client, url)) {
-            errorMsg = "Failed to initialize HTTP tail fetch";
-        } else {
-            http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-            http.setTimeout(30000);
-            success = readTail(http);
-            http.end();
+        asyncState.ringHead += n;
+        asyncState.totalDownloaded += n;
+        data += n;
+        len -= n;
+        if (asyncState.dataAvailable) {
+            xSemaphoreGive(asyncState.dataAvailable);
         }
     }
-
-    if (success) {
-        asyncState.totalDownloaded = asyncState.file.position();
-        Serial.printf("FileManager: Tail fetch completed, file now %u bytes\n",
-                     static_cast<unsigned>(asyncState.totalDownloaded));
-    }
-
-    return success;
-}
-
-// Buffer swap function - called from onAsyncData when bufferA is full
-bool FileManager::swapBuffers() {
-    unsigned long swapStart = millis();
-    
-    // Wait for previous write to complete (should be instant if write task is fast)
-    if (xSemaphoreTake(asyncState.writeCompleteSemaphore, pdMS_TO_TICKS(100)) != pdTRUE) {
-        Serial.println("⚠️  Write task blocked - timeout waiting for previous write!");
-        return false;
-    }
-    
-    // Now safe to swap - write task is idle
-    asyncState.swapRequested = true;
-    
-    // Swap the pointers immediately (write task is waiting)
-    uint8_t* temp = asyncState.bufferB;
-    asyncState.bufferB = asyncState.bufferA;
-    asyncState.bufferA = temp;
-    
-    size_t bytesToWrite = asyncState.bufferAUsed;  // Old bufferA, now in bufferB
-    asyncState.bufferBUsed = bytesToWrite;
-    asyncState.bufferAUsed = 0;  // Reset for new network data
-    
-    asyncState.swapRequested = false;
-    
-    // Signal write task to start writing bufferB
-    xSemaphoreGive(asyncState.bufferSwapSemaphore);
-    
-    unsigned long swapTime = millis() - swapStart;
-    if (swapTime > 5) {
-        Serial.printf("⚠️  Buffer swap delayed: %lu ms (write task busy)\n", swapTime);
-    }
-
     return true;
 }
 
-// FreeRTOS task that runs on Core 0 and writes buffers to SD card
+// SD writer task (core 0): drains the PSRAM ring in DOWNLOAD_BUFFER_SIZE chunks through the
+// internal bounce buffer, hashing as it goes. Exits only when told to AND signals it, so the
+// owner can delete the semaphore safely.
 void FileManager::sdWriteTask(void* parameter) {
     FileManager* self = static_cast<FileManager*>(parameter);
-    
-    Serial.println("[WriteTask] Started on Core 0");
-    
-    while (self->asyncState.writeTaskRunning) {
-        // Wait for buffer swap signal from network task
-        if (xSemaphoreTake(self->asyncState.bufferSwapSemaphore, pdMS_TO_TICKS(100)) == pdTRUE) {
-            
-            if (!self->asyncState.writeTaskRunning) break;  // Exit signal
-            
-            // Pointers already swapped by swapBuffers(), just write bufferB
-            size_t bytesToWrite = self->asyncState.bufferBUsed;
-            
-            if (bytesToWrite > 0) {
-                unsigned long writeStart = micros();
-                size_t written = self->asyncState.file.write(self->asyncState.bufferB, bytesToWrite);
-                unsigned long writeTime = micros() - writeStart;
-                
-                self->asyncState.totalWriteTime += (writeTime / 1000);  // Convert to ms
-                self->asyncState.writeCount++;
-                
-                // Only log every 50 writes to reduce spam
-                if (self->asyncState.writeCount % 50 == 0) {
-                    float writeTimeMs = writeTime / 1000.0f;
-                    float speedMbps = (bytesToWrite / 1024.0f) / (writeTimeMs / 1000.0f) * 8.0f / 1024.0f;
-                    Serial.printf("[SD Write #%d] %.2f ms (%.1f Mbps) | %lu bytes total\n",
-                                 self->asyncState.writeCount, writeTimeMs, speedMbps,
-                                 self->asyncState.file.position());
-                }
-                
-                if (written != bytesToWrite) {
-                    Serial.printf("❌ SD Write #%d failed: %d/%d bytes\n", 
-                                 self->asyncState.writeCount, written, bytesToWrite);
-                }
-                
-                self->asyncState.bufferBUsed = 0;
-            }
-            
-            // Signal that write is complete - network can proceed
-            xSemaphoreGive(self->asyncState.writeCompleteSemaphore);
+    for (;;) {
+        size_t avail = self->ringAvailable();
+        const bool flushTail = self->asyncState.producerDone && avail > 0;
+        if (self->asyncState.discardRing) {
+            break;
         }
+        if (avail >= DOWNLOAD_BUFFER_SIZE || flushTail) {
+            size_t n = avail < DOWNLOAD_BUFFER_SIZE ? avail : DOWNLOAD_BUFFER_SIZE;
+            size_t tailIdx = self->asyncState.ringTail % RING_SIZE;
+            size_t first = (RING_SIZE - tailIdx) < n ? (RING_SIZE - tailIdx) : n;
+            memcpy(self->persistentBufferA, self->ringBuffer + tailIdx, first);
+            if (n > first) {
+                memcpy(self->persistentBufferA + first, self->ringBuffer, n - first);
+            }
+            unsigned long writeStart = micros();
+            size_t written = self->asyncState.file.write(self->persistentBufferA, n);
+            unsigned long writeTime = micros() - writeStart;
+            if (self->asyncState.shaActive) {
+                mbedtls_sha256_update(&self->asyncState.sha, self->persistentBufferA, written);
+            }
+            self->asyncState.totalWriteTime += (writeTime / 1000);
+            self->asyncState.writeCount++;
+            if (writeTime > 300000) {
+                Serial.printf("FileManager: slow SD write #%d: %lu ms for %u bytes (ring backlog %u KB)\n",
+                              self->asyncState.writeCount, writeTime / 1000, (unsigned)n,
+                              (unsigned)(self->ringAvailable() / 1024));
+            }
+            if (written != n) {
+                Serial.printf("FileManager: SD write #%d short: %u/%u bytes\n",
+                              self->asyncState.writeCount, (unsigned)written, (unsigned)n);
+                self->requestAsyncFinish(false, "SD write failed");
+                self->asyncState.discardRing = true;
+                break;
+            }
+            self->asyncState.ringTail += n;
+            continue;
+        }
+        if (!self->asyncState.writeTaskRunning && avail == 0) {
+            break;
+        }
+        if (!self->asyncState.writeTaskRunning && !self->asyncState.producerDone) {
+            break; // stopped without a drain request
+        }
+        xSemaphoreTake(self->asyncState.dataAvailable, pdMS_TO_TICKS(50));
     }
-    
-    Serial.println("[WriteTask] Exiting");
+    self->asyncState.writerExited = true;
     vTaskDelete(NULL);
 }
 
-void FileManager::cleanupAsyncDownload(bool success, const String& errorMsg) {
-    // Stop write task if running
-    if (asyncState.writeTaskHandle) {
-        asyncState.writeTaskRunning = false;
-        xSemaphoreGive(asyncState.bufferSwapSemaphore);  // Wake task to exit
-        vTaskDelay(pdMS_TO_TICKS(200));  // Wait for task to finish
-        asyncState.writeTaskHandle = nullptr;
-    }
-    
-    // Delete semaphores
-    if (asyncState.bufferSwapSemaphore) {
-        vSemaphoreDelete(asyncState.bufferSwapSemaphore);
-        asyncState.bufferSwapSemaphore = nullptr;
-    }
-    if (asyncState.writeCompleteSemaphore) {
-        vSemaphoreDelete(asyncState.writeCompleteSemaphore);
-        asyncState.writeCompleteSemaphore = nullptr;
-    }
-    
-    // Close file
-    if (asyncState.file) {
-        asyncState.file.close();
-    }
-    
-    // Clear buffer pointers (but don't free - they're persistent)
-    // The buffers remain allocated and will be reused for next download
-    asyncState.bufferA = nullptr;
-    asyncState.bufferB = nullptr;
-    asyncState.bufferAUsed = 0;
-    asyncState.bufferBUsed = 0;
-    
-    // Clean up client
+// Runs on the loop task once the callbacks have requested completion.
+void FileManager::finalizeAsyncDownload() {
+    bool success = asyncState.finishSuccess;
+    String errorMsg = asyncState.finishError;
+    bool hardFailure = false;
+
+    // 1. Network side: detach callbacks, close, delete (we are not inside a callback here).
     if (asyncState.client) {
+        asyncState.client->onConnect(nullptr, nullptr);
+        asyncState.client->onData(nullptr, nullptr);
+        asyncState.client->onDisconnect(nullptr, nullptr);
+        asyncState.client->onError(nullptr, nullptr);
+        asyncState.client->onTimeout(nullptr, nullptr);
         asyncState.client->close(true);
+        delay(20); // let the async_tcp task drain any event already queued for this client
         delete asyncState.client;
         asyncState.client = nullptr;
     }
-    
-    // Remove temp file on failure
+
+    // 2. Let the writer drain the ring (success) or drop it (failure). The drain is NOT
+    //    waited for here: this runs on the loop task and a 4 MB backlog on a slow card takes
+    //    10+ s. We return and come back on later update() calls until the ring is empty.
+    if (asyncState.writeTaskHandle) {
+        if (success) {
+            if (!asyncState.producerDone) {
+                asyncState.producerDone = true;
+                asyncState.drainStartedMs = millis();
+                if (asyncState.dataAvailable) {
+                    xSemaphoreGive(asyncState.dataAvailable);
+                }
+            }
+            if (ringAvailable() > 0 && !asyncState.discardRing) {
+                if (millis() - asyncState.drainStartedMs < 180000UL) {
+                    return; // still draining; try again next loop
+                }
+                success = false;
+                errorMsg = "SD writer did not drain the ring";
+                asyncState.discardRing = true;
+            }
+        } else {
+            asyncState.discardRing = true;
+        }
+        asyncState.writeTaskRunning = false;
+        if (asyncState.dataAvailable) {
+            xSemaphoreGive(asyncState.dataAvailable);
+        }
+        for (int i = 0; i < 500 && !asyncState.writerExited; ++i) {
+            delay(10);
+        }
+        if (!asyncState.writerExited) {
+            Serial.println("FileManager: SD writer did not exit; leaking its semaphore rather than crashing");
+            asyncState.dataAvailable = nullptr;
+        }
+        asyncState.writeTaskHandle = nullptr;
+    }
+    if (asyncState.dataAvailable) {
+        vSemaphoreDelete(asyncState.dataAvailable);
+        asyncState.dataAvailable = nullptr;
+    }
+    // A short SD write inside the writer requests a failed finish after we started finalizing.
+    if (success && asyncState.discardRing) {
+        success = false;
+        errorMsg = "SD write failed";
+    }
+
+    // 4. File: sync and close; verify size and checksum before it becomes visible.
+    size_t bytesWritten = 0;
+    if (asyncState.file) {
+        asyncState.file.flush();
+        bytesWritten = asyncState.file.position();
+        asyncState.file.close();
+    }
+    String actualSha;
+    if (asyncState.shaActive) {
+        uint8_t digest[32];
+        mbedtls_sha256_finish(&asyncState.sha, digest);
+        mbedtls_sha256_free(&asyncState.sha);
+        asyncState.shaActive = false;
+        char hex[65];
+        for (size_t i = 0; i < sizeof(digest); ++i) {
+            snprintf(&hex[i * 2], 3, "%02x", digest[i]);
+        }
+        hex[64] = '\0';
+        actualSha = hex;
+    }
+    if (success) {
+        if (bytesWritten == 0) {
+            success = false;
+            errorMsg = "No data received";
+        } else if (asyncState.contentLength > 0 && bytesWritten != static_cast<size_t>(asyncState.contentLength)) {
+            success = false;
+            hardFailure = true;
+            errorMsg = "Size mismatch: wrote " + String(bytesWritten) + " expected " + String(asyncState.contentLength);
+        } else if (!asyncState.checksum.isEmpty() && !actualSha.equalsIgnoreCase(asyncState.checksum)) {
+            success = false;
+            hardFailure = true;
+            errorMsg = "Checksum mismatch";
+        }
+    }
+    if (success) {
+        if (SD_MMC.exists(asyncState.localPath)) {
+            SD_MMC.remove(asyncState.localPath);
+        }
+        if (!SD_MMC.rename(asyncState.tempPath, asyncState.localPath)) {
+            success = false;
+            errorMsg = "Failed to rename temp file";
+        }
+    }
     if (!success && SD_MMC.exists(asyncState.tempPath)) {
         SD_MMC.remove(asyncState.tempPath);
     }
-    
-    // Update statistics and handle queue
+
+    // 5. Stats, queue and callbacks (owner task). Failure callbacks only when terminal.
     downloadStats.totalDownloads++;
+    auto it = std::find_if(downloadQueue.begin(), downloadQueue.end(),
+        [this](const DownloadTask& task) { return task.localPath == asyncState.localPath; });
+
     if (success) {
         downloadStats.successfulDownloads++;
-        downloadStats.totalBytesDownloaded += asyncState.totalDownloaded;
-        
-        // Remove successful download from queue
-        auto it = std::find_if(downloadQueue.begin(), downloadQueue.end(),
-            [this](const DownloadTask& task) {
-                return task.localPath == asyncState.localPath;
-            });
+        downloadStats.totalBytesDownloaded += bytesWritten;
+        unsigned long totalTime = millis() - asyncState.startTime;
+        float mbps = totalTime > 0 ? (bytesWritten * 8.0f) / (totalTime / 1000.0f) / 1e6f : 0;
+        Serial.printf("FileManager: Download completed: %s (%u bytes, %.2f Mbps, %d SD writes, %lu ms in SD writes)%s\n",
+                      asyncState.localPath.c_str(), (unsigned)bytesWritten, mbps, asyncState.writeCount,
+                      asyncState.totalWriteTime, asyncState.checksum.isEmpty() ? "" : ", sha256 verified");
         if (it != downloadQueue.end()) {
             downloadQueue.erase(it);
             saveDownloadQueue();
         }
-        
-        Serial.printf("Download completed: %s (%d bytes)\n", 
-                     asyncState.localPath.substring(asyncState.localPath.lastIndexOf('/') + 1).c_str(),
-                     asyncState.totalDownloaded);
-        
-        if (downloadCompleteCallback) {
-            downloadCompleteCallback(asyncState.url, asyncState.localPath, true, "");
+        if (cachedFreeBytes > bytesWritten) {
+            cachedFreeBytes -= bytesWritten;
         }
-    } else {
-        downloadStats.failedDownloads++;
-        
-        Serial.printf("Download failed: %s\n", errorMsg.c_str());
-        
+        const String url = asyncState.url, path = asyncState.localPath;
+        downloadInProgress = false;
+        asyncState.reset();
+        saveDownloadStats();
         if (downloadCompleteCallback) {
-            downloadCompleteCallback(asyncState.url, asyncState.localPath, false, errorMsg);
+            downloadCompleteCallback(url, path, true, "");
         }
+        return;
     }
-    
-    saveDownloadStats();
-    
-    // Reset state
+
+    downloadStats.failedDownloads++;
+    bool terminal = asyncState.permanentFailure;
+    if (it != downloadQueue.end()) {
+        if (hardFailure) {
+            it->hardFailures++;
+            if (it->hardFailures >= MAX_HARD_FAILURES) {
+                terminal = true;
+            }
+        }
+        if (terminal) {
+            downloadQueue.erase(it);
+        }
+        saveDownloadQueue();
+    } else {
+        terminal = true; // ad-hoc download (not queued): nothing will retry it
+    }
+    Serial.printf("FileManager: Download failed: %s (%s)%s\n", asyncState.localPath.c_str(), errorMsg.c_str(),
+                  terminal ? " - giving up" : " - will retry");
+    const String url = asyncState.url, path = asyncState.localPath;
     downloadInProgress = false;
     asyncState.reset();
+    saveDownloadStats();
+    if (terminal && downloadCompleteCallback) {
+        downloadCompleteCallback(url, path, false, errorMsg);
+    }
 }
