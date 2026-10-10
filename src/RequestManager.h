@@ -113,7 +113,9 @@ public:
     };
 
     // Figure download callback system
-    typedef void (*FigureDownloadCompleteCallback)(const String &uid, const String &figureName, bool success, const String &error, const Figure &figure);
+    // isUpdate=false: first playable state for this tap (play it). isUpdate=true: more tracks
+    // became available for a figure that was already announced (merge, do not restart).
+    typedef void (*FigureDownloadCompleteCallback)(const String &uid, const String &figureName, bool success, const String &error, const Figure &figure, bool isUpdate);
     void setFigureDownloadCompleteCallback(FigureDownloadCompleteCallback callback);
     
     // Helper method to get figure ID from UID (for deletion purposes)
@@ -144,6 +146,7 @@ private:
         bool hasPendingManifest = false;
         String pendingManifestJson;
         String previousManifestJson;
+        bool emittedAny = false;  // a playable state was already announced for this tap
     };
 
     struct PendingFigureCompletion {
@@ -152,6 +155,7 @@ private:
         bool success = false;
         String error;
         Figure figureData;
+        bool isUpdate = false;
     };
     
     std::vector<FigureDownloadTracker> activeDownloads;
@@ -161,10 +165,14 @@ private:
     std::map<String, String> uidToFigureIdMap;
     
     // Helper methods for tracking
-    void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData, bool hasPendingManifest = false, const String &pendingManifestJson = String(), const String &previousManifestJson = String());
+    void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData, bool hasPendingManifest = false, const String &pendingManifestJson = String(), const String &previousManifestJson = String(), bool alreadyEmitted = false);
     void checkFigureDownloadStatus(const String &uid);
     void onTrackDownloadComplete(const String &path, bool success);
-    void queueFigureDownloadCompletion(const String &uid, const String &figureName, bool success, const String &error, const Figure &figureData);
+    void queueFigureDownloadCompletion(const String &uid, const String &figureName, bool success, const String &error, const Figure &figureData, bool isUpdate = false);
+    bool emitFromCache(const String &uid);                 // cache-first: announce whatever is already on the card
+    Figure filterExisting(const Figure &figure) const;      // keep only tracks whose files exist
+    bool firstTrackExists(const Figure &figure) const;      // first track in play order is on the card
+    void emitTrackerState(FigureDownloadTracker &tracker);  // announce the currently playable subset
     void storeUidToFigureIdMapping(const String &uid, const String &figureId);
     static void staticFileDownloadCallback(const String& url, const String& path, bool success, const String& error);
     
@@ -187,7 +195,7 @@ private:
     std::vector<String> extractAssetPaths(const JsonDocument &manifest) const;
     bool isAssetReferencedByOtherUnit(const String &assetPath, const String &currentUid) const;
     void removeStaleAssets(const String &uid, const JsonDocument &currentManifest, const JsonDocument *previousManifest);
-    void processOnlineFigureRequest(const String &uid);
+    void processOnlineFigureRequest(const String &uid, bool alreadyEmitted);
     void processOfflineFigureRequest(const String &uid);
 };
 

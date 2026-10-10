@@ -67,6 +67,9 @@ public:
     bool prevTrack();
     bool playTrack(const String& trackId); // Jump to a specific track by backend ID
     void setPlaylist(const std::vector<String>& trackPaths, const String& figureUid);
+    // Replace the playlist for the same figure without interrupting the current track
+    // (tracks that finished downloading are added in order; the playing track keeps its slot).
+    void mergePlaylist(const std::vector<String>& trackPaths, const String& figureUid);
     void clearPlaylist();
     
     // Playlist information

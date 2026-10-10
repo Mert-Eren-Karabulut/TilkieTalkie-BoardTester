@@ -833,6 +833,41 @@ void AudioController::setPlaylist(const std::vector<String>& trackPaths, const S
     }
 }
 
+void AudioController::mergePlaylist(const std::vector<String>& trackPaths, const String& figureUid) {
+    bool taskSuspended = suspendBackgroundTaskForControl();
+    if (figureUid != playlistFigureUid || playlist.empty()) {
+        playlist = trackPaths;
+        playlistFigureUid = figureUid;
+        currentPlaylistIndex = -1;
+        playlistFinished = false;
+    } else {
+        int newIndex = -1;
+        if (currentPlaylistIndex >= 0 && currentPlaylistIndex < (int)playlist.size()) {
+            const String current = playlist[currentPlaylistIndex];
+            for (size_t i = 0; i < trackPaths.size(); ++i) {
+                if (trackPaths[i] == current) {
+                    newIndex = (int)i;
+                    break;
+                }
+            }
+        }
+        playlist = trackPaths;
+        if (newIndex >= 0) {
+            currentPlaylistIndex = newIndex;
+            if (playlistFinished && newIndex + 1 < (int)playlist.size()) {
+                playlistFinished = false; // new tracks arrived after the one we finished on
+            }
+        } else if (currentPlaylistIndex >= (int)playlist.size()) {
+            currentPlaylistIndex = (int)playlist.size() - 1;
+        }
+    }
+    Serial.printf("AudioController: playlist merged: %u tracks for %s (index %d)\n",
+                  (unsigned)playlist.size(), figureUid.c_str(), currentPlaylistIndex);
+    if (taskSuspended) {
+        resumeBackgroundTaskForControl();
+    }
+}
+
 void AudioController::clearPlaylist() {
     bool taskSuspended = suspendBackgroundTaskForControl();
     playlist.clear();
@@ -867,11 +902,16 @@ bool AudioController::nextTrack() {
         return play(); // Call play() without parameters to use playlist
     }
     
-    // Move to next track
+    // Move to the next track that actually exists on the card (tracks still downloading or
+    // permanently missing are skipped instead of ending the playlist).
     currentPlaylistIndex++;
+    while (currentPlaylistIndex < (int)playlist.size() && !fileManager.fileExists(playlist[currentPlaylistIndex])) {
+        Serial.printf("AudioController: skipping missing track %s\n", playlist[currentPlaylistIndex].c_str());
+        currentPlaylistIndex++;
+    }
     
     // Check if we've reached the end
-    if (currentPlaylistIndex >= playlist.size()) {
+    if (currentPlaylistIndex >= (int)playlist.size()) {
         Serial.println("AudioController: Reached end of playlist");
         playlistFinished = true;
         stop();
@@ -959,20 +999,16 @@ void AudioController::updatePlaybackSlice() {
     if (currentState == PLAYING) {
         const int maxDecodePassesPerUpdate = 4;
 
-        if (hasPlaylist() && !digitalRead(POGO_SWITCH_PIN)) {
-            Serial.println("AudioController: Raw pogo switch indicates detach during playback");
+        // Safety net only: the debounced detach (NfcController -> afterDetachNFC) is the real
+        // stop path. A raw pin read here stopped playback on every wobble of the figure.
+        if (hasPlaylist() && !NfcController::getInstance().isCardPresent()) {
+            Serial.println("AudioController: figure no longer present during playback");
             stop();
             return;
         }
 
         if (audioMP3 && audioMP3->isRunning()) {
             for (int decodePass = 0; decodePass < maxDecodePassesPerUpdate; ++decodePass) {
-                if (hasPlaylist() && !digitalRead(POGO_SWITCH_PIN)) {
-                    Serial.println("AudioController: Raw pogo switch indicates detach during decode");
-                    stop();
-                    return;
-                }
-
                 if (!audioMP3->loop()) {
                     // Track finished
                     stop();
@@ -1328,35 +1364,17 @@ bool AudioController::initializeAudioComponents() {
 }
 
 bool AudioController::isNfcSessionActive(const String& expectedUid) const {
-    // We need to include NfcController here to check the session
-    extern NfcController &nfcController; // Reference to the global instance from main.cpp
-    
-    Serial.printf("AudioController: Checking NFC session - expected UID: %s\n", expectedUid.c_str());
-
-    if (!digitalRead(POGO_SWITCH_PIN)) {
-        Serial.println("AudioController: Raw pogo switch indicates no active NFC session");
+    NfcController &nfc = NfcController::getInstance();
+    if (!nfc.isCardPresent()) {
+        Serial.println("AudioController: no figure present");
         return false;
     }
-    
-    // Safety check - make sure we can access the NFC controller
- 
-        bool cardPresent = nfcController.isCardPresent();
-        Serial.printf("AudioController: Card present: %s\n", cardPresent ? "YES" : "NO");
-        if (!cardPresent) {
-            Serial.println("AudioController: No card present in NFC session check");
-            return false;
-        }
-        
-        String currentUid = nfcController.currentNFCData().uidString;
-        Serial.printf("AudioController: Current UID: %s\n", currentUid.c_str());
-        if (currentUid != expectedUid) {
-            Serial.printf("AudioController: UID mismatch - expected: %s, current: %s\n", 
-                         expectedUid.c_str(), currentUid.c_str());
-            return false;
-        }
-        
-        Serial.println("AudioController: NFC session is active and UID matches");
-        return true;
-   
+    String currentUid = nfc.currentNFCData().uidString;
+    if (currentUid != expectedUid) {
+        Serial.printf("AudioController: figure UID mismatch (playlist %s, mounted %s)\n",
+                      expectedUid.c_str(), currentUid.c_str());
+        return false;
+    }
+    return true;
 }
 

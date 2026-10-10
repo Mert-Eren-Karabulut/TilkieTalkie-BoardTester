@@ -475,74 +475,58 @@ void handleChatMessage(const String &message)
 // +++ NFC Callback Functions +++
 
 // Callback function for when figure download is complete
-void onFigureDownloadComplete(const String &uid, const String &figureName, bool success, const String &error, const RequestManager::Figure &figure)
+void onFigureDownloadComplete(const String &uid, const String &figureName, bool success, const String &error, const RequestManager::Figure &figure, bool isUpdate)
 {
-    ESP_LOGI(TAG, "=== Figure Download Complete ===");
-    ESP_LOGI(TAG, "UID: %s", uid.c_str());
-    ESP_LOGI(TAG, "Figure: %s", figureName.c_str());
-    ESP_LOGI(TAG, "Success: %s", success ? "YES" : "NO");
+    const bool mounted = nfcController.isCardPresent() && nfcController.currentNFCData().uidString == uid;
 
-    if (success)
+    if (!success)
     {
-        ESP_LOGI(TAG, "All tracks are ready! Checking if figure is still mounted...");
-
-        // Check if the figure is still mounted on the device
-        if (nfcController.isCardPresent() && nfcController.currentNFCData().uidString == uid)
+        ESP_LOGE(TAG, "Figure %s (%s): %s", figureName.c_str(), uid.c_str(), error.c_str());
+        if (mounted)
         {
-            ESP_LOGI(TAG, "Figure is still mounted! Starting automatic playback...");
-            // Pulse LED green to indicate success
-            // ledController.pulseRapid(0x00FF00, 2); // Green color, 2 rapid pulses
+            ledController.pulseRapid(0xFF0000, 5); // red: nothing to play
+        }
+        return;
+    }
 
-            // Create the playback order from manifest contents first, then append custom tracks.
-            std::vector<String> playlist;
-            for (const auto &content : figure.contents)
-            {
-                for (const auto &episode : content.episodes)
-                {
-                    for (const auto &track : episode.tracks)
-                    {
-                        playlist.push_back(track.localPath);
-                        ESP_LOGI(TAG, "Added content track: %s (%s)", track.localPath.c_str(), track.name.c_str());
-                    }
-                }
-            }
-
-            for (const auto &track : figure.customTracks)
+    // Play order: manifest contents (sorted by the backend), then custom tracks.
+    std::vector<String> playlist;
+    for (const auto &content : figure.contents)
+    {
+        for (const auto &episode : content.episodes)
+        {
+            for (const auto &track : episode.tracks)
             {
                 playlist.push_back(track.localPath);
-                ESP_LOGI(TAG, "Added custom track: %s (%s)", track.localPath.c_str(), track.name.c_str());
-            }
-
-            if (!playlist.empty())
-            {
-                // Set the playlist and start playing
-                audioController.setPlaylist(playlist, uid);
-                audioController.play(); // Start playing the first track
-                ESP_LOGI(TAG, "Started playing figure '%s' with %d tracks", figureName.c_str(), playlist.size());
-            }
-            else
-            {
-                ESP_LOGW(TAG, "No tracks found in figure structure!");
             }
         }
-        else
-        {
-            ESP_LOGI(TAG, "Figure is no longer mounted. Not starting playback.");
-        }
-
-        ESP_LOGI(TAG, "Figure is ready for playback!");
     }
-    else
+    for (const auto &track : figure.customTracks)
     {
-        ESP_LOGE(TAG, "Download failed: %s", error.c_str());
-
-        // Pulse LED red to indicate failure
-        ledController.pulseRapid(0xFF0000, 5); // Red color, 5 rapid pulses
-
-        ESP_LOGW(TAG, "Some tracks may be missing. Check download status.");
+        playlist.push_back(track.localPath);
     }
 
-    ESP_LOGI(TAG, "================================");
+    ESP_LOGI(TAG, "Figure %s (%s): %u playable track(s)%s%s", figureName.c_str(), uid.c_str(),
+             (unsigned)playlist.size(), isUpdate ? " [update]" : "", mounted ? "" : " (figure no longer mounted)");
+
+    if (!mounted || playlist.empty())
+    {
+        return;
+    }
+
+    const bool samePlaylist = audioController.hasPlaylist() && audioController.getPlaylistFigureUid() == uid;
+    if (isUpdate && samePlaylist)
+    {
+        audioController.mergePlaylist(playlist, uid); // never interrupts the current track
+        return;
+    }
+    if (samePlaylist)
+    {
+        return; // already playing this figure (e.g. a second tap event)
+    }
+    audioController.setPlaylist(playlist, uid);
+    audioController.play();
+    ESP_LOGI(TAG, "Started playing figure '%s'", figureName.c_str());
 }
 
 // This function will be called ONLY ONCE when a new card is detected
@@ -1226,6 +1210,7 @@ void loop()
             ESP_LOGI(TAG, "  pulse <hex> - Start pulsing LED with hex color");
             ESP_LOGI(TAG, "  rapid <hex> <count> - Rapid pulse LED for count times");
             ESP_LOGI(TAG, "NFC Commands:");
+            ESP_LOGI(TAG, "  tap <uid> / untap - simulate mounting/removing a figure (bench)");
             ESP_LOGI(TAG, "  nfcstatus - Show NFC controller status");
             ESP_LOGI(TAG, "  nfcdata   - Show current NFC card data");
             ESP_LOGI(TAG, "  nfcreed   - Show reed switch status");
@@ -1965,6 +1950,26 @@ void loop()
             }
         }
         // NFC commands
+        else if (command.startsWith("tap ") && DEBUG)
+        {
+            // tap <uid> - simulate mounting a figure (bench), e.g. tap 04-1F-76-D2-56-68-80
+            String uid = command.substring(4);
+            uid.trim();
+            uid.toUpperCase();
+            if (uid.isEmpty())
+            {
+                ESP_LOGI(TAG, "Usage: tap <nfc-uid>");
+            }
+            else
+            {
+                sleepController.resetActivity();
+                nfcController.simulateCard(uid);
+            }
+        }
+        else if (command == "untap" && DEBUG)
+        {
+            nfcController.clearSimulation();
+        }
         else if (command == "nfcstatus")
         {
             ESP_LOGI(TAG, "--- NFC Controller Status ---");

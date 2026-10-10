@@ -72,7 +72,7 @@ bool NfcController::begin()
 
 void NfcController::update()
 {
-    if (!nfcReady)
+    if (!nfcReady || simulated)
     {
         return;
     }
@@ -237,6 +237,43 @@ void NfcController::handleNFCReading()
         }
     }
     // Note: No need for card removal detection here since reed switch handles that
+}
+
+void NfcController::simulateCard(const String &uid)
+{
+    simulated = true;
+    pogoActive = true;
+    cardReadInSession = true;
+    lastReadUID = uid;
+    dockedCardData = NFCData();
+    dockedCardData.uidString = uid;
+    dockedCardData.timestamp = millis();
+    dockedCardData.isValid = true;
+    cardPresent = true;
+    Serial.printf("NfcController: SIMULATED figure %s mounted\n", uid.c_str());
+    if (afterNFCReadCallback)
+    {
+        afterNFCReadCallback(dockedCardData);
+    }
+}
+
+void NfcController::clearSimulation()
+{
+    if (!simulated)
+    {
+        return;
+    }
+    Serial.println("NfcController: SIMULATED figure removed");
+    if (cardReadInSession && afterDetachNFCCallback)
+    {
+        afterDetachNFCCallback();
+    }
+    cardPresent = false;
+    cardReadInSession = false;
+    dockedCardData.isValid = false;
+    pogoActive = false;
+    lastReadUID = "";
+    simulated = false;
 }
 
 bool NfcController::powerDown()

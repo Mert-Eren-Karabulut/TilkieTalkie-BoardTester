@@ -55,6 +55,12 @@ public:
     void setAfterNFCReadCallback(std::function<void(const NFCData &)> cb);
     void setAfterDetachNFCCallback(std::function<void()> cb);
 
+    // Bench simulation: behaves exactly like a mounted figure (callbacks, presence, UID)
+    // without the top PCB. `tap <uid>` / `untap` on the console.
+    void simulateCard(const String &uid);
+    void clearSimulation();
+    bool isSimulated() const { return simulated; }
+
     // Getters for status
     bool isNFCReady() const;
     bool isPogoSwitchActive() const;
@@ -79,6 +85,7 @@ private:
     bool pogoActive;
     bool cardPresent;
     bool cardReadInSession;
+    bool simulated = false;
     String lastReadUID;
     NFCData dockedCardData;
 

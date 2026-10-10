@@ -137,7 +137,8 @@ void RequestManager::update()
         completion.figureName,
         completion.success,
         completion.error,
-        completion.figureData
+        completion.figureData,
+        completion.isUpdate
     );
 }
 
@@ -225,10 +226,32 @@ JsonDocument RequestManager::executeHttpRequest(const String& endpoint, const St
     
     lastStatusCode = httpResponseCode;
 
+    if (httpResponseCode == 401 && !endpoint.endsWith("/token") && !endpoint.endsWith("/validate-token")) {
+        // Token revoked server-side (e.g. another hub of the same user fetched a new one):
+        // re-acquire once and retry, instead of staying dead until the next reboot.
+        static bool retrying = false;
+        http.end();
+        if (!retrying) {
+            retrying = true;
+            Serial.println("RequestManager: 401 - refreshing hub token and retrying once");
+            authToken = "";
+            ConfigManager::getInstance().setJWTToken(String());
+            initConnection();
+            JsonDocument retried = authToken.length() > 0 ? executeHttpRequest(endpoint, method, payload) : emptyDoc;
+            retrying = false;
+            if (authToken.length() > 0) {
+                return retried;
+            }
+        }
+        lastError = "Unauthorized";
+        emptyDoc["error"] = true;
+        emptyDoc["message"] = lastError;
+        return emptyDoc;
+    }
+
     if (httpResponseCode > 0) {
         String response = http.getString();
-        Serial.printf("RequestManager: %s %s -> %d\n", method.c_str(), endpoint.c_str(), httpResponseCode);
-        Serial.println("RequestManager: Response body: " + response);
+        Serial.printf("RequestManager: %s %s -> %d (%u bytes)\n", method.c_str(), endpoint.c_str(), httpResponseCode, (unsigned)response.length());
         http.end();
         return parseResponse(response);
     }
@@ -357,28 +380,37 @@ void RequestManager::initConnection()
 void RequestManager::getCheckFigureTracks(const String &uid)
 {
     Serial.println(F("RequestManager: Processing figure tracks request"));
-    
+
+    // Cache-first: whatever is already on the card plays immediately; the backend is then
+    // asked for changes. A down portal, an expired token or slow WiFi must never keep a
+    // known figure silent.
+    const bool emitted = emitFromCache(uid);
+
     if (isNetworkReady()) {
-        processOnlineFigureRequest(uid);
-    } else {
+        processOnlineFigureRequest(uid, emitted);
+    } else if (!emitted) {
         processOfflineFigureRequest(uid);
     }
 }
 
-void RequestManager::processOnlineFigureRequest(const String &uid)
+void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyEmitted)
 {
     JsonDocument doc = get("/units/" + uid);
-    
+
     if (doc["error"].as<bool>()) {
-        Serial.println(F("RequestManager: API returned error"));
+        Serial.printf("RequestManager: manifest fetch failed (%s)\n", lastError.c_str());
+        if (!alreadyEmitted && figureDownloadCompleteCallback) {
+            Figure emptyFigure;
+            queueFigureDownloadCompletion(uid, "Unknown", false, "Backend unreachable and nothing cached", emptyFigure);
+        }
         return;
     }
 
     JsonObject figure = doc["figure"].as<JsonObject>();
     if (figure.isNull()) {
-        if (figureDownloadCompleteCallback) {
+        if (!alreadyEmitted && figureDownloadCompleteCallback) {
             Figure emptyFigure;
-            figureDownloadCompleteCallback(uid, "null", false, "No figure data found", emptyFigure);
+            queueFigureDownloadCompletion(uid, "null", false, "No figure data found", emptyFigure);
         }
         return;
     }
@@ -388,117 +420,165 @@ void RequestManager::processOnlineFigureRequest(const String &uid)
     String figureName = figure["name"].as<String>();
     JsonArray assetManifest = doc["asset_manifest"].as<JsonArray>();
     if (assetManifest.isNull()) {
-        if (figureDownloadCompleteCallback) {
+        if (!alreadyEmitted && figureDownloadCompleteCallback) {
             Figure emptyFigure;
-            figureDownloadCompleteCallback(uid, figureName, false, "Manifest is missing asset_manifest", emptyFigure);
+            queueFigureDownloadCompletion(uid, figureName, false, "Manifest is missing asset_manifest", emptyFigure);
         }
         return;
     }
-    
+
     storeUidToFigureIdMapping(uid, figureId);
 
+    // Unchanged manifest (same manifest_checksum as the cached copy): nothing to re-save,
+    // just make sure every asset is present.
     JsonDocument previousManifest;
     String previousManifestJson;
-    if (loadUnitManifest(uid, previousManifest)) {
+    bool haveCached = loadUnitManifest(uid, previousManifest);
+    const String newChecksum = doc["manifest_checksum"].as<String>();
+    const String oldChecksum = haveCached ? previousManifest["manifest_checksum"].as<String>() : String();
+    const bool unchanged = haveCached && !newChecksum.isEmpty() && newChecksum == oldChecksum;
+    if (haveCached) {
         serializeJson(previousManifest, previousManifestJson);
-    }
-
-    String pendingManifestJson;
-    serializeJson(doc, pendingManifestJson);
-
-    if (!savePendingUnitManifest(uid, doc)) {
-        if (figureDownloadCompleteCallback) {
-            Figure emptyFigure;
-            figureDownloadCompleteCallback(uid, figureName, false, "Failed to cache pending manifest", emptyFigure);
-        }
-        return;
     }
 
     std::vector<String> trackPaths;
     int assetsToDownload = 0;
     int assetsAlreadyCached = 0;
-
     for (JsonVariant assetVar : assetManifest) {
         JsonObject asset = assetVar.as<JsonObject>();
         String storagePath = normalizeStoragePath(asset["storage_path"].as<String>());
         String url = asset["url"].as<String>();
         String checksum = asset["checksum"].as<String>();
-
         if (storagePath.isEmpty()) {
             continue;
         }
-
         trackPaths.push_back(storagePath);
         fileManager.addRequiredFile(storagePath, url, checksum);
-
-        bool needsDownload = !fileManager.fileExists(storagePath);
-        if (!needsDownload && !checksum.isEmpty()) {
-            String currentChecksum = fileManager.calculateFileChecksum(storagePath);
-            if (currentChecksum != checksum) {
-                Serial.printf("RequestManager: Checksum mismatch, refreshing asset: %s\n", storagePath.c_str());
-                fileManager.deleteFile(storagePath);
-                needsDownload = true;
+        // Existence only: integrity was verified (sha256) when the file was downloaded.
+        // Re-hashing every cached track here used to block the loop for tens of seconds.
+        if (!fileManager.fileExists(storagePath)) {
+            if (url.length() > 0) {
+                fileManager.scheduleDownload(url, storagePath, checksum);
+                assetsToDownload++;
             }
-        }
-
-        if (needsDownload && url.length() > 0) {
-            fileManager.scheduleDownload(url, storagePath, checksum);
-            assetsToDownload++;
-        } else if (!needsDownload) {
+        } else {
             assetsAlreadyCached++;
         }
     }
 
+    if (unchanged && assetsToDownload == 0) {
+        Serial.printf("RequestManager: manifest for %s unchanged, all %d assets present\n", figureName.c_str(), assetsAlreadyCached);
+        if (!alreadyEmitted) {
+            // Nothing was playable from the cache (should not happen when all assets exist) - announce now.
+            Figure figureData = buildFigureFromManifest(doc, true);
+            queueFigureDownloadCompletion(uid, figureName, !figureData.contents.empty() || !figureData.customTracks.empty(),
+                                          "", figureData, false);
+        }
+        return;
+    }
+
+    String pendingManifestJson;
+    bool hasPending = false;
+    if (!unchanged) {
+        serializeJson(doc, pendingManifestJson);
+        hasPending = savePendingUnitManifest(uid, doc);
+        if (!hasPending) {
+            Serial.println("RequestManager: failed to cache pending manifest (continuing without stale-asset cleanup)");
+        }
+    }
+
     Figure figureData = buildFigureFromManifest(doc);
-    
-    startTrackingFigure(uid, figureName, figureId, trackPaths, figureData, true, pendingManifestJson, previousManifestJson);
-    
+    startTrackingFigure(uid, figureName, figureId, trackPaths, figureData, hasPending, pendingManifestJson, previousManifestJson, alreadyEmitted);
+
     if (assetsToDownload > 0) {
-        Serial.printf("RequestManager: Starting %d asset downloads for %s\n", assetsToDownload, figureName.c_str());
+        Serial.printf("RequestManager: %d asset(s) to download for %s (%d already cached)\n", assetsToDownload, figureName.c_str(), assetsAlreadyCached);
     }
-    if (assetsAlreadyCached > 0) {
-        Serial.printf("RequestManager: %d assets already cached for %s\n", assetsAlreadyCached, figureName.c_str());
+}
+
+bool RequestManager::emitFromCache(const String &uid)
+{
+    JsonDocument manifest;
+    if (!loadUnitManifest(uid, manifest)) {
+        return false;
     }
+    Figure cached = buildFigureFromManifest(manifest, true);
+    if (cached.contents.empty() && cached.customTracks.empty()) {
+        return false;
+    }
+    Serial.printf("RequestManager: cache hit for %s (%s) - playing what is on the card\n",
+                  uid.c_str(), cached.name.c_str());
+    queueFigureDownloadCompletion(uid, cached.name, true, "", cached, false);
+    return true;
+}
+
+RequestManager::Figure RequestManager::filterExisting(const Figure &figure) const
+{
+    FileManager &fileManager = FileManager::getInstance();
+    Figure out;
+    out.id = figure.id;
+    out.name = figure.name;
+    out.description = figure.description;
+    out.type = figure.type;
+    out.manifestChecksum = figure.manifestChecksum;
+    for (const auto &content : figure.contents) {
+        Content c = content;
+        c.episodes.clear();
+        for (const auto &episode : content.episodes) {
+            Episode e = episode;
+            e.tracks.clear();
+            for (const auto &track : episode.tracks) {
+                if (fileManager.fileExists(track.localPath)) {
+                    e.tracks.push_back(track);
+                }
+            }
+            if (!e.tracks.empty()) {
+                c.episodes.push_back(e);
+            }
+        }
+        if (!c.episodes.empty()) {
+            out.contents.push_back(c);
+        }
+    }
+    for (const auto &track : figure.customTracks) {
+        if (fileManager.fileExists(track.localPath)) {
+            out.customTracks.push_back(track);
+        }
+    }
+    return out;
+}
+
+bool RequestManager::firstTrackExists(const Figure &figure) const
+{
+    FileManager &fileManager = FileManager::getInstance();
+    for (const auto &content : figure.contents) {
+        for (const auto &episode : content.episodes) {
+            for (const auto &track : episode.tracks) {
+                return fileManager.fileExists(track.localPath);
+            }
+        }
+    }
+    if (!figure.customTracks.empty()) {
+        return fileManager.fileExists(figure.customTracks.front().localPath);
+    }
+    return false;
+}
+
+void RequestManager::emitTrackerState(FigureDownloadTracker &tracker)
+{
+    Figure playable = filterExisting(tracker.figureData);
+    if (playable.contents.empty() && playable.customTracks.empty()) {
+        return;
+    }
+    queueFigureDownloadCompletion(tracker.uid, tracker.figureName, true, "", playable, tracker.emittedAny);
+    tracker.emittedAny = true;
 }
 
 void RequestManager::processOfflineFigureRequest(const String &uid)
 {
-    Serial.println(F("RequestManager: Processing offline figure request"));
-
-    JsonDocument manifest;
-    if (!loadUnitManifest(uid, manifest)) {
-        if (figureDownloadCompleteCallback) {
-            Figure emptyFigure;
-            figureDownloadCompleteCallback(uid, "Unknown", false, "No offline data available", emptyFigure);
-        }
-        return;
-    }
-
-    Figure figureData = buildFigureFromManifest(manifest, true);
-
-    std::vector<String> trackPaths;
-    for (const auto& content : figureData.contents) {
-        for (const auto& episode : content.episodes) {
-            for (const auto& track : episode.tracks) {
-                trackPaths.push_back(track.localPath);
-            }
-        }
-    }
-
-    for (const auto& customTrack : figureData.customTracks) {
-        trackPaths.push_back(customTrack.localPath);
-    }
-
-    if (trackPaths.empty()) {
-        if (figureDownloadCompleteCallback) {
-            figureDownloadCompleteCallback(uid, figureData.name.isEmpty() ? "Unknown" : figureData.name, 
-                                         false, "No local tracks available", figureData);
-        }
-        return;
-    }
-
-    String figureId = figureData.id.isEmpty() ? getFigureIdFromUid(uid) : figureData.id;
-    startTrackingFigure(uid, figureData.name, figureId, trackPaths, figureData);
+    // Only reached when there is no network AND emitFromCache() found nothing playable.
+    Serial.println(F("RequestManager: offline and nothing cached for this figure"));
+    Figure emptyFigure;
+    queueFigureDownloadCompletion(uid, "Unknown", false, "Offline and no cached tracks", emptyFigure);
 }
 
 void RequestManager::setFigureDownloadCompleteCallback(FigureDownloadCompleteCallback callback)
@@ -506,7 +586,7 @@ void RequestManager::setFigureDownloadCompleteCallback(FigureDownloadCompleteCal
     this->figureDownloadCompleteCallback = callback;
 }
 
-void RequestManager::queueFigureDownloadCompletion(const String &uid, const String &figureName, bool success, const String &error, const Figure &figureData)
+void RequestManager::queueFigureDownloadCompletion(const String &uid, const String &figureName, bool success, const String &error, const Figure &figureData, bool isUpdate)
 {
     PendingFigureCompletion completion;
     completion.uid = uid;
@@ -514,13 +594,14 @@ void RequestManager::queueFigureDownloadCompletion(const String &uid, const Stri
     completion.success = success;
     completion.error = error;
     completion.figureData = figureData;
+    completion.isUpdate = isUpdate;
     pendingCompletions.push_back(completion);
 }
 
 void RequestManager::startTrackingFigure(const String &uid, const String &figureName, const String &figureId, 
                                           const std::vector<String> &trackPaths, const Figure &figureData,
                                           bool hasPendingManifest, const String &pendingManifestJson,
-                                          const String &previousManifestJson)
+                                          const String &previousManifestJson, bool alreadyEmitted)
 {
     // Remove completed trackers
     activeDownloads.erase(
@@ -546,6 +627,7 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     tracker.hasPendingManifest = hasPendingManifest;
     tracker.pendingManifestJson = pendingManifestJson;
     tracker.previousManifestJson = previousManifestJson;
+    tracker.emittedAny = alreadyEmitted;
     
     FileManager &fileManager = FileManager::getInstance();
     for (const String &path : trackPaths) {
@@ -559,7 +641,17 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     if (allReady) {
         tracker.completed = true;
         finalizeTrackedManifest(tracker, true);
-        queueFigureDownloadCompletion(uid, figureName, true, "", figureData);
+        queueFigureDownloadCompletion(uid, figureName, true, "", figureData, tracker.emittedAny);
+        tracker.emittedAny = true;
+    } else if (tracker.totalTracks == 0) {
+        tracker.completed = true;
+        finalizeTrackedManifest(tracker, false);
+        if (!tracker.emittedAny) {
+            queueFigureDownloadCompletion(uid, figureName, false, "Figure has no tracks", figureData);
+        }
+    } else if (!tracker.emittedAny && firstTrackExists(figureData)) {
+        // Play what is already here while the rest downloads.
+        emitTrackerState(tracker);
     }
     
     activeDownloads.push_back(tracker);
@@ -571,11 +663,19 @@ void RequestManager::checkFigureDownloadStatus(const String &uid)
         if (tracker.uid == uid && !tracker.completed) {
             if (tracker.tracksReady + tracker.tracksFailed >= tracker.totalTracks) {
                 tracker.completed = true;
-                bool success = (tracker.tracksReady > 0) && (tracker.tracksFailed == 0);
-                finalizeTrackedManifest(tracker, success);
-
-                queueFigureDownloadCompletion(uid, tracker.figureName, success,
-                    success ? "" : "Some tracks failed", tracker.figureData);
+                bool anyReady = tracker.tracksReady > 0;
+                // The manifest is promoted even if some assets failed permanently: it still
+                // describes the figure; the missing files are retried on the next tap.
+                finalizeTrackedManifest(tracker, anyReady);
+                if (anyReady) {
+                    if (tracker.tracksFailed > 0) {
+                        Serial.printf("RequestManager: %s: %d track(s) could not be downloaded, playing the rest\n",
+                                      tracker.figureName.c_str(), tracker.tracksFailed);
+                    }
+                    emitTrackerState(tracker);
+                } else if (!tracker.emittedAny) {
+                    queueFigureDownloadCompletion(uid, tracker.figureName, false, "No track could be downloaded", tracker.figureData);
+                }
             }
             break;
         }
@@ -584,20 +684,36 @@ void RequestManager::checkFigureDownloadStatus(const String &uid)
 
 void RequestManager::onTrackDownloadComplete(const String &path, bool success)
 {
+    // Credit every tracker that references this path (figures can share assets).
     for (auto &tracker : activeDownloads) {
-        if (!tracker.completed) {
-            for (const String &trackPath : tracker.trackPaths) {
-                if (trackPath == path) {
-                    if (success) {
-                        tracker.tracksReady++;
-                    } else {
-                        tracker.tracksFailed++;
-                    }
-                    checkFigureDownloadStatus(tracker.uid);
-                    return;
-                }
+        if (tracker.completed) {
+            continue;
+        }
+        bool referenced = false;
+        for (const String &trackPath : tracker.trackPaths) {
+            if (trackPath == path) {
+                referenced = true;
+                break;
             }
         }
+        if (!referenced) {
+            continue;
+        }
+        if (success) {
+            tracker.tracksReady++;
+            // First playable state, or an update with one more track: announce it (the
+            // playback side merges without restarting).
+            if (!tracker.emittedAny) {
+                if (firstTrackExists(tracker.figureData)) {
+                    emitTrackerState(tracker);
+                }
+            } else if (tracker.tracksReady + tracker.tracksFailed < tracker.totalTracks) {
+                emitTrackerState(tracker);
+            }
+        } else {
+            tracker.tracksFailed++;
+        }
+        checkFigureDownloadStatus(tracker.uid);
     }
 }
 
@@ -609,6 +725,10 @@ void RequestManager::staticFileDownloadCallback(const String& url, const String&
 
 void RequestManager::storeUidToFigureIdMapping(const String &uid, const String &figureId)
 {
+    auto it = uidToFigureIdMap.find(uid);
+    if (it != uidToFigureIdMap.end() && it->second == figureId) {
+        return; // unchanged: no NVS write on every tap
+    }
     uidToFigureIdMap[uid] = figureId;
     saveUidMappings();
 }
