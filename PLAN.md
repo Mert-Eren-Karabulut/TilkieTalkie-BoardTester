@@ -79,7 +79,16 @@ BT controller memory release when booting already provisioned (needs reboot-into
 3. Fix `learndis`/`learnrest` (floor above Term Voltage, charging re-enabled at floor, rest under load).
 4. Hardware: path resistance (~100 mΩ), cell connector rating, NTC in production packs (Temperature Enable 0x02 then).
 
-### E. Backend (security prerequisites before OTA)
+### E. Backend — done 2026-10-12 except the device-scoped token
+Private `private-device.{uuid}` channel only (Firebase, Sanctum and web guards on /broadcasting/auth), commands only via
+`POST /api/hubs/{hub}/command` (allowlist in config/tilkie.php) and the admin route, device reports as `client-device-report`
+validated by the listener (subscribed sender, matching device_id), hub secrets (`hub:secret`, POST token with X-Hub-Secret),
+rate limits, XSS and Horizon fixes, remember-token fix, 148 tests green. `docs/MOBILE-APP-MIGRATION.md` for the app developer,
+`docs/SECURITY-CHANGES.md` for the state (incl. the Reverb client-event relay caveat). CI: `.github/workflows/deploy.yml` +
+`deploy/deploy.sh` (needs the four GitHub secrets, see deploy/README.md). Open: device-scoped token (with the factory flow),
+MySQL, APP_DEBUG=false before launch, a Reverb check in front of client events.
+
+#### E (old notes)
 1. Replace `GET /api/hubs/{uuid}/token` with a factory-provisioned per-device secret → device-scoped Sanctum token on the Hub model.
 2. Private `private-hub.{id}` channels, server-side command publishing, remove the `X-Client-Source` bypass, Reverb `allowed_origins`.
 3. Fix the `appScheme` XSS; `APP_DEBUG=false`; Horizon gate; rate limits; ownership checks on `/api/units/{nfc_id}` and content binding.
