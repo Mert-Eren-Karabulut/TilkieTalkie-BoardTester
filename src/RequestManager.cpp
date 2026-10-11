@@ -1130,11 +1130,12 @@ std::vector<String> RequestManager::extractAssetPaths(const JsonDocument &manife
     return paths;
 }
 
-bool RequestManager::isAssetReferencedByOtherUnit(const String &assetPath, const String &currentUid) const
+std::vector<String> RequestManager::assetsReferencedByOtherUnits(const String &currentUid) const
 {
+    std::vector<String> referenced;
     File manifestDir = SD_MMC.open(SD_MANIFEST_DIR);
     if (!manifestDir || !manifestDir.isDirectory()) {
-        return false;
+        return referenced;
     }
 
     String currentManifestFile = currentUid + ".json";
@@ -1145,23 +1146,18 @@ bool RequestManager::isAssetReferencedByOtherUnit(const String &assetPath, const
             JsonDocument manifest;
             DeserializationError error = deserializeJson(manifest, entry);
             entry.close();
-
             if (!error) {
                 std::vector<String> assetPaths = extractAssetPaths(manifest);
-                if (std::find(assetPaths.begin(), assetPaths.end(), assetPath) != assetPaths.end()) {
-                    manifestDir.close();
-                    return true;
-                }
+                referenced.insert(referenced.end(), assetPaths.begin(), assetPaths.end());
             }
         } else {
             entry.close();
         }
-
         entry = manifestDir.openNextFile();
     }
 
     manifestDir.close();
-    return false;
+    return referenced;
 }
 
 void RequestManager::removeStaleAssets(const String &uid, const JsonDocument &currentManifest, const JsonDocument *previousManifest)
@@ -1170,23 +1166,34 @@ void RequestManager::removeStaleAssets(const String &uid, const JsonDocument &cu
         return;
     }
 
-    FileManager &fileManager = FileManager::getInstance();
     std::vector<String> currentPaths = extractAssetPaths(currentManifest);
-    std::vector<String> previousPaths = extractAssetPaths(*previousManifest);
+    std::vector<String> stale;
+    for (const String &oldPath : extractAssetPaths(*previousManifest)) {
+        if (std::find(currentPaths.begin(), currentPaths.end(), oldPath) == currentPaths.end()) {
+            stale.push_back(oldPath);
+        }
+    }
+    if (stale.empty()) {
+        return;
+    }
 
-    for (const String &oldPath : previousPaths) {
-        if (std::find(currentPaths.begin(), currentPaths.end(), oldPath) != currentPaths.end()) {
+    // This runs on the loop task: scan the other units' manifests once (not once per asset),
+    // rewrite the required-files list once, and leave the slow card erases to the SD
+    // maintenance task.
+    std::vector<String> referenced = assetsReferencedByOtherUnits(uid);
+    FileManager &fileManager = FileManager::getInstance();
+    bool requiredChanged = false;
+    for (const String &oldPath : stale) {
+        if (std::find(referenced.begin(), referenced.end(), oldPath) != referenced.end()) {
             continue;
         }
-
-        if (isAssetReferencedByOtherUnit(oldPath, uid)) {
-            continue;
-        }
-
-        fileManager.removeRequiredFile(oldPath);
+        requiredChanged = fileManager.removeRequiredFile(oldPath, false) || requiredChanged;
         if (fileManager.fileExists(oldPath)) {
-            fileManager.deleteFile(oldPath);
+            fileManager.deleteFileDeferred(oldPath);
         }
-        Serial.printf("RequestManager: Removed stale asset: %s\n", oldPath.c_str());
+        Serial.printf("RequestManager: stale asset queued for deletion: %s\n", oldPath.c_str());
+    }
+    if (requiredChanged) {
+        fileManager.flushRequiredFiles();
     }
 }

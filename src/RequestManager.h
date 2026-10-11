@@ -193,7 +193,7 @@ private:
     void finalizeTrackedManifest(FigureDownloadTracker &tracker, bool success);
     Figure buildFigureFromManifest(const JsonDocument &manifest, bool existingFilesOnly = false) const;
     std::vector<String> extractAssetPaths(const JsonDocument &manifest) const;
-    bool isAssetReferencedByOtherUnit(const String &assetPath, const String &currentUid) const;
+    std::vector<String> assetsReferencedByOtherUnits(const String &currentUid) const; // one scan of the other manifests
     void removeStaleAssets(const String &uid, const JsonDocument &currentManifest, const JsonDocument *previousManifest);
     void processOnlineFigureRequest(const String &uid, bool alreadyEmitted);
     void processOfflineFigureRequest(const String &uid);

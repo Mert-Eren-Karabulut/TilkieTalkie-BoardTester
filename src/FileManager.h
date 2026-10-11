@@ -11,6 +11,8 @@
 #include <AsyncTCP.h>
 #include <ArduinoJson.h>
 #include <mbedtls/sha256.h>
+#include <freertos/queue.h>
+#include <atomic>
 
 struct DownloadTask
 {
@@ -206,6 +208,13 @@ private:
     
     // Async download helpers
     static void sdWriteTask(void* parameter);
+
+    // Deferred deletes: SD_MMC.remove() takes 0.3-2 s per file on a slow card, so stale assets are
+    // erased by a low-priority task on core 0 instead of stalling the loop task.
+    QueueHandle_t deleteQueue = nullptr;
+    TaskHandle_t maintenanceTaskHandle = nullptr;
+    std::atomic<int> pendingDeletes{0};
+    static void sdMaintenanceTask(void* parameter);
     bool ringPush(const uint8_t* data, size_t len);
     size_t ringAvailable() const { return asyncState.ringHead - asyncState.ringTail; }
     size_t ringFree() const { return RING_SIZE - ringAvailable() - 1; }
@@ -230,6 +239,9 @@ public:
 
     // File management methods
     bool deleteFile(const String &path);
+    bool deleteFileDeferred(const String &path);                  // erased later by the SD maintenance task
+    bool hasPendingMaintenance() const { return pendingDeletes.load() > 0; }
+    bool flushRequiredFiles() { return saveRequiredFiles(); }
     bool deleteFileAndRemoveFromRequired(const String &path); // Smart delete that removes from required list
     bool createDirectory(const String &path);
     bool removeDirectory(const String &path);
@@ -251,7 +263,7 @@ public:
 
     // Required files management
     bool addRequiredFile(const String &localPath, const String &url, const String &checksum = "");
-    bool removeRequiredFile(const String &localPath);
+    bool removeRequiredFile(const String &localPath, bool persist = true); // persist=false: caller calls flushRequiredFiles()
     void checkRequiredFiles();
     std::vector<String> getRequiredFilesByPattern(const String &pattern); // Get required files matching pattern
 

@@ -78,6 +78,10 @@ bool FileManager::begin() {
 }
 
 void FileManager::end() {
+    // Let queued background deletes finish before the card goes away (bounded).
+    for (int i = 0; i < 100 && pendingDeletes.load() > 0; ++i) {
+        delay(50);
+    }
     // Save current state to SD card
     saveDownloadQueue();
     saveRequiredFiles();
@@ -342,6 +346,53 @@ bool FileManager::deleteFile(const String& path) {
     }
     
     return success;
+}
+
+bool FileManager::deleteFileDeferred(const String& path) {
+    if (!sdCardInitialized || path.isEmpty()) {
+        return false;
+    }
+    if (!deleteQueue) {
+        deleteQueue = xQueueCreate(32, sizeof(char*));
+        if (!deleteQueue) {
+            return deleteFile(path);
+        }
+    }
+    if (!maintenanceTaskHandle) {
+        if (xTaskCreatePinnedToCore(sdMaintenanceTask, "sd_maint", 4096, this, 2, &maintenanceTaskHandle, 0) != pdPASS) {
+            maintenanceTaskHandle = nullptr;
+            return deleteFile(path);
+        }
+    }
+    char* copy = strdup(path.c_str());
+    if (!copy) {
+        return deleteFile(path);
+    }
+    pendingDeletes++;
+    if (xQueueSend(deleteQueue, &copy, 0) != pdTRUE) {
+        pendingDeletes--;
+        free(copy);
+        Serial.printf("FileManager: delete queue full, deleting inline: %s\n", path.c_str());
+        return deleteFile(path);
+    }
+    return true;
+}
+
+void FileManager::sdMaintenanceTask(void* parameter) {
+    FileManager* self = static_cast<FileManager*>(parameter);
+    char* path = nullptr;
+    for (;;) {
+        if (xQueueReceive(self->deleteQueue, &path, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (self->sdCardInitialized) {
+            unsigned long t0 = millis();
+            bool ok = SD_MMC.remove(path);
+            Serial.printf("FileManager: %s %s (%lu ms, background)\n", ok ? "deleted" : "failed to delete", path, millis() - t0);
+        }
+        free(path);
+        self->pendingDeletes--;
+    }
 }
 
 bool FileManager::deleteFileAndRemoveFromRequired(const String& path) {
@@ -767,7 +818,7 @@ bool FileManager::addRequiredFile(const String& localPath, const String& url, co
     return true;
 }
 
-bool FileManager::removeRequiredFile(const String& localPath) {
+bool FileManager::removeRequiredFile(const String& localPath, bool persist) {
     auto it = std::remove_if(requiredFiles.begin(), requiredFiles.end(),
         [&localPath](const FileEntry& entry) {
             return entry.path == localPath;
@@ -778,7 +829,9 @@ bool FileManager::removeRequiredFile(const String& localPath) {
     }
 
     requiredFiles.erase(it, requiredFiles.end());
-    saveRequiredFiles();
+    if (persist) {
+        saveRequiredFiles();
+    }
     Serial.printf("FileManager: Removed required file: %s\n", localPath.c_str());
     return true;
 }
