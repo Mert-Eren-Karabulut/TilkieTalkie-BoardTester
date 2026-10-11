@@ -2685,7 +2685,7 @@ CONFIG_FATFS_LINK_LOCK=y
 #
 # File system free space calculation behavior
 #
-CONFIG_FATFS_DONT_TRUST_FREE_CLUSTER_CNT=0
+CONFIG_FATFS_DONT_TRUST_FREE_CLUSTER_CNT=1
 CONFIG_FATFS_DONT_TRUST_LAST_ALLOC=0
 # end of File system free space calculation behavior
 # end of FAT Filesystem support
