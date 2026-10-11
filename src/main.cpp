@@ -474,6 +474,19 @@ static void printEndpoints()
     ESP_LOGI(TAG, "Reverb:   %s://%s:%u (app key %s)", ep.reverbTls ? "wss" : "ws", ep.reverbHost.c_str(), ep.reverbPort, ep.appKey.c_str());
     ESP_LOGI(TAG, "%s", config.getString("ep_api", "").isEmpty() ? "(production defaults)" : "(bench override from NVS - 'endpoint clear' to revert)");
 }
+// ReverbClient calls this when /broadcasting/auth rejects the stored hub token (revoked
+// server-side); the fresh token is persisted and shared with the API client.
+static String refreshHubTokenForReverb()
+{
+    String fresh = requestManager.getJWTToken();
+    if (fresh.length() > 0)
+    {
+        config.setJWTToken(fresh);
+        requestManager.setAuthToken(fresh);
+    }
+    return fresh;
+}
+
 static void startReverb()
 {
     Endpoints ep = loadEndpoints();
@@ -482,6 +495,7 @@ static void startReverb()
     reverb.begin(ep.reverbHost.c_str(), ep.reverbPort, ep.appKey.c_str(), token.c_str(), deviceId.c_str(),
                  ep.reverbTls, ep.apiOrigin.c_str());
     reverb.onChatMessage(handleChatMessage);
+    reverb.onAuthTokenRefresh(refreshHubTokenForReverb);
 }
 
 String getDeviceEfuseMacDecimal()

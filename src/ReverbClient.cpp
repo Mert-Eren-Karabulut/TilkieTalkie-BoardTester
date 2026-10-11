@@ -10,9 +10,10 @@
 #include "AudioController.h"
 #include "NfcController.h"
 #include "ConfigManager.h"
+#include "CaBundle.h"
 
 // Define static members
-char ReverbClient::jsonBuffer[512];
+char ReverbClient::jsonBuffer[768];
 char ReverbClient::urlBuffer[128];
 char ReverbClient::headerBuffer[256];
 char ReverbClient::channelBuffer[64];
@@ -51,7 +52,7 @@ void ReverbClient::begin(const char *host, uint16_t port, const char *appKey, co
         if (_httpSecure)
         {
             WiFiClientSecure *secure = new WiFiClientSecure();
-            secure->setInsecure();
+            secure->setCACertBundle(caBundleStart(), caBundleSize()); // verify the portal's certificate
             _httpClient = secure;
         }
         else
@@ -89,7 +90,7 @@ void ReverbClient::startWebSocket()
     snprintf(wsPathBuffer, sizeof(wsPathBuffer), "/app/%s?protocol=7&client=esp32-client&version=1.0", _appKey.c_str());
     if (_useTls)
     {
-        _ws->beginSSL(_host.c_str(), _port, wsPathBuffer);
+        _ws->beginSslWithBundle(_host.c_str(), _port, wsPathBuffer, caBundleStart(), caBundleSize());
     }
     else
     {
@@ -110,6 +111,8 @@ void ReverbClient::update()
                 _ws->disconnect();
             }
             _isConnected = false;
+            _isPrivateSubscribed = false;
+            _pendingSubscribe = false;
             _wsStarted = false;
         }
         return;
@@ -129,13 +132,56 @@ void ReverbClient::update()
         _ws->loop();
     }
 
-    // Send device reports when connected
-    static unsigned long lastReportTime = 0;
-    if (_isConnected && millis() - lastReportTime >= 1000)
+    serviceSubscription();
+
+    if (isConnected())
     {
-        lastReportTime = millis();
-        sendDeviceReport();
+        sendDeviceReport(false);
     }
+}
+
+void ReverbClient::serviceSubscription()
+{
+    if (!_pendingSubscribe || !_isConnected || _socketId.isEmpty() || millis() < _subscribeRetryAt)
+    {
+        return;
+    }
+
+    int code = subscribeToPrivate();
+    if (code == 0)
+    {
+        _pendingSubscribe = false; // confirmed by pusher_internal:subscription_succeeded
+        return;
+    }
+
+    _subscribeFailures++;
+    unsigned long delayMs = 5000UL << (_subscribeFailures > 4 ? 3 : _subscribeFailures - 1); // 5, 10, 20, 40 s
+    if (delayMs > 60000UL)
+    {
+        delayMs = 60000UL;
+    }
+    _subscribeRetryAt = millis() + delayMs;
+    Serial.printf("ReverbClient: channel auth failed (HTTP %d), retry in %lu s\n", code, delayMs / 1000);
+
+    if ((code == 401 || code == 403) && _tokenRefreshCb)
+    {
+        String fresh = _tokenRefreshCb();
+        if (fresh.length() > 0)
+        {
+            _authToken = fresh;
+            Serial.println("ReverbClient: hub token refreshed for channel auth");
+        }
+    }
+}
+
+void ReverbClient::bumpReconnectBackoff()
+{
+    _reconnectDelayMs = _reconnectDelayMs >= 30000UL ? 60000UL : _reconnectDelayMs * 2;
+    if (_ws)
+    {
+        _ws->setReconnectInterval(_reconnectDelayMs);
+    }
+    Serial.printf("ReverbClient: next reconnect attempt in %lu s\n", _reconnectDelayMs / 1000);
 }
 
 bool ReverbClient::isConnected()
@@ -264,7 +310,10 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
     case WStype_DISCONNECTED:
         Serial.println("ReverbClient: WebSocket disconnected");
         _isConnected = false;
+        _isPrivateSubscribed = false;
+        _pendingSubscribe = false;
         _socketId = "";
+        bumpReconnectBackoff();
         break;
 
     case WStype_CONNECTED:
@@ -275,7 +324,10 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
     case WStype_ERROR:
         Serial.printf("ReverbClient: WebSocket error: %.*s\n", length, payload);
         _isConnected = false;
+        _isPrivateSubscribed = false;
+        _pendingSubscribe = false;
         _socketId = "";
+        bumpReconnectBackoff();
         break;
 
     case WStype_TEXT:
@@ -316,19 +368,26 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
                         *socketEnd = tempChar; // Restore the character
 
                         Serial.printf("ReverbClient: Connected with socket ID: %s\n", _socketId.c_str());
-                        if (subscribeToPrivate())
-                        {
-                            Serial.println("ReverbClient: Successfully subscribed to private channel");
-                            _isPrivateSubscribed = true;
-                        }
-                        else
-                        {
-                            Serial.println("ReverbClient: Failed to subscribe to private channel");
-                            _isPrivateSubscribed = false;
-                        }
+                        // The channel auth is an HTTP round trip: done from update(), not here.
+                        _isPrivateSubscribed = false;
+                        _pendingSubscribe = true;
+                        _subscribeRetryAt = 0;
+                        _subscribeFailures = 0;
+                        _reconnectDelayMs = 2000;
+                        _ws->setReconnectInterval(_reconnectDelayMs);
                     }
                 }
             }
+        }
+        else if (strstr(payloadStr, "pusher_internal:subscription_succeeded"))
+        {
+            Serial.println("ReverbClient: Successfully subscribed to private channel");
+            _isPrivateSubscribed = true;
+            _reportDue = true;
+        }
+        else if (strstr(payloadStr, "pusher:error"))
+        {
+            Serial.printf("ReverbClient: server error: %.*s\n", (int)length, payload);
         }
         else if (strstr(payloadStr, "pusher:ping"))
         {
@@ -405,63 +464,70 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
     }
 }
 
-void ReverbClient::sendDeviceReport()
+void ReverbClient::sendDeviceReport(bool force)
 {
     if (!isConnected())
         return;
 
-    // Get and cache all values to minimize object access
     BatteryManager &battery = BatteryManager::getInstance();
     FileManager &fileManager = FileManager::getInstance();
     AudioController &audio = AudioController::getInstance();
     NfcController &nfc = NfcController::getInstance();
-    ConfigManager &config = ConfigManager::getInstance();
 
     bool isCharging = battery.getChargingStatus();
     float batteryPercent = battery.getBatteryPercentage();
     float batteryVoltage = battery.getBatteryVoltage();
     bool isFileSyncing = fileManager.getPendingDownloadsCount() > 0;
     uint32_t sdFreeSpace = fileManager.getSDCardFreeSpace();
-    String wifiSSID = config.getWiFiSSID();
     int wifiRSSI = WiFi.RSSI();
-    int audioState = audio.getState(); // Use int instead of enum
+    int audioState = audio.getState();
     bool isPogoActive = nfc.isPogoSwitchActive();
     bool isCardPresent = nfc.isCardPresent();
 
-    // Pre-build channel name
-    snprintf(channelBuffer, sizeof(channelBuffer), "device.%s", _deviceId.c_str());
-
-    // Get audio status
     const char *audioStatus = "stopped";
     String currentTrack = "";
     int currentSecond = 0;
     int currentVolume = audio.getCurrentVolume();
     int volumeCeiling = audio.getVolumeCeiling();
     if (audioState == 1)
-    { // PLAYING state
+    {
         audioStatus = "playing";
         currentTrack = audio.getCurrentTrack();
         currentSecond = (int)audio.getCurrentTrackSeconds();
     }
     else if (audioState == 2)
-    { // PAUSED state
+    {
         audioStatus = "paused";
         currentTrack = audio.getCurrentTrack();
         currentSecond = (int)audio.getCurrentTrackSeconds();
     }
-
-    // Sanitize strings
-    wifiSSID.replace("\"", "\\\"");
     currentTrack.replace("\"", "\\\"");
 
-    // Get NFC card ID
     String nfcCardId = "";
     if (isPogoActive && isCardPresent)
     {
         nfcCardId = nfc.currentNFCData().uidString;
     }
 
-    // Build optimized JSON
+    // Everything but the play position, quantised: a report goes out when this changes, every
+    // 5 s while playing (position), and at least every 60 s (heartbeat).
+    char signature[200];
+    snprintf(signature, sizeof(signature), "%d|%d|%d|%d|%u|%d|%s|%s|%d|%d|%d|%s",
+             isCharging ? 1 : 0, (int)lroundf(batteryPercent), (int)lroundf(batteryVoltage * 20.0f),
+             isFileSyncing ? 1 : 0, (unsigned)(sdFreeSpace >> 20), wifiRSSI / 5, audioStatus,
+             currentTrack.c_str(), currentVolume, volumeCeiling, isPogoActive ? 1 : 0, nfcCardId.c_str());
+
+    unsigned long now = millis();
+    bool changed = (_lastReportSignature != signature);
+    bool heartbeat = (now - _lastReportAt) >= 60000UL;
+    bool position = (audioState == 1) && (now - _lastPositionReportAt) >= 5000UL;
+    if (!force && !_reportDue && !changed && !heartbeat && !position)
+    {
+        return;
+    }
+
+    snprintf(channelBuffer, sizeof(channelBuffer), "device.%s", _deviceId.c_str());
+
     int written = snprintf(jsonBuffer, sizeof(jsonBuffer),
                            "{"
                            "\"event\":\"device-report\","
@@ -477,7 +543,6 @@ void ReverbClient::sendDeviceReport()
                            "\"files\":{"
                            "\"status\":\"%s\","
                            "\"sd_remaining\":%u,"
-                           "\"wifi_ssid\":\"%s\","
                            "\"wifi_rssi\":%d"
                            "},"
                            "\"audio\":{"
@@ -501,7 +566,6 @@ void ReverbClient::sendDeviceReport()
                            batteryVoltage,
                            isFileSyncing ? "syncing" : "in_sync",
                            sdFreeSpace,
-                           wifiSSID.c_str(),
                            wifiRSSI,
                            audioStatus,
                            currentTrack.length() > 0 ? ",\"current_track_id\":\"" : "",
@@ -515,17 +579,25 @@ void ReverbClient::sendDeviceReport()
                            nfcCardId.c_str(),
                            nfcCardId.length() > 0 ? "\"" : "");
 
-    if (written > 0 && written < sizeof(jsonBuffer) - 1)
+    if (written <= 0 || written >= (int)sizeof(jsonBuffer) - 1)
     {
-        _ws->sendTXT(jsonBuffer, written);
+        Serial.printf("ReverbClient: device report too large (%d bytes), skipped\n", written);
+        return;
+    }
+    if (_ws->sendTXT(jsonBuffer, written))
+    {
+        _lastReportAt = now;
+        _lastPositionReportAt = now;
+        _lastReportSignature = signature;
+        _reportDue = false;
     }
 }
 
-bool ReverbClient::subscribeToPrivate()
+int ReverbClient::subscribeToPrivate()
 {
     if (_socketId.length() == 0 || !_httpClient)
     {
-        return false;
+        return -1;
     }
 
     HTTPClient http;
@@ -548,7 +620,7 @@ bool ReverbClient::subscribeToPrivate()
         if (httpCode != 200)
         {
             http.end();
-            return false;
+            return httpCode > 0 ? httpCode : -1;
         }
 
         String authResponse = http.getString();
@@ -558,7 +630,7 @@ bool ReverbClient::subscribeToPrivate()
         int authEnd = authResponse.indexOf("\"", authStart);
         if (authStart < 8 || authEnd < 0)
         {
-            return false;
+            return -1;
         }
         String authValue = authResponse.substring(authStart, authEnd);
 
@@ -567,9 +639,9 @@ bool ReverbClient::subscribeToPrivate()
                  authValue.c_str(), channelBuffer);
 
         _ws->sendTXT(jsonBuffer, strlen(jsonBuffer));
-        return true;
+        return 0;
     }
-    return false;
+    return -1;
 }
 
 void ReverbClient::handleDeviceCommand(const char *payloadStr)
@@ -643,6 +715,18 @@ void ReverbClient::handleDeviceCommand(const char *payloadStr)
     unescapedData.replace("\\\\", "\\");
 
     Serial.printf("ReverbClient: Parsing command data: %s\n", unescapedData.c_str());
+
+    int idStart = unescapedData.indexOf("\"device_id\":\"");
+    if (idStart >= 0)
+    {
+        idStart += 13;
+        int idEnd = unescapedData.indexOf("\"", idStart);
+        if (idEnd > idStart && unescapedData.substring(idStart, idEnd) != _deviceId)
+        {
+            Serial.println("ReverbClient: command addressed to another device, ignored");
+            return;
+        }
+    }
 
     // Extract command type
     String commandType = "";
@@ -763,8 +847,11 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
         Serial.println("ReverbClient: Executing play command");
         if (hasValue && value.length() > 0)
         {
-            Serial.printf("ReverbClient: Playing track: %s\n", value.c_str());
-            if (audio.play(value))
+            if (!value.startsWith("/assets/"))
+            {
+                Serial.println("ReverbClient: play refused - only files under /assets/ can be started remotely");
+            }
+            else if (audio.play(value))
             {
                 Serial.println("ReverbClient: Track playback started successfully");
             }

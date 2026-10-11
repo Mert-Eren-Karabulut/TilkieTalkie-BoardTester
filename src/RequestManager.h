@@ -6,6 +6,7 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <FileManager.h>
 #include <nvs_flash.h>
 #include <nvs.h>
@@ -17,7 +18,9 @@ class RequestManager
 {
 private:
     HTTPClient http;
-    WiFiClient client; // Regular WiFi client for HTTP connections
+    WiFiClient plainClient;          // http:// base (bench)
+    WiFiClientSecure secureClient;   // https:// base (production), verified against the CA bundle
+    WiFiClient *client = &plainClient; // selected by setBaseUrl()
     String baseUrl;
     String authToken;
     int timeout;

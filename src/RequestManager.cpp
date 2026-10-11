@@ -1,5 +1,6 @@
 #include "RequestManager.h"
 #include "ReverbClient.h"
+#include "CaBundle.h"
 
 // Initialize static members
 const char* RequestManager::NVS_NAMESPACE = "requestmgr";
@@ -59,6 +60,7 @@ RequestManager::RequestManager(const String &baseUrl)
     , figureDownloadCompleteCallback(nullptr)
     , nvsHandle(0)
 {
+    setBaseUrl(baseUrl);
     // Convert HTTPS to HTTP for memory efficiency
     this->baseUrl = baseUrl;
     if (this->baseUrl.startsWith("https://")) {
@@ -108,10 +110,16 @@ bool RequestManager::begin()
 // Configuration methods
 void RequestManager::setBaseUrl(const String &url)
 {
-    this->baseUrl = url;
-    if (this->baseUrl.startsWith("https://")) {
-        this->baseUrl.replace("https://", "http://");
+    baseUrl = url;
+    if (baseUrl.startsWith("https://")) {
+        // The hub token travels in every request: verify the portal's certificate.
+        secureClient.setCACertBundle(caBundleStart(), caBundleSize());
+        client = &secureClient;
+    } else {
+        client = &plainClient;
     }
+    Serial.printf("RequestManager: API base %s (%s)\n", baseUrl.c_str(),
+                  client == &secureClient ? "TLS, CA bundle" : "plain HTTP");
 }
 
 void RequestManager::setAuthToken(const String &token)
@@ -206,7 +214,7 @@ JsonDocument RequestManager::executeHttpRequest(const String& endpoint, const St
     String url = baseUrl + endpoint;
     http.end();
     
-    if (!http.begin(client, url)) {
+    if (!http.begin(*client, url)) {
         lastError = "Failed to connect to " + url;
         emptyDoc["error"] = true;
         emptyDoc["message"] = lastError;
@@ -343,7 +351,7 @@ bool RequestManager::validateToken(const String& token)
     http.end();
     String url = baseUrl + endpoint;
     
-    if (!http.begin(client, url)) {
+    if (!http.begin(*client, url)) {
         return false;
     }
     
