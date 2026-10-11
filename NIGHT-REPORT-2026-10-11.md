@@ -88,3 +88,8 @@ Device: bench board on `/dev/cu.usbmodem21201`, pointed at the LAN bench portal 
 - **Report cadence:** 15 s heartbeat while docked, 60 s on battery; "syncing" only while something is really queued (dead queue entries are dropped, `dlclear` exists).
 - **Updates reach devices fast:** the portal now pushes `ota-update` to the model's hubs when a release is uploaded (CI pipeline fixed on the way: broadcasts no longer need Redis in tests, the deploy job checks out the repo; first green run deployed 2e0bc8a); the device checks hourly otherwise.
 - **Loop stalls:** all SD writes (required-file list, download queue, stats, manifests, pending-manifest delete) now run on the SD maintenance task; the loop only serialises. What remains on the loop are the open/rename at the start and end of a download (~200 ms each on this card) - invisible to the LED task (own task) and audio (own task), a 200 ms delay for a WebSocket command at worst.
+
+## 2026-10-12, 00:30 — the toy never slept on battery
+- Cause: the charger's ADC runs one-shot and (since my night optimisation) was re-triggered only at boot, so the VBUS reading froze at the boot value; the sleep gate "VBUS ADC > 4 V" never cleared after an unplug. Fixed in 1.2.8: a conversion is re-armed every poll, VBUS reads 0 when the status bit says none, and the sleep controller logs why it is not sleeping once a minute.
+- Verified with the console attached on battery (the bench USB hub delivers data but no 5 V): 5 min after boot "Inactivity timeout reached", sleep tone, peripheral power off, wake sources buttons + pogo, deep sleep.
+- The card was reformatted with tools/sdcard-prepare.sh: FAT volume 30181 MB now.

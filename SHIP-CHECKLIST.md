@@ -34,7 +34,7 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 
 ## Remaining before ship (firmware)
 0. Out-of-box run #2 with the prompts and the pack on the card (pairing, update, first figure, buttons, sleep).
-1. Deep sleep + wake test (needs a hand: unplug the charge port, `sleep`, press a button); sleep current unknown.
+1. Deep sleep on battery verified 2026-10-12 (idle 5 min after the unplug -> sleep tone -> deep sleep, wake on buttons/pogo). Still open: wake-by-button check by the owner, sleep current (`sleeptest`).
 2. BLE provisioning on NimBLE (needs the mobile app once).
 3. Low-battery path: forced sleep at the critical threshold uses the coulomb-counted SOC — re-check after gauge calibration.
 4. Time to first story on a never-tapped figure = first track download (SD-bound, ~2.4 Mbps:
