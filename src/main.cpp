@@ -564,10 +564,42 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
     const bool samePlaylist = audioController.hasPlaylist() && audioController.getPlaylistFigureUid() == uid;
     if (isUpdate && samePlaylist)
     {
-        audioController.mergePlaylist(playlist, uid); // never interrupts the current track
-        return;
+        // Same UID, but is the content we announced still this figure's content? The cache-first
+        // path may have started tracks from an older manifest (figure re-bound, content replaced);
+        // once the backend's answer arrives, content that is not in it must not keep playing.
+        const String current = audioController.getCurrentTrack();
+        bool keepPlaying = false;
+        if (!current.isEmpty())
+        {
+            for (const auto &path : playlist)
+            {
+                if (path == current)
+                {
+                    keepPlaying = true;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            for (const auto &path : playlist) // nothing playing: same figure if any track overlaps
+            {
+                if (audioController.playlistContains(path))
+                {
+                    keepPlaying = true;
+                    break;
+                }
+            }
+        }
+        if (keepPlaying)
+        {
+            audioController.mergePlaylist(playlist, uid); // never interrupts the current track
+            return;
+        }
+        ESP_LOGW(TAG, "Figure %s (%s): current content is not in the new manifest - restarting with the new content",
+                 figureName.c_str(), uid.c_str());
     }
-    if (samePlaylist)
+    else if (samePlaylist)
     {
         return; // already playing this figure (e.g. a second tap event)
     }

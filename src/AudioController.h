@@ -77,6 +77,10 @@ public:
     int getCurrentTrackIndex() const { return currentPlaylistIndex; }
     int getPlaylistSize() const { return playlist.size(); }
     String getPlaylistFigureUid() const { return playlistFigureUid; }
+    bool playlistContains(const String& path) const {
+        for (const auto& p : playlist) { if (p == path) return true; }
+        return false;
+    }
 
     // Volume control
     bool volumeUp();

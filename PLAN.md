@@ -72,8 +72,17 @@ Firmware: version reporting, check/download/verify, `esp_ota_*` with rollback en
 rollout %, admin upload page, device check endpoint (design in the audit §4). Factory: enrollment with serial numbers
 (owner: replaces eFuse MAC as identity), QA upload, factory build flag.
 
-## Local portal for bench testing (proposal)
-Run the Laravel app on the Mac bound to the LAN (`php artisan serve --host 0.0.0.0 --port 8000`, `php artisan reverb:start
---host 0.0.0.0 --port 8080`, `QUEUE_CONNECTION=sync`), seed a bench dataset (hub uuid = device eFuse MAC decimal, a bound user,
-unit `04-1F-76-D2-56-68-80` with a figure/content/episodes/tracks and MP3s in `storage/app/public`), and point the device at the Mac with the firmware's
-`endpoint set http://<mac-ip>:8000/api <mac-ip> 8080 0 <local-reverb-key>` (NVS-backed, done; `endpoint clear` reverts to production). Media URLs follow `APP_URL`/request host, so they resolve to the Mac automatically.
+## Local portal for bench testing (done 2026-10-11)
+The backend repo (`/Users/mert/Herd/portal.tilkietalkie.com`, branch `develop`) now has `scripts/bench/` — see its README.
+`scripts/bench/bench.sh up` starts `artisan serve` (:8000, 4 workers), `reverb:start` (:8080, plain ws, app key `ttbench`) and a
+redis queue worker on the Mac's LAN IP with every override injected as process env (own `database/bench.sqlite`, own redis
+prefix; Herd and `.env` untouched). `bench.sh seed` generates spoken test MP3s (`gen_tracks.py`, macOS `say` + lameenc) and runs
+`php artisan bench:seed`: user `bench@tilkietalkie.local`/`bench1234` (admin), hub `250696234569532` (this board), units
+`04-1F-76-D2-56-68-80` (Bench Fox, 5 tracks / 2.9 MB), `04-BE-11-C2-00-00-01` (Bench Owl, 1 track), `04-BE-11-C2-00-00-02`
+(Bench Wildcard: 2 custom tracks + unit-scoped pack). `bench.sh check` curls token + manifest; `bench.sh device` prints:
+`endpoint set http://<ip>:8000/api <ip> 8080 0 ttbench` + `restart` (NVS-backed; `endpoint clear` + `restart` returns to production).
+
+Verified on the device: token refresh after the stale production token is rejected, Reverb subscribe + device-report relay
+(listener → queue → `device.status.updated`), tap → manifest → 5 downloads at ~2.4 Mbps with sha256 verified and play-as-they-arrive
+merges, re-tap cache hit with `manifest unchanged`, wildcard custom tracks, stale-asset removal. Re-seeding changes all ids, which
+reproduces the "same UID, different figure" case (cached content plays, new manifest arrives) — used to fix the merge-vs-restart bug.

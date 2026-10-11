@@ -15,3 +15,7 @@ All scripts use the PlatformIO Python environment (it has pyserial):
 Useful firmware console commands added for the bench: `timing`, `tasks`, `heap`, `coredump`,
 `dfread <hexaddr> [len]`, `dfwrite8 <hexaddr> <hexval>`, `sdwritebench [chunkKB] [count]`,
 `cat <path>`, `tap <uid>` / `untap` (simulated figure), `download <url> <path>`.
+
+Local portal bench: the backend repo's `scripts/bench/bench.sh up && scripts/bench/bench.sh seed` brings up a LAN-bound copy of
+the portal with a seeded data set for this board (see `scripts/bench/README.md` there); `bench.sh device` prints the
+`endpoint set ...` console command for the device, `endpoint clear` + `restart` returns it to production.
