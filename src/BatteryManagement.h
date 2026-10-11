@@ -480,6 +480,7 @@ public:
     // temperature guard (datasheet charge window 0-60°C).
     float getTemperatureC() const { return currentTemperatureCelsius; }
     bool isGaugeSocTrusted() const { return gaugeSocTrusted; }
+    bool isGaugeChargeInhibited() const { return gaugePresent && (gaugeOperationStatus & 0x4000) != 0; } // XCHG: gauge declared full / inhibits charge
     void printChargeMonitorLine(unsigned long t);  // one compact diagnostic line (full poll)
     int getBatteryCurrentMilliAmps() const { return currentBatteryCurrentMilliAmps; } // + charging, - discharging
     // Input current limit (IINDPM, REG06). 0 = clear override, restore the default and

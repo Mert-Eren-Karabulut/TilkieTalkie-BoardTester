@@ -762,6 +762,7 @@ static void superviseChargerOnUsb()
     static bool chargeSuspendedByTemp = false;
     static int tempOutOfWindowPolls = 0;
     static bool tempDerated = false;
+    static bool fullHold = false;          // charger paused because the pack is full
     // Input budget for sources without a PD contract. The charger's POR default (3.3 A + ICO
     // probing upwards) collapses weak 5 V adapters and power banks: VBUS drops out, the charger
     // stops, the source recovers, and the cycle repeats every few seconds (the red STAT LED
@@ -804,6 +805,8 @@ static void superviseChargerOnUsb()
         lastPdBudgetCheck = 0;
         battery.setInputCurrentLimit(nonPdInputLimitMa);
         battery.setIcoEnabled(false);
+        fullHold = false;
+        battery.setChargeEnabled(true);
     }
 
     if (gBringupPhase != BRINGUP_INACTIVE || gLearnDischarge || !battery.hasTelemetry())
@@ -912,6 +915,47 @@ static void superviseChargerOnUsb()
             nonPdLimitApplied = true;
             ESP_LOGI(TAG, "CHARGER: no PD contract - input limit %u mA, ICO off.", nonPdInputLimitMa);
         }
+    }
+
+    // Full-charge hold. When the gauge decides the pack is full it sets XCHG and opens its CHG
+    // FET; a charger that keeps trying then sees its battery node float, trips VBAT-OVP and
+    // retries once a second (the blinking STAT LED, the charging/discharging flips). Honour the
+    // gauge (or the charger's own termination): disable charging and leave it off until the
+    // cell has really come down. VSYS runs from VBUS meanwhile, so the cell rests.
+    // ...but only when the cell agrees. The gauge's learned capacity is bogus until it is
+    // calibrated (127 mAh against 4000), so it can set FC after a few minutes of charge. A
+    // "full" that the cell voltage does not corroborate is reseeded away (QMax + FC cleared,
+    // ~1 s, no brown-out on USB) and charging goes on; at most once a minute.
+    static unsigned long lastGaugeReseed = 0;
+    if (!fullHold && battery.isGaugeChargeInhibited() && !battery.isChargeDone())
+    {
+        const int iMa = battery.getBatteryCurrentMilliAmps();
+        const bool corroborated = (iMa > -100 && iMa < 100) ? v >= 3.38f : v >= 3.45f;
+        if (!corroborated && (lastGaugeReseed == 0 || millis() - lastGaugeReseed > 60000UL))
+        {
+            lastGaugeReseed = millis();
+            ESP_LOGW(TAG, "CHARGER: gauge says full at %.3fV (%+d mA) - not plausible, reseeding the gauge's learned capacity", v, iMa);
+            battery.resetGaugeLearningState();
+            return;
+        }
+    }
+    if (!fullHold && (battery.isGaugeChargeInhibited() || battery.isChargeDone()))
+    {
+        fullHold = true;
+        battery.setChargeEnabled(false);
+        ESP_LOGI(TAG, "CHARGER: pack full (%s) at %.3fV - charging paused until the cell drops",
+                 battery.isGaugeChargeInhibited() ? "gauge FC" : "charger termination", v);
+    }
+    if (fullHold)
+    {
+        const bool cellDown = v < 3.30f || battery.getBatteryPercentage() < 90.0f;
+        if (cellDown && !battery.isGaugeChargeInhibited())
+        {
+            fullHold = false;
+            battery.setChargeEnabled(true);
+            ESP_LOGI(TAG, "CHARGER: cell at %.3fV - charging resumed", v);
+        }
+        return; // no tiering or kicking while holding
     }
 
     // Never "kick" after Charge Done: toggling EN_CHG there starts a fresh CC/CV cycle every

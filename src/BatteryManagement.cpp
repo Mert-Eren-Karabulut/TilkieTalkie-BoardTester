@@ -1059,6 +1059,9 @@ bool BatteryManager::verifyChargerVoltageSetting() {
 void BatteryManager::printChargeMonitorLine(unsigned long t) {
     refreshDiagnostics();
     uint8_t chg = (chargerStatus1 >> 5) & 0x07;
+    uint8_t ctl0 = 0xFF;
+    readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, ctl0);
+    Serial.printf("CM ctl0=0x%02x(EN_CHG=%d) ", ctl0, (ctl0 & kBq25792ChargeEnableMask) ? 1 : 0);
     Serial.printf("CM t=%3lus VBUS=%.2f SYS=%.2f PACK=%.3f CELL=%.3f I=%+dmA chg=%u(%s) st0=0x%02x st1=0x%02x st2=0x%02x "
                   "fault=%02x/%02x flag=%02x/%02x/%02x/%02x ffl=%02x/%02x gop=0x%04x FET C/D=%d/%d XCHG=%d XDSG=%d T=%.1f\n",
                   t, currentVbusVoltage, currentSystemVoltage, gaugePackVoltageMillivolts / 1000.0f,
@@ -1676,8 +1679,8 @@ bool BatteryManager::updateGaugeMeasurements(bool full) {
         } else {
             ccSocPercent += (batteryCurrent * hours) / (float)DEFAULT_GAUGE_DESIGN_CAPACITY_MAH * 100.0f;
         }
-        if (isChargeDone()) {
-            ccSocPercent = 100.0f;
+        if (isChargeDone() || (gaugeOperationStatus & 0x4000)) {
+            ccSocPercent = 100.0f; // charger termination or the gauge's own full-charge verdict
         }
         ccSocPercent = constrain(ccSocPercent, 0.0f, 100.0f);
         currentPercentage = ccSocPercent;
@@ -1687,6 +1690,15 @@ bool BatteryManager::updateGaugeMeasurements(bool full) {
     currentRemainingCapacityMilliAmpHours = remainingCapacity;
     currentFullChargeCapacityMilliAmpHours = fullChargeCapacity;
     gaugeSafetyStatus = safetyStatus;
+
+    // OperationStatus every poll (one MAC read): XCHG tells us within seconds that the gauge
+    // declared the pack full and opened its CHG FET.
+    {
+        uint16_t operationStatus = 0;
+        if (readGaugeOperationStatus(operationStatus)) {
+            gaugeOperationStatus = operationStatus;
+        }
+    }
 
     if (!full) {
         return true;
@@ -1931,6 +1943,7 @@ bool BatteryManager::setChargeEnabled(bool enable) {
     if (!chargerPresent) {
         return false;
     }
+    Serial.printf("BatteryManager: setChargeEnabled(%s)\n", enable ? "true" : "false");
     uint8_t control0 = 0;
     if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
         return false;
@@ -1951,6 +1964,7 @@ bool BatteryManager::restartChargeCycle() {
     if (!chargerPresent) {
         return false;
     }
+    Serial.println("BatteryManager: restartChargeCycle()");
 
     uint8_t control0 = 0;
     if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
