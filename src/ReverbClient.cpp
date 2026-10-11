@@ -164,7 +164,9 @@ void ReverbClient::serviceSubscription()
     _subscribeRetryAt = millis() + delayMs;
     Serial.printf("ReverbClient: channel auth failed (HTTP %d), retry in %lu s\n", code, delayMs / 1000);
 
-    if ((code == 401 || code == 403) && _tokenRefreshCb)
+    // 401/403 means the token is bad; a backend that answers 419/5xx twice in a row to the same
+    // token is treated the same way (a revoked token produced 500s before the backend fix).
+    if ((code == 401 || code == 403 || _subscribeFailures >= 2) && _tokenRefreshCb)
     {
         String fresh = _tokenRefreshCb();
         if (fresh.length() > 0)
