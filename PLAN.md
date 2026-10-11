@@ -4,7 +4,7 @@ Branch `IDF-Migration` is the production branch (ESP32-S3-WROOM-1-N16R8, Arduino
 ESP-IDF 5.5.5 via the pioarduino platform, env `esp32-s3-devkitc-1`). Full findings: `AUDIT-2026-10-11.md`.
 Bench device: `/dev/cu.usbmodem21201`; flash backup of the previous device build in `backups/` (git-ignored).
 
-## Status (2026-10-11)
+## Status (2026-10-12, after the unattended night — see NIGHT-REPORT-2026-10-11.md for the narrative)
 
 Done, bench-verified, committed (f33317e..b051d28):
 
@@ -52,6 +52,11 @@ dual-publishes already); per-unit provisioning PoP (factory topic); esp_websocke
 BT controller memory release when booting already provisioned (needs reboot-into-provisioning flow).
 
 ### C. Power task / runtime
+- Done 2026-10-12: battery poll on its own task (bus lock), LED on its own task with scenes, quiet diagnostics,
+  USB console non-blocking, BLE controller memory released on provisioned boots, PSRAM threshold 2 KB, tap debounce.
+  Still open: RequestManager HTTP on the loop task (an 8 s manifest timeout can still freeze the loop), temp-guard
+  sanity range, NFC finite retries + RF off, pogo ext1 wake loop, monitor-phase sleep, SD unmount before rail-off,
+  console/log gating for release builds, play-while-downloading for faster time-to-first-story.
 - Internal heap (2026-10-11, after `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 16 KB→4 KB, AsyncTCP stack 16→8 KB, audio task
   10→8 KB): idle 50 KB (largest block 31 KB), playing 43 KB, playing + downloading 21 KB, min since boot 11.7 KB (was 716 B
   with largest block 3 KB before the tuning). Still thin: Reverb's TLS WebSocket costs ~60 KB internal at connect; BT
