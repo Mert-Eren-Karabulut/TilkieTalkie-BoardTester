@@ -51,7 +51,7 @@ Remaining: subscribe to `private-device.{uuid}` once the backend flag `TILKIE_PU
 dual-publishes already); per-unit provisioning PoP (factory topic); esp_websocket_client on its own task (nice to have);
 BT controller memory release when booting already provisioned (needs reboot-into-provisioning flow).
 
-### C. Power task / runtime
+### C. Power task / runtime — day 2 evening: manifest fetch / OTA check / status posts moved to a request worker task (loop never waits for HTTP); chargemon non-blocking; flash auto-suspend evaluated and left off
 - Done 2026-10-12: battery poll on its own task (bus lock), LED on its own task with scenes, quiet diagnostics,
   USB console non-blocking, BLE controller memory released on provisioned boots, PSRAM threshold 2 KB, tap debounce.
   Still open: RequestManager HTTP on the loop task (an 8 s manifest timeout can still freeze the loop), temp-guard
@@ -95,7 +95,7 @@ MySQL, APP_DEBUG=false before launch, a Reverb check in front of client events.
 4. Device API v2: compact manifest with ETag/304, signed media URLs, server-side transcode, status via HTTPS.
 5. MySQL/Postgres + string FKs before real traffic.
 
-### F. OTA + factory mode — OTA done 2026-10-12 (device + backend), factory mode open
+### F. OTA + factory mode — OTA done 2026-10-12 (device + backend); factory mode planned in docs/FACTORY-MODE.md (evening of day 2), implementation next
 Device: `src/OtaManager.*` (download task on core 0, Arduino Update into the spare partition, SHA-256 over the stream, Range
 resume on dropped connections, status posts from the loop task, rollback-safe: `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, the
 new image confirms itself when Reverb connects or after 30 s, otherwise the bootloader returns to the previous image and the
