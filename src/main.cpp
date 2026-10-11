@@ -760,6 +760,7 @@ static void superviseChargerOnUsb()
     static uint16_t requestedChargeCurrentMa = 0;
     static bool wasVbusPresent = false;
     static bool chargeSuspendedByTemp = false;
+    static int tempOutOfWindowPolls = 0;
     static bool tempDerated = false;
 
     if (!battery.isVbusPresent())
@@ -791,6 +792,10 @@ static void superviseChargerOnUsb()
     const float t = battery.getTemperatureC();
 
     // Hard temperature window (datasheet: charge 0..60°C), 2°C re-entry hysteresis.
+    if (t >= 0.0f && t <= 60.0f)
+    {
+        tempOutOfWindowPolls = 0;
+    }
     if (chargeSuspendedByTemp)
     {
         if (t >= 2.0f && t <= 58.0f)
@@ -803,6 +808,11 @@ static void superviseChargerOnUsb()
         {
             return; // stay suspended; no tier management or kicking
         }
+    }
+    else if ((t < 0.0f || t > 60.0f) && ++tempOutOfWindowPolls < 3)
+    {
+        // one reading outside the window is not a reason to stop charging; three in a row is
+        return;
     }
     else if (t < 0.0f || t > 60.0f)
     {

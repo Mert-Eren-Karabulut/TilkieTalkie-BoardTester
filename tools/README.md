@@ -12,6 +12,11 @@ All scripts use the PlatformIO Python environment (it has pyserial):
 - `batt_series.py <log>` — tabulates repeated `battery` dumps (cell V, current, BAT/PACK drop, path resistance).
 - `latency.py <log>` — first-response latency per sent command (loop responsiveness).
 
+Console commands added 2026-10-11/12: `audio` (state, codec registers, read-ahead fill, underruns, heap), `volume <n>`,
+`amp on|off|auto` (speaker amplifier override), `version`, `ota` / `ota check [release]` / `ota url <url> <sha256> <size>`,
+`diag on|off` (per-section loop timing table every 10 s vs. one line a minute), `crash` (panic on purpose: exercises the
+crash-loop guard), `endpoint set|clear` (bench vs production backend, NVS-backed).
+
 Useful firmware console commands added for the bench: `timing`, `tasks`, `heap`, `coredump`,
 `dfread <hexaddr> [len]`, `dfwrite8 <hexaddr> <hexval>`, `sdwritebench [chunkKB] [count]`,
 `cat <path>`, `tap <uid>` / `untap` (simulated figure), `download <url> <path>`.

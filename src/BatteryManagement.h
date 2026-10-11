@@ -254,6 +254,7 @@ private:
     float currentVoltage;
     float currentPercentage;
     float currentTemperatureCelsius;
+    uint32_t implausibleGaugeReads = 0;  // polls rejected by the plausibility check
     float currentSystemVoltage;
     float currentVbusVoltage;
     int currentBatteryCurrentMilliAmps;

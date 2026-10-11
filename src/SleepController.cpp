@@ -165,6 +165,9 @@ void SleepController::enterDeepSleep() {
     
     // Codec muted and powered down, amp off, I2S pins released before the rail goes.
     AudioController::getInstance().end();
+    // Flush the download queue / required-files state and unmount the card before its rail
+    // is cut (an unmounted FAT with a pending write is how cards get corrupted).
+    FileManager::getInstance().end();
 
     // Disable peripheral power to save energy (latches GPIO4 low via gpio_hold_en).
     disablePeripheralPower();

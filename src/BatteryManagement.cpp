@@ -1615,9 +1615,22 @@ bool BatteryManager::updateGaugeMeasurements(bool full) {
         return false;
     }
 
+    // Plausibility: a wedged bit-banged bus once delivered 0x7F7F-style garbage that read as
+    // "4629 C" and suspended charging. Anything a 1S LiFePO4 pack cannot physically report is
+    // treated as a failed poll (previous values stay in place) instead of a measurement.
+    const float tempC = (temperatureDeciKelvin / 10.0f) - 273.15f;
+    if (tempC < -30.0f || tempC > 100.0f || voltageMillivolts < 1500 || voltageMillivolts > 4500) {
+        implausibleGaugeReads++;
+        if (implausibleGaugeReads <= 5 || (implausibleGaugeReads % 50) == 0) {
+            Serial.printf("BatteryManager: implausible gauge poll ignored (%.1f C, %u mV, #%u)\n",
+                          tempC, (unsigned)voltageMillivolts, (unsigned)implausibleGaugeReads);
+        }
+        return false;
+    }
+
     currentVoltage = voltageMillivolts / 1000.0f;
     currentPercentage = constrain(relativeStateOfCharge > 100 ? (relativeStateOfCharge & 0xFF) : relativeStateOfCharge, 0, 100);
-    currentTemperatureCelsius = (temperatureDeciKelvin / 10.0f) - 273.15f;
+    currentTemperatureCelsius = tempC;
     currentBatteryCurrentMilliAmps = batteryCurrent;
     currentRemainingCapacityMilliAmpHours = remainingCapacity;
     currentFullChargeCapacityMilliAmpHours = fullChargeCapacity;
