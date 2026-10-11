@@ -6,3 +6,6 @@
 managed_components
 # device flash backups (large binaries)
 backups/
+
+# tools/release.sh output
+/releases
