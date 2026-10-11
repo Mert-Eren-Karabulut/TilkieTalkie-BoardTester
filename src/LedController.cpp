@@ -268,6 +268,7 @@ void LedController::renderScene(unsigned long now) {
                 int ledTenths = filledTenths - i * 10;
                 if (ledTenths >= 10) frame[i] = scaled(COLOR_PURPLE, level);
                 else if (ledTenths > 0) frame[i] = scaled(COLOR_PURPLE, (int)(level * (0.3f + 0.7f * breathe(now, 1000))));
+                else frame[i] = 0; // not reached yet: dark (left stale, these flashed)
             }
             break;
         }

@@ -71,6 +71,7 @@ void OtaManager::begin()
     if (running && esp_ota_get_state_partition(running, &imgState) == ESP_OK)
     {
         _pendingVerify = (imgState == ESP_OTA_IMG_PENDING_VERIFY);
+        _bootedFromOta = _pendingVerify;
     }
     Serial.printf("OTA: firmware %s (code %u, %s) on %s%s\n", firmwareVersion(), (unsigned)firmwareVersionCode(),
                   TT_HARDWARE_REV, running ? running->label : "?", _pendingVerify ? " - pending verification" : "");

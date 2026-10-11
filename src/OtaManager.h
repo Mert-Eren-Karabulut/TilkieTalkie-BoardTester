@@ -55,6 +55,7 @@ public:
     String lastError() const { return _error; }
     void printStatus();
     bool consumeJustUpdated();  // true once, on the boot that confirmed a new image
+    bool bootedFromUpdate() const { return _bootedFromOta; } // this boot runs a freshly installed image
     bool consumeJustFailed();   // true once after an update attempt failed
 
     // Gate for starting a download: true when the toy is idle enough for an update.
@@ -93,5 +94,6 @@ private:
     bool _pendingVerify = false;
     bool _bootReported = false;
     bool _justUpdated = false;
+    bool _bootedFromOta = false;
     bool _justFailed = false;
 };

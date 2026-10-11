@@ -121,6 +121,7 @@ static unsigned long gFigureLoadingSince = 0;   // tap time until something play
 static bool gSystemError = false;               // SD or audio failed to come up
 static int gOtaProgress = -1;                   // 0-100 while an update is being written
 static int gLastOtaProgress = -1;
+static bool gUpdateAnnounced = false;           // "updating myself" spoken before the download starts
 // Network services (API client + Reverb) start when WiFi is up: in startFullSystem() on a
 // provisioned boot, or later from the loop once a fresh provisioning / a late reconnect lands.
 static bool gNetworkServicesStarted = false;
@@ -1211,6 +1212,13 @@ void setup()
 // Brings up the heavy subsystems (SD, WiFi, audio, Reverb, NFC, buttons). Called once the
 // battery can support them — immediately from setup() on a healthy cell, or later from
 // loop() once a depleted cell has charged back above SYSTEM_START_V.
+// The toy is idle enough for an update to be written (used by OtaManager's idle check).
+static bool otaIdleConditions()
+{
+    return !audioController.isPaused() && !nfcController.isCardPresent() && !fileManager.hasActiveDownload() &&
+           (battery.getChargingStatus() || battery.getBatteryPercentage() >= 40.0f);
+}
+
 // API client + Reverb. Safe to call once WiFi has an IP; idempotent.
 static void startNetworkServices()
 {
@@ -1438,10 +1446,9 @@ void startFullSystem()
 
     OtaManager::getInstance().setIdleCheck([]() {
         // Flash writes stall every task for tens of ms: never while a story plays or a file is
-        // being written, and not on a nearly empty cell.
-        return !audioController.isPlaying() && !audioController.isPaused() && !nfcController.isCardPresent() &&
-               !fileManager.hasActiveDownload() &&
-               (battery.getChargingStatus() || battery.getBatteryPercentage() >= 40.0f);
+        // being written, not on a nearly empty cell, and only after "updating myself" was said
+        // (and finished - a prompt counts as playing).
+        return otaIdleConditions() && gUpdateAnnounced && !audioController.isPlaying();
     });
     ESP_LOGI(TAG, "Full system started.");
     // audioController.play("/sounds/12.mp3"); // Play startup sound
@@ -1563,7 +1570,10 @@ static void serviceUxPrompts()
     {
         return;
     }
-    prompts.update();
+    if (!OtaManager::getInstance().inProgress())
+    {
+        prompts.update(); // flash writes make speech stutter: hold prompts during an update
+    }
     if (audioController.consumePlaylistEnded())
     {
         prompts.say(Prompt::PLAYLIST_END);
@@ -1594,6 +1604,10 @@ static void serviceUxPrompts()
     if (!gIdleHelloDone && now - gFullSystemStartedAt > 3000)
     {
         gIdleHelloDone = true;
+        if (OtaManager::getInstance().bootedFromUpdate())
+        {
+            prompts.say(Prompt::UPDATE_DONE); // first words after an update
+        }
         if (provisioned && !nfcController.isPogoSwitchActive())
         {
             prompts.say(Prompt::IDLE_HELLO);
@@ -3492,15 +3506,27 @@ void loop()
 #endif
     TT_TIMED("ota", OtaManager::getInstance().update());
     gOtaProgress = OtaManager::getInstance().inProgress() ? OtaManager::getInstance().progress() : -1;
-    if (gOtaProgress >= 0 && gLastOtaProgress < 0)
     {
-        prompts.say(Prompt::UPDATE_START);
+        OtaManager &ota = OtaManager::getInstance();
+        // Say "updating myself" first, while nothing else plays; the download starts when the
+        // sentence is over (idle check). A forced (mandatory) start still gets the prompt.
+        if (ota.state() == OtaManager::WAITING && !gUpdateAnnounced && otaIdleConditions() && !audioController.isPlaying())
+        {
+            gUpdateAnnounced = true;
+            prompts.say(Prompt::UPDATE_START);
+        }
+        else if (gOtaProgress >= 0 && gLastOtaProgress < 0 && !gUpdateAnnounced)
+        {
+            gUpdateAnnounced = true;
+            prompts.say(Prompt::UPDATE_START);
+        }
+        if (ota.state() == OtaManager::IDLE || ota.state() == OtaManager::FAILED)
+        {
+            gUpdateAnnounced = false;
+        }
+        (void)ota.consumeJustUpdated(); // "update done" is spoken at boot (bootedFromUpdate)
     }
     gLastOtaProgress = gOtaProgress;
-    if (OtaManager::getInstance().consumeJustUpdated())
-    {
-        prompts.say(Prompt::UPDATE_DONE);
-    }
     if (OtaManager::getInstance().consumeJustFailed())
     {
         ReverbClient::setLastError("karpuz");
