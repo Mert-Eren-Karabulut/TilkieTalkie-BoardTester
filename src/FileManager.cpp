@@ -87,7 +87,10 @@ void FileManager::end() {
     saveDownloadQueue();
     saveRequiredFiles();
     saveDownloadStats();
-    
+    for (int i = 0; i < 200 && pendingDeletes.load() > 0; ++i) {
+        delay(50); // queued writes must land before the card goes away
+    }
+
     // Unmount SD card
     SD_MMC.end();
     sdCardInitialized = false;
@@ -276,6 +279,7 @@ bool FileManager::initializeSDCard() {
     Serial.printf("FileManager: SD card size: %lluMB\n", cardSize);
     
     sdCardInitialized = true;
+    ensureMaintenanceTask(); // background deletes/writes + the first free-space count
     
     // Create necessary directories
     createDirectory("/audio");
@@ -349,62 +353,131 @@ bool FileManager::deleteFile(const String& path) {
     return success;
 }
 
+bool FileManager::ensureMaintenanceTask() {
+    if (!deleteQueue) {
+        deleteQueue = xQueueCreate(32, sizeof(MaintJob*));
+        if (!deleteQueue) {
+            return false;
+        }
+    }
+    if (!maintenanceTaskHandle) {
+        if (xTaskCreatePinnedToCore(sdMaintenanceTask, "sd_maint", 6144, this, 2, &maintenanceTaskHandle, 0) != pdPASS) {
+            maintenanceTaskHandle = nullptr;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool FileManager::enqueueJob(uint8_t kind, const String& path, const char* data, size_t len) {
+    if (!ensureMaintenanceTask()) {
+        return false;
+    }
+    MaintJob* job = static_cast<MaintJob*>(calloc(1, sizeof(MaintJob)));
+    if (!job) {
+        return false;
+    }
+    job->kind = kind;
+    job->path = strdup(path.c_str());
+    if (data && len) {
+        job->data = static_cast<char*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!job->data) job->data = static_cast<char*>(malloc(len));
+        if (job->data) {
+            memcpy(job->data, data, len);
+            job->len = len;
+        }
+    }
+    if (!job->path || (data && len && !job->data)) {
+        free(job->path); free(job->data); free(job);
+        return false;
+    }
+    pendingDeletes++;
+    if (xQueueSend(deleteQueue, &job, 0) != pdTRUE) {
+        pendingDeletes--;
+        free(job->path); free(job->data); free(job);
+        return false;
+    }
+    return true;
+}
+
 bool FileManager::deleteFileDeferred(const String& path) {
     if (!sdCardInitialized || path.isEmpty()) {
         return false;
     }
-    if (!deleteQueue) {
-        deleteQueue = xQueueCreate(32, sizeof(char*));
-        if (!deleteQueue) {
-            return deleteFile(path);
-        }
-    }
-    if (!maintenanceTaskHandle) {
-        if (xTaskCreatePinnedToCore(sdMaintenanceTask, "sd_maint", 4096, this, 2, &maintenanceTaskHandle, 0) != pdPASS) {
-            maintenanceTaskHandle = nullptr;
-            return deleteFile(path);
-        }
-    }
-    char* copy = strdup(path.c_str());
-    if (!copy) {
-        return deleteFile(path);
-    }
-    pendingDeletes++;
-    if (xQueueSend(deleteQueue, &copy, 0) != pdTRUE) {
-        pendingDeletes--;
-        free(copy);
+    if (!enqueueJob(0, path, nullptr, 0)) {
         Serial.printf("FileManager: delete queue full, deleting inline: %s\n", path.c_str());
         return deleteFile(path);
     }
     return true;
 }
 
-static const char* const kFreeSpaceMarker = "\x01free";
+bool FileManager::writeFileDeferred(const String& path, const String& content) {
+    if (!sdCardInitialized || path.isEmpty()) {
+        return false;
+    }
+    if (!enqueueJob(1, path, content.c_str(), content.length())) {
+        Serial.printf("FileManager: write queue full, writing inline: %s\n", path.c_str());
+        return writeFileNow(path.c_str(), content.c_str(), content.length());
+    }
+    return true;
+}
+
+// tmp + rename so a power cut mid-write never leaves an empty or truncated file behind.
+bool FileManager::writeFileNow(const char* path, const char* data, size_t len) {
+    String tmp = String(path) + ".tmp";
+    if (SD_MMC.exists(tmp)) {
+        SD_MMC.remove(tmp);
+    }
+    File file = SD_MMC.open(tmp, FILE_WRITE);
+    if (!file) {
+        Serial.printf("FileManager: Failed to open %s for writing\n", tmp.c_str());
+        return false;
+    }
+    size_t written = len ? file.write(reinterpret_cast<const uint8_t*>(data), len) : 0;
+    file.flush();
+    file.close();
+    if (written != len) {
+        SD_MMC.remove(tmp);
+        Serial.printf("FileManager: short write %u/%u to %s\n", (unsigned)written, (unsigned)len, path);
+        return false;
+    }
+    if (SD_MMC.exists(path)) {
+        SD_MMC.remove(path); // FatFs rename does not overwrite
+    }
+    return SD_MMC.rename(tmp, path);
+}
 
 void FileManager::sdMaintenanceTask(void* parameter) {
     FileManager* self = static_cast<FileManager*>(parameter);
-    char* path = nullptr;
     // First free-space count of this boot: with CONFIG_FATFS_DONT_TRUST_FREE_CLUSTER_CNT the
-    // FAT is scanned (seconds on a slow card) - here, never on the loop task.
+    // FAT is scanned (hundreds of ms to seconds on a slow card) - here, never on the loop task.
     self->freeRefreshInFlight = true;
     self->refreshFreeSpaceCache();
     self->freeRefreshInFlight = false;
+    MaintJob* job = nullptr;
     for (;;) {
-        if (xQueueReceive(self->deleteQueue, &path, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-        if (strcmp(path, kFreeSpaceMarker) == 0) {
-            free(path);
-            self->refreshFreeSpaceCache();
-            self->freeRefreshInFlight = false;
+        if (xQueueReceive(self->deleteQueue, &job, portMAX_DELAY) != pdTRUE || !job) {
             continue;
         }
         if (self->sdCardInitialized) {
             unsigned long t0 = millis();
-            bool ok = SD_MMC.remove(path);
-            Serial.printf("FileManager: %s %s (%lu ms, background)\n", ok ? "deleted" : "failed to delete", path, millis() - t0);
+            if (job->kind == 0) {
+                bool ok = SD_MMC.remove(job->path);
+                Serial.printf("FileManager: %s %s (%lu ms, background)\n", ok ? "deleted" : "failed to delete", job->path, millis() - t0);
+            } else if (job->kind == 1) {
+                bool ok = self->writeFileNow(job->path, job->data, job->len);
+                unsigned long dt = millis() - t0;
+                if (!ok || dt > 500) {
+                    Serial.printf("FileManager: %s %s (%u bytes, %lu ms, background)\n", ok ? "wrote" : "failed to write", job->path, (unsigned)job->len, dt);
+                }
+            } else {
+                self->refreshFreeSpaceCache();
+                self->freeRefreshInFlight = false;
+            }
         }
-        free(path);
+        free(job->path);
+        free(job->data);
+        free(job);
         self->pendingDeletes--;
     }
 }
@@ -1026,17 +1099,11 @@ size_t FileManager::getSDCardFreeSpace() {
 }
 
 void FileManager::requestFreeSpaceRefresh() {
-    if (!deleteQueue || freeRefreshInFlight) {
+    if (freeRefreshInFlight) {
         return;
     }
-    char* marker = strdup(kFreeSpaceMarker);
-    if (!marker) {
-        return;
-    }
-    if (xQueueSend(deleteQueue, &marker, 0) == pdTRUE) {
+    if (enqueueJob(2, "/", nullptr, 0)) {
         freeRefreshInFlight = true;
-    } else {
-        free(marker);
     }
 }
 
@@ -1162,26 +1229,13 @@ bool FileManager::saveDownloadQueue() {
 // Write-to-temp + rename so a power cut mid-write never leaves an empty/truncated list
 // (an unparseable file used to be loaded as "no files", and the next save made that permanent).
 bool FileManager::writeJsonAtomic(const char *path, const JsonDocument &doc) {
-    String tmp = String(path) + ".tmp";
-    if (SD_MMC.exists(tmp)) {
-        SD_MMC.remove(tmp);
-    }
-    File file = SD_MMC.open(tmp, FILE_WRITE);
-    if (!file) {
-        Serial.printf("FileManager: Failed to open %s for writing\n", tmp.c_str());
+    String json;
+    json.reserve(measureJson(doc) + 1);
+    if (serializeJson(doc, json) == 0) {
         return false;
     }
-    size_t written = serializeJson(doc, file);
-    file.flush();
-    file.close();
-    if (written == 0) {
-        SD_MMC.remove(tmp);
-        return false;
-    }
-    if (SD_MMC.exists(path)) {
-        SD_MMC.remove(path); // FatFs rename does not overwrite
-    }
-    return SD_MMC.rename(tmp, path);
+    // Serialising is cheap; the SD write (up to seconds on a slow card) runs on the maintenance task.
+    return writeFileDeferred(path, json);
 }
 
 bool FileManager::openJsonForRead(const char *path, File &file) {

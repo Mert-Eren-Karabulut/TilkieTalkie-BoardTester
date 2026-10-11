@@ -25,11 +25,49 @@ LedController::LedController()
     maxBrightness = constrain(maxBrightness, 0, LED_MAX_POWER);
 }
 
+// WS2812B over the ESP32 RMT peripheral, driven directly instead of through FastLED's RMT
+// backend: with four memory blocks (192 symbols) the whole 5-LED frame (121 symbols) is loaded
+// into the RMT memory before transmission starts, so no interrupt is needed while it clocks
+// out. FastLED refilled the RMT memory from an interrupt that cannot run while the flash is
+// being written (OTA, NVS): frames were cut mid-way and the LEDs at the end of the chain got
+// random data ("flashing" during updates).
+namespace {
+constexpr int kNumLeds = 5;             // LedController::NUM_LEDS (private)
+static_assert(kNumLeds * 24 + 1 <= 192, "frame must fit the reserved RMT memory");
+constexpr uint32_t kRmtHz = 10000000;   // 0.1 us ticks
+constexpr uint16_t kT0H = 4, kT0L = 8;  // 0.4 / 0.8 us
+constexpr uint16_t kT1H = 8, kT1L = 4;  // 0.8 / 0.4 us
+rmt_data_t gLedSymbols[kNumLeds * 24 + 1];
+}
+
+void LedController::showLeds() {
+    static_assert(NUM_LEDS == kNumLeds, "keep kNumLeds in sync with NUM_LEDS");
+    size_t n = 0;
+    for (int i = 0; i < NUM_LEDS; ++i) {
+        const uint8_t bytes[3] = {leds[i].g, leds[i].r, leds[i].b}; // GRB on the wire
+        for (int b = 0; b < 3; ++b) {
+            for (int bit = 7; bit >= 0; --bit) {
+                const bool one = (bytes[b] >> bit) & 1;
+                gLedSymbols[n].level0 = 1;
+                gLedSymbols[n].duration0 = one ? kT1H : kT0H;
+                gLedSymbols[n].level1 = 0;
+                gLedSymbols[n].duration1 = one ? kT1L : kT0L;
+                n++;
+            }
+        }
+    }
+    gLedSymbols[n].level0 = 0; gLedSymbols[n].duration0 = 1500; // 300 us reset (latch)
+    gLedSymbols[n].level1 = 0; gLedSymbols[n].duration1 = 1500;
+    n++;
+    rmtWrite(LED_PIN, gLedSymbols, n, 10);
+}
+
 void LedController::begin() {
-    FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
-    FastLED.setBrightness(255);
-    FastLED.clear();
-    FastLED.show();
+    if (!rmtInit(LED_PIN, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_4, kRmtHz)) {
+        Serial.println("LedController: RMT init failed");
+    }
+    for (int i = 0; i < NUM_LEDS; ++i) leds[i] = CRGB(0, 0, 0);
+    showLeds();
     if (!lock) {
         lock = xSemaphoreCreateMutex();
     }
@@ -60,7 +98,7 @@ void LedController::renderLoop() {
             }
             xSemaphoreGive(lock);
             memcpy(leds, frame, sizeof(leds));
-            FastLED.show();
+            showLeds();
         }
         {
             static int64_t lastFrameUs = 0;

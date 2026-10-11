@@ -2454,6 +2454,12 @@ void loop()
             gChargeMonNextAt = gChargeMonStart;
             gChargeMonUntil = gChargeMonStart + (unsigned long)seconds * 1000UL;
         }
+        else if (command == "sdinfo")
+        {
+            ESP_LOGI(TAG, "SD: card %llu MB, FAT volume %llu MB, used %llu MB, free %u MB (cached)",
+                     (unsigned long long)(SD_MMC.cardSize() >> 20), (unsigned long long)(SD_MMC.totalBytes() >> 20),
+                     (unsigned long long)(SD_MMC.usedBytes() >> 20), (unsigned)fileManager.getSDCardFreeMB());
+        }
         else if (command == "dlclear")
         {
             fileManager.cancelAllDownloads();

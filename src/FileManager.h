@@ -213,10 +213,21 @@ private:
 
     // Deferred deletes: SD_MMC.remove() takes 0.3-2 s per file on a slow card, so stale assets are
     // erased by a low-priority task on core 0 instead of stalling the loop task.
+    // The queue carries MaintJob pointers: deletes, atomic file writes (tmp + rename) and the
+    // free-space count. FIFO, so a write followed by a delete of the same path stays ordered.
+    struct MaintJob {
+        uint8_t kind;        // 0 delete, 1 write, 2 free-space refresh
+        char* path;
+        char* data;          // write: content (malloc'd)
+        size_t len;
+    };
     QueueHandle_t deleteQueue = nullptr;
     TaskHandle_t maintenanceTaskHandle = nullptr;
-    std::atomic<int> pendingDeletes{0};
+    std::atomic<int> pendingDeletes{0};   // all queued jobs (name kept for the callers)
     static void sdMaintenanceTask(void* parameter);
+    bool ensureMaintenanceTask();
+    bool enqueueJob(uint8_t kind, const String& path, const char* data, size_t len);
+    bool writeFileNow(const char* path, const char* data, size_t len); // tmp + rename, any task
     bool ringPush(const uint8_t* data, size_t len);
     size_t ringAvailable() const { return asyncState.ringHead - asyncState.ringTail; }
     size_t ringFree() const { return RING_SIZE - ringAvailable() - 1; }
@@ -242,6 +253,7 @@ public:
     // File management methods
     bool deleteFile(const String &path);
     bool deleteFileDeferred(const String &path);                  // erased later by the SD maintenance task
+    bool writeFileDeferred(const String &path, const String &content); // written later (tmp + rename) by the SD maintenance task
     bool hasPendingMaintenance() const { return pendingDeletes.load() > 0; }
     bool flushRequiredFiles() { return saveRequiredFiles(); }
     bool deleteFileAndRemoveFromRequired(const String &path); // Smart delete that removes from required list

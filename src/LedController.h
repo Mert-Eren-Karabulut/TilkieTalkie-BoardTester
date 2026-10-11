@@ -103,6 +103,7 @@ private:
     void renderScene(unsigned long now);
     bool renderEffect(unsigned long now);  // false when the effect is over
     void fillAll(CRGB c);
+    void showLeds();   // push leds[] to the strip (RMT, whole frame preloaded)
     CRGB scaled(uint32_t hex, int intensity) const;
     int pct(int percentOfMax) const { return (maxBrightness * percentOfMax) / 100; }
     static float breathe(unsigned long now, unsigned long periodMs);  // 0..1 sine

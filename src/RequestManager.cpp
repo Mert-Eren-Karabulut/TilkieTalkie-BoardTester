@@ -1020,25 +1020,16 @@ bool RequestManager::saveUnitManifest(const String &uid, const JsonDocument &man
     FileManager &fileManager = FileManager::getInstance();
     fileManager.createDirectory(SD_DATA_DIR);
     fileManager.createDirectory(SD_MANIFEST_DIR);
-
-    String manifestPath = getUnitManifestPath(uid);
-    if (SD_MMC.exists(manifestPath)) {
-        SD_MMC.remove(manifestPath);
-    }
-
-    File file = SD_MMC.open(manifestPath, FILE_WRITE);
-    if (!file) {
-        Serial.printf("RequestManager: Failed to open manifest for writing: %s\n", uid.c_str());
-        return false;
-    }
-
-    if (serializeJson(manifest, file) == 0) {
-        file.close();
+    String json;
+    if (serializeJson(manifest, json) == 0) {
         Serial.printf("RequestManager: Failed to serialize manifest for unit: %s\n", uid.c_str());
         return false;
     }
-
-    file.close();
+    // Written by the SD maintenance task (tmp + rename); the loop never waits for the card.
+    if (!fileManager.writeFileDeferred(getUnitManifestPath(uid), json)) {
+        Serial.printf("RequestManager: Failed to queue manifest for unit: %s\n", uid.c_str());
+        return false;
+    }
     Serial.printf("RequestManager: Saved manifest for unit: %s\n", uid.c_str());
     return true;
 }
@@ -1048,25 +1039,16 @@ bool RequestManager::savePendingUnitManifest(const String &uid, const JsonDocume
     FileManager &fileManager = FileManager::getInstance();
     fileManager.createDirectory(SD_DATA_DIR);
     fileManager.createDirectory(SD_PENDING_MANIFEST_DIR);
-
-    String manifestPath = getPendingUnitManifestPath(uid);
-    if (SD_MMC.exists(manifestPath)) {
-        SD_MMC.remove(manifestPath);
-    }
-
-    File file = SD_MMC.open(manifestPath, FILE_WRITE);
-    if (!file) {
-        Serial.printf("RequestManager: Failed to open pending manifest for writing: %s\n", uid.c_str());
-        return false;
-    }
-
-    if (serializeJson(manifest, file) == 0) {
-        file.close();
+    String json;
+    if (serializeJson(manifest, json) == 0) {
         Serial.printf("RequestManager: Failed to serialize pending manifest for unit: %s\n", uid.c_str());
         return false;
     }
-
-    file.close();
+    // Written by the SD maintenance task (tmp + rename); the loop never waits for the card.
+    if (!fileManager.writeFileDeferred(getPendingUnitManifestPath(uid), json)) {
+        Serial.printf("RequestManager: Failed to queue pending manifest for unit: %s\n", uid.c_str());
+        return false;
+    }
     Serial.printf("RequestManager: Saved pending manifest for unit: %s\n", uid.c_str());
     return true;
 }
@@ -1091,17 +1073,8 @@ bool RequestManager::loadUnitManifest(const String &uid, JsonDocument &manifest)
 
 bool RequestManager::deletePendingUnitManifest(const String &uid)
 {
-    String pendingManifestPath = getPendingUnitManifestPath(uid);
-    if (!SD_MMC.exists(pendingManifestPath)) {
-        return true;
-    }
-
-    bool deleted = SD_MMC.remove(pendingManifestPath);
-    if (!deleted) {
-        Serial.printf("RequestManager: Failed to delete pending manifest for unit: %s\n", uid.c_str());
-    }
-
-    return deleted;
+    // Queued behind any pending write of the same file (FIFO), so the order is preserved.
+    return FileManager::getInstance().deleteFileDeferred(getPendingUnitManifestPath(uid));
 }
 
 bool RequestManager::loadPendingUnitManifest(const String &uid, JsonDocument &manifest)

@@ -26,6 +26,11 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 - Voice prompts + tones (Turkish) from the SD card, docs/VOICE-PROMPTS.md; the card needs the pack
   (`tools/sdcard-prepare.sh /dev/diskN`). Fruit error codes in `device_report.last_error` (portal: not stored yet).
 - Volume buttons 5 s = forget WiFi; 2+3 5 s = restart.
+- LEDs driven directly over RMT with the whole frame preloaded (no flashing during flash writes).
+- SD writes off the loop (maintenance task); free space counted from the FAT, reported in MB.
+- Portal pushes `ota-update` on upload; device checks hourly; dock heartbeat 15 s.
+- **The bench card has a 127 MB FAT volume on a 30 GB card**: reformat with `tools/sdcard-prepare.sh`.
+  Production cards must be formatted full-size by the same script (factory step).
 
 ## Remaining before ship (firmware)
 0. Out-of-box run #2 with the prompts and the pack on the card (pairing, update, first figure, buttons, sleep).
