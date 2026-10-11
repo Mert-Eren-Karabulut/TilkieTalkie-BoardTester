@@ -46,6 +46,9 @@ and sustains only ~0.3 MB/s; the portal currently returns an empty manifest for 
 7. Later: `esp_websocket_client` in a dedicated net task; device-scoped token (backend work).
 
 ### C. Power task / runtime
+- Loop latency still measured on the bench (2026-10-11, after moving stale erases to the SD task): manifest fetch+parse
+  `request` 241 ms, download finalize/manifest save `files` up to 667 ms, worst loop gap 1.4 s during a 5-track download.
+  Candidates: parse manifests off the loop (request task), make writeJsonAtomic/pending-manifest handling incremental.
 1. Move battery polling to its own task (core 0, prio ~6) so the remaining ~55 ms/s + 185 ms/10 s leave the loop; temperature guard sanity range (a bad read suspended charging at "4629 °C").
 2. Async boot: buttons/NFC/audio/LED first; no 5 s + 10 s waits; `wifiProv.begin` 30 s wait off the loop.
 3. NFC: finite passive-activation retries + RF off after a read (RF field left on all session); init retry.
