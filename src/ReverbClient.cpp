@@ -11,6 +11,7 @@
 #include "NfcController.h"
 #include "ConfigManager.h"
 #include "CaBundle.h"
+#include "OtaManager.h"
 
 // Define static members
 char ReverbClient::jsonBuffer[768];
@@ -1014,6 +1015,12 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
         {
             Serial.println("ReverbClient: Seek command missing value");
         }
+    }
+    else if (lowerType == "ota-update")
+    {
+        uint32_t releaseId = (hasValue && value.length() > 0) ? (uint32_t)value.toInt() : 0;
+        Serial.printf("ReverbClient: OTA update requested (release %u)\n", (unsigned)releaseId);
+        OtaManager::getInstance().checkNow(releaseId, "command");
     }
     else if (lowerType == "reboot" || lowerType == "restart")
     {

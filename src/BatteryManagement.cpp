@@ -284,6 +284,7 @@ BatteryManager::BatteryManager()
     , chargingStateChangeCallback(nullptr)
     , lowBatteryCallbackTriggered(false)
 {
+    busLock = xSemaphoreCreateRecursiveMutex();
     // Initialize voltage buffer
     for (int i = 0; i < SMOOTHING_SAMPLES; i++) {
         voltageBuffer[i] = 0.0;
@@ -407,7 +408,28 @@ bool BatteryManager::resetGaugeLearningState() {
         && gaugeUpdateStatus == DEFAULT_GAUGE_UPDATE_STATUS;
 }
 
+void BatteryManager::pollTaskEntry(void *arg) {
+    BatteryManager *self = static_cast<BatteryManager *>(arg);
+    for (;;) {
+        self->update();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void BatteryManager::startTask() {
+    if (pollTask) return;
+    if (xTaskCreatePinnedToCore(pollTaskEntry, "battery", 4096, this, 4, &pollTask, 0) != pdPASS) {
+        pollTask = nullptr;
+        Serial.println("BatteryManager: poll task creation failed, staying on the loop");
+        return;
+    }
+    Serial.println("BatteryManager: polling on its own task (core 0)");
+}
+
 void BatteryManager::update() {
+    if (pollTask && xTaskGetCurrentTaskHandle() != pollTask) {
+        return; // the poll task owns the periodic work now
+    }
     unsigned long currentTime = millis();
     
     // Update at specified interval
@@ -2076,7 +2098,17 @@ bool BatteryManager::waitForSCLHigh() {
 // flight, which with a ~100 ms/s poll duty is likely on every reflash) keeps clocking out its
 // current byte and every subsequent read returns 0x7F/0xBF/0xFF patterns until it sees nine
 // clocks with SDA released followed by a STOP. Slaves do not reset with the host.
+
+namespace {
+struct BusGuard {
+    SemaphoreHandle_t m;
+    explicit BusGuard(SemaphoreHandle_t lock) : m(lock) { if (m) xSemaphoreTakeRecursive(m, portMAX_DELAY); }
+    ~BusGuard() { if (m) xSemaphoreGiveRecursive(m); }
+};
+}
+
 void BatteryManager::i2cBusRecover() {
+    BusGuard guard(busLock);
     releaseSDA();
     releaseSCL();
     waitForSCLHigh();
@@ -2196,6 +2228,7 @@ bool BatteryManager::probeDevice(uint8_t address) {
 }
 
 bool BatteryManager::writeRegisters(uint8_t address, uint8_t startReg, const uint8_t *data, size_t length) {
+    BusGuard guard(busLock);
     if (!busInitialized) {
         return false;
     }
@@ -2211,6 +2244,7 @@ bool BatteryManager::writeRegisters(uint8_t address, uint8_t startReg, const uin
 }
 
 bool BatteryManager::readRegisters(uint8_t address, uint8_t startReg, uint8_t *data, size_t length) {
+    BusGuard guard(busLock);
     if (!busInitialized) {
         return false;
     }

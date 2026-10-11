@@ -3,6 +3,9 @@
 
 #include <Arduino.h>
 #include <driver/gpio.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 class BatteryManager {
 private:
@@ -362,6 +365,12 @@ private:
     void i2cDelay();
     bool waitForSCLHigh();
     void i2cBusRecover();
+
+    // One bit-banged bus, two callers (poll task + loop-side charger supervision): every
+    // transaction takes this recursive lock.
+    SemaphoreHandle_t busLock = nullptr;
+    TaskHandle_t pollTask = nullptr;
+    static void pollTaskEntry(void *arg);
     void i2cStart();
     void i2cStop();
     bool i2cWriteByte(uint8_t value);
@@ -477,6 +486,10 @@ public:
 
     // Main update method (call regularly in loop)
     void update();
+    // Run the periodic poll on its own task (core 0). After this, update() calls from the loop
+    // return immediately; the ~190 ms of bit-banged I2C per poll no longer stall the loop.
+    void startTask();
+    bool isTaskRunning() const { return pollTask != nullptr; }
     bool restoreGaugeFetControl();
     bool setGaugeSingleCellMode();
     // Calibrate the gauge current sense (CC Gain) against the BQ25792's IBAT ADC.

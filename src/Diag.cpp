@@ -140,6 +140,10 @@ void Diag::printSectionStats(bool reset)
     if (reset) { g_loopIters = 0; g_loopMaxGapUs = 0; }
 }
 
+static bool g_verbose = false;
+void Diag::setVerbose(bool on) { g_verbose = on; }
+bool Diag::verbose() { return g_verbose; }
+
 void Diag::periodicReport(uint32_t intervalMs)
 {
     int64_t now = esp_timer_get_time();
@@ -152,9 +156,18 @@ void Diag::periodicReport(uint32_t intervalMs)
     g_loopIters++;
 
     static int64_t lastReport = 0;
-    if (now - lastReport < (int64_t)intervalMs * 1000) return;
+    const int64_t interval = (g_verbose ? (int64_t)intervalMs : 60000LL) * 1000LL;
+    if (now - lastReport < interval) return;
     lastReport = now;
-    printSectionStats(true);
+    if (g_verbose)
+    {
+        printSectionStats(true); // ~16 lines over USB-CDC: only when asked for ('diag on')
+    }
+    else
+    {
+        ESP_LOGI(TAG, "loop max gap %.0f ms", g_loopMaxGapUs / 1000.0);
+        g_loopMaxGapUs = 0;
+    }
     ESP_LOGI(TAG, "  heap: internal free=%u largest=%u minfree=%u | psram free=%u | loop stack hwm=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),

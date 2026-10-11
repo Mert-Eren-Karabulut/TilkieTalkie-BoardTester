@@ -13,6 +13,8 @@ namespace Diag
 
     // Periodic report of section timings + heap; call from loop() (rate-limited inside).
     void periodicReport(uint32_t intervalMs = 10000);
+    void setVerbose(bool on);   // print the per-section table every interval (default: one heap line a minute)
+    bool verbose();
 
     // Print section timing table now and reset the max values.
     void printSectionStats(bool reset = true);

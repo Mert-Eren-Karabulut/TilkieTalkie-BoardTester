@@ -41,14 +41,15 @@ Open: (1) the owner has to confirm the speaker still sounds right at low volume 
 (`audio` shows "headphone plugged"); if GPIO41 turns out not to be NS4150B CTRL, `amp` handling is a two-line revert;
 (2) no `/sounds/beep.mp3` on the bench card, beep path untested; (3) seek assumes 96 kbps CBR (12 kB/s).
 
-### B. Network (ReverbClient / WiFiProvisioning / RequestManager)
-1. Remove `reboot`/`restart`, `set-max-volume`, `play <path>` from remote commands; require `device_id == own`; rate-limit.
-2. Status report: on change + 60 s heartbeat; drop SSID and NFC UID; fix the 512 B frame overflow (silent drops).
-3. Reconnect with exponential backoff; subscribe without the HTTPS auth POST inside the WS callback (public channel today); start services on GOT_IP (device stays offline forever if WiFi is late at boot); make `begin()` idempotent (the `reverbstart` leak).
-4. HTTPS for the API (CA bundle is compiled in; `MBEDTLS_EXTERNAL_MEM_ALLOC` now on) — owner agreed: HTTPS for API, HTTP for media with sha256.
-5. Deinit provisioning at PROV_END (BLE memory); per-unit PoP instead of `abcd1234`.
-6. ~~Configurable API/Reverb host for local testing~~ done (`endpoint` command).
-7. Later: `esp_websocket_client` in a dedicated net task; device-scoped token (backend work).
+### B. Network (ReverbClient / WiFiProvisioning / RequestManager) — mostly done 2026-10-11
+Done: TLS with the embedded CA bundle for the API, wss and /broadcasting/auth (the old setBaseUrl() downgraded https to
+http); channel auth runs from update() with 5/10/20/40 s backoff and a token refresh on 401/403; subscription confirmed on
+`pusher_internal:subscription_succeeded`; reconnects back off 2 s → 60 s; device report on change / 5 s position while
+playing / 60 s heartbeat (was 1/s), SSID dropped; commands for another device_id ignored; remote `play <path>` limited to
+/assets/; report buffer 768 B with an overflow guard; USB console `setTxTimeoutMs(5)` so an unread port cannot stall the loop.
+Remaining: subscribe to `private-device.{uuid}` once the backend flag `TILKIE_PUBLIC_DEVICE_CHANNEL` is turned off (backend
+dual-publishes already); per-unit provisioning PoP (factory topic); esp_websocket_client on its own task (nice to have);
+BT controller memory release when booting already provisioned (needs reboot-into-provisioning flow).
 
 ### C. Power task / runtime
 - Internal heap (2026-10-11, after `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 16 KB→4 KB, AsyncTCP stack 16→8 KB, audio task
@@ -80,10 +81,19 @@ Open: (1) the owner has to confirm the speaker still sounds right at low volume 
 4. Device API v2: compact manifest with ETag/304, signed media URLs, server-side transcode, status via HTTPS.
 5. MySQL/Postgres + string FKs before real traffic.
 
-### F. OTA + factory mode
-Firmware: version reporting, check/download/verify, `esp_ota_*` with rollback enabled. Backend: firmware_releases table,
-rollout %, admin upload page, device check endpoint (design in the audit §4). Factory: enrollment with serial numbers
-(owner: replaces eFuse MAC as identity), QA upload, factory build flag.
+### F. OTA + factory mode — OTA done 2026-10-12 (device + backend), factory mode open
+Device: `src/OtaManager.*` (download task on core 0, Arduino Update into the spare partition, SHA-256 over the stream, Range
+resume on dropped connections, status posts from the loop task, rollback-safe: `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, the
+new image confirms itself when Reverb connects or after 30 s, otherwise the bootloader returns to the previous image and the
+device reports `rolled_back`). Version = `CONFIG_APP_PROJECT_VER` (sdkconfig) → app descriptor → parsed by the backend upload.
+Updates start only when idle (no playback/figure/download, charging or ≥ 40 %); mandatory ones force after 1 h; periodic
+check 24 h; remote `ota-update <release_id>`. Backend: branch `feature/ota` (merged on the bench): firmware_releases,
+hub firmware columns, hub_firmware_events, selector (pin > channel/rollout/min_version), signed 15-min download URLs with
+Range, admin Firmware pages + Hub firmware card, 28 tests, docs/OTA.md.
+Verified on the bench: 1.1.0 → 1.1.1 via the backend (15 s download+flash), success reported; crashing 1.1.3 rolled back by the
+bootloader and reported. Open: factory mode (serial-number enrollment, `hub:secret` is the backend half), flash auto-suspend so
+LED/WebSocket keep running during the flash writes (`CONFIG_SPI_FLASH_AUTO_SUSPEND`), production nginx (PHP's dev server was
+flaky on long downloads).
 
 ## Local portal for bench testing (done 2026-10-11)
 The backend repo (`/Users/mert/Herd/portal.tilkietalkie.com`, branch `develop`) now has `scripts/bench/` — see its README.

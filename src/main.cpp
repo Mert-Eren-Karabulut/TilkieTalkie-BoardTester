@@ -23,6 +23,8 @@
 #include "SleepController.h"
 #include "rtc_wake_stub_vbus.h"
 #include "Diag.h"
+#include "OtaManager.h"
+#include "Version.h"
 
 // The espidf CMake build compiles every file in src/ regardless of build_src_filter,
 // so the sleep-probe build (env:sleepprobe, -DSLEEP_PROBE_BUILD) excludes this whole
@@ -109,6 +111,10 @@ enum SystemPhase
     PHASE_RUNNING  // full system started
 };
 static SystemPhase gSystemPhase = PHASE_MONITOR;
+static unsigned long gFullSystemStartedAt = 0;  // millis() when startFullSystem() ran
+static unsigned long gFigureLoadingSince = 0;   // tap time until something plays / fails
+static bool gSystemError = false;               // SD or audio failed to come up
+static int gOtaProgress = -1;                   // 0-100 while an update is being written
 static const float SYSTEM_START_V = 3.10f;            // cell must reach this to start full system
 static const uint32_t SYSTEM_MONITOR_LED = 0x0000FF;  // blue breathing while warming up / charging
 void startFullSystem();
@@ -291,7 +297,7 @@ static void updateChargingUx()
         }
         else
         {
-            ledController.enableOperatingAnimation(true); // restore the idle sweep
+            // running phase: deriveLedScene() picks the next scene on the following loop
         }
     }
 }
@@ -525,7 +531,7 @@ void handleChatMessage(const String &message)
     ESP_LOGI(TAG, "[REVERB] Message Received: %s", message.c_str());
 
     // Example action: Pulse the LED blue when a message comes in
-    ledController.pulseRapid(0x0000FF, 2); // Blue color
+    ledController.flash(LedController::FX_MESSAGE);
 
     // You can add more complex logic here, e.g., parsing the message
     // if (message == "play_sound") {
@@ -543,9 +549,10 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
     if (!success)
     {
         ESP_LOGE(TAG, "Figure %s (%s): %s", figureName.c_str(), uid.c_str(), error.c_str());
+        gFigureLoadingSince = 0;
         if (mounted)
         {
-            ledController.pulseRapid(0xFF0000, 5); // red: nothing to play
+            ledController.flash(LedController::FX_NO_CONTENT);
         }
         return;
     }
@@ -575,6 +582,7 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
         return;
     }
 
+    gFigureLoadingSince = 0;
     const bool samePlaylist = audioController.hasPlaylist() && audioController.getPlaylistFigureUid() == uid;
     if (isUpdate && samePlaylist)
     {
@@ -631,7 +639,8 @@ void afterNFCRead(const NFCData &nfcData)
 
     // Example: Play a sound and turn the LED green
     // audioController.play("/sounds/nfc_success.mp3");
-    ledController.pulseRapid(0x00FF00, 3); // Green color
+    ledController.flash(LedController::FX_ACK);
+    gFigureLoadingSince = millis(); // amber chase until the first track plays
     // we need to check if the figure tracks are downloaded and they exist
     // we need to send get request with bearer token to the url :https://portal.tilkietalkie.com/api/units/{nfc_uid}
     requestManager.getCheckFigureTracks(nfcData.uidString);
@@ -649,7 +658,7 @@ void afterDetachNFC()
     // Stop audio and clear the playlist
     audioController.stop();
     audioController.clearPlaylist();
-    ledController.pulseRapid(0xFF0000, 3); // Red color
+    gFigureLoadingSince = 0; // removing the figure is normal: no red, the scene just returns to idle
 
     ESP_LOGI(TAG, "Playlist cleared due to figure removal.");
     ESP_LOGI(TAG, "==========================");
@@ -864,6 +873,7 @@ void setup()
     if (DEBUG)
     {
         Serial.begin(115200);
+        Serial.setTxTimeoutMs(5); // a host that is not draining the USB console must not stall the loop
         delay(1000); // Give serial time to initialize
     }
     ESP_LOGI(TAG, "=== TilkieTalkie Board Tester ===");
@@ -907,6 +917,7 @@ void setup()
     // of brown-out looping at WiFi bring-up. ---
     ESP_LOGI(TAG, "Initializing LED Controller...");
     ledController.begin();
+    OtaManager::getInstance().begin();
 
     ESP_LOGI(TAG, "Initializing Sleep Controller...");
     sleepController.begin();
@@ -916,8 +927,8 @@ void setup()
     sleepController.onSleep([]()
                             {
                                 ESP_LOGI(TAG, "Device is about to enter deep sleep...");
-                                ledController.pulseRapid(0xFFFF00, 3); // Yellow pulse before sleep
-                                delay(1000);                           // Give time for LED animation
+                                ledController.setScene(LedController::SCENE_SLEEPING); // fade out
+                                delay(900);
                                 // The PN532 sits on the always-on 3.3V rail with RSTPD_N pulled
                                 // high in hardware, so GPIO4 can't de-power it. Without this
                                 // command it idles ~40mA through deep sleep (5-day depletion
@@ -997,6 +1008,7 @@ void startFullSystem()
         return; // already started
     }
     gSystemPhase = PHASE_RUNNING;
+    gFullSystemStartedAt = millis();
     ESP_LOGI(TAG, "Battery ready (%.3fV) — starting full system.",
              battery.hasTelemetry() ? battery.getBatteryVoltage() : 0.0f);
 
@@ -1074,6 +1086,7 @@ void startFullSystem()
         if (reverb.isConnected())
         {
             ESP_LOGI(TAG, "Reverb connected successfully!");
+            OtaManager::getInstance().markBootHealthy();
         }
         else
         {
@@ -1096,7 +1109,7 @@ void startFullSystem()
         ESP_LOGE(TAG, "FATAL: NFC Controller initialization failed!");
         ESP_LOGE(TAG, "NFC functionality will not be available.");
         // Handle failure, maybe by pulsing an error color
-        ledController.pulseLed(0xFF0000); // Pulse red for error
+        gSystemError = true; // deriveLedScene() shows the steady red error scene
     }
 
     // Initialize other modules here
@@ -1116,19 +1129,19 @@ void startFullSystem()
         switch(button) {
             case ButtonController::BUTTON_1:
                     ESP_LOGI(TAG, "Button 1: Volume up");
-                    audioController.volumeUp();
+                    audioController.volumeUp(); ledController.flash(LedController::FX_VOLUME, audioController.getCurrentVolume());
                 break;
             case ButtonController::BUTTON_2:
                 ESP_LOGI(TAG, "Button 2: Next track");
-                audioController.nextTrack();
+                audioController.nextTrack(); ledController.flash(LedController::FX_NEXT);
                 break;
             case ButtonController::BUTTON_3:
                 ESP_LOGI(TAG, "Button 3: Previous track");
-                audioController.prevTrack();
+                audioController.prevTrack(); ledController.flash(LedController::FX_PREV);
                 break;
             case ButtonController::BUTTON_4:
                     ESP_LOGI(TAG, "Button 4: Volume down");
-                    audioController.volumeDown();
+                    audioController.volumeDown(); ledController.flash(LedController::FX_VOLUME, audioController.getCurrentVolume());
                 break;
         } });
 
@@ -1146,10 +1159,10 @@ void startFullSystem()
                                       {
             if (button == ButtonController::BUTTON_1) {
             ESP_LOGI(TAG, "Volume up (held for %lu ms)", duration);
-                audioController.volumeUp();
+                audioController.volumeUp(); ledController.flash(LedController::FX_VOLUME, audioController.getCurrentVolume());
         } else if (button == ButtonController::BUTTON_4) {
             ESP_LOGI(TAG, "Volume down (held for %lu ms)", duration);
-                audioController.volumeDown();
+                audioController.volumeDown(); ledController.flash(LedController::FX_VOLUME, audioController.getCurrentVolume());
         } });
 
     buttonController.onHoldEnd([](ButtonController::ButtonId button, unsigned long duration)
@@ -1160,7 +1173,7 @@ void startFullSystem()
     buttonController.onComboHold([]()
                                  {
                                          ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (1+4) - RESTARTING DEVICE!");
-                                     ledController.pulseRapid(0xFF0000, 5); // Rapid red pulse
+                                     ledController.flash(LedController::FX_FAIL);
                                      delay(2000);                           // Give time for LED animation
                                      ESP.restart();                         // Restart the device
                                  });
@@ -1168,7 +1181,7 @@ void startFullSystem()
     buttonController.onComboHold2([]()
                                   {
                                           ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (2+3) - RESETTING WIFI & RESTARTING!");
-                                      ledController.pulseRapid(0xFF00FF, 5); // Rapid magenta pulse
+                                      ledController.flash(LedController::FX_RESET);
                                       delay(1000);                           // Give time for LED animation
                                       wifiProv.reset();                      // Reset WiFi provisioning
                                       delay(1000);                           // Give time for reset
@@ -1178,12 +1191,82 @@ void startFullSystem()
     ESP_LOGI(TAG, "Button Controller initialized successfully!");
 
     // rapid pulse LED to indicate system is ready
-    ledController.pulseRapid(0x00FF00, 3); // Rapid pulse green
+    ledController.flash(LedController::FX_SUCCESS);
+    battery.startTask(); // ~190 ms of bit-banged I2C per poll leaves the loop
+    OtaManager::getInstance().setIdleCheck([]() {
+        // Flash writes stall every task for tens of ms: never while a story plays or a file is
+        // being written, and not on a nearly empty cell.
+        return !audioController.isPlaying() && !audioController.isPaused() && !nfcController.isCardPresent() &&
+               !fileManager.hasActiveDownload() &&
+               (battery.getChargingStatus() || battery.getBatteryPercentage() >= 40.0f);
+    });
     ESP_LOGI(TAG, "Full system started.");
     // audioController.play("/sounds/12.mp3"); // Play startup sound
 }
 static unsigned long lastFreeCall = 0;
 static unsigned long lastStackCheck = 0;
+
+// Single owner of the persistent LED scene while the full system runs. Derived from state on
+// every loop iteration, so no code path can leave a stale animation behind; event feedback
+// uses ledController.flash() and plays on top.
+static void deriveLedScene()
+{
+    if (gSystemPhase != PHASE_RUNNING)
+    {
+        return; // monitor / bring-up drive the LED directly
+    }
+    if (ledController.isChargeDisplayActive())
+    {
+        return; // docked SOC bar (chargeux section owns it)
+    }
+    if (gOtaProgress >= 0)
+    {
+        ledController.setScene(LedController::SCENE_OTA, gOtaProgress);
+        return;
+    }
+    if (gSystemError)
+    {
+        ledController.setScene(LedController::SCENE_ERROR);
+        return;
+    }
+
+    const bool lowBattery = battery.hasTelemetry() && !battery.getChargingStatus() && battery.getBatteryPercentage() < 15.0f;
+    ledController.setLowBattery(lowBattery);
+
+    if (audioController.isPlaying())
+    {
+        ledController.setScene(LedController::SCENE_PLAYING);
+    }
+    else if (audioController.isPaused())
+    {
+        ledController.setScene(LedController::SCENE_PAUSED);
+    }
+    else if (gFigureLoadingSince != 0 && millis() - gFigureLoadingSince < 30000UL)
+    {
+        ledController.setScene(LedController::SCENE_LOADING);
+    }
+    else if (fileManager.hasActiveDownload())
+    {
+        ledController.setScene(LedController::SCENE_DOWNLOADING);
+    }
+    else if (!WiFi.isConnected())
+    {
+        if (wifiProv.isProvisioningManagerActive())
+            ledController.setScene(LedController::SCENE_PROVISIONING);
+        else if (millis() - gFullSystemStartedAt < 60000UL)
+            ledController.setScene(LedController::SCENE_WIFI_CONNECTING);
+        else
+            ledController.setScene(LedController::SCENE_OFFLINE);
+    }
+    else if (lowBattery)
+    {
+        ledController.setScene(LedController::SCENE_LOW_BATTERY);
+    }
+    else
+    {
+        ledController.setScene(LedController::SCENE_OFF);
+    }
+}
 
 void loop()
 {
@@ -1924,6 +2007,69 @@ void loop()
         else if (command == "audio")
         {
             audioController.printStatus();
+        }
+        else if (command == "crash")
+        {
+            ESP_LOGE(TAG, "crash requested from the console (panic)");
+            delay(50);
+            abort();
+        }
+        else if (command == "version")
+        {
+            ESP_LOGI(TAG, "Firmware %s (code %u), hardware %s, IDF %s", firmwareVersion(), (unsigned)firmwareVersionCode(),
+                     TT_HARDWARE_REV, esp_app_get_description()->idf_ver);
+        }
+        else if (command.startsWith("diag"))
+        {
+            String arg = command.substring(4);
+            arg.trim();
+            if (arg == "on") Diag::setVerbose(true);
+            else if (arg == "off") Diag::setVerbose(false);
+            ESP_LOGI(TAG, "Periodic diagnostics: %s", Diag::verbose() ? "verbose (section table every 10 s)" : "quiet (one line a minute)");
+        }
+        else if (command.startsWith("ota"))
+        {
+            // ota | ota check [release_id] | ota url <url> <sha256> <size> [version]
+            String arg = command.substring(3);
+            arg.trim();
+            OtaManager &ota = OtaManager::getInstance();
+            if (arg.isEmpty())
+            {
+                ota.printStatus();
+            }
+            else if (arg.startsWith("check"))
+            {
+                String id = arg.substring(5);
+                id.trim();
+                ota.checkNow(id.isEmpty() ? 0 : (uint32_t)id.toInt(), "console");
+            }
+            else if (arg.startsWith("url "))
+            {
+                String rest = arg.substring(4);
+                String parts[4];
+                int n = 0;
+                while (n < 4 && rest.length() > 0)
+                {
+                    int sp = rest.indexOf(' ');
+                    parts[n++] = sp > 0 ? rest.substring(0, sp) : rest;
+                    rest = sp > 0 ? rest.substring(sp + 1) : "";
+                    rest.trim();
+                }
+                if (n < 3)
+                {
+                    ESP_LOGW(TAG, "usage: ota url <url> <sha256> <size> [version]");
+                }
+                else
+                {
+                    OtaManager::Job job;
+                    job.url = parts[0];
+                    job.sha256 = parts[1];
+                    job.size = (size_t)parts[2].toInt();
+                    job.version = n > 3 ? parts[3] : String("bench");
+                    job.releaseId = 0;
+                    ota.startJob(job);
+                }
+            }
         }
         else if (command.startsWith("amp"))
         {
@@ -2873,7 +3019,18 @@ void loop()
     }
 
     // Update LED controller (handles pulse and pulseRapid animations)
-    TT_TIMED("led", ledController.update());
+#ifdef TT_OTA_CRASH_TEST
+    // Bench only (-DTT_OTA_CRASH_TEST=<ms>): an image that dies before confirming itself must be
+    // rolled back by the bootloader; one that dies later must trip the crash-loop guard.
+    if (millis() > (unsigned long)(TT_OTA_CRASH_TEST))
+    {
+        ESP_LOGE(TAG, "TT_OTA_CRASH_TEST: aborting before the image is confirmed");
+        abort();
+    }
+#endif
+    TT_TIMED("ota", OtaManager::getInstance().update());
+    gOtaProgress = OtaManager::getInstance().inProgress() ? OtaManager::getInstance().progress() : -1;
+    TT_TIMED("led", deriveLedScene(); ledController.update());
 
     // Update Button controller (handles button state changes and callbacks)
     TT_TIMED("buttons", buttonController.update());
