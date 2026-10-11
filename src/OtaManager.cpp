@@ -19,7 +19,7 @@ namespace
 {
 const char *NVS_OTA_RELEASE = "ota_rel";   // release we rebooted into (set right before the reboot)
 const char *NVS_OTA_VCODE = "ota_vcode";   // version_code that image should report
-const unsigned long CHECK_INTERVAL_MS = 24UL * 60UL * 60UL * 1000UL;
+const unsigned long CHECK_INTERVAL_MS = 60UL * 60UL * 1000UL; // the portal also pushes ota-update when a release is published
 const unsigned long CHECK_RETRY_MS = 60UL * 60UL * 1000UL;
 const unsigned long CHECK_RETRY_SOON_MS = 2UL * 60UL * 1000UL; // connection-level failure
 const unsigned long FIRST_CHECK_DELAY_MS = 90UL * 1000UL;

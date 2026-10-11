@@ -766,6 +766,14 @@ void FileManager::processDownloadQueue() {
             return;
         }
 
+        if (task.retryCount >= MAX_RETRY_COUNT) {
+            // Gave up: the next tap of the figure re-queues whatever its manifest still needs.
+            Serial.printf("FileManager: giving up on %s after %d attempts\n", task.url.c_str(), task.retryCount);
+            downloadQueue.erase(it);
+            saveDownloadQueue();
+            return;
+        }
+
         task.lastAttempt = millis();
         task.retryCount++;
         Serial.printf("FileManager: Attempting download (attempt %d): %s\n", task.retryCount, task.url.c_str());
@@ -774,6 +782,12 @@ void FileManager::processDownloadQueue() {
         const String url = task.url, localPath = task.localPath, checksum = task.checksum;
         if (!downloadFileFromURL(url, localPath, checksum, errorMsg)) {
             Serial.printf("FileManager: Download failed to start: %s (%s)\n", url.c_str(), errorMsg.c_str());
+            if (errorMsg.indexOf("directory") >= 0 || errorMsg.indexOf("Failed to create") >= 0 ||
+                errorMsg.indexOf("open") >= 0) {
+                // A local path that cannot be created never will be; retrying only keeps "syncing" on.
+                Serial.println("FileManager: dropping the entry (local path error)");
+                downloadQueue.erase(it);
+            }
         }
         saveDownloadQueue();
         return; // one download at a time
@@ -995,6 +1009,20 @@ size_t FileManager::getSDCardFreeSpace() {
     }
     // size_t is 32-bit here; saturate instead of wrapping on cards over 4 GB.
     return freeBytes > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<size_t>(freeBytes);
+}
+
+uint32_t FileManager::getSDCardFreeMB() {
+    if (!sdCardInitialized) {
+        return 0;
+    }
+    if (!downloadInProgress && (cachedFreeAt == 0 || millis() - cachedFreeAt > 60000)) {
+        refreshFreeSpaceCache();
+    }
+    uint64_t freeBytes = cachedFreeBytes;
+    if (downloadInProgress && freeBytes > static_cast<uint64_t>(asyncState.totalDownloaded)) {
+        freeBytes -= asyncState.totalDownloaded;
+    }
+    return static_cast<uint32_t>(freeBytes >> 20);
 }
 
 String FileManager::getSDCardInfo() {

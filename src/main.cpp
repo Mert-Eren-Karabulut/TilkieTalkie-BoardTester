@@ -1769,6 +1769,7 @@ void loop()
             ESP_LOGI(TAG, "  batterycfg - Reapply 4V5 rail and charger defaults");
             ESP_LOGI(TAG, "  batteryclearflags - Clear latched BQ25792 charger/fault flags");
             ESP_LOGI(TAG, "  chargekick - Toggle BQ25792 EN_CHG off/on to restart charging");
+            ESP_LOGI(TAG, "  dlclear - drop every queued download (the next tap re-queues what a figure needs)");
             ESP_LOGI(TAG, "  gaugebus [release|attach] - hand the charger/gauge bus to bqStudio (EV2400) and back; persists across reboots");
             ESP_LOGI(TAG, "  sleep now - deep sleep unconditionally (also on USB)");
             ESP_LOGI(TAG, "  gaugefets - Re-enable gauge FET control if it is disabled");
@@ -2452,6 +2453,10 @@ void loop()
             gChargeMonStart = millis();
             gChargeMonNextAt = gChargeMonStart;
             gChargeMonUntil = gChargeMonStart + (unsigned long)seconds * 1000UL;
+        }
+        else if (command == "dlclear")
+        {
+            fileManager.cancelAllDownloads();
         }
         else if (command == "gaugebus" || command.startsWith("gaugebus "))
         {

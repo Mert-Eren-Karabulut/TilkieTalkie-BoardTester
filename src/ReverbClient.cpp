@@ -487,7 +487,7 @@ void ReverbClient::sendDeviceReport(bool force)
     float batteryPercent = battery.getBatteryPercentage();
     float batteryVoltage = battery.getBatteryVoltage();
     bool isFileSyncing = fileManager.getPendingDownloadsCount() > 0;
-    uint32_t sdFreeSpace = fileManager.getSDCardFreeSpace();
+    uint32_t sdFreeSpace = fileManager.getSDCardFreeMB(); // reported as MB
     int wifiRSSI = WiFi.RSSI();
     int audioState = audio.getState();
     bool isPogoActive = nfc.isPogoSwitchActive();
@@ -531,8 +531,10 @@ void ReverbClient::sendDeviceReport(bool force)
                    fabsf(batteryPercent - _lastReportedPercent) >= 2.0f ||
                    fabsf(batteryVoltage - _lastReportedVoltage) >= 0.10f ||
                    abs(wifiRSSI - _lastReportedRssi) >= 10 ||
-                   (sdFreeSpace >> 20) != (_lastReportedSdFree >> 20);
-    bool heartbeat = (now - _lastReportAt) >= 60000UL;
+                   sdFreeSpace != _lastReportedSdFree;
+    // Docked: power is free and the owner is likely looking at the portal -> 15 s; on battery 60 s.
+    const unsigned long heartbeatMs = battery.isVbusPresent() ? 15000UL : 60000UL;
+    bool heartbeat = (now - _lastReportAt) >= heartbeatMs;
     bool position = (audioState == 1) && (now - _lastPositionReportAt) >= 5000UL;
     if (!force && !_reportDue && !changed && !heartbeat && !position)
     {

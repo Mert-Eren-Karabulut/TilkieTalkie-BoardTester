@@ -276,6 +276,7 @@ public:
     size_t getSDCardTotalSpace();
     size_t getSDCardUsedSpace();
     size_t getSDCardFreeSpace();
+    uint32_t getSDCardFreeMB();   // same cache, in MB (the byte value saturates at 4 GB)
     String getSDCardInfo();
 
     // Download statistics
