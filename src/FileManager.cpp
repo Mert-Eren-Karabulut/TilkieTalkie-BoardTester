@@ -379,11 +379,24 @@ bool FileManager::deleteFileDeferred(const String& path) {
     return true;
 }
 
+static const char* const kFreeSpaceMarker = "\x01free";
+
 void FileManager::sdMaintenanceTask(void* parameter) {
     FileManager* self = static_cast<FileManager*>(parameter);
     char* path = nullptr;
+    // First free-space count of this boot: with CONFIG_FATFS_DONT_TRUST_FREE_CLUSTER_CNT the
+    // FAT is scanned (seconds on a slow card) - here, never on the loop task.
+    self->freeRefreshInFlight = true;
+    self->refreshFreeSpaceCache();
+    self->freeRefreshInFlight = false;
     for (;;) {
         if (xQueueReceive(self->deleteQueue, &path, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (strcmp(path, kFreeSpaceMarker) == 0) {
+            free(path);
+            self->refreshFreeSpaceCache();
+            self->freeRefreshInFlight = false;
             continue;
         }
         if (self->sdCardInitialized) {
@@ -999,9 +1012,10 @@ size_t FileManager::getSDCardFreeSpace() {
         return 0;
     }
     // Never query the FAT while a download is writing (lock contention); otherwise refresh
-    // at most once a minute. Callers only use this for the status report and a sanity check.
+    // at most once a minute, on the maintenance task. Callers only use this for the status
+    // report and a sanity check.
     if (!downloadInProgress && (cachedFreeAt == 0 || millis() - cachedFreeAt > 60000)) {
-        refreshFreeSpaceCache();
+        requestFreeSpaceRefresh();
     }
     uint64_t freeBytes = cachedFreeBytes;
     if (downloadInProgress && freeBytes > static_cast<uint64_t>(asyncState.totalDownloaded)) {
@@ -1011,12 +1025,27 @@ size_t FileManager::getSDCardFreeSpace() {
     return freeBytes > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<size_t>(freeBytes);
 }
 
+void FileManager::requestFreeSpaceRefresh() {
+    if (!deleteQueue || freeRefreshInFlight) {
+        return;
+    }
+    char* marker = strdup(kFreeSpaceMarker);
+    if (!marker) {
+        return;
+    }
+    if (xQueueSend(deleteQueue, &marker, 0) == pdTRUE) {
+        freeRefreshInFlight = true;
+    } else {
+        free(marker);
+    }
+}
+
 uint32_t FileManager::getSDCardFreeMB() {
     if (!sdCardInitialized) {
         return 0;
     }
     if (!downloadInProgress && (cachedFreeAt == 0 || millis() - cachedFreeAt > 60000)) {
-        refreshFreeSpaceCache();
+        requestFreeSpaceRefresh();
     }
     uint64_t freeBytes = cachedFreeBytes;
     if (downloadInProgress && freeBytes > static_cast<uint64_t>(asyncState.totalDownloaded)) {

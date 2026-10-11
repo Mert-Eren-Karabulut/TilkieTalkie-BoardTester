@@ -152,6 +152,8 @@ private:
     // while holding the filesystem lock, so it is refreshed only when idle and at most once a minute.
     uint64_t cachedFreeBytes = 0;
     unsigned long cachedFreeAt = 0;
+    volatile bool freeRefreshInFlight = false;
+    void requestFreeSpaceRefresh();   // runs the FAT free-cluster count on the maintenance task
     void refreshFreeSpaceCache();
 
     // Allocated once at startup: 32 KB internal DMA bounce buffer for SD writes and the
