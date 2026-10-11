@@ -13,7 +13,7 @@
 // 128 KB of read-ahead (about 10 s of 96 kbps audio) a pause only drains the ring.
 class ReadAheadFileSource : public AudioFileSource {
 public:
-    ReadAheadFileSource(size_t ringBytes = 128 * 1024, size_t chunkBytes = 8 * 1024);
+    ReadAheadFileSource(size_t ringBytes = 128 * 1024, size_t chunkBytes = 4 * 1024);
     ~ReadAheadFileSource() override;
 
     bool begin();  // allocate the buffers and start the reader task (once)

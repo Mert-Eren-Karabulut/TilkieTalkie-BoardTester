@@ -155,12 +155,20 @@ bool AudioController::begin() {
 
     if (!mp3Prealloc) {
         mp3PreallocSize = AudioGeneratorMP3::preAllocSize();
-        mp3Prealloc = heap_caps_malloc(mp3PreallocSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        // libmad's stream/frame/synth state (~29 KB) lives in PSRAM: internal RAM is the scarce
+        // resource on this board and the S3's 64 KB data cache keeps the decoder's working set
+        // close. Falls back to internal RAM if PSRAM is unavailable.
+        mp3Prealloc = heap_caps_malloc(mp3PreallocSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        const char* where = "PSRAM";
+        if (!mp3Prealloc) {
+            mp3Prealloc = heap_caps_malloc(mp3PreallocSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            where = "internal RAM";
+        }
         if (!mp3Prealloc) {
             Serial.println("AudioController: Failed to allocate the decoder workspace");
             return false;
         }
-        Serial.printf("AudioController: decoder workspace %d bytes (internal RAM, allocated once)\n", mp3PreallocSize);
+        Serial.printf("AudioController: decoder workspace %d bytes (%s, allocated once)\n", mp3PreallocSize, where);
     }
 
     delay(50); // MCLK settles
