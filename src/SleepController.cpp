@@ -129,6 +129,7 @@ bool SleepController::canEnterSleep() {
             lastVbusSeenAt = currentTime == 0 ? 1 : currentTime;
         }
         if (lastVbusSeenAt != 0 && currentTime - lastVbusSeenAt < 30000UL) {
+            blockedReason = "USB power seen within the last 30 s";
             lastCheckResult = false;
             return false;
         }
@@ -138,6 +139,7 @@ bool SleepController::canEnterSleep() {
     // or the server unreachable it would keep a battery-powered toy awake until the cell
     // is empty. The queue is persisted and resumes on the next wake with connectivity.
     if (fileManager.hasActiveDownload() || fileManager.hasPendingMaintenance()) {
+        blockedReason = fileManager.hasActiveDownload() ? "download in progress" : "SD writes pending";
         lastCheckResult = false;
         return false;
     }
@@ -145,11 +147,13 @@ bool SleepController::canEnterSleep() {
     // Check audio state (0=STOPPED, 1=PLAYING, 2=PAUSED)
     // Only prevent sleep if audio is actively playing
     if (audio.getState() == 1) { // PLAYING
+        blockedReason = "audio playing";
         lastCheckResult = false;
         return false;
     }
     
     // All conditions met - can enter sleep
+    blockedReason = nullptr;
     lastCheckResult = true;
     return true;
 }
@@ -312,6 +316,10 @@ void SleepController::update() {
         if (conditionsMetForSleep) {
             conditionsMetForSleep = false;
             conditionsMetLogged = false;
+        }
+        if (currentTime - lastBlockedLog > 60000UL) {
+            lastBlockedLog = currentTime;
+            ESP_LOGI(TAG, "Sleep blocked: %s", blockedReason ? blockedReason : "unknown");
         }
     }
 }

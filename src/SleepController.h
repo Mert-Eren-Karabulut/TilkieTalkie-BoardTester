@@ -25,6 +25,8 @@ public:
     // Sleep management
     void checkAndSleep();            // Check conditions and enter sleep if appropriate
     void forceSleep();               // Enter deep sleep immediately, bypassing conditions
+    const char* blockedReason = nullptr;   // why canEnterSleep() said no (diagnostics)
+    unsigned long lastBlockedLog = 0;
     void scheduleSleep(unsigned long timeoutMs);
     void cancelSleep();
     void resetActivity();            // Reset inactivity timer

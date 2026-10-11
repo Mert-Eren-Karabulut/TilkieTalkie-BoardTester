@@ -392,8 +392,10 @@ bool FileManager::enqueueJob(uint8_t kind, const String& path, const char* data,
         return false;
     }
     pendingDeletes++;
+    if (kind != 2) pendingWork++;
     if (xQueueSend(deleteQueue, &job, 0) != pdTRUE) {
         pendingDeletes--;
+        if (kind != 2) pendingWork--;
         free(job->path); free(job->data); free(job);
         return false;
     }
@@ -475,10 +477,12 @@ void FileManager::sdMaintenanceTask(void* parameter) {
                 self->freeRefreshInFlight = false;
             }
         }
+        const bool work = job->kind != 2;
         free(job->path);
         free(job->data);
         free(job);
         self->pendingDeletes--;
+        if (work) self->pendingWork--;
     }
 }
 

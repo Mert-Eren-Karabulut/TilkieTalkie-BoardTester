@@ -224,6 +224,7 @@ private:
     QueueHandle_t deleteQueue = nullptr;
     TaskHandle_t maintenanceTaskHandle = nullptr;
     std::atomic<int> pendingDeletes{0};   // all queued jobs (name kept for the callers)
+    std::atomic<int> pendingWork{0};      // deletes + writes only (the free-space count must not hold off sleep)
     static void sdMaintenanceTask(void* parameter);
     bool ensureMaintenanceTask();
     bool enqueueJob(uint8_t kind, const String& path, const char* data, size_t len);
@@ -254,7 +255,7 @@ public:
     bool deleteFile(const String &path);
     bool deleteFileDeferred(const String &path);                  // erased later by the SD maintenance task
     bool writeFileDeferred(const String &path, const String &content); // written later (tmp + rename) by the SD maintenance task
-    bool hasPendingMaintenance() const { return pendingDeletes.load() > 0; }
+    bool hasPendingMaintenance() const { return pendingWork.load() > 0; }
     bool flushRequiredFiles() { return saveRequiredFiles(); }
     bool deleteFileAndRemoveFromRequired(const String &path); // Smart delete that removes from required list
     bool createDirectory(const String &path);

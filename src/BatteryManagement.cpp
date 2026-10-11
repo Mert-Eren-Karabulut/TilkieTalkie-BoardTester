@@ -2089,7 +2089,15 @@ bool BatteryManager::updateChargerMeasurements(bool full) {
     }
 
     currentSystemVoltage = vsysMillivolts / 1000.0f;
-    currentVbusVoltage = vbusMillivolts / 1000.0f;
+    // The ADC runs in one-shot mode (ADC_EN self-clears), so the registers only change when a
+    // conversion is re-triggered. That used to happen only at boot / reconfiguration: after an
+    // unplug the VBUS ADC kept reading ~5 V forever and the sleep gate never cleared. Re-arm it
+    // once per poll (three cheap register accesses); VBUS is also forced to 0 when the status
+    // bit says there is none.
+    currentVbusVoltage = (chargerStatus0 & 0x01) ? (vbusMillivolts / 1000.0f) : 0.0f;
+    if (chargerAdcEnabled) {
+        enableChargerAdc();
+    }
     if (!gaugePresent) {
         currentBatteryCurrentMilliAmps = static_cast<int>(ibatMilliamps);
     }
