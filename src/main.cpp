@@ -1897,9 +1897,32 @@ void loop()
                 ESP_LOGW(TAG, "Volume already at minimum");
             }
         }
+        else if (command.startsWith("volume "))
+        {
+            int requested = command.substring(7).toInt();
+            audioController.setVolume(requested);
+            ESP_LOGI(TAG, "Volume now %d%% (ceiling %d%%)", audioController.getCurrentVolume(), audioController.getVolumeCeiling());
+        }
         else if (command == "volume")
         {
-            ESP_LOGI(TAG, "Current volume: %d%%", audioController.getCurrentVolume());
+            ESP_LOGI(TAG, "Current volume: %d%% (ceiling %d%%)", audioController.getCurrentVolume(), audioController.getVolumeCeiling());
+        }
+        else if (command == "audio")
+        {
+            audioController.printStatus();
+        }
+        else if (command.startsWith("amp"))
+        {
+            // amp on|off|auto - speaker amplifier override for bench diagnostics
+            String arg = command.substring(3);
+            arg.trim();
+            if (arg == "on")
+                audioController.setAmpMode(AudioController::AMP_FORCE_ON);
+            else if (arg == "off")
+                audioController.setAmpMode(AudioController::AMP_FORCE_OFF);
+            else if (arg == "auto")
+                audioController.setAmpMode(AudioController::AMP_AUTO);
+            audioController.printStatus();
         }
         else if (command == "track")
         {

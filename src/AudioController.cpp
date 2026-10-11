@@ -1,12 +1,8 @@
 #include "AudioController.h"
 #include "ConfigManager.h"
 #include "NfcController.h"
-#include "AudioFileSourceFS.h"
 #include <SD_MMC.h>
-    
-#include "AudioFileSourceBuffer.h"
-#include "AudioGeneratorMP3.h"
-#include "AudioOutputI2S.h"
+#include <esp_heap_caps.h>
 
 // Initialize static members
 AudioController* AudioController::instance = nullptr;
@@ -16,6 +12,7 @@ const int AudioController::MIN_VOLUME;
 const int AudioController::MAX_VOLUME;
 const int AudioController::DEFAULT_VOLUME;
 const int AudioController::VOLUME_STEP;
+const int AudioController::HEADPHONE_CEILING_STEPS;
 
 // ES8388 register definitions
 #define ES8388_CONTROL1         0x00
@@ -28,56 +25,48 @@ const int AudioController::VOLUME_STEP;
 #define ES8388_ANAVOLMANAG      0x07
 #define ES8388_MASTERMODE       0x08
 #define ES8388_ADCCONTROL1      0x09
-#define ES8388_ADCCONTROL2      0x0A
-#define ES8388_ADCCONTROL3      0x0B
 #define ES8388_ADCCONTROL4      0x0C
-#define ES8388_ADCCONTROL5      0x0D
-#define ES8388_ADCCONTROL6      0x0E
-#define ES8388_ADCCONTROL7      0x0F
-#define ES8388_ADCCONTROL8      0x10
-#define ES8388_ADCCONTROL9      0x11
-#define ES8388_ADCCONTROL10     0x12
-#define ES8388_ADCCONTROL11     0x13
-#define ES8388_ADCCONTROL12     0x14
-#define ES8388_ADCCONTROL13     0x15
-#define ES8388_ADCCONTROL14     0x16
 #define ES8388_DACCONTROL1      0x17
 #define ES8388_DACCONTROL2      0x18
 #define ES8388_DACCONTROL3      0x19
 #define ES8388_DACCONTROL4      0x1A
 #define ES8388_DACCONTROL5      0x1B
-#define ES8388_DACCONTROL6      0x1C
-#define ES8388_DACCONTROL7      0x1D
-#define ES8388_DACCONTROL8      0x1E
-#define ES8388_DACCONTROL9      0x1F
-#define ES8388_DACCONTROL10     0x20
-#define ES8388_DACCONTROL11     0x21
-#define ES8388_DACCONTROL12     0x22
-#define ES8388_DACCONTROL13     0x23
-#define ES8388_DACCONTROL14     0x24
-#define ES8388_DACCONTROL15     0x25
 #define ES8388_DACCONTROL16     0x26
 #define ES8388_DACCONTROL17     0x27
-#define ES8388_DACCONTROL18     0x28
-#define ES8388_DACCONTROL19     0x29
 #define ES8388_DACCONTROL20     0x2A
 #define ES8388_DACCONTROL21     0x2B
-#define ES8388_DACCONTROL22     0x2C
 #define ES8388_DACCONTROL23     0x2D
-#define ES8388_LOUT1VOL         0x2E  // ES8388_DACCONTROL24
-#define ES8388_ROUT1VOL         0x2F  // ES8388_DACCONTROL25
-#define ES8388_LOUT2VOL         0x30
+#define ES8388_LOUT1VOL         0x2E  // speaker path (NS4150B on LOUT1)
+#define ES8388_ROUT1VOL         0x2F  // unconnected on this board
+#define ES8388_LOUT2VOL         0x30  // headphone jack
 #define ES8388_ROUT2VOL         0x31
 
+// DACPOWER: DAC L/R on (bits 7:6 = 0), LOUT1 (0x20), LOUT2 (0x08), ROUT2 (0x04). ROUT1 is not wired.
+#define ES8388_DACPOWER_ACTIVE  0x2C
+#define ES8388_DACPOWER_OFF     0xC0
+// DACCONTROL3: bit5 soft ramp, bit1 mute
+#define ES8388_DAC_UNMUTE_RAMP  0x20
+#define ES8388_DAC_MUTE_RAMP    0x22
+
 AudioController::AudioController() :
-    audioFile(nullptr),
-    audioBuffer(nullptr),
-    audioMP3(nullptr),
     audioOutput(nullptr),
+    source(nullptr),
+    audioMP3(nullptr),
+    mp3Prealloc(nullptr),
+    mp3PreallocSize(0),
     currentState(STOPPED),
     currentTrackPath(""),
     currentVolume(DEFAULT_VOLUME),
     initialized(false),
+    transientPlayback(false),
+    outputsActive(false),
+    codecMuted(true),
+    ampMode(AMP_AUTO),
+    ampEnabled(false),
+    headphonePlugged(false),
+    lastPlugPoll(0),
+    volumeDirty(false),
+    volumeDirtyAt(0),
     pausedTimeSeconds(0.0f),
     hasPausedTime(false),
     trackStartTime(0),
@@ -89,26 +78,19 @@ AudioController::AudioController() :
     fileManager(FileManager::getInstance()),
     audioTaskHandle(nullptr),
     audioMutex(nullptr) {
-    
-    // Load volume ceiling from NVS, default to MAX_VOLUME if not set
+
     ConfigManager& config = ConfigManager::getInstance();
     volumeCeiling = config.getInt("volume_ceiling", MAX_VOLUME);
-    
-    // Ensure the volume ceiling is within valid range
     volumeCeiling = min(volumeCeiling, MAX_VOLUME);
     volumeCeiling = max(volumeCeiling, MIN_VOLUME);
-    
-    // Load saved volume from NVS, default to DEFAULT_VOLUME if not set
+
     currentVolume = config.getInt("audio_volume", DEFAULT_VOLUME);
-    
-    // Ensure saved volume is within valid range and ceiling
     currentVolume = min(currentVolume, volumeCeiling);
     currentVolume = max(currentVolume, MIN_VOLUME);
 }
 
 AudioController::~AudioController() {
     end();
-    cleanupAudioComponents();
 }
 
 AudioController& AudioController::getInstance() {
@@ -132,35 +114,62 @@ bool AudioController::begin() {
             return false;
         }
     }
-    
-    // Initialize I2C for ES8388 control
+
+    // Speaker amp off until there is something to play (open-drain: LOW = off, released = on).
+    pinMode(AMP_MODE_PIN, OUTPUT_OPEN_DRAIN);
+    digitalWrite(AMP_MODE_PIN, LOW);
+    ampEnabled = false;
+
+    // I2C for ES8388 control
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(100000);
-    
-    // GPIO41 is a board status/mode signal on this revision, not a driven mute pin.
-    pinMode(AMP_MODE_PIN, INPUT);
-    
-    // CRITICAL: Initialize I2S and audio components FIRST
-    // This starts the MCLK signal that the ES8388 needs
-    if (!initializeI2S()) {
-        Serial.println("AudioController: Failed to initialize I2S");
+
+    // I2S first: the driver stays installed from here on, so MCLK runs before the codec is
+    // configured and keeps running between tracks.
+    if (!audioOutput) {
+        audioOutput = new PersistentI2SOutput(0, AudioOutputI2S::EXTERNAL_I2S, 16, AudioOutputI2S::APLL_DISABLE);
+        if (!audioOutput->SetMclk(true) ||
+            !audioOutput->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN)) {
+            Serial.println("AudioController: Failed to configure I2S pins");
+            delete audioOutput;
+            audioOutput = nullptr;
+            return false;
+        }
+        audioOutput->SetOutputModeMono(true); // speaker is on LOUT1 only: feed it the L+R mix
+        audioOutput->SetGain(1.0f);           // attenuation is done in the codec, not in software
+    }
+    if (!audioOutput->installed() && !audioOutput->begin()) {
+        Serial.println("AudioController: Failed to install the I2S driver");
+        return false;
+    }
+    Serial.printf("AudioController: I2S up - BCLK:%d, LRCK:%d, DOUT:%d, MCLK:%d (16 DMA buffers, mono mix)\n",
+                  I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN);
+
+    if (!source) {
+        source = new ReadAheadFileSource();
+    }
+    if (!source->begin()) {
+        Serial.println("AudioController: Failed to start the read-ahead source");
         return false;
     }
 
-    if (!initializeAudioComponents()) {
-        Serial.println("AudioController: Failed to initialize audio components");
-        return false;
+    if (!mp3Prealloc) {
+        mp3PreallocSize = AudioGeneratorMP3::preAllocSize();
+        mp3Prealloc = heap_caps_malloc(mp3PreallocSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!mp3Prealloc) {
+            Serial.println("AudioController: Failed to allocate the decoder workspace");
+            return false;
+        }
+        Serial.printf("AudioController: decoder workspace %d bytes (internal RAM, allocated once)\n", mp3PreallocSize);
     }
-    
-    // Small delay to let MCLK stabilize before configuring ES8388
-    delay(100);
-    
-    // Now initialize ES8388 (it needs MCLK running)
+
+    delay(50); // MCLK settles
+
     if (!initializeES8388()) {
         Serial.println("AudioController: Failed to initialize ES8388");
         return false;
     }
-    
+
     initialized = true;
 
     if (!audioTaskHandle) {
@@ -169,7 +178,7 @@ bool AudioController::begin() {
             "AudioPlayback",
             8192,
             this,
-            1,
+            12,  // above the loop task and WiFi housekeeping; blocks on I2S DMA back-pressure
             &audioTaskHandle,
             1);
 
@@ -177,17 +186,12 @@ bool AudioController::begin() {
             Serial.println("AudioController: Failed to create background audio task, falling back to loop updates");
             audioTaskHandle = nullptr;
         } else {
-            Serial.println("AudioController: Background audio task created on Core 1");
+            Serial.println("AudioController: Background audio task created on Core 1 (priority 12)");
         }
     }
 
-    // Set volume after codec init.
-    setVolume(currentVolume, true);
-    delay(50); // Let volume setting propagate
-    Serial.printf("AudioController: AMP mode GPIO%d state: %d\n", AMP_MODE_PIN, digitalRead(AMP_MODE_PIN));
-    
-    Serial.println("AudioController: Initialization complete - ready for playback");
-    
+    applyCodecVolume();
+    Serial.printf("AudioController: Initialization complete - volume %d%% (ceiling %d%%)\n", currentVolume, volumeCeiling);
     return true;
 }
 
@@ -196,19 +200,25 @@ void AudioController::end() {
         return;
     }
 
-    // Stop any current playback
+    if (volumeDirty) {
+        ConfigManager::getInstance().storeInt("audio_volume", currentVolume);
+        volumeDirty = false;
+    }
+
     stop();
 
-    // Clean up audio components
-    cleanupAudioComponents();
-
-    // Clean up audio output
+    // Codec and amp down, I2S released: nothing drives the speaker or draws current in sleep.
+    muteES8388(true);
+    writeES8388Register(ES8388_DACPOWER, ES8388_DACPOWER_OFF);
+    writeES8388Register(ES8388_CHIPPOWER, 0xFF);
+    digitalWrite(AMP_MODE_PIN, LOW);
+    ampEnabled = false;
     if (audioOutput) {
-        delete audioOutput;
-        audioOutput = nullptr;
+        audioOutput->teardown();
     }
 
     initialized = false;
+    Serial.println("AudioController: powered down");
 }
 
 bool AudioController::suspendBackgroundTaskForControl() {
@@ -243,6 +253,94 @@ void AudioController::audioTaskEntry(void* parameter) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Output path: codec mute + speaker amp follow one flag so every transition is ordered the same
+// way (amp on -> unmute with ramp; mute with ramp -> amp off).
+// ---------------------------------------------------------------------------------------------
+
+void AudioController::setOutputsActive(bool active) {
+    outputsActive = active;
+    if (active) {
+        applyAmp();
+        muteES8388(currentVolume == 0);
+    } else {
+        muteES8388(true);
+        delay(15); // let the soft ramp finish before the amp drops
+        applyAmp();
+    }
+}
+
+void AudioController::applyAmp() {
+    bool desired;
+    switch (ampMode) {
+        case AMP_FORCE_ON:  desired = true; break;
+        case AMP_FORCE_OFF: desired = false; break;
+        default:            desired = outputsActive; break;
+    }
+    if (desired == ampEnabled) {
+        return;
+    }
+    // Open-drain: HIGH releases the line (board pull-up / jack contact decide), LOW forces off.
+    digitalWrite(AMP_MODE_PIN, desired ? HIGH : LOW);
+    ampEnabled = desired;
+    Serial.printf("AudioController: amp %s\n", desired ? "released (on unless a plug is in)" : "off");
+}
+
+void AudioController::pollHeadphone() {
+    // Only meaningful while the line is released: a plug pulls AMP_CTRL low.
+    if (!ampEnabled || millis() - lastPlugPoll < 500) {
+        return;
+    }
+    lastPlugPoll = millis();
+    bool plugged = digitalRead(AMP_MODE_PIN) == LOW;
+    if (plugged != headphonePlugged) {
+        headphonePlugged = plugged;
+        Serial.printf("AudioController: headphone %s\n", plugged ? "plugged (speaker muted by the jack)" : "removed");
+    }
+}
+
+void AudioController::setAmpMode(AmpMode mode) {
+    ampMode = mode;
+    applyAmp();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Decoder lifecycle: the read-ahead source, I2S output and libmad workspace live for the whole
+// run; only the small AudioGeneratorMP3 object is created per track.
+// ---------------------------------------------------------------------------------------------
+
+bool AudioController::startDecoder(const String& filePath) {
+    releaseDecoder();
+
+    if (!source->open(filePath.c_str())) {
+        Serial.printf("AudioController: Failed to open file: %s\n", filePath.c_str());
+        return false;
+    }
+
+    audioMP3 = new AudioGeneratorMP3(mp3Prealloc, mp3PreallocSize);
+    if (!audioMP3) {
+        source->close();
+        return false;
+    }
+    if (!audioMP3->begin(source, audioOutput)) {
+        Serial.println("AudioController: Failed to start MP3 decoder");
+        releaseDecoder();
+        return false;
+    }
+    return true;
+}
+
+void AudioController::releaseDecoder() {
+    if (audioMP3) {
+        audioMP3->stop(); // our output keeps I2S; this also closes (parks) the source
+        delete audioMP3;
+        audioMP3 = nullptr;
+    }
+    if (source && source->isOpen()) {
+        source->close();
+    }
+}
+
 bool AudioController::play(const String& filePath) {
     bool taskSuspended = suspendBackgroundTaskForControl();
     bool success = false;
@@ -270,7 +368,7 @@ bool AudioController::play(const String& filePath) {
                 playlistFinished = false;
             }
 
-            if (currentPlaylistIndex >= playlist.size()) {
+            if (currentPlaylistIndex >= (int)playlist.size()) {
                 Serial.println("AudioController: Playlist index out of range");
                 break;
             }
@@ -293,53 +391,9 @@ bool AudioController::play(const String& filePath) {
 
         if (currentState != STOPPED) {
             stop();
-            delay(10);
         }
 
-        cleanupAudioComponents();
-
-        audioFile = new AudioFileSourceFS(SD_MMC);
-        if (!audioFile) {
-            Serial.println("AudioController: Failed to create AudioFileSourceFS");
-            break;
-        }
-
-        if (!audioFile->open(filePath.c_str())) {
-            Serial.printf("AudioController: Failed to open file: %s\n", filePath.c_str());
-            delete audioFile;
-            audioFile = nullptr;
-            break;
-        }
-
-        uint32_t spiBufferSize = 8192;
-        byte *spiBuffer = (byte *)ps_malloc(spiBufferSize);
-        if (!spiBuffer) {
-            Serial.println("AudioController: Failed to allocate PSRAM buffer");
-            delete audioFile;
-            audioFile = nullptr;
-            break;
-        }
-
-        audioBuffer = new AudioFileSourceBuffer(audioFile, spiBuffer, spiBufferSize);
-        if (!audioBuffer) {
-            Serial.println("AudioController: Failed to create AudioFileSourceBuffer");
-            free(spiBuffer);
-            delete audioFile;
-            audioFile = nullptr;
-            break;
-        }
-
-        audioMP3 = new AudioGeneratorMP3();
-        if (!audioMP3) {
-            Serial.println("AudioController: Failed to create AudioGeneratorMP3");
-            cleanupAudioComponents();
-            break;
-        }
-
-        Serial.println("AudioController: Starting MP3 playback");
-        if (!audioMP3->begin(audioBuffer, audioOutput)) {
-            Serial.println("AudioController: Failed to start MP3 playback");
-            cleanupAudioComponents();
+        if (!startDecoder(filePath)) {
             break;
         }
 
@@ -348,6 +402,8 @@ bool AudioController::play(const String& filePath) {
         trackStartTime = millis();
         accumulatedPlayTime = 0.0f;
         pauseStartTime = 0;
+        hasPausedTime = false;
+        setOutputsActive(true);
 
         Serial.printf("AudioController: Successfully started playing: %s\n", filePath.c_str());
         success = true;
@@ -365,17 +421,17 @@ bool AudioController::pause() {
     bool success = false;
 
     if (initialized && currentState == PLAYING && audioMP3 && audioMP3->isRunning()) {
-        if (trackStartTime > 0) {
-            float currentPlayTime = accumulatedPlayTime + ((millis() - trackStartTime) / 1000.0f);
-            pausedTimeSeconds = currentPlayTime;
-            hasPausedTime = true;
-            Serial.printf("AudioController: Paused at %.2f seconds\n", pausedTimeSeconds);
-            accumulatedPlayTime = currentPlayTime;
-            pauseStartTime = millis();
-        }
+        float currentPlayTime = accumulatedPlayTime + ((millis() - trackStartTime) / 1000.0f);
+        pausedTimeSeconds = currentPlayTime;
+        hasPausedTime = true;
+        accumulatedPlayTime = currentPlayTime;
+        pauseStartTime = millis();
 
-        audioMP3->stop();
+        // The decoder simply stops being serviced: nothing is torn down, resume continues
+        // exactly where we were.
         currentState = PAUSED;
+        setOutputsActive(false);
+        Serial.printf("AudioController: Paused at %.2f seconds\n", pausedTimeSeconds);
         success = true;
     }
 
@@ -390,137 +446,22 @@ bool AudioController::resume() {
     bool taskSuspended = suspendBackgroundTaskForControl();
     bool success = false;
 
-    do {
-        if (!initialized || currentState != PAUSED) {
-            break;
-        }
-
-        if (currentTrackPath.isEmpty()) {
-            break;
-        }
-
-        cleanupAudioComponents();
-
-        audioMP3 = new AudioGeneratorMP3();
-        if (!audioMP3) {
-            Serial.println("AudioController: Failed to create MP3 generator for resume");
-            currentState = STOPPED;
-            currentTrackPath = "";
-            hasPausedTime = false;
-            break;
-        }
-
-        audioFile = new AudioFileSourceFS(SD_MMC);
-        if (!audioFile) {
-            Serial.printf("AudioController: Failed to create AudioFileSourceFS for resume\n");
-            cleanupAudioComponents();
-            currentState = STOPPED;
-            currentTrackPath = "";
-            hasPausedTime = false;
-            break;
-        }
-
-        if (!audioFile->open(currentTrackPath.c_str())) {
-            Serial.printf("AudioController: Failed to open audio file for resume: %s\n", currentTrackPath.c_str());
-            delete audioFile;
-            audioFile = nullptr;
-            delete audioMP3;
-            audioMP3 = nullptr;
-            currentState = STOPPED;
-            currentTrackPath = "";
-            hasPausedTime = false;
-            break;
-        }
-
-        uint32_t resumeBufferSize = 8192;
-        byte *resumeBuffer = (byte *)ps_malloc(resumeBufferSize);
-        if (!resumeBuffer) {
-            Serial.printf("AudioController: Failed to allocate PSRAM buffer for resume\n");
-            cleanupAudioComponents();
-            currentState = STOPPED;
-            currentTrackPath = "";
-            hasPausedTime = false;
-            break;
-        }
-
-        audioBuffer = new AudioFileSourceBuffer(audioFile, resumeBuffer, resumeBufferSize);
-        if (!audioBuffer) {
-            Serial.printf("AudioController: Failed to create audio buffer\n");
-            free(resumeBuffer);
-            cleanupAudioComponents();
-            currentState = STOPPED;
-            currentTrackPath = "";
-            hasPausedTime = false;
-            break;
-        }
-
-        if (!audioMP3->begin(audioBuffer, audioOutput)) {
-            Serial.printf("AudioController: Failed to start MP3 playback\n");
-            cleanupAudioComponents();
-            currentState = STOPPED;
-            currentTrackPath = "";
-            hasPausedTime = false;
-            break;
-        }
-
-        if (hasPausedTime && pausedTimeSeconds > 0.1f) {
-            Serial.printf("AudioController: Fast-forwarding to %.2f seconds...\n", pausedTimeSeconds);
-            const uint32_t BYTES_PER_SECOND = 12000;
-            uint32_t targetBytePosition = (uint32_t)(pausedTimeSeconds * BYTES_PER_SECOND);
-            const uint32_t HEADER_OFFSET = 512;
-            targetBytePosition += HEADER_OFFSET;
-
-            uint32_t fileSize = audioFile->getSize();
-            if (targetBytePosition > fileSize) {
-                targetBytePosition = fileSize - 1024;
-            }
-
-            Serial.printf("AudioController: Calculated byte position: %u (file size: %u)\n",
-                         targetBytePosition, fileSize);
-
-            float savedGain = currentVolume / 100.0f;
-            if (audioOutput) {
-                audioOutput->SetGain(0.0f);
-            }
-
-            if (audioFile->seek(targetBytePosition, SEEK_SET)) {
-                Serial.printf("AudioController: Seeked to byte %u\n", targetBytePosition);
-                unsigned long startTime = millis();
-                int loopCount = 0;
-                const int MAX_SYNC_LOOPS = 50;
-
-                while (audioMP3->isRunning() && loopCount < MAX_SYNC_LOOPS) {
-                    if (!audioMP3->loop()) {
-                        Serial.println("AudioController: Reached EOF during frame sync");
-                        break;
-                    }
-                    loopCount++;
-                    if ((loopCount % 5) == 0) {
-                        yield();
-                    }
-                }
-
-                unsigned long syncTime = millis() - startTime;
-                Serial.printf("AudioController: Frame sync complete after %d loops (%lu ms)\n",
-                             loopCount, syncTime);
-            } else {
-                Serial.printf("AudioController: Seek failed, starting from beginning\n");
-            }
-
-            if (audioOutput) {
-                audioOutput->SetGain(savedGain);
-            }
-
-            hasPausedTime = false;
-        }
-
+    if (initialized && currentState == PAUSED && audioMP3 && audioMP3->isRunning()) {
         currentState = PLAYING;
         trackStartTime = millis();
-        accumulatedPlayTime = pausedTimeSeconds;
-
-        Serial.printf("AudioController: Resumed successfully from %.2f seconds\n", pausedTimeSeconds);
+        setOutputsActive(true);
+        Serial.printf("AudioController: Resumed from %.2f seconds\n", accumulatedPlayTime);
         success = true;
-    } while (false);
+    } else if (initialized && currentState == PAUSED) {
+        // Decoder went away (should not happen); restart the track from the paused position.
+        String path = currentTrackPath;
+        float at = pausedTimeSeconds;
+        currentState = STOPPED;
+        if (!path.isEmpty() && play(path)) {
+            if (at > 0.5f) seekTo(at);
+            success = true;
+        }
+    }
 
     if (taskSuspended) {
         resumeBackgroundTaskForControl();
@@ -534,12 +475,8 @@ bool AudioController::stop() {
     bool success = false;
 
     if (initialized && currentState != STOPPED) {
-        if (audioMP3 && audioMP3->isRunning()) {
-            audioMP3->stop();
-            delay(10);
-        }
-
-        cleanupAudioComponents();
+        setOutputsActive(false);
+        releaseDecoder();
         currentState = STOPPED;
         currentTrackPath = "";
         pausedTimeSeconds = 0.0f;
@@ -567,140 +504,42 @@ bool AudioController::seekTo(float seconds) {
             break;
         }
 
-        if (currentState == STOPPED || currentTrackPath.isEmpty()) {
+        if (currentState == STOPPED || currentTrackPath.isEmpty() || !audioMP3 || !source->isOpen()) {
             Serial.println("AudioController: Cannot seek - no track loaded");
             break;
         }
 
         if (seconds < 0) {
-            Serial.println("AudioController: Invalid seek position - negative time");
+            seconds = 0;
+        }
+
+        // Byte estimate for our CBR content (96 kbps); libmad resyncs on the next frame header.
+        const uint32_t BYTES_PER_SECOND = 12000;
+        const uint32_t HEADER_OFFSET = 512;
+        uint32_t fileSize = source->getSize();
+        uint32_t target = (uint32_t)(seconds * BYTES_PER_SECOND) + HEADER_OFFSET;
+        if (fileSize > 1024 && target > fileSize - 1024) {
+            target = fileSize - 1024;
+        }
+
+        bool wasActive = outputsActive;
+        if (wasActive) muteES8388(true); // hide the resync glitch
+        if (!source->seek((int32_t)target, SEEK_SET)) {
+            Serial.println("AudioController: Seek failed");
+            if (wasActive) muteES8388(currentVolume == 0);
             break;
         }
+        audioMP3->desync();
+        if (wasActive) muteES8388(currentVolume == 0);
 
-        Serial.printf("AudioController: Seeking to %.2f seconds\n", seconds);
-
-        AudioState previousState = currentState;
-        String trackPath = currentTrackPath;
-
-        if (audioMP3 && audioMP3->isRunning()) {
-            audioMP3->stop();
-            delay(10);
-        }
-
-        cleanupAudioComponents();
-
-        audioMP3 = new AudioGeneratorMP3();
-        if (!audioMP3) {
-            Serial.println("AudioController: Failed to create MP3 generator for seek");
-            currentState = STOPPED;
-            currentTrackPath = "";
-            break;
-        }
-
-        audioFile = new AudioFileSourceFS(SD_MMC);
-        if (!audioFile) {
-            Serial.println("AudioController: Failed to create AudioFileSourceFS for seek");
-            cleanupAudioComponents();
-            currentState = STOPPED;
-            currentTrackPath = "";
-            break;
-        }
-
-        if (!audioFile->open(trackPath.c_str())) {
-            Serial.printf("AudioController: Failed to open audio file for seek: %s\n", trackPath.c_str());
-            cleanupAudioComponents();
-            currentState = STOPPED;
-            currentTrackPath = "";
-            break;
-        }
-
-        uint32_t seekBufferSize = 8192;
-        byte *seekBuffer = (byte *)ps_malloc(seekBufferSize);
-        if (!seekBuffer) {
-            Serial.println("AudioController: Failed to allocate PSRAM buffer for seek");
-            cleanupAudioComponents();
-            currentState = STOPPED;
-            currentTrackPath = "";
-            break;
-        }
-
-        audioBuffer = new AudioFileSourceBuffer(audioFile, seekBuffer, seekBufferSize);
-        if (!audioBuffer) {
-            Serial.println("AudioController: Failed to create audio buffer for seek");
-            free(seekBuffer);
-            cleanupAudioComponents();
-            currentState = STOPPED;
-            currentTrackPath = "";
-            break;
-        }
-
-        if (!audioMP3->begin(audioBuffer, audioOutput)) {
-            Serial.println("AudioController: Failed to start MP3 playback for seek");
-            cleanupAudioComponents();
-            currentState = STOPPED;
-            currentTrackPath = "";
-            break;
-        }
-
-        if (seconds > 0.1f) {
-            const uint32_t BYTES_PER_SECOND = 12000;
-            uint32_t targetBytePosition = (uint32_t)(seconds * BYTES_PER_SECOND);
-            const uint32_t HEADER_OFFSET = 512;
-            targetBytePosition += HEADER_OFFSET;
-
-            uint32_t fileSize = audioFile->getSize();
-            if (targetBytePosition > fileSize) {
-                targetBytePosition = fileSize - 1024;
-            }
-
-            Serial.printf("AudioController: Seeking to byte position: %u\n", targetBytePosition);
-
-            float savedGain = currentVolume / 100.0f;
-            if (audioOutput) {
-                audioOutput->SetGain(0.0f);
-            }
-
-            if (audioFile->seek(targetBytePosition, SEEK_SET)) {
-                int loopCount = 0;
-                const int MAX_SYNC_LOOPS = 50;
-
-                while (audioMP3->isRunning() && loopCount < MAX_SYNC_LOOPS) {
-                    if (!audioMP3->loop()) {
-                        Serial.println("AudioController: Reached EOF during seek frame sync");
-                        break;
-                    }
-                    loopCount++;
-                    if ((loopCount % 5) == 0) {
-                        yield();
-                    }
-                }
-
-                Serial.printf("AudioController: Seek frame sync complete after %d loops\n", loopCount);
-            } else {
-                Serial.println("AudioController: Seek failed");
-            }
-
-            if (audioOutput) {
-                audioOutput->SetGain(savedGain);
-            }
-        }
-
-        currentTrackPath = trackPath;
-
-        if (previousState == PLAYING) {
-            currentState = PLAYING;
+        accumulatedPlayTime = seconds;
+        if (currentState == PLAYING) {
             trackStartTime = millis();
-            accumulatedPlayTime = seconds;
-            Serial.printf("AudioController: Seek complete, resuming playback from %.2f seconds\n", seconds);
-        } else if (previousState == PAUSED) {
-            audioMP3->stop();
-            currentState = PAUSED;
+        } else {
             pausedTimeSeconds = seconds;
             hasPausedTime = true;
-            accumulatedPlayTime = seconds;
-            Serial.printf("AudioController: Seek complete, paused at %.2f seconds\n", seconds);
         }
-
+        Serial.printf("AudioController: Seeked to %.2f s (byte %u of %u)\n", seconds, (unsigned)target, (unsigned)fileSize);
         success = true;
     } while (false);
 
@@ -711,17 +550,22 @@ bool AudioController::seekTo(float seconds) {
     return success;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Volume: codec attenuation only (software gain stays 1.0). LOUT1VOL (speaker) gets the setting,
+// LOUT2/ROUT2 (jack) sit HEADPHONE_CEILING_STEPS below it. The NVS write is deferred to update().
+// ---------------------------------------------------------------------------------------------
+
 bool AudioController::volumeUp() {
     int newVolume = currentVolume + VOLUME_STEP;
     if (newVolume > volumeCeiling) {
         newVolume = volumeCeiling;
     }
-    
+
     bool changed = setVolume(newVolume);
     if (changed && currentState == STOPPED) {
         volumeBeep();
     }
-    
+
     return changed;
 }
 
@@ -730,81 +574,81 @@ bool AudioController::volumeDown() {
     if (newVolume < MIN_VOLUME) {
         newVolume = MIN_VOLUME;
     }
-    
+
     bool changed = setVolume(newVolume);
     if (changed && currentState == STOPPED) {
         volumeBeep();
     }
-    
+
     return changed;
 }
 
 bool AudioController::setVolume(int volume, bool initialize /* = false */) {
     bool taskSuspended = suspendBackgroundTaskForControl();
-    if (!initialized) {
-        Serial.printf("AudioController: Cannot set volume - not initialized\n");
-        if (taskSuspended) {
-            resumeBackgroundTaskForControl();
+    bool changed = false;
+
+    do {
+        if (!initialized) {
+            Serial.printf("AudioController: Cannot set volume - not initialized\n");
+            break;
         }
-        return false;
-    }
 
-    // Clamp volume to valid range and volume ceiling
-    if (volume < MIN_VOLUME) volume = MIN_VOLUME;
-    if (volume > volumeCeiling) volume = volumeCeiling;
+        if (volume < MIN_VOLUME) volume = MIN_VOLUME;
+        if (volume > volumeCeiling) volume = volumeCeiling;
 
-    if (volume == currentVolume && !initialize) {
-        Serial.printf("AudioController: Volume already at %d%%, no change needed\n", volume);
-        if (taskSuspended) {
-            resumeBackgroundTaskForControl();
+        if (volume == currentVolume && !initialize) {
+            break;
         }
-        return false;
-    }
 
-    Serial.printf("AudioController: Setting volume from %d%% to %d%%\n", currentVolume, volume);
-    currentVolume = volume;
-    
-    // Save volume to NVS for persistence across sleep/wake
-    if (!initialize) {
-        ConfigManager& config = ConfigManager::getInstance();
-        config.storeInt("audio_volume", currentVolume);
-    }
-
-    // Set audio output gain
-    if (audioOutput) {
-        audioOutput->SetGain(volume / 100.0f);
-        Serial.printf("AudioController: Set AudioOutput gain to %.2f\n", volume / 100.0f);
-    }
-
-    // Set ES8388 volume
-    setES8388Volume(volume);
-
-    Serial.printf("AudioController: Volume set to %d%%\n", volume);
+        currentVolume = volume;
+        applyCodecVolume();
+        if (!initialize) {
+            volumeDirty = true;
+            volumeDirtyAt = millis();
+        }
+        Serial.printf("AudioController: Volume %d%%\n", volume);
+        changed = true;
+    } while (false);
 
     if (taskSuspended) {
         resumeBackgroundTaskForControl();
     }
-    return true;
+    return changed;
+}
+
+void AudioController::applyCodecVolume() {
+    // LOUTxVOL: 6-bit, 0 = -45 dB, 30 (0x1E) = 0 dB, 1.5 dB per step. 0 % is a real mute.
+    uint8_t speaker = 0;
+    if (currentVolume > 0) {
+        speaker = (uint8_t)round((currentVolume / 100.0f) * 30.0f);
+        if (speaker > 0x1E) speaker = 0x1E;
+    }
+    uint8_t headphone = speaker > HEADPHONE_CEILING_STEPS ? speaker - HEADPHONE_CEILING_STEPS : 0;
+
+    writeES8388Register(ES8388_LOUT1VOL, speaker);
+    writeES8388Register(ES8388_ROUT1VOL, speaker);
+    writeES8388Register(ES8388_LOUT2VOL, headphone);
+    writeES8388Register(ES8388_ROUT2VOL, headphone);
+
+    if (outputsActive) {
+        muteES8388(currentVolume == 0);
+    }
 }
 
 // Volume ceiling control methods
 void AudioController::setVolumeCeiling(int ceiling) {
-    // Clamp ceiling to valid range
     ceiling = min(ceiling, MAX_VOLUME);
     ceiling = max(ceiling, MIN_VOLUME);
-    
-    // Store the new ceiling
+
     volumeCeiling = ceiling;
-    
-    // Store in NVS
+
     ConfigManager& config = ConfigManager::getInstance();
     config.storeInt("volume_ceiling", volumeCeiling);
-    
-    // If current volume is higher than new ceiling, lower it
+
     if (currentVolume > volumeCeiling) {
         setVolume(volumeCeiling);
     }
-    
+
     Serial.printf("AudioController: Volume ceiling set to %d%%\n", volumeCeiling);
 }
 
@@ -819,12 +663,11 @@ void AudioController::setPlaylist(const std::vector<String>& trackPaths, const S
     playlistFigureUid = figureUid;
     currentPlaylistIndex = -1; // Start at -1, first play() will set to 0
     playlistFinished = false;
-    
-    Serial.printf("AudioController: Playlist set with %d tracks for figure UID: %s\n", 
+
+    Serial.printf("AudioController: Playlist set with %d tracks for figure UID: %s\n",
                  playlist.size(), figureUid.c_str());
-    
-    // Print playlist for debugging
-    for (int i = 0; i < playlist.size(); i++) {
+
+    for (int i = 0; i < (int)playlist.size(); i++) {
         Serial.printf("  Track %d: %s\n", i + 1, playlist[i].c_str());
     }
 
@@ -874,7 +717,7 @@ void AudioController::clearPlaylist() {
     currentPlaylistIndex = -1;
     playlistFigureUid = "";
     playlistFinished = false;
-    
+
     Serial.println("AudioController: Playlist cleared");
 
     if (taskSuspended) {
@@ -887,21 +730,19 @@ bool AudioController::nextTrack() {
         Serial.println("AudioController: No playlist available");
         return false;
     }
-    
-    // Check if NFC session is still active for the figure associated with this playlist
+
     if (!isNfcSessionActive(playlistFigureUid)) {
         Serial.println("AudioController: Figure not present or different figure detected, clearing playlist");
         clearPlaylist();
         return false;
     }
-    
-    // If playlist finished, start from beginning
+
     if (playlistFinished) {
         currentPlaylistIndex = 0;
         playlistFinished = false;
-        return play(); // Call play() without parameters to use playlist
+        return play();
     }
-    
+
     // Move to the next track that actually exists on the card (tracks still downloading or
     // permanently missing are skipped instead of ending the playlist).
     currentPlaylistIndex++;
@@ -909,17 +750,15 @@ bool AudioController::nextTrack() {
         Serial.printf("AudioController: skipping missing track %s\n", playlist[currentPlaylistIndex].c_str());
         currentPlaylistIndex++;
     }
-    
-    // Check if we've reached the end
+
     if (currentPlaylistIndex >= (int)playlist.size()) {
         Serial.println("AudioController: Reached end of playlist");
         playlistFinished = true;
         stop();
         return false;
     }
-    
-    // Play the next track
-    return play(); // Call play() without parameters to use playlist
+
+    return play();
 }
 
 bool AudioController::prevTrack() {
@@ -927,37 +766,31 @@ bool AudioController::prevTrack() {
         Serial.println("AudioController: No playlist available");
         return false;
     }
-    
-    // Check if NFC session is still active for the figure associated with this playlist
+
     if (!isNfcSessionActive(playlistFigureUid)) {
         Serial.println("AudioController: Figure not present or different figure detected, clearing playlist");
         clearPlaylist();
         return false;
     }
 
-    // Restarting through play(currentTrackPath) is safer than seekTo(0) here because
-    // the background playback task and decoder are already known-good on the normal play path.
+    // More than 3 s in: restart the current track.
     if ((currentState == PLAYING || currentState == PAUSED) && (getCurrentTrackSeconds() > 3.0f)) {
         Serial.println("AudioController: Restarting current track");
         String trackPath = currentTrackPath;
         if (trackPath.isEmpty()) {
-            Serial.println("AudioController: Cannot restart current track - no track path");
             return false;
         }
-
-        return play(trackPath); // Don't fall through to previous track navigation
+        return play(trackPath);
     }
-    
-    // If playlist finished or at first track, go to last track
+
     if (playlistFinished || currentPlaylistIndex <= 0) {
         currentPlaylistIndex = playlist.size() - 1;
         playlistFinished = false;
-        return play(); // Call play() without parameters to use playlist
+        return play();
     }
-    
-    // Move to previous track
+
     currentPlaylistIndex--;
-    return play(); // Call play() without parameters to use playlist
+    return play();
 }
 
 bool AudioController::playTrack(const String& trackId) {
@@ -965,29 +798,36 @@ bool AudioController::playTrack(const String& trackId) {
         Serial.println("AudioController: No playlist available");
         return false;
     }
-    
-    // Check if NFC session is still active
+
     if (!isNfcSessionActive(playlistFigureUid)) {
         Serial.println("AudioController: Figure not present or different figure detected, clearing playlist");
         clearPlaylist();
         return false;
     }
-    
-    // Search for the track ID in the playlist
-    // Playlist paths follow the format: /figures/{figureId}/{episodeId}/{trackId}.mp3
+
+    // Playlist paths end in /{trackId}.mp3
     String suffix = "/" + trackId + ".mp3";
-    
-    for (int i = 0; i < playlist.size(); i++) {
+
+    for (int i = 0; i < (int)playlist.size(); i++) {
         if (playlist[i].endsWith(suffix)) {
             Serial.printf("AudioController: Found track ID %s at playlist index %d\n", trackId.c_str(), i);
             currentPlaylistIndex = i;
             playlistFinished = false;
-            return play(); // Play the matched track
+            return play();
         }
     }
-    
+
     Serial.printf("AudioController: Track ID %s not found in current playlist\n", trackId.c_str());
     return false;
+}
+
+void AudioController::finishTrack() {
+    const bool wasTransient = transientPlayback;
+    stop();
+    transientPlayback = false;
+    if (!wasTransient && hasPlaylist() && !playlistFinished) {
+        nextTrack();
+    }
 }
 
 void AudioController::updatePlaybackSlice() {
@@ -995,7 +835,6 @@ void AudioController::updatePlaybackSlice() {
         return;
     }
 
-    // Update audio processing only if playing
     if (currentState == PLAYING) {
         const int maxDecodePassesPerUpdate = 4;
 
@@ -1010,128 +849,130 @@ void AudioController::updatePlaybackSlice() {
         if (audioMP3 && audioMP3->isRunning()) {
             for (int decodePass = 0; decodePass < maxDecodePassesPerUpdate; ++decodePass) {
                 if (!audioMP3->loop()) {
-                    // Track finished
-                    stop();
-
-                    // If we have a playlist, automatically go to next track
-                    if (hasPlaylist() && !playlistFinished) {
-                        nextTrack();
-                    }
+                    finishTrack();
                     break;
                 }
             }
         } else {
-            // Should be playing but isn't - something went wrong
             Serial.println("AudioController: Playback stopped unexpectedly");
             stop();
         }
     }
-    // For PAUSED state, we don't call audioMP3->loop() so playback remains stopped
-    // For STOPPED state, there's nothing to update
+    // PAUSED: the decoder is simply not serviced; STOPPED: nothing to do
 }
 
 void AudioController::update() {
-    if (audioTaskHandle) {
+    // Loop-task housekeeping only; decoding happens on the audio task.
+    if (!initialized) {
         return;
     }
-
-    updatePlaybackSlice();
+    if (volumeDirty && millis() - volumeDirtyAt > 2000) {
+        ConfigManager::getInstance().storeInt("audio_volume", currentVolume);
+        volumeDirty = false;
+    }
+    pollHeadphone();
+    if (!audioTaskHandle) {
+        bool locked = suspendBackgroundTaskForControl();
+        updatePlaybackSlice();
+        if (locked) resumeBackgroundTaskForControl();
+    }
 }
 
 void AudioController::volumeBeep() {
     if (!initialized || currentState == PLAYING) {
-        // Don't beep if a track is already playing to avoid interruption.
-        return;
+        return; // never interrupt a track
     }
-    
-    // Play the beep.mp3 file instead of generating a tone
+
     const String beepPath = "/sounds/beep.mp3";
-    
-    // Check if beep file exists
     if (!fileManager.fileExists(beepPath)) {
         return;
     }
-    
-    // Store current state to restore after beep
-    String previousTrackPath = currentTrackPath;
-    AudioState previousState = currentState;
-    
-    // Play the beep file
+
+    transientPlayback = true; // the audio task must not advance the playlist when it ends
     if (play(beepPath)) {
-        // Wait for the beep to finish playing
-        while (currentState == PLAYING) {
+        unsigned long start = millis();
+        while (currentState == PLAYING && millis() - start < 3000) {
             update();
-            delay(10); // Small delay to prevent busy waiting
-        }
-        
-        // Restore previous state if there was a track playing
-        if (previousState == PLAYING && !previousTrackPath.isEmpty()) {
-            play(previousTrackPath);
-        } else if (previousState == PAUSED && !previousTrackPath.isEmpty()) {
-            play(previousTrackPath);
-            pause();
+            delay(10);
         }
     }
+    transientPlayback = false;
 }
+
+void AudioController::printStatus() {
+    const char* stateName = currentState == PLAYING ? "PLAYING" : currentState == PAUSED ? "PAUSED" : "STOPPED";
+    Serial.printf("Audio: %s %s @ %.1fs | volume %d%% (ceiling %d%%) codec %s | amp %s (mode %s)%s | playlist %d/%d%s\n",
+                  stateName, currentTrackPath.isEmpty() ? "-" : currentTrackPath.c_str(), getCurrentTrackSeconds(),
+                  currentVolume, volumeCeiling, codecMuted ? "muted" : "live",
+                  ampEnabled ? "released" : "off",
+                  ampMode == AMP_AUTO ? "auto" : ampMode == AMP_FORCE_ON ? "on" : "off",
+                  headphonePlugged ? " headphone plugged" : "",
+                  currentPlaylistIndex + 1, (int)playlist.size(), playlistFinished ? " (finished)" : "");
+    Serial.printf("Audio: read-ahead %u/%u KB, underruns %u, decoder %s, I2S %s, AMP_CTRL level %d | heap int %u PSRAM %u\n",
+                  (unsigned)(getReadAheadFill() / 1024), (unsigned)(getReadAheadCapacity() / 1024), (unsigned)getUnderruns(),
+                  (audioMP3 && audioMP3->isRunning()) ? "running" : "idle",
+                  (audioOutput && audioOutput->installed()) ? "installed" : "released",
+                  digitalRead(AMP_MODE_PIN),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    uint8_t dacPower = readES8388Register(ES8388_DACPOWER);
+    uint8_t dacControl3 = readES8388Register(ES8388_DACCONTROL3);
+    uint8_t lout1 = readES8388Register(ES8388_LOUT1VOL);
+    uint8_t lout2 = readES8388Register(ES8388_LOUT2VOL);
+    Serial.printf("Audio: ES8388 DACPOWER 0x%02X DACCONTROL3 0x%02X LOUT1VOL 0x%02X LOUT2VOL 0x%02X\n", dacPower, dacControl3, lout1, lout2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// ES8388 (Espressif ADF init order): outputs off while configuring, VMID enabled, DAC-only,
+// DAC to both mixers at 0 dB, then LOUT1 + LOUT2/ROUT2 powered. Starts muted; the output path
+// unmutes when something plays.
+// ---------------------------------------------------------------------------------------------
 
 bool AudioController::initializeES8388() {
     Serial.println("AudioController: Initializing ES8388...");
-    
-    // Reset ES8388 to default values
-    writeES8388Register(ES8388_CONTROL1, 0x80);
+
+    writeES8388Register(ES8388_CONTROL1, 0x80);   // reset
     delay(50);
     writeES8388Register(ES8388_CONTROL1, 0x00);
     delay(50);
 
-    // --- Power Management ---
-    // Power up analog and bias generation
-    writeES8388Register(ES8388_CONTROL2, 0x40);  // Power up analog, disable low power modes
-    writeES8388Register(ES8388_CONTROL1, 0x04);  // Enable reference circuits
-    writeES8388Register(ES8388_CHIPPOWER, 0x00); // Power up digital blocks
-    
-    // **NEW**: Explicitly power down the entire ADC path to reduce noise
-    writeES8388Register(ES8388_ADCPOWER, 0xFF);  // Power down ADC, Mic Bias, and analog inputs 
-    
-    // --- Clocking and Format ---
-    writeES8388Register(ES8388_MASTERMODE, 0x00);   // Set to Slave mode (ESP32-S3 is master)
-    writeES8388Register(ES8388_ADCCONTROL4, 0x0C);  // Set ADC to I2S, 16-bit
-    writeES8388Register(ES8388_DACCONTROL1, 0x18);  // Set DAC to I2S, 16-bit
+    writeES8388Register(ES8388_DACCONTROL3, 0x04);  // DAC muted while configuring
+    writeES8388Register(ES8388_CONTROL2, 0x50);     // analog power, VREF up
+    writeES8388Register(ES8388_CHIPPOWER, 0x00);    // everything powered
+    writeES8388Register(0x35, 0xA0);                // internal DLL off (ADF)
+    writeES8388Register(0x37, 0xD0);
+    writeES8388Register(0x39, 0xD0);
+    writeES8388Register(ES8388_MASTERMODE, 0x00);   // slave, ESP32 drives the clocks
+    writeES8388Register(ES8388_DACPOWER, ES8388_DACPOWER_OFF); // outputs off until configured
+    writeES8388Register(ES8388_CONTROL1, 0x12);     // VMID 500k divider, DAC MCLK, play mode
+    writeES8388Register(ES8388_DACCONTROL1, 0x18);  // I2S, 16-bit
+    writeES8388Register(ES8388_DACCONTROL2, 0x02);  // single speed, 256 x fs
+    writeES8388Register(ES8388_DACCONTROL16, 0x00);
+    writeES8388Register(ES8388_DACCONTROL17, 0x90); // left DAC -> left mixer, 0 dB
+    writeES8388Register(ES8388_DACCONTROL20, 0x90); // right DAC -> right mixer, 0 dB
+    writeES8388Register(ES8388_DACCONTROL21, 0x80); // DAC and ADC share LRCK
+    writeES8388Register(ES8388_DACCONTROL23, 0x00);
+    writeES8388Register(ES8388_DACCONTROL4, 0x00);  // DAC digital volume 0 dB
+    writeES8388Register(ES8388_DACCONTROL5, 0x00);
+    writeES8388Register(ES8388_ADCPOWER, 0xFF);     // no ADC, no mic bias
+    writeES8388Register(ES8388_ADCCONTROL1, 0x00);
 
-    // --- Clocking and Format ---
-    writeES8388Register(ES8388_MASTERMODE, 0x00);   // Set to Slave mode (ESP32-S3 is master)
-    writeES8388Register(ES8388_ADCCONTROL4, 0x0C);  // Set ADC to I2S, 16-bit
-    writeES8388Register(ES8388_DACCONTROL1, 0x18);  // Set DAC to I2S, 16-bit
+    writeES8388Register(ES8388_LOUT1VOL, 0x00);     // outputs at minimum until applyCodecVolume()
+    writeES8388Register(ES8388_ROUT1VOL, 0x00);
+    writeES8388Register(ES8388_LOUT2VOL, 0x00);
+    writeES8388Register(ES8388_ROUT2VOL, 0x00);
 
-    // --- Gain and Volume (Fix for distortion) ---
-    // Apply -12dB of digital attenuation to the DAC to prevent clipping
-    // The digital volume registers attenuate in 0.5dB steps. 24 * -0.5dB = -12dB.
-    writeES8388Register(ES8388_DACCONTROL4, 0x00);  // Left DAC digital volume to -12dB 
-    writeES8388Register(ES8388_DACCONTROL5, 0x00);  // Right DAC digital volume to -12dB
-
-    // --- Output Mixer Configuration ---
-    // Route the DAC signal to the headphone output (LOUT1/ROUT1)
-    writeES8388Register(ES8388_DACCONTROL17, 0x80); // Enable Left DAC to Left Mixer
-    writeES8388Register(ES8388_DACCONTROL20, 0x80); // Enable Right DAC to Right Mixer
-
-    // --- Final Power-Up ---
-    // Power up the DACs and enable the Headphone Outputs (LOUT1/ROUT1)
-    writeES8388Register(ES8388_DACPOWER, 0x30);     // Enable DAC L/R and LOUT1/ROUT1
-    writeES8388Register(ES8388_DACCONTROL3, 0x20);  // Unmute DAC with soft ramp enabled
-    
-    // Initialize headphone output volume to a reasonable default (will be overridden by setVolume later)
-    // Set to about 50% volume initially to avoid any potential issues
-    writeES8388Register(ES8388_LOUT1VOL, 0x0F);     // Set left headphone volume to ~50%
-    writeES8388Register(ES8388_ROUT1VOL, 0x0F);     // Set right headphone volume to ~50%
-
-    // Small delay to let ES8388 process the writes before verification reads
+    writeES8388Register(ES8388_DACPOWER, ES8388_DACPOWER_ACTIVE); // DACs + LOUT1 + LOUT2/ROUT2
+    codecMuted = true;
+    writeES8388Register(ES8388_DACCONTROL3, ES8388_DAC_MUTE_RAMP);
     delay(20);
 
-    // Verify critical registers to ensure ES8388 is properly configured
     uint8_t dacPower = readES8388Register(ES8388_DACPOWER);
     uint8_t dacControl3 = readES8388Register(ES8388_DACCONTROL3);
-    Serial.printf("AudioController: ES8388 verification - DACPOWER: 0x%02X, DACCONTROL3: 0x%02X\n", dacPower, dacControl3);
-    
-    if (dacPower == 0xFF || dacControl3 == 0xFF) {
+    uint8_t control1 = readES8388Register(ES8388_CONTROL1);
+    Serial.printf("AudioController: ES8388 verification - CONTROL1: 0x%02X, DACPOWER: 0x%02X, DACCONTROL3: 0x%02X\n",
+                  control1, dacPower, dacControl3);
+
+    if (dacPower != ES8388_DACPOWER_ACTIVE || dacControl3 == 0xFF) {
         Serial.println("AudioController: WARNING - ES8388 register verification failed, I2C communication issues");
         return false;
     }
@@ -1141,226 +982,81 @@ bool AudioController::initializeES8388() {
 }
 
 bool AudioController::writeES8388Register(uint8_t reg, uint8_t value) {
-    // Add retry logic and error handling for I2C conflicts
     const int maxRetries = 3;
     const int retryDelay = 10;
-    
+
     for (int attempt = 0; attempt < maxRetries; attempt++) {
         Wire.beginTransmission(ES8388_ADDR);
         Wire.write(reg);
         Wire.write(value);
         uint8_t result = Wire.endTransmission();
-        
+
         if (result == 0) {
-            // Success
             return true;
         }
-        
-        // If not the last attempt, wait and retry
+
         if (attempt < maxRetries - 1) {
             delay(retryDelay);
         } else {
-            // Last attempt failed, log the error
-            Serial.printf("AudioController: ES8388 write failed (reg=0x%02X, val=0x%02X, error=%d)\n", 
+            Serial.printf("AudioController: ES8388 write failed (reg=0x%02X, val=0x%02X, error=%d)\n",
                          reg, value, result);
         }
     }
-    
+
     return false;
 }
 
 uint8_t AudioController::readES8388Register(uint8_t reg) {
-    // Add retry logic for reads as well
     const int maxRetries = 3;
     const int retryDelay = 10;
-    
+
     for (int attempt = 0; attempt < maxRetries; attempt++) {
         Wire.beginTransmission(ES8388_ADDR);
         Wire.write(reg);
         uint8_t result = Wire.endTransmission(false);
-        
+
         if (result == 0) {
             Wire.requestFrom(ES8388_ADDR, (uint8_t)1);
             if (Wire.available()) {
                 return Wire.read();
             }
         }
-        
-        // If not the last attempt, wait and retry
+
         if (attempt < maxRetries - 1) {
             delay(retryDelay);
         }
     }
-    
-    // Only log error in debug mode to reduce serial spam
-    #ifdef AUDIO_DEBUG_VERBOSE
-    Serial.printf("AudioController: ES8388 read failed (reg=0x%02X)\n", reg);
-    #endif
+
     return 0xFF; // Error value
 }
 
-bool AudioController::setES8388Volume(int volume) {
-    // Convert 0-100 volume to ES8388 headphone register value.
-    // From ES8388 Datasheet, page 28, registers 46 (LOUT1VOL) and 47 (ROUT1VOL).
-    // The control is a 6-bit value with a direct scale (not inverted).
-    // 0x00 = -45dB (min), 0x1E = 0dB (a good max).
-    // We will map the 0-100% volume to this range.
-    
-    // NOTE: Removed verification reads to prevent I2C Error 263 timeouts.
-    // The verification reads were causing frequent `Wire.requestFrom()` calls
-    // which were timing out when the ES8388 was busy, generating Error 263.
-    // Volume setting works fine without verification.
-
-    uint8_t regValue;
-    
-    if (volume == 0) {
-        // Use the lowest volume setting for 0%.
-        regValue = 0x00;
-    } else {
-        // Map 1-100% volume to the register range 0 to 30 (0x00 to 0x1E).
-        // This provides a linear mapping to the dB range of -45dB to 0dB.
-        regValue = (uint8_t) round((volume / 100.0f) * 30.0f);
-        if (regValue > 0x1E) regValue = 0x1E; // Cap at 0dB (value 30)
+void AudioController::muteES8388(bool mute) {
+    if (mute == codecMuted) {
+        return;
     }
-    
-    // Write to both left and right headphone volume registers
-    bool success = true;
-    success &= writeES8388Register(ES8388_LOUT1VOL, regValue);
-    delayMicroseconds(500); // Small delay to prevent I2C bus congestion
-    success &= writeES8388Register(ES8388_ROUT1VOL, regValue);
-    
-    // Optional verification read - disable to reduce I2C traffic and avoid timeout errors
-    // Only verify on critical operations or when debugging
-    #ifdef AUDIO_DEBUG_VERBOSE
-    uint8_t readBackL = readES8388Register(ES8388_LOUT1VOL);
-    uint8_t readBackR = readES8388Register(ES8388_ROUT1VOL);
-    Serial.printf("AudioController: Volume readback - L: 0x%02X, R: 0x%02X\n", readBackL, readBackR);
-    #endif
-    
-    return success;
-}
-
-bool AudioController::muteES8388(bool mute) {
-    // ES8388_DACCONTROL3 register controls DAC mute
-    // Bit 1 (DACMute): 0 = unmute, 1 = mute
-    uint8_t regValue = 0x20; // Base value with soft ramp enabled
-    
-    if (mute) {
-        regValue |= 0x02; // Set DACMute bit
-    }
-    
-    writeES8388Register(ES8388_DACCONTROL3, regValue);
-    
-    Serial.printf("AudioController: ES8388 %s\n", mute ? "muted" : "unmuted");
-    return true;
-}
-
-bool AudioController::initializeI2S() {
-    // Let ESP8266Audio library handle I2S initialization
-    // Don't manually install I2S driver as it conflicts with the library
-    return true;
-}
-
-void AudioController::deinitializeI2S() {
-    // Let ESP8266Audio library handle I2S cleanup
-    // Don't manually uninstall as it's managed by AudioOutputI2S
-    i2s_driver_installed = false;
-}
-
-bool AudioController::reinitializeAudioOutput() {
-    Serial.println("AudioController: Reinitializing audio output");
-    
-    // Clean up existing audio output
-    if (audioOutput) {
-        delete audioOutput;
-        audioOutput = nullptr;
-    }
-    
-    // Ensure I2S is properly initialized
-    if (!initializeI2S()) {
-        Serial.println(F("AudioController: Failed to reinitialize I2S"));
-        return false;
-    }
-    
-    // Create new audio output
-    return initializeAudioComponents();
+    writeES8388Register(ES8388_DACCONTROL3, mute ? ES8388_DAC_MUTE_RAMP : ES8388_DAC_UNMUTE_RAMP);
+    codecMuted = mute;
 }
 
 float AudioController::getCurrentTrackSeconds() const {
     if (!initialized || currentState == STOPPED || currentTrackPath.isEmpty()) {
         return 0.0f;
     }
-    
+
     float totalTime = accumulatedPlayTime;
-    
-    // If currently playing, add the time since trackStartTime
+
     if (currentState == PLAYING && trackStartTime > 0) {
         totalTime += (millis() - trackStartTime) / 1000.0f;
     }
-    
+
     return totalTime;
 }
 
 bool AudioController::isValidAudioFile(const String& filePath) {
-    // Check file extension - now only supporting MP3 files
     String lowerPath = filePath;
     lowerPath.toLowerCase();
-    
+
     return lowerPath.endsWith(".mp3");
-}
-
-void AudioController::cleanupAudioComponents() {
-    // Following the working example pattern - stop and free components
-    if (audioMP3) {
-        if (audioMP3->isRunning()) {
-            audioMP3->stop();
-        }
-        delete audioMP3;
-        audioMP3 = nullptr;
-    }
-    
-    if (audioBuffer) {
-        delete audioBuffer;
-        audioBuffer = nullptr;
-    }
-    
-    if (audioFile) {
-        // Clean up the file source
-        delete audioFile;
-        audioFile = nullptr;
-    }
-}
-
-bool AudioController::initializeAudioComponents() {
-    // Create audio output if it doesn't exist
-    if (!audioOutput) {
-        audioOutput = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S, 8, AudioOutputI2S::APLL_AUTO);
-        if (!audioOutput) {
-            Serial.println("AudioController: Failed to create I2S output");
-            return false;
-        }
-
-        if (!audioOutput->SetMclk(true)) {
-            Serial.println("AudioController: Failed to enable MCLK output");
-            delete audioOutput;
-            audioOutput = nullptr;
-            return false;
-        }
-        
-        // Configure audio output WITH MCLK - critical for ES8388!
-        if (!audioOutput->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN)) {
-            Serial.println("AudioController: Failed to configure I2S pinout");
-            delete audioOutput;
-            audioOutput = nullptr;
-            return false;
-        }
-        audioOutput->SetGain(currentVolume / 100.0f);
-        
-        Serial.printf("AudioController: I2S configured - BCLK:%d, LRCK:%d, DOUT:%d, MCLK:%d\n",
-                     I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN);
-    }
-    
-    return true;
 }
 
 bool AudioController::isNfcSessionActive(const String& expectedUid) const {
@@ -1377,4 +1073,3 @@ bool AudioController::isNfcSessionActive(const String& expectedUid) const {
     }
     return true;
 }
-

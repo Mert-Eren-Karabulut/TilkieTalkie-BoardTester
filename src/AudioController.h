@@ -2,20 +2,29 @@
 #define AUDIOCONTROLLER_H
 
 #include <Arduino.h>
-#include <driver/i2s_std.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <Wire.h>
 #include <vector>
-#include "AudioFileSourceFS.h"
-#include "AudioFileSourceBuffer.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
+#include "ReadAheadFileSource.h"
 #include "FileManager.h"
 
 // Forward declaration to avoid circular includes
 class NfcController;
+
+// AudioOutputI2S installs the I2S driver in begin() and uninstalls it in stop(), i.e. on every
+// track change: MCLK to the ES8388 drops, the queued DMA tail is cut and the codec pops. This
+// keeps the driver (and MCLK) up for the life of the device; teardown() is only for sleep.
+class PersistentI2SOutput : public AudioOutputI2S {
+public:
+    using AudioOutputI2S::AudioOutputI2S;
+    bool stop() override { return i2sOn; }  // queued samples play out, tx_desc_auto_clear then gives silence
+    bool teardown() { return AudioOutputI2S::stop(); }
+    bool installed() const { return i2sOn; }
+};
 
 class AudioController {
 public:
@@ -26,34 +35,41 @@ public:
         PAUSED
     };
 
+    // Speaker amplifier control (NS4150B CTRL on GPIO41, shared with the jack contact)
+    enum AmpMode {
+        AMP_AUTO,       // on while sound is produced, off otherwise
+        AMP_FORCE_ON,   // diagnostics
+        AMP_FORCE_OFF
+    };
+
     // Volume levels (0-100)
     static const int MIN_VOLUME = 0;
     static const int MAX_VOLUME = 100;
     static const int DEFAULT_VOLUME = 75;
     static const int VOLUME_STEP = 5;
+    static const int HEADPHONE_CEILING_STEPS = 4;  // jack (LOUT2/ROUT2) sits 4 x 1.5 dB under the speaker
 
     // ES8388 I2C address
     static const uint8_t ES8388_ADDR = 0x10;
 
-    // Pin definitions (updated with actual GPIO assignments)
-    static const int I2S_BCLK_PIN = 7;     // c_sclk - I2S bit clock (GPIO7) ESP32-S3
-    static const int I2S_LRCK_PIN = 8;     // c_lrck - I2S left/right clock (GPIO8) ESP32-S3
-    static const int I2S_DOUT_PIN = 10;    // c_dsdin - I2S data from ESP32 to ES8388 (GPIO10) ESP32-S3
-    static const int I2S_MCLK_PIN = 11;    // c_mclk - I2S master clock (GPIO11) ESP32-S3
-    static const int I2C_SDA_PIN = 17;     // c_sda - I2C data for ES8388 control (GPIO17) ESP32-S3
-    static const int I2C_SCL_PIN = 18;     // c_scl - I2C clock for ES8388 control (GPIO18) ESP32-S3
-    static const int AMP_MODE_PIN = 41;    // GPIO41 comes from the NS4150 / headphone path on this board.
-    // Available but not used: c_asdout (GPIO35)
-
-    // Buffer size for audio streaming
-    static const int AUDIO_BUFFER_SIZE = 4096;
+    // Pin definitions (ESP32-S3, board "Adem v7")
+    static const int I2S_BCLK_PIN = 7;     // c_sclk
+    static const int I2S_LRCK_PIN = 8;     // c_lrck
+    static const int I2S_DOUT_PIN = 10;    // c_dsdin - ESP32 -> ES8388
+    static const int I2S_MCLK_PIN = 11;    // c_mclk
+    static const int I2C_SDA_PIN = 17;     // c_sda - ES8388 control
+    static const int I2C_SCL_PIN = 18;     // c_scl
+    // AMP_CTRL: NS4150B CTRL, held high by the board, pulled low by the headphone jack contact.
+    // Driven open-drain: LOW = speaker off, released = board/jack decide (and the level tells
+    // us whether a plug is in).
+    static const int AMP_MODE_PIN = 41;
 
     // Singleton pattern
     static AudioController& getInstance();
 
     // Initialization
     bool begin();
-    void end();
+    void end();  // mute, power the codec/amp down and release I2S (before sleep)
 
     // Playback control
     bool play(const String& filePath = ""); // Play specific file or current playlist track
@@ -61,7 +77,7 @@ public:
     bool resume();
     bool stop();
     bool seekTo(float seconds); // Seek to specific time position (works during playback or when paused)
-    
+
     // Playlist control methods
     bool nextTrack();
     bool prevTrack();
@@ -71,7 +87,7 @@ public:
     // (tracks that finished downloading are added in order; the playing track keeps its slot).
     void mergePlaylist(const std::vector<String>& trackPaths, const String& figureUid);
     void clearPlaylist();
-    
+
     // Playlist information
     bool hasPlaylist() const { return !playlist.empty(); }
     int getCurrentTrackIndex() const { return currentPlaylistIndex; }
@@ -82,15 +98,21 @@ public:
         return false;
     }
 
-    // Volume control
+    // Volume control (codec attenuation only; the NVS write is deferred to update())
     bool volumeUp();
     bool volumeDown();
-    bool setVolume(int volume, bool initialize = false); // Added initialize flag for internal use
+    bool setVolume(int volume, bool initialize = false);
     int getCurrentVolume() const { return currentVolume; }
-    
+
     // Volume ceiling control
     void setVolumeCeiling(int ceiling);
     int getVolumeCeiling() const;
+
+    // Amplifier / headphone
+    void setAmpMode(AmpMode mode);
+    AmpMode getAmpMode() const { return ampMode; }
+    bool isAmpEnabled() const { return ampEnabled; }
+    bool isHeadphonePlugged() const { return headphonePlugged; }
 
     // Status
     AudioState getState() const { return currentState; }
@@ -98,32 +120,37 @@ public:
     bool isPlaying() const { return currentState == PLAYING; }
     bool isPaused() const { return currentState == PAUSED; }
     bool isStopped() const { return currentState == STOPPED; }
-    
+    uint32_t getReadAheadFill() const { return source ? source->available() : 0; }
+    uint32_t getReadAheadCapacity() const { return source ? source->capacity() : 0; }
+    uint32_t getUnderruns() const { return source ? source->underruns() : 0; }
+    void printStatus();
+
     // Track timing
     float getCurrentTrackSeconds() const;
 
-    // Update function (call in main loop)
+    // Loop-task housekeeping (deferred NVS writes, headphone polling); decoding runs on its own task
     void update();
-    
+
     // Beep functions
     void volumeBeep(); // Beep to indicate volume level
-    
+
     // NFC session check (public for SleepController)
     bool isNfcSessionActive(const String& expectedUid) const;
 
 private:
     // Singleton instance
     static AudioController* instance;
-    
+
     // Constructor (private for singleton)
     AudioController();
     ~AudioController();
 
-    // Audio components
-    AudioFileSourceFS* audioFile;
-    AudioFileSourceBuffer* audioBuffer;
+    // Audio components (allocated once in begin(); only the decoder object is per track)
+    PersistentI2SOutput* audioOutput;
+    ReadAheadFileSource* source;
     AudioGeneratorMP3* audioMP3;
-    AudioOutputI2S* audioOutput;
+    void* mp3Prealloc;
+    int mp3PreallocSize;
 
     // State variables
     AudioState currentState;
@@ -131,17 +158,25 @@ private:
     int currentVolume;
     int volumeCeiling;  // Maximum allowed volume (0-100), stored in NVS
     bool initialized;
-    bool i2s_driver_installed;  // Track I2S driver state to prevent double initialization
-    
-    // Pause/resume time tracking (time-based instead of byte-based for accurate MP3 resume)
+    bool transientPlayback;   // a beep: must not advance the playlist when it ends
+    bool outputsActive;       // codec unmuted + amp released
+    bool codecMuted;
+    AmpMode ampMode;
+    bool ampEnabled;
+    bool headphonePlugged;
+    unsigned long lastPlugPoll;
+    bool volumeDirty;
+    unsigned long volumeDirtyAt;
+
+    // Pause/resume time tracking
     float pausedTimeSeconds;         // Time position in seconds when paused
     bool hasPausedTime;              // Whether we have a valid paused time
-    
+
     // Track timing variables
     unsigned long trackStartTime;    // millis() when track started playing
     float accumulatedPlayTime;       // accumulated play time in seconds
     unsigned long pauseStartTime;    // millis() when track was paused
-    
+
     // Playlist variables
     std::vector<String> playlist;
     int currentPlaylistIndex;
@@ -152,18 +187,19 @@ private:
     bool initializeES8388();
     bool writeES8388Register(uint8_t reg, uint8_t value);
     uint8_t readES8388Register(uint8_t reg);
-    bool setES8388Volume(int volume);
-    bool muteES8388(bool mute);
+    void applyCodecVolume();
+    void muteES8388(bool mute);
 
-    // I2S configuration
-    bool initializeI2S();
-    void deinitializeI2S();
-    bool reinitializeAudioOutput();
+    // Output path
+    void setOutputsActive(bool active);
+    void applyAmp();
+    void pollHeadphone();
 
     // Helper functions
     bool isValidAudioFile(const String& filePath);
-    void cleanupAudioComponents();
-    bool initializeAudioComponents();
+    bool startDecoder(const String& filePath);
+    void releaseDecoder();
+    void finishTrack();
     void updatePlaybackSlice();
     bool suspendBackgroundTaskForControl();
     void resumeBackgroundTaskForControl();

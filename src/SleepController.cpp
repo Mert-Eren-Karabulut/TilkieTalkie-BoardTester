@@ -163,6 +163,9 @@ void SleepController::enterDeepSleep() {
     rtcSleepState.hasValidSleep = true;
     rtcSleepState.magic = RTC_MAGIC;
     
+    // Codec muted and powered down, amp off, I2S pins released before the rail goes.
+    AudioController::getInstance().end();
+
     // Disable peripheral power to save energy (latches GPIO4 low via gpio_hold_en).
     disablePeripheralPower();
 

@@ -26,15 +26,20 @@ and sustains only ~0.3 MB/s; the portal currently returns an empty manifest for 
 
 ## Remaining work (in order)
 
-### A. Audio (AudioController) — next
-1. ES8388 init: enable VMID (0x00 = 0x12 per ADF sequence), DACPOWER 0x2C so LOUT2/ROUT2 (headphone jack) are powered, set 0x30/0x31 volumes with a lower headphone ceiling; mute-before-config, unmute with ramp.
-2. Drive the amp enable (GPIO41 = AMP_CTRL, currently INPUT): HIGH while playing, LOW idle/sleep; read it as INPUT_PULLUP briefly to detect a plug (confirm jack wiring with owner).
-3. Install the I2S driver once (subclass `AudioOutputI2S` so `stop()` doesn't uninstall), `APLL_DISABLE`, `dma_buf_count` 16; stop the 23 ms tail truncation and pops.
-4. Fix the 8 KB PSRAM leak per track start (buffer allocated in `play()`/resume/seek/beep, never freed): allocate once in `begin()`.
-5. Audio task priority ~12–16 on core 1; `SDWriteTask` already on core 0.
-6. Volume: write NVS 2 s after the last change (currently every step, inside the audio mutex); software gain fixed at 1.0, codec-only attenuation.
-7. Pause/resume without destroying the decoder; beep must not advance the playlist; codec mute + amp off before sleep.
-8. SD read-ahead task with a 64–128 KB PSRAM buffer so the decoder tolerates the card's 3 s pauses (dropouts during downloads).
+### A. Audio (AudioController) — done 2026-10-11, needs a listening check by the owner
+Rewritten (`src/AudioController.*`, `src/ReadAheadFileSource.*`): ES8388 brought up in the ADF order (VMID on, DAC-only,
+DACPOWER 0x2C = LOUT1 speaker + LOUT2/ROUT2 jack, jack 6 dB under the speaker, starts muted); AMP_CTRL (GPIO41) driven
+open-drain (LOW = speaker off, released = board/jack decide; the level while released reports a plug); I2S driver installed
+once at boot and kept (MCLK never drops, APLL off, 16 DMA buffers, mono L+R mix for the single speaker); libmad workspace
+allocated once; audio task priority 12 on core 1; volume = codec attenuation only (software gain 1.0), NVS write deferred
+2 s; pause/resume keep the decoder (resume continues exactly where it stopped), beep no longer advances the playlist;
+`end()` mutes, powers the codec down, drops the amp and releases I2S before deep sleep; 128 KB PSRAM read-ahead with its
+own reader task (core 0, prio 6) so the decoder never waits on the card. Console: `volume <n>`, `audio`, `amp on|off|auto`.
+Verified on the bench: play/pause/resume/next/prev, 15 track changes without heap drift, a 1 MB download during playback
+with 2–3 s card stalls and zero underruns, seek-in-track pending (Reverb path).
+Open: (1) the owner has to confirm the speaker still sounds right at low volume and that a plugged headphone mutes it
+(`audio` shows "headphone plugged"); if GPIO41 turns out not to be NS4150B CTRL, `amp` handling is a two-line revert;
+(2) no `/sounds/beep.mp3` on the bench card, beep path untested; (3) seek assumes 96 kbps CBR (12 kB/s).
 
 ### B. Network (ReverbClient / WiFiProvisioning / RequestManager)
 1. Remove `reboot`/`restart`, `set-max-volume`, `play <path>` from remote commands; require `device_id == own`; rate-limit.
@@ -46,6 +51,11 @@ and sustains only ~0.3 MB/s; the portal currently returns an empty manifest for 
 7. Later: `esp_websocket_client` in a dedicated net task; device-scoped token (backend work).
 
 ### C. Power task / runtime
+- Internal heap (2026-10-11, after `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 16 KB→4 KB, AsyncTCP stack 16→8 KB, audio task
+  10→8 KB): idle 50 KB (largest block 31 KB), playing 43 KB, playing + downloading 21 KB, min since boot 11.7 KB (was 716 B
+  with largest block 3 KB before the tuning). Still thin: Reverb's TLS WebSocket costs ~60 KB internal at connect; BT
+  controller memory is only released after a provisioning run (`FREE_BTDM`), never when booting already provisioned —
+  releasing it at boot means re-provisioning must reboot into provisioning mode.
 - Loop latency still measured on the bench (2026-10-11, after moving stale erases to the SD task): manifest fetch+parse
   `request` 241 ms, download finalize/manifest save `files` up to 667 ms, worst loop gap 1.4 s during a 5-track download.
   Candidates: parse manifests off the loop (request task), make writeJsonAtomic/pending-manifest handling incremental.
