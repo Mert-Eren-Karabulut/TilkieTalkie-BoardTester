@@ -21,6 +21,7 @@ const char *NVS_OTA_RELEASE = "ota_rel";   // release we rebooted into (set righ
 const char *NVS_OTA_VCODE = "ota_vcode";   // version_code that image should report
 const unsigned long CHECK_INTERVAL_MS = 24UL * 60UL * 60UL * 1000UL;
 const unsigned long CHECK_RETRY_MS = 60UL * 60UL * 1000UL;
+const unsigned long CHECK_RETRY_SOON_MS = 2UL * 60UL * 1000UL; // connection-level failure
 const unsigned long FIRST_CHECK_DELAY_MS = 90UL * 1000UL;
 const unsigned long MANDATORY_WAIT_MAX_MS = 60UL * 60UL * 1000UL;
 const unsigned long CONFIRM_AFTER_MS = 60UL * 1000UL;   // a crash before this rolls back (bootloader)
@@ -244,7 +245,7 @@ void OtaManager::onCheckResult(JsonDocument &doc, int code)
     if (code != 200 || !doc["release_id"].is<uint32_t>())
     {
         Serial.printf("OTA: check failed (HTTP %d)\n", code);
-        _nextCheckAt = millis() + CHECK_RETRY_MS;
+        _nextCheckAt = millis() + (code <= 0 ? CHECK_RETRY_SOON_MS : CHECK_RETRY_MS);
         _state = IDLE;
         return;
     }
@@ -573,7 +574,7 @@ void OtaManager::update()
     }
 
     // 6. Periodic check
-    if (_state == IDLE && WiFi.isConnected() && now >= _nextCheckAt)
+    if (_state == IDLE && WiFi.isConnected() && _networkHealthy && now >= _nextCheckAt)
     {
         checkNow(0, "periodic");
     }

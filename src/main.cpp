@@ -1600,7 +1600,7 @@ static void serviceUxPrompts()
         }
     }
     // Provisioned but no network for a minute.
-    if (provisioned && !WiFi.isConnected() && now - gFullSystemStartedAt > 60000UL)
+    if (provisioned && !WiFi.isConnected() && !wifiProv.isProvisioningManagerActive() && now - gFullSystemStartedAt > 60000UL)
     {
         if (!gWifiLostAnnounced || now - gWifiLostAnnouncedAt > 600000UL)
         {

@@ -34,6 +34,13 @@ void WiFiProvisioningManager::begin() {
     delay(100);
     
     WiFi.onEvent(onSysProvEvent);
+    if (!provEventsRegistered) {
+        esp_err_t er = esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &provEventHandler, this);
+        provEventsRegistered = (er == ESP_OK);
+        if (er != ESP_OK) {
+            Serial.printf("WiFiProvisioning: cannot register WIFI_PROV_EVENT handler: %s\n", esp_err_to_name(er));
+        }
+    }
     
     // Initialize the wifi provisioning manager
     wifi_prov_mgr_config_t prov_config = {
@@ -296,6 +303,16 @@ void WiFiProvisioningManager::reset() {
 }
 
 void WiFiProvisioningManager::handleBackgroundReconnection() {
+    if (provEndPending) {
+        // Provisioning finished (the app got its "success"): release the manager and tell the UX.
+        provEndPending = false;
+        if (provisioningManagerInitialized) {
+            wifi_prov_mgr_deinit();
+            provisioningManagerInitialized = false;
+        }
+        Serial.printf("🏁 Provisioning ended, manager released (free heap %u)\n", ESP.getFreeHeap());
+        if (eventCb) eventCb(ProvEvent::ENDED);
+    }
     // Only attempt reconnection if we're provisioned but not connected
     if (isConnected() || provisioningManagerInitialized || !isProvisioned()) {
         return;
@@ -414,6 +431,43 @@ void WiFiProvisioningManager::handleProvisioningEvent(arduino_event_t *sys_event
             if (eventCb) eventCb(ProvEvent::ENDED);
             break;
             
+        default:
+            break;
+    }
+}
+
+void WiFiProvisioningManager::provEventHandler(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    WiFiProvisioningManager *self = static_cast<WiFiProvisioningManager *>(arg);
+    if (!self || base != WIFI_PROV_EVENT) {
+        return;
+    }
+    switch (id) {
+        case WIFI_PROV_START:
+            Serial.println("🔵 Provisioning started (IDF event)");
+            break;
+        case WIFI_PROV_CRED_RECV: {
+            const wifi_sta_config_t *cfg = static_cast<const wifi_sta_config_t *>(data);
+            Serial.printf("📨 Credentials received for '%s'\n", cfg ? (const char *)cfg->ssid : "?");
+            if (self->eventCb) self->eventCb(ProvEvent::CRED_RECV);
+            break;
+        }
+        case WIFI_PROV_CRED_FAIL: {
+            const wifi_prov_sta_fail_reason_t *reason = static_cast<const wifi_prov_sta_fail_reason_t *>(data);
+            Serial.printf("❌ Provisioning failed: %s\n",
+                          (reason && *reason == WIFI_PROV_STA_AUTH_ERROR) ? "wrong password" : "network not found");
+            if (self->eventCb) self->eventCb(ProvEvent::CRED_FAIL);
+            break;
+        }
+        case WIFI_PROV_CRED_SUCCESS:
+            Serial.println("✅ Provisioning: credentials accepted, connected");
+            if (self->eventCb) self->eventCb(ProvEvent::CRED_SUCCESS);
+            break;
+        case WIFI_PROV_END:
+            self->provEndPending = true; // deinit from the loop task, not from the event task
+            break;
+        case WIFI_PROV_DEINIT:
+            self->provisioningManagerInitialized = false;
+            break;
         default:
             break;
     }
