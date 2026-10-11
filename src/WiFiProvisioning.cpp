@@ -383,17 +383,20 @@ void WiFiProvisioningManager::handleProvisioningEvent(arduino_event_t *sys_event
             config.setWiFiCredentials(ssid, password);
             config.commit();
             Serial.println("✅ Credentials backed up to ConfigManager");
+            if (eventCb) eventCb(ProvEvent::CRED_RECV);
             break;
         }
 
         case ARDUINO_EVENT_PROV_CRED_FAIL:
             Serial.println("\n❌ Provisioning failed - invalid credentials");
             Serial.println("Please check WiFi network name and password");
+            if (eventCb) eventCb(ProvEvent::CRED_FAIL);
             break;
 
         case ARDUINO_EVENT_PROV_CRED_SUCCESS:
             Serial.println("\n✅ Provisioning successful - credentials accepted");
             Serial.println("Device will now connect to WiFi...");
+            if (eventCb) eventCb(ProvEvent::CRED_SUCCESS);
             break;
 
         case ARDUINO_EVENT_PROV_END:
@@ -408,6 +411,7 @@ void WiFiProvisioningManager::handleProvisioningEvent(arduino_event_t *sys_event
                 Serial.printf("🆓 Free heap after cleanup: %d bytes\n", ESP.getFreeHeap());
                 Serial.println("🌐 System ready for HTTPS/WebSocket connections");
             }
+            if (eventCb) eventCb(ProvEvent::ENDED);
             break;
             
         default:

@@ -138,6 +138,9 @@ public:
     // became available for a figure that was already announced (merge, do not restart).
     typedef void (*FigureDownloadCompleteCallback)(const String &uid, const String &figureName, bool success, const String &error, const Figure &figure, bool isUpdate);
     void setFigureDownloadCompleteCallback(FigureDownloadCompleteCallback callback);
+    // Progress events for the UX layer (loop task).
+    enum class FigureEvent { DOWNLOADS_STARTED };  // nothing playable yet, stories being downloaded
+    void setFigureEventCallback(std::function<void(const String &uid, FigureEvent)> cb) { figureEventCallback = cb; }
     
     // Helper method to get figure ID from UID (for deletion purposes)
     String getFigureIdFromUid(const String &uid);
@@ -180,6 +183,7 @@ private:
     };
     
     std::vector<FigureDownloadTracker> activeDownloads;
+    std::function<void(const String &, FigureEvent)> figureEventCallback;
     std::vector<PendingFigureCompletion> pendingCompletions;
     
     // UID to Figure ID mapping for deletion purposes

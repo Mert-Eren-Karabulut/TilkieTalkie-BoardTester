@@ -133,6 +133,11 @@ public:
 
     // Beep functions
     void volumeBeep(); // Beep to indicate volume level
+    // Spoken prompts / tones (VoicePrompts): interrupts a playing or paused track, which is
+    // resumed at the same position when the prompt ends. One prompt at a time.
+    bool playPrompt(const String& filePath);
+    bool isPromptPlaying() const { return transientPlayback && currentState == PLAYING; }
+    bool consumePlaylistEnded();      // true once after the last playlist track finished
 
     // NFC session check (public for SleepController)
     bool isNfcSessionActive(const String& expectedUid) const;
@@ -159,6 +164,15 @@ private:
     int volumeCeiling;  // Maximum allowed volume (0-100), stored in NVS
     bool initialized;
     bool transientPlayback;   // a beep: must not advance the playlist when it ends
+    String resumeTrackPath;          // track interrupted by a prompt
+    float resumeSeconds = 0.0f;
+    bool resumeAfterPrompt = false;
+    bool resumeAsPaused = false;
+    volatile bool promptEnded = false;   // set by the audio task, handled in update()
+    bool startingPrompt = false;         // play() called from playPrompt()
+    bool deferredPlayPending = false;    // a story asked to start while a prompt was playing
+    String deferredPlayPath;
+    volatile bool playlistEnded = false; // set when the last track finished
     bool outputsActive;       // codec unmuted + amp released
     bool codecMuted;
     AmpMode ampMode;

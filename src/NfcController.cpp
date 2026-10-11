@@ -111,6 +111,7 @@ void NfcController::handlePogoSwitch()
                 cardReadInSession = false; // Reset session flag
                 lastReadUID = "";          // Clear last read UID for the new session
                 consecutiveFailures = 0;   // Reset failure count for fresh start
+                lastSuccessfulNFCRead = millis(); // the watchdog counts from the session start, not from a read hours ago
             }
             else
             {

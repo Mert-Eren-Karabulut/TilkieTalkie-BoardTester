@@ -1,4 +1,5 @@
 #include "SleepController.h"
+#include "VoicePrompts.h"
 #include "AudioController.h"
 #include "BatteryManagement.h"
 #include "FileManager.h"
@@ -181,6 +182,7 @@ void SleepController::enterDeepSleep() {
     rtcSleepState.magic = RTC_MAGIC;
     
     // Codec muted and powered down, amp off, I2S pins released before the rail goes.
+    VoicePrompts::getInstance().sayBlocking(Prompt::TONE_SLEEP, 1500);
     AudioController::getInstance().end();
     // Flush the download queue / required-files state and unmount the card before its rail
     // is cut (an unmounted FAT with a pending write is how cards get corrupted).

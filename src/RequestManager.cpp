@@ -683,6 +683,9 @@ void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, 
 
     if (assetsToDownload > 0) {
         Serial.printf("RequestManager: %d asset(s) to download for %s (%d already cached)\n", assetsToDownload, figureName.c_str(), assetsAlreadyCached);
+        if (!alreadyEmitted && figureEventCallback) {
+            figureEventCallback(uid, FigureEvent::DOWNLOADS_STARTED);
+        }
     }
 }
 

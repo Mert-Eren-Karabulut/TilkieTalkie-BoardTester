@@ -24,6 +24,7 @@
 #include "rtc_wake_stub_vbus.h"
 #include "Diag.h"
 #include "OtaManager.h"
+#include "VoicePrompts.h"
 #include "Version.h"
 
 // The espidf CMake build compiles every file in src/ regardless of build_src_filter,
@@ -119,6 +120,19 @@ static unsigned long gFullSystemStartedAt = 0;  // millis() when startFullSystem
 static unsigned long gFigureLoadingSince = 0;   // tap time until something plays / fails
 static bool gSystemError = false;               // SD or audio failed to come up
 static int gOtaProgress = -1;                   // 0-100 while an update is being written
+static int gLastOtaProgress = -1;
+// Network services (API client + Reverb) start when WiFi is up: in startFullSystem() on a
+// provisioned boot, or later from the loop once a fresh provisioning / a late reconnect lands.
+static bool gNetworkServicesStarted = false;
+static unsigned long gWifiUpSince = 0;
+// Voice feedback state
+static VoicePrompts &prompts = VoicePrompts::getInstance();
+static unsigned long gSetupWelcomeNextAt = 0;
+static uint8_t gSetupWelcomeRepeats = 0;
+static bool gIdleHelloDone = false;
+static bool gWifiLostAnnounced = false;
+static unsigned long gWifiLostAnnouncedAt = 0;
+static String gDownloadAnnouncedUid;
 static const float SYSTEM_START_V = 3.10f;            // cell must reach this to start full system
 static const uint32_t SYSTEM_MONITOR_LED = 0x0000FF;  // blue breathing while warming up / charging
 void startFullSystem();
@@ -259,13 +273,45 @@ static void runSleepTest(uint32_t minutes, bool railOn, bool nfcAwake, bool hold
 // discharge (uses the LEDs as its load), and transient pulseRapid event feedback
 // (plays over the bar, which resumes by itself). Read-only towards the charging
 // state machine — supervisor, PD negotiation, recovery and bring-up are untouched.
+// The docked charge bar is the idle picture. Anything the user is waiting for (pairing,
+// connecting, loading a figure, downloading, playing, updating, an error) owns the LEDs.
+static bool chargeBarAllowed()
+{
+    if (gSystemPhase != PHASE_RUNNING)
+    {
+        return true;
+    }
+    if (gOtaProgress >= 0 || gSystemError)
+    {
+        return false;
+    }
+    if (audioController.isPlaying() || audioController.isPaused())
+    {
+        return false;
+    }
+    if (gFigureLoadingSince != 0 && millis() - gFigureLoadingSince < 30000UL)
+    {
+        return false;
+    }
+    if (fileManager.hasActiveDownload())
+    {
+        return false;
+    }
+    if (!WiFi.isConnected() && (wifiProv.isProvisioningManagerActive() || millis() - gFullSystemStartedAt < 60000UL))
+    {
+        return false; // pairing / connecting; a long offline stretch shows the bar again
+    }
+    return true;
+}
+
 static void updateChargingUx()
 {
     static bool wasShowingCharge = false;
     const bool showCharge = battery.isVbusPresent() &&
                             gBringupPhase == BRINGUP_INACTIVE &&
                             !gLearnDischarge &&
-                            battery.hasTelemetry();
+                            battery.hasTelemetry() &&
+                            chargeBarAllowed();
     if (showCharge)
     {
         // Spike filter: a glitched gauge read once flashed the bar full for a frame.
@@ -565,6 +611,21 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
         if (mounted)
         {
             ledController.flash(LedController::FX_NO_CONTENT);
+            if (error.indexOf("unreachable") >= 0 || error.indexOf("Offline") >= 0)
+            {
+                ReverbClient::setLastError("armut");
+                prompts.say(Prompt::FIGURE_OFFLINE);
+            }
+            else if (error.indexOf("downloaded") >= 0)
+            {
+                ReverbClient::setLastError("kiraz");
+                prompts.say(Prompt::DOWNLOAD_FAILED);
+            }
+            else
+            {
+                ReverbClient::setLastError("elma");
+                prompts.say(Prompt::FIGURE_NO_CONTENT);
+            }
         }
         return;
     }
@@ -640,6 +701,11 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
     audioController.setPlaylist(playlist, uid);
     audioController.play();
     ESP_LOGI(TAG, "Started playing figure '%s'", figureName.c_str());
+    if (gDownloadAnnouncedUid == uid)
+    {
+        gDownloadAnnouncedUid = "";
+        prompts.say(Prompt::DOWNLOAD_DONE); // spoken over the first second, the story resumes after
+    }
 }
 
 // This function will be called ONLY ONCE when a new card is detected
@@ -767,6 +833,7 @@ static void superviseChargerOnUsb()
     static int tempOutOfWindowPolls = 0;
     static bool tempDerated = false;
     static bool fullHold = false;          // charger paused because the pack is full
+    static unsigned long vbusSessionStartedAt = 0;
     // Input budget for sources without a PD contract. The charger's POR default (3.3 A + ICO
     // probing upwards) collapses weak 5 V adapters and power banks: VBUS drops out, the charger
     // stops, the source recovers, and the cycle repeats every few seconds (the red STAT LED
@@ -787,6 +854,10 @@ static void superviseChargerOnUsb()
         {
             wasVbusPresent = false;
             nonPdLimitApplied = false;
+            if (millis() - gFullSystemStartedAt > 15000UL)
+            {
+                prompts.say(Prompt::TONE_CHARGE_OFF);
+            }
             if (firstDropoutAt == 0 || millis() - firstDropoutAt > 120000UL)
             {
                 firstDropoutAt = millis();
@@ -806,6 +877,11 @@ static void superviseChargerOnUsb()
     }
     if (!wasVbusPresent)
     {
+        vbusSessionStartedAt = millis() ? millis() : 1;
+        if (millis() - gFullSystemStartedAt > 15000UL)
+        {
+            prompts.say(Prompt::TONE_CHARGE_ON); // a plug-in, not the cable that was there at boot
+        }
         // New VBUS session: conservative budget right away, then give the CH224Q a few polls
         // to report a PD contract that may raise it.
         wasVbusPresent = true;
@@ -935,6 +1011,10 @@ static void superviseChargerOnUsb()
         fullHold = true;
         ESP_LOGI(TAG, "CHARGER: pack full (%s) at %.3fV - no more charge kicks until the cell drops",
                  battery.isGaugeChargeInhibited() ? "gauge FC" : "charger termination", v);
+        if (vbusSessionStartedAt && millis() - vbusSessionStartedAt > 120000UL)
+        {
+            prompts.say(Prompt::CHARGE_FULL); // it charged in this session; not "full" for a cable that was there at boot
+        }
     }
     if (fullHold)
     {
@@ -1131,6 +1211,28 @@ void setup()
 // Brings up the heavy subsystems (SD, WiFi, audio, Reverb, NFC, buttons). Called once the
 // battery can support them — immediately from setup() on a healthy cell, or later from
 // loop() once a depleted cell has charged back above SYSTEM_START_V.
+// API client + Reverb. Safe to call once WiFi has an IP; idempotent.
+static void startNetworkServices()
+{
+    if (gNetworkServicesStarted)
+    {
+        return;
+    }
+    gNetworkServicesStarted = true;
+    ESP_LOGI(TAG, "Initializing network services...");
+    // Apply the configured API base (production unless overridden for the bench).
+    requestManager.setBaseUrl(loadEndpoints().apiBase);
+    if (!requestManager.begin())
+    {
+        ESP_LOGW(TAG, "Request Manager initialization failed (no token yet) - Reverb will retry the token");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Request Manager initialized successfully");
+    }
+    startReverb();
+}
+
 void startFullSystem()
 {
     if (gSystemPhase == PHASE_RUNNING)
@@ -1149,9 +1251,27 @@ void startFullSystem()
     }
     // Set up figure download complete callback (before WiFi connection)
     requestManager.setFigureDownloadCompleteCallback(onFigureDownloadComplete);
+    requestManager.setFigureEventCallback([](const String &uid, RequestManager::FigureEvent ev) {
+        if (ev == RequestManager::FigureEvent::DOWNLOADS_STARTED)
+        {
+            gDownloadAnnouncedUid = uid;
+            prompts.say(Prompt::DOWNLOAD_START);
+        }
+    });
 
     // Initialize WiFi provisioning (the battery is verified able to buffer RF inrush).
     ESP_LOGI(TAG, "Initializing WiFi...");
+    wifiProv.onProvisioningEvent([](WiFiProvisioningManager::ProvEvent ev) {
+        switch (ev)
+        {
+        case WiFiProvisioningManager::ProvEvent::CRED_RECV: prompts.say(Prompt::SETUP_CONNECTING); break;
+        case WiFiProvisioningManager::ProvEvent::CRED_FAIL: prompts.say(Prompt::SETUP_FAILED); break;
+        case WiFiProvisioningManager::ProvEvent::ENDED:
+            if (WiFi.isConnected()) prompts.say(Prompt::SETUP_SUCCESS);
+            break;
+        default: break;
+        }
+    });
     wifiProv.begin();
 
     // Initialize audio controller
@@ -1175,28 +1295,11 @@ void startFullSystem()
 
     if (WiFi.isConnected())
     {
-        ESP_LOGI(TAG, "WiFi is connected. Initializing network services...");
-
-        // Apply the configured API base (production unless overridden for the bench).
-        requestManager.setBaseUrl(loadEndpoints().apiBase);
-
-        // Initialize request manager (needs WiFi)
-        if (!requestManager.begin())
-        {
-            ESP_LOGW(TAG, "Request Manager initialization failed!");
-            ESP_LOGW(TAG, "API functionality may be limited.");
-        }
-        else
-        {
-            ESP_LOGI(TAG, "Request Manager initialized successfully");
-        }
-
-        startReverb();
+        startNetworkServices();
     }
     else
     {
-        ESP_LOGW(TAG, "WiFi connection timed out.");
-        ESP_LOGW(TAG, "Network services (API, Reverb) will not be started.");
+        ESP_LOGW(TAG, "WiFi not connected yet: network services start as soon as it is (provisioning or reconnect).");
     }
 
     // --- Initialize NFC Controller ---
@@ -1248,6 +1351,7 @@ void startFullSystem()
     // Initialize Button Controller
     ESP_LOGI(TAG, "Initializing Button Controller...");
     buttonController.begin();
+    buttonController.setComboHoldTime(5000); // both combos: 5 s
 
     // Set up button callbacks
     buttonController.onSingleClick([](ButtonController::ButtonId button)
@@ -1301,28 +1405,37 @@ void startFullSystem()
                                });
 
     buttonController.onComboHold([]()
-                                 {
-                                         ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (1+4) - RESTARTING DEVICE!");
-                                     ledController.flash(LedController::FX_FAIL);
-                                     delay(2000);                           // Give time for LED animation
-                                     ESP.restart();                         // Restart the device
-                                 });
+    {
+        // Volume buttons held together for 5 s: forget the WiFi network (stories stay on the
+        // card), tell the user, then restart into BLE provisioning.
+        ESP_LOGW(TAG, "COMBO HOLD (1+4) - forgetting the WiFi network, restarting into provisioning");
+        ledController.flash(LedController::FX_RESET);
+        prompts.sayBlocking(Prompt::WIFI_RESET_DONE, 6000);
+        wifiProv.reset(); // clears credentials and restarts
+    });
 
     buttonController.onComboHold2([]()
-                                  {
-                                          ESP_LOGW(TAG, "COMBO HOLD TRIGGERED (2+3) - RESETTING WIFI & RESTARTING!");
-                                      ledController.flash(LedController::FX_RESET);
-                                      delay(1000);                           // Give time for LED animation
-                                      wifiProv.reset();                      // Reset WiFi provisioning
-                                      delay(1000);                           // Give time for reset
-                                      ESP.restart();                         // Restart the device
-                                  });
+    {
+        ESP_LOGW(TAG, "COMBO HOLD (2+3) - restarting");
+        ledController.flash(LedController::FX_FAIL);
+        delay(1500);
+        ESP.restart();
+    });
 
     ESP_LOGI(TAG, "Button Controller initialized successfully!");
 
     // rapid pulse LED to indicate system is ready
     ledController.flash(LedController::FX_SUCCESS);
     battery.startTask(); // ~190 ms of bit-banged I2C per poll leaves the loop
+    // Voice feedback: Turkish prompts from the SD card (docs/VOICE-PROMPTS.md)
+    prompts.begin();
+    if (!wifiProv.isProvisioned())
+    {
+        prompts.say(Prompt::SETUP_WELCOME);
+        gSetupWelcomeNextAt = millis() + 90000UL;
+        gSetupWelcomeRepeats = 1;
+    }
+
     OtaManager::getInstance().setIdleCheck([]() {
         // Flash writes stall every task for tens of ms: never while a story plays or a file is
         // being written, and not on a nearly empty cell.
@@ -1363,7 +1476,7 @@ static void deriveLedScene()
     const bool lowBattery = battery.hasTelemetry() && !battery.getChargingStatus() && battery.getBatteryPercentage() < 15.0f;
     ledController.setLowBattery(lowBattery);
 
-    if (audioController.isPlaying())
+    if (audioController.isPlaying() && !audioController.isPromptPlaying())
     {
         ledController.setScene(LedController::SCENE_PLAYING);
     }
@@ -1395,6 +1508,159 @@ static void deriveLedScene()
     else
     {
         ledController.setScene(LedController::SCENE_OFF);
+    }
+}
+
+// Start the API client + Reverb when WiFi comes up after boot (fresh provisioning, router
+// back), once the BLE provisioning stack is gone and the heap has recovered.
+static void serviceNetworkStart()
+{
+    if (gSystemPhase != PHASE_RUNNING)
+    {
+        return;
+    }
+    if (!WiFi.isConnected())
+    {
+        gWifiUpSince = 0;
+        return;
+    }
+    if (gWifiUpSince == 0)
+    {
+        gWifiUpSince = millis() ? millis() : 1;
+    }
+    if (gNetworkServicesStarted)
+    {
+        static bool healthyMarked = false;
+        if (!healthyMarked && reverb.isConnected())
+        {
+            healthyMarked = true;
+            OtaManager::getInstance().markBootHealthy();
+        }
+        return;
+    }
+    if (wifiProv.isProvisioningManagerActive() || millis() - gWifiUpSince < 2000)
+    {
+        return; // the provisioning app is still attached / BLE memory not yet released
+    }
+    if (ESP.getFreeHeap() < 55000)
+    {
+        static unsigned long lastLog = 0;
+        if (millis() - lastLog > 10000)
+        {
+            lastLog = millis();
+            ESP_LOGW(TAG, "NET: waiting for memory before starting the network services (%u free)", ESP.getFreeHeap());
+        }
+        return;
+    }
+    ESP_LOGI(TAG, "NET: WiFi is up - starting network services");
+    startNetworkServices();
+}
+
+// Voice feedback that depends on state rather than on an event.
+static void serviceUxPrompts()
+{
+    if (gSystemPhase != PHASE_RUNNING)
+    {
+        return;
+    }
+    prompts.update();
+    if (audioController.consumePlaylistEnded())
+    {
+        prompts.say(Prompt::PLAYLIST_END);
+    }
+    static unsigned long lastCheck = 0;
+    const unsigned long now = millis();
+    if (now - lastCheck < 1000)
+    {
+        return;
+    }
+    lastCheck = now;
+    const bool provisioned = wifiProv.isProvisioned();
+    // Not provisioned: repeat the invitation a few times while nobody pairs.
+    if (gSetupWelcomeNextAt && !WiFi.isConnected() && wifiProv.isProvisioningManagerActive() && (long)(now - gSetupWelcomeNextAt) >= 0)
+    {
+        if (gSetupWelcomeRepeats < 5)
+        {
+            gSetupWelcomeRepeats++;
+            gSetupWelcomeNextAt = now + 90000UL;
+            prompts.say(Prompt::SETUP_WELCOME);
+        }
+        else
+        {
+            gSetupWelcomeNextAt = 0;
+        }
+    }
+    // Provisioned boot without a figure: say hello once (3 s in, so the pogo state is settled).
+    if (!gIdleHelloDone && now - gFullSystemStartedAt > 3000)
+    {
+        gIdleHelloDone = true;
+        if (provisioned && !nfcController.isPogoSwitchActive())
+        {
+            prompts.say(Prompt::IDLE_HELLO);
+        }
+    }
+    // Provisioned but no network for a minute.
+    if (provisioned && !WiFi.isConnected() && now - gFullSystemStartedAt > 60000UL)
+    {
+        if (!gWifiLostAnnounced || now - gWifiLostAnnouncedAt > 600000UL)
+        {
+            gWifiLostAnnounced = true;
+            gWifiLostAnnouncedAt = now;
+            ReverbClient::setLastError("portakal");
+            prompts.say(Prompt::WIFI_LOST);
+            prompts.say(Prompt::WIFI_RESET_HINT);
+        }
+    }
+    else if (WiFi.isConnected())
+    {
+        gWifiLostAnnounced = false;
+    }
+    // Figure on the pogo pins but no card read within 3 s.
+    static unsigned long pogoSince = 0;
+    static bool troubleSaid = false;
+    if (nfcController.isPogoSwitchActive())
+    {
+        if (pogoSince == 0)
+        {
+            pogoSince = now;
+            troubleSaid = false;
+        }
+        if (!nfcController.isCardPresent() && !troubleSaid && now - pogoSince > 3000UL)
+        {
+            troubleSaid = true;
+            prompts.say(Prompt::NFC_READ_TROUBLE);
+        }
+    }
+    else
+    {
+        pogoSince = 0;
+    }
+}
+
+// Battery warnings on battery power: at 20 % and every 5 % below.
+static void updateBatteryUx()
+{
+    static int lastWarnStep = 100;
+    if (gSystemPhase != PHASE_RUNNING || !battery.hasTelemetry())
+    {
+        return;
+    }
+    if (battery.isVbusPresent() || battery.getChargingStatus())
+    {
+        lastWarnStep = 100;
+        return;
+    }
+    const int pct = (int)battery.getBatteryPercentage();
+    if (pct > 20)
+    {
+        lastWarnStep = 100;
+        return;
+    }
+    const int step = pct / 5; // 20 -> 4, 15 -> 3, 10 -> 2, 5 -> 1
+    if (step < lastWarnStep)
+    {
+        lastWarnStep = step;
+        prompts.say(Prompt::BATTERY_LOW);
     }
 }
 
@@ -3098,6 +3364,7 @@ void loop()
                     // acceptable "battery dead" UX. Once standby is sub-mA, restore the
                     // two-tier (deep sleep at 3.00V, ship only at 2.85V) so button-wake
                     // survives at empty.
+                    prompts.sayBlocking(Prompt::BATTERY_CRITICAL, 6000);
                     ESP_LOGW(TAG, "Disconnecting cell (ship mode) — plug USB to wake.");
                     nfcController.powerDown();   // PN532 is on the always-on rail
                     battery.enterShipMode();     // on battery power this does not return
@@ -3225,6 +3492,20 @@ void loop()
 #endif
     TT_TIMED("ota", OtaManager::getInstance().update());
     gOtaProgress = OtaManager::getInstance().inProgress() ? OtaManager::getInstance().progress() : -1;
+    if (gOtaProgress >= 0 && gLastOtaProgress < 0)
+    {
+        prompts.say(Prompt::UPDATE_START);
+    }
+    gLastOtaProgress = gOtaProgress;
+    if (OtaManager::getInstance().consumeJustUpdated())
+    {
+        prompts.say(Prompt::UPDATE_DONE);
+    }
+    if (OtaManager::getInstance().consumeJustFailed())
+    {
+        ReverbClient::setLastError("karpuz");
+        prompts.say(Prompt::UPDATE_FAILED);
+    }
     TT_TIMED("led", deriveLedScene(); ledController.update());
 
     // Update Button controller (handles button state changes and callbacks)
@@ -3241,6 +3522,9 @@ void loop()
 
     // Charge bar while docked (transient NFC/audio pulses play over it and it resumes).
     TT_TIMED("chargeux", updateChargingUx());
+    TT_TIMED("netstart", serviceNetworkStart());
+    TT_TIMED("ux", serviceUxPrompts());
+    TT_TIMED("battux", updateBatteryUx());
 
     // No sleeping while docked: charging is the toy's "plugged in" UX. resetActivity()
     // keeps the inactivity countdown cleared (silent no-op once clear), so after unplug

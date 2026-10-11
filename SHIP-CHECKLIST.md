@@ -20,7 +20,15 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 - LED task: 20 ms frames, max gap 21–28 ms in normal use (new Diag metric); ~300 ms freezes only
   during OTA flash block erases (cache off; flash auto-suspend tested, no gain, left off).
 
+## Added on the night of day 2 (1.2.2)
+- Network services start whenever WiFi comes up (fresh provisioning, router back), not only at boot.
+- LED: the charge bar is the idle picture only; pairing/connecting/loading/downloading/playing/OTA/error win.
+- Voice prompts + tones (Turkish) from the SD card, docs/VOICE-PROMPTS.md; the card needs the pack
+  (`tools/sdcard-prepare.sh /dev/diskN`). Fruit error codes in `device_report.last_error` (portal: not stored yet).
+- Volume buttons 5 s = forget WiFi; 2+3 5 s = restart.
+
 ## Remaining before ship (firmware)
+0. Out-of-box run #2 with the prompts and the pack on the card (pairing, update, first figure, buttons, sleep).
 1. Deep sleep + wake test (needs a hand: unplug the charge port, `sleep`, press a button); sleep current unknown.
 2. BLE provisioning on NimBLE (needs the mobile app once).
 3. Low-battery path: forced sleep at the critical threshold uses the coulomb-counted SOC — re-check after gauge calibration.

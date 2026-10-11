@@ -19,6 +19,12 @@ char ReverbClient::urlBuffer[128];
 char ReverbClient::headerBuffer[256];
 char ReverbClient::channelBuffer[64];
 char ReverbClient::tempBuffer[256];
+char ReverbClient::_lastError[16] = "";
+
+void ReverbClient::setLastError(const char *code)
+{
+    strlcpy(_lastError, code ? code : "", sizeof(_lastError));
+}
 ReverbClient *ReverbClient::instance = nullptr;
 
 ReverbClient &ReverbClient::getInstance()
@@ -542,6 +548,7 @@ void ReverbClient::sendDeviceReport(bool force)
                            "\"data\":{"
                            "\"device_report\":{"
                            "\"device_id\":\"%s\","
+                           "\"last_error\":\"%s\","
                            "\"battery\":{"
                            "\"status\":\"%s\","
                            "\"percent\":%.1f,"
@@ -568,6 +575,7 @@ void ReverbClient::sendDeviceReport(bool force)
                            "}",
                            channelBuffer,
                            _deviceId.c_str(),
+                           _lastError,
                            isCharging ? "charging" : "discharging",
                            batteryPercent,
                            batteryVoltage,

@@ -33,6 +33,9 @@ public:
     void disconnect();
     void forceReconnect();
     bool sendMessage(const String &message);
+    // Child-facing error code of the last problem (fruit names, see docs/VOICE-PROMPTS.md), sent in reports.
+    static void setLastError(const char *code);
+    static const char *lastError() { return _lastError; }
 
 private:
     // Private constructor for singleton
@@ -86,6 +89,7 @@ private:
     static char headerBuffer[256];
     static char channelBuffer[64];
     static char tempBuffer[256];
+    static char _lastError[16];
 
     static ReverbClient *instance;
 };

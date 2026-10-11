@@ -54,6 +54,8 @@ public:
     const Job &job() const { return _job; }
     String lastError() const { return _error; }
     void printStatus();
+    bool consumeJustUpdated();  // true once, on the boot that confirmed a new image
+    bool consumeJustFailed();   // true once after an update attempt failed
 
     // Gate for starting a download: true when the toy is idle enough for an update.
     void setIdleCheck(std::function<bool()> fn) { _idleCheck = fn; }
@@ -90,4 +92,6 @@ private:
     void confirmImage();
     bool _pendingVerify = false;
     bool _bootReported = false;
+    bool _justUpdated = false;
+    bool _justFailed = false;
 };

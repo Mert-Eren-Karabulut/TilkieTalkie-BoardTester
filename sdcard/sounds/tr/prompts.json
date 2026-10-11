@@ -1,0 +1,28 @@
+{
+  "language": "tr",
+  "voice": "Yelda",
+  "version": 1,
+  "prompts": {
+    "setup_welcome": "Merhaba! Ben Tilki. Beni internete bağlamak için telefonundaki Tilki Toki uygulamasını aç ve yeni cihaz ekle'ye dokun.",
+    "setup_connecting": "Teşekkürler! İnternete bağlanıyorum, birazcık bekle.",
+    "setup_success": "Harika, internete bağlandım! Şimdi ilk figürünü üzerime yerleştir.",
+    "setup_failed": "Bağlanamadım. Kablosuz ağ adını ve şifresini kontrol edip uygulamadan tekrar dene. Hata kodu: Üzüm.",
+    "wifi_lost": "İnternete bağlanamıyorum. Modemin açık olduğundan emin ol. Hata kodu: Portakal.",
+    "wifi_reset_hint": "Kablosuz ağın değiştiyse iki ses tuşuna birlikte beş saniye basılı tut, sonra beni uygulamadan yeniden bağla.",
+    "wifi_reset_done": "Ağ ayarlarını sildim. Şimdi beni uygulamadan yeniden bağlayabilirsin.",
+    "idle_hello": "Merhaba! Bir hikâye dinlemek için figürünü üzerime koy.",
+    "nfc_read_trouble": "Figürü okuyamadım. Lütfen kaldırıp yeniden yerleştir.",
+    "figure_no_content": "Bu figürde henüz hikâye yok. Hata kodu: Elma.",
+    "figure_offline": "Hikâyeleri şu an alamıyorum, internete bağlı değilim. Hata kodu: Armut.",
+    "download_start": "Yeni bir figür! Hikâyelerini indiriyorum, hazır olunca sana haber vereceğim.",
+    "download_done": "Hikâyelerin hazır!",
+    "download_failed": "Hikâyeleri indiremedim, birazdan yeniden deneyeceğim. Hata kodu: Kiraz.",
+    "playlist_end": "Hikâyelerin sonuna geldik. Baştan dinlemek için figürü kaldırıp yeniden koy.",
+    "battery_low": "Şarjım azalıyor, beni şarja takar mısın?",
+    "battery_critical": "Şarjım bitti, uyuyorum. Beni şarja tak.",
+    "charge_full": "Şarjım doldu!",
+    "update_start": "Kendimi güncelliyorum, birkaç dakika sürebilir. Bu sırada beni kapatma.",
+    "update_done": "Güncelleme tamamlandı!",
+    "update_failed": "Güncelleme başarısız oldu, daha sonra yeniden deneyeceğim. Hata kodu: Karpuz."
+  }
+}

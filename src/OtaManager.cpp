@@ -148,7 +148,7 @@ void OtaManager::setState(State s, int progress, const String &error)
     {
     case DOWNLOADING: status = "downloading"; break;
     case APPLYING: status = "applying"; break;
-    case FAILED: status = "failed"; break;
+    case FAILED: status = "failed"; _justFailed = true; break;
     default: break;
     }
     if (status)
@@ -522,6 +522,7 @@ void OtaManager::update()
             if (ok)
             {
                 cfg.storeInt(NVS_OTA_LAST_REL, (int)rel);
+                _justUpdated = true;
             }
             postStatus(ok ? "success" : "rolled_back", 100,
                        ok ? String()
@@ -594,4 +595,18 @@ void OtaManager::printStatus()
     }
     Serial.printf("OTA: next periodic check in %ld s, crash resets in a row %u, network %s\n",
                   (long)((long)_nextCheckAt - (long)millis()) / 1000, (unsigned)g_otaCrashCount, _networkHealthy ? "ok" : "not yet");
+}
+
+bool OtaManager::consumeJustUpdated()
+{
+    const bool v = _justUpdated;
+    _justUpdated = false;
+    return v;
+}
+
+bool OtaManager::consumeJustFailed()
+{
+    const bool v = _justFailed;
+    _justFailed = false;
+    return v;
 }

@@ -2,6 +2,7 @@
 #define WIFI_PROVISIONING_H
 
 #include <WiFiProv.h>
+#include <functional>
 #include <WiFi.h>
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
@@ -38,6 +39,12 @@ public:
     
     // Callback for provisioning events
     void handleProvisioningEvent(arduino_event_t *sys_event);
+
+    enum class ProvEvent { CRED_RECV, CRED_FAIL, CRED_SUCCESS, ENDED };
+    // Runs on the WiFi event task: keep it short (queue work for the loop).
+    void onProvisioningEvent(std::function<void(ProvEvent)> cb) { eventCb = cb; }
+private:
+    std::function<void(ProvEvent)> eventCb;
 };
 
 #endif

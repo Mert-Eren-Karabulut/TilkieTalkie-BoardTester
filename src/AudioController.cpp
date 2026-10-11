@@ -406,6 +406,19 @@ bool AudioController::play(const String& filePath) {
             break;
         }
 
+        if (!startingPrompt) {
+            if (isPromptPlaying()) {
+                // Let the prompt finish its sentence; update() starts the story right after.
+                deferredPlayPath = filePath;
+                deferredPlayPending = true;
+                Serial.printf("AudioController: story %s waits for the prompt to finish\n", filePath.c_str());
+                success = true;
+                break;
+            }
+            transientPlayback = false; // a story start abandons any prompt bookkeeping
+            resumeAfterPrompt = false;
+        }
+
         if (currentState != STOPPED) {
             stop();
         }
@@ -675,6 +688,7 @@ int AudioController::getVolumeCeiling() const {
 
 // Playlist management methods
 void AudioController::setPlaylist(const std::vector<String>& trackPaths, const String& figureUid) {
+    resumeAfterPrompt = false;
     bool taskSuspended = suspendBackgroundTaskForControl();
     playlist = trackPaths;
     playlistFigureUid = figureUid;
@@ -729,6 +743,8 @@ void AudioController::mergePlaylist(const std::vector<String>& trackPaths, const
 }
 
 void AudioController::clearPlaylist() {
+    resumeAfterPrompt = false;
+    deferredPlayPending = false;
     bool taskSuspended = suspendBackgroundTaskForControl();
     playlist.clear();
     currentPlaylistIndex = -1;
@@ -771,6 +787,7 @@ bool AudioController::nextTrack() {
     if (currentPlaylistIndex >= (int)playlist.size()) {
         Serial.println("AudioController: Reached end of playlist");
         playlistFinished = true;
+        playlistEnded = true;
         stop();
         return false;
     }
@@ -842,9 +859,50 @@ void AudioController::finishTrack() {
     const bool wasTransient = transientPlayback;
     stop();
     transientPlayback = false;
-    if (!wasTransient && hasPlaylist() && !playlistFinished) {
+    if (wasTransient) {
+        promptEnded = true; // the loop task resumes the interrupted track (update())
+        return;
+    }
+    if (hasPlaylist() && !playlistFinished) {
         nextTrack();
     }
+}
+
+bool AudioController::playPrompt(const String& filePath) {
+    if (!initialized) {
+        return false;
+    }
+    if (!fileManager.fileExists(filePath)) {
+        Serial.printf("AudioController: prompt file missing: %s\n", filePath.c_str());
+        return false;
+    }
+    if (isPromptPlaying()) {
+        return false; // one at a time; VoicePrompts queues the rest
+    }
+    resumeAfterPrompt = false;
+    if ((currentState == PLAYING || currentState == PAUSED) && !currentTrackPath.isEmpty()) {
+        resumeTrackPath = currentTrackPath;
+        resumeSeconds = getCurrentTrackSeconds();
+        resumeAsPaused = (currentState == PAUSED);
+        resumeAfterPrompt = true;
+    }
+    promptEnded = false;
+    transientPlayback = true;
+    startingPrompt = true;
+    const bool ok = play(filePath);
+    startingPrompt = false;
+    if (!ok) {
+        transientPlayback = false;
+        resumeAfterPrompt = false;
+        return false;
+    }
+    return true;
+}
+
+bool AudioController::consumePlaylistEnded() {
+    const bool v = playlistEnded;
+    playlistEnded = false;
+    return v;
 }
 
 void AudioController::updatePlaybackSlice() {
@@ -886,6 +944,26 @@ void AudioController::update() {
     if (volumeDirty && millis() - volumeDirtyAt > 2000) {
         ConfigManager::getInstance().storeInt("audio_volume", currentVolume);
         volumeDirty = false;
+    }
+    if (promptEnded) {
+        promptEnded = false;
+        if (deferredPlayPending) {
+            deferredPlayPending = false;
+            resumeAfterPrompt = false;
+            const String path = deferredPlayPath;
+            play(path);
+        } else if (resumeAfterPrompt) {
+            resumeAfterPrompt = false;
+            const bool figureStillThere = playlist.empty() || isNfcSessionActive(playlistFigureUid);
+            if (figureStillThere && fileManager.fileExists(resumeTrackPath) && play(resumeTrackPath)) {
+                if (resumeSeconds > 1.0f) {
+                    seekTo(resumeSeconds);
+                }
+                if (resumeAsPaused) {
+                    pause();
+                }
+            }
+        }
     }
     pollHeadphone();
     if (!audioTaskHandle) {
