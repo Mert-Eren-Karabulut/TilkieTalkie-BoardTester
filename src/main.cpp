@@ -1128,6 +1128,7 @@ void setup()
     // of brown-out looping at WiFi bring-up. ---
     ESP_LOGI(TAG, "Initializing LED Controller...");
     ledController.begin();
+    ledController.setScene(LedController::SCENE_BOOT); // "waking up" from the first second
     OtaManager::getInstance().begin();
 
     ESP_LOGI(TAG, "Initializing Sleep Controller...");
@@ -1268,19 +1269,6 @@ void startFullSystem()
     });
 
     // Initialize WiFi provisioning (the battery is verified able to buffer RF inrush).
-    ESP_LOGI(TAG, "Initializing WiFi...");
-    wifiProv.onProvisioningEvent([](WiFiProvisioningManager::ProvEvent ev) {
-        switch (ev)
-        {
-        case WiFiProvisioningManager::ProvEvent::CRED_RECV: prompts.say(Prompt::SETUP_CONNECTING); break;
-        case WiFiProvisioningManager::ProvEvent::CRED_FAIL: prompts.say(Prompt::SETUP_FAILED); break;
-        case WiFiProvisioningManager::ProvEvent::ENDED:
-            if (WiFi.isConnected()) prompts.say(Prompt::SETUP_SUCCESS);
-            break;
-        default: break;
-        }
-    });
-    wifiProv.begin();
 
     // Initialize audio controller
     if (!audioController.begin())
@@ -1289,51 +1277,12 @@ void startFullSystem()
         ESP_LOGW(TAG, "Audio functionality will not be available.");
     }
 
-    // --- Initialize Reverb Client ---
-    ESP_LOGI(TAG, "Initializing Reverb WebSocket Client...");
-
-    // Wait for WiFi to connect before starting Reverb client
-    unsigned long wifi_timeout = millis() + 5000; // 5 second timeout
-    while (!WiFi.isConnected() && millis() < wifi_timeout)
-    {
-        delay(500);
-        ESP_LOGI(TAG, ".");
-    }
-    ESP_LOGI(TAG, "");
-
-    if (WiFi.isConnected())
-    {
-        startNetworkServices();
-    }
-    else
-    {
-        ESP_LOGW(TAG, "WiFi not connected yet: network services start as soon as it is (provisioning or reconnect).");
-    }
+    // Network services (API client, Reverb) are started by serviceNetworkStart() in the loop
+    // as soon as WiFi has an IP - nothing here waits for the network.
 
     // --- Initialize NFC Controller ---
     ESP_LOGI(TAG, "Initializing NFC Controller...");
 
-    // If network is available, wait for Reverb to connect before proceeding
-    if (WiFi.isConnected())
-    {
-        ESP_LOGI(TAG, "Network available, waiting for Reverb to connect...");
-        unsigned long reverbTimeout = millis() + 10000; // 10 second timeout
-        while (!reverb.isConnected() && millis() < reverbTimeout)
-        {
-            reverb.update(); // Keep updating Reverb to help it connect
-            delay(100);
-        }
-
-        if (reverb.isConnected())
-        {
-            ESP_LOGI(TAG, "Reverb connected successfully!");
-            OtaManager::getInstance().markBootHealthy();
-        }
-        else
-        {
-            ESP_LOGW(TAG, "Reverb connection timeout, proceeding anyway");
-        }
-    }
 
     if (nfcController.begin())
     {
@@ -1435,6 +1384,20 @@ void startFullSystem()
     // rapid pulse LED to indicate system is ready
     ledController.flash(LedController::FX_SUCCESS);
     battery.startTask(); // ~190 ms of bit-banged I2C per poll leaves the loop
+    ESP_LOGI(TAG, "Initializing WiFi...");
+    wifiProv.onProvisioningEvent([](WiFiProvisioningManager::ProvEvent ev) {
+        switch (ev)
+        {
+        case WiFiProvisioningManager::ProvEvent::CRED_RECV: prompts.say(Prompt::SETUP_CONNECTING); break;
+        case WiFiProvisioningManager::ProvEvent::CRED_FAIL: prompts.say(Prompt::SETUP_FAILED); break;
+        case WiFiProvisioningManager::ProvEvent::ENDED:
+            if (WiFi.isConnected()) prompts.say(Prompt::SETUP_SUCCESS);
+            break;
+        default: break;
+        }
+    });
+    wifiProv.begin();
+
     // Voice feedback: Turkish prompts from the SD card (docs/VOICE-PROMPTS.md)
     prompts.begin();
     if (!wifiProv.isProvisioned())

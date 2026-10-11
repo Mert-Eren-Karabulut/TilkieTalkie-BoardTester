@@ -451,8 +451,8 @@ bool FileManager::writeFileNow(const char* path, const char* data, size_t len) {
 
 void FileManager::sdMaintenanceTask(void* parameter) {
     FileManager* self = static_cast<FileManager*>(parameter);
-    // First free-space count of this boot: with CONFIG_FATFS_DONT_TRUST_FREE_CLUSTER_CNT the
-    // FAT is scanned (hundreds of ms to seconds on a slow card) - here, never on the loop task.
+    // First free-space count of this boot. FatFS trusts the card's FSInfo record (a full FAT
+    // scan of a 30 GB card took 5.5 s and, through the filesystem lock, stalled the boot).
     self->freeRefreshInFlight = true;
     self->refreshFreeSpaceCache();
     self->freeRefreshInFlight = false;

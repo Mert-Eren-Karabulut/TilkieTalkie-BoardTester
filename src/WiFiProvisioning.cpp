@@ -97,51 +97,14 @@ void WiFiProvisioningManager::begin() {
         }
         
         // BLE is automatically disabled by the library when device is provisioned
-        // Try to connect with existing credentials
+        // Connect in the background: the loop (serviceNetworkStart) starts the API client and
+        // Reverb once there is an IP, and handleBackgroundReconnection() retries. Nothing waits
+        // here any more - a wake-up must light the LEDs and play a cached story in seconds.
         WiFi.begin();
-        
-        // Wait for connection attempt with longer timeout
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 60) { // Increased to 30 seconds
-            delay(500);
-            Serial.print(".");
-            attempts++;
-            
-            // Every 10 seconds, show status
-            if (attempts % 20 == 0) {
-                Serial.printf("\nConnection attempt %d/60, WiFi status: %d\n", attempts, WiFi.status());
-            }
-        }
-        
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("\n✅ Connected to WiFi with stored credentials!");
-            Serial.print("IP Address: ");
-            Serial.println(WiFi.localIP());
-            Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
-            Serial.printf("Signal strength: %d dBm\n", WiFi.RSSI());
-            Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
-        } else {
-            Serial.println("\n❌ Connection failed with stored credentials.");
-            Serial.printf("WiFi status: %d\n", WiFi.status());
-            Serial.println("This could indicate:");
-            Serial.println("1. WiFi network is not available");
-            Serial.println("2. Credentials are corrupted");
-            Serial.println("3. Router settings changed");
-            Serial.println("Will continue retrying in background. Use 'reset' command to reprovision.");
-
-            // We already know the device is provisioned, so the provisioning manager
-            // no longer needs to stay active while background reconnects use WiFi.begin().
-            wifi_prov_mgr_deinit();
-            provisioningManagerInitialized = false;
-            Serial.println("Provisioning manager deinitialized after failed initial connect.");
-        }
-
-        // Deinitialize manager if connected (saves memory)
-        if (WiFi.isConnected()) {
-            wifi_prov_mgr_deinit();
-            provisioningManagerInitialized = false;
-            Serial.println("Provisioning manager deinitialized - memory freed for HTTPS/WebSocket");
-        }
+        Serial.println("Connecting to WiFi in the background...");
+        // The manager is only needed to provision; release it (and its memory) right away.
+        wifi_prov_mgr_deinit();
+        provisioningManagerInitialized = false;
     } else {
         // Device not provisioned - start provisioning
         Serial.println("Device not provisioned - starting BLE provisioning...");
@@ -318,29 +281,18 @@ void WiFiProvisioningManager::handleBackgroundReconnection() {
         return;
     }
     
-    // Attempt reconnection every 30 seconds
+    // Retry without blocking: every 10 s until the first connection of this boot, then every
+    // 30 s. The WiFi driver reports the result through the events; nothing is waited for here.
+    static bool connectedOnce = false;
     unsigned long currentTime = millis();
-    if (currentTime - lastReconnectAttempt >= 30000) {
+    const unsigned long interval = connectedOnce ? 30000UL : 10000UL;
+    if (currentTime - lastReconnectAttempt >= interval) {
         lastReconnectAttempt = currentTime;
-        
-        Serial.println("Attempting WiFi reconnection with stored credentials...");
+        Serial.println("Attempting WiFi reconnection with stored credentials (background)...");
         WiFi.begin(); // Use stored credentials
-        
-        // Brief wait to see if connection succeeds quickly
-        int quickAttempts = 0;
-        while (WiFi.status() != WL_CONNECTED && quickAttempts < 10) {
-            delay(500);
-            quickAttempts++;
-        }
-        
-        if (WiFi.isConnected()) {
-            Serial.println("✅ WiFi reconnected successfully!");
-            Serial.print("IP Address: ");
-            Serial.println(WiFi.localIP());
-        } else {
-            Serial.println("⚠️ Reconnection attempt failed. Will retry in 30 seconds.");
-            Serial.println("   Use 'reset' command to clear credentials and reprovision.");
-        }
+    }
+    if (WiFi.isConnected()) {
+        connectedOnce = true;
     }
 }
 
