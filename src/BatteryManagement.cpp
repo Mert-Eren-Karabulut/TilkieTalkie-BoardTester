@@ -1056,6 +1056,19 @@ bool BatteryManager::verifyChargerVoltageSetting() {
     return chargerVoltageVerified;
 }
 
+void BatteryManager::printChargeMonitorLine(unsigned long t) {
+    refreshDiagnostics();
+    uint8_t chg = (chargerStatus1 >> 5) & 0x07;
+    Serial.printf("CM t=%3lus VBUS=%.2f SYS=%.2f PACK=%.3f CELL=%.3f I=%+dmA chg=%u(%s) st0=0x%02x st1=0x%02x st2=0x%02x "
+                  "fault=%02x/%02x flag=%02x/%02x/%02x/%02x ffl=%02x/%02x gop=0x%04x FET C/D=%d/%d XCHG=%d XDSG=%d T=%.1f\n",
+                  t, currentVbusVoltage, currentSystemVoltage, gaugePackVoltageMillivolts / 1000.0f,
+                  gaugeBatVoltageMillivolts / 1000.0f, currentBatteryCurrentMilliAmps, chg, chargerStateToString(chg),
+                  chargerStatus0, chargerStatus1, chargerStatus2, chargerFaultStatus0, chargerFaultStatus1,
+                  chargerFlag0, chargerFlag1, chargerFlag2, chargerFlag3, chargerFaultFlag0, chargerFaultFlag1,
+                  gaugeOperationStatus, (gaugeOperationStatus & 0x0004) ? 1 : 0, (gaugeOperationStatus & 0x0002) ? 1 : 0,
+                  (gaugeOperationStatus & 0x4000) ? 1 : 0, (gaugeOperationStatus & 0x2000) ? 1 : 0, currentTemperatureCelsius);
+}
+
 bool BatteryManager::isChargeDone() const {
     return chargerPresent && ((chargerStatus1 >> 5) & 0x07) == 0x07;
 }
@@ -1649,8 +1662,25 @@ bool BatteryManager::updateGaugeMeasurements(bool full) {
     // pack path, whenever the gauge's full-charge capacity is implausible.
     gaugeSocTrusted = fullChargeCapacity >= 1000;
     if (!gaugeSocTrusted) {
-        const float ocv = currentVoltage - (batteryCurrent / 1000.0f) * 0.10f;
-        currentPercentage = voltageToPercentage(ocv);
+        // Coulomb counting on the gauge's (accurate) current, anchored on the LFP OCV curve
+        // whenever the pack has rested for two minutes, 100 % when the charger terminates.
+        // The flat LFP curve makes a pure voltage estimate swing with every 50 mA of load.
+        const unsigned long now = millis();
+        const float hours = ccLastMs ? (now - ccLastMs) / 3600000.0f : 0.0f;
+        ccLastMs = now;
+        const bool resting = batteryCurrent > -25 && batteryCurrent < 25;
+        if (resting) { if (!ccRestSince) ccRestSince = now; } else { ccRestSince = 0; }
+        const float ocvPercent = voltageToPercentage(currentVoltage - (batteryCurrent / 1000.0f) * 0.10f);
+        if (ccSocPercent < 0.0f || (resting && now - ccRestSince > 120000UL)) {
+            ccSocPercent = ocvPercent;
+        } else {
+            ccSocPercent += (batteryCurrent * hours) / (float)DEFAULT_GAUGE_DESIGN_CAPACITY_MAH * 100.0f;
+        }
+        if (isChargeDone()) {
+            ccSocPercent = 100.0f;
+        }
+        ccSocPercent = constrain(ccSocPercent, 0.0f, 100.0f);
+        currentPercentage = ccSocPercent;
     }
     currentTemperatureCelsius = tempC;
     currentBatteryCurrentMilliAmps = batteryCurrent;

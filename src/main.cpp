@@ -2096,6 +2096,21 @@ void loop()
         {
             audioController.printStatus();
         }
+        else if (command.startsWith("chargemon"))
+        {
+            // chargemon [seconds]: one line per second of charger + gauge state (blocks the loop)
+            String arg = command.substring(9);
+            arg.trim();
+            int seconds = arg.isEmpty() ? 30 : arg.toInt();
+            if (seconds < 1) seconds = 1;
+            if (seconds > 300) seconds = 300;
+            unsigned long start = millis();
+            for (int i = 0; i < seconds; ++i)
+            {
+                battery.printChargeMonitorLine((millis() - start) / 1000);
+                delay(1000);
+            }
+        }
         else if (command == "crash")
         {
             ESP_LOGE(TAG, "crash requested from the console (panic)");

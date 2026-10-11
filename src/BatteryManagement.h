@@ -206,8 +206,8 @@ private:
     static const uint16_t DEFAULT_GAUGE_CHARGING_VOLTAGE_MV = 3600;  // LiFePO4 1S charge voltage (all temp zones)
     // SLUA777 §3 relationship: Taper > Dsg/Chg current threshold > Quit; Quit < C/20.
     // 4000mAh: C/10=400, C/20=200. Taper 200mA, Dsg 100, Chg 75, Quit 40.
-    static const uint16_t DEFAULT_GAUGE_TAPER_CURRENT_MA = 250;    // TRM default; must stay above the charger ITERM (120 mA)
-    static const uint16_t DEFAULT_GAUGE_CHARGE_TERM_VOLTAGE_MV = 100; // valid termination needs cell + this >= Charging Voltage
+    static const uint16_t DEFAULT_GAUGE_TAPER_CURRENT_MA = 100;    // below the charger ITERM (120 mA): the charger ends the charge, the gauge only confirms it
+    static const uint16_t DEFAULT_GAUGE_CHARGE_TERM_VOLTAGE_MV = 25;  // valid termination needs cell >= 3575 mV: the ~0.2 ohm pack path put the cell at 3.5 V while the charger sat at 3.6 V, and the gauge called that full
     static const uint16_t DEFAULT_GAUGE_VOLTAGE_RANGE_LOW_MV = 2900;
     static const uint16_t DEFAULT_GAUGE_VOLTAGE_RANGE_MED_MV = 3300;
     static const uint16_t DEFAULT_GAUGE_VOLTAGE_RANGE_HIGH_MV = 3450;
@@ -255,7 +255,10 @@ private:
     float currentPercentage;
     float currentTemperatureCelsius;
     uint32_t implausibleGaugeReads = 0;  // polls rejected by the plausibility check
-    bool gaugeSocTrusted = false;         // false: percentage comes from the LFP voltage curve
+    bool gaugeSocTrusted = false;         // false: percentage comes from coulomb counting anchored on the LFP OCV curve
+    float ccSocPercent = -1.0f;           // coulomb-counted SOC while the gauge is unlearned
+    unsigned long ccLastMs = 0;
+    unsigned long ccRestSince = 0;
     uint8_t rt6160MissCount = 0;          // consecutive failed presence probes
     uint8_t chargerMissCount = 0;
     uint8_t gaugeMissCount = 0;
@@ -477,6 +480,7 @@ public:
     // temperature guard (datasheet charge window 0-60°C).
     float getTemperatureC() const { return currentTemperatureCelsius; }
     bool isGaugeSocTrusted() const { return gaugeSocTrusted; }
+    void printChargeMonitorLine(unsigned long t);  // one compact diagnostic line (full poll)
     int getBatteryCurrentMilliAmps() const { return currentBatteryCurrentMilliAmps; } // + charging, - discharging
     // Input current limit (IINDPM, REG06). 0 = clear override, restore the default and
     // let ICO adapt. Sticky against the periodic charger reconfiguration.
