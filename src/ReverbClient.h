@@ -74,6 +74,10 @@ private:
     unsigned long _lastReportAt = 0;
     unsigned long _lastPositionReportAt = 0;
     String _lastReportSignature;
+    float _lastReportedPercent = -100.0f;
+    float _lastReportedVoltage = 0.0f;
+    int _lastReportedRssi = 0;
+    uint32_t _lastReportedSdFree = 0;
     bool _reportDue = false;
     
     // Pre-allocated static buffers to reduce heap fragmentation

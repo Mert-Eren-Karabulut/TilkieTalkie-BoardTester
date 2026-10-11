@@ -73,7 +73,7 @@ BT controller memory release when booting already provisioned (needs reboot-into
 6. Console: table-driven, dangerous commands (`sdformat`, `pdvolt 20`, `gaugeprog`, `learndis`, `poweroff`, `factory`) behind a factory/dev flag; no unbounded `while(!Serial.available())`.
 7. Release hygiene: `-O2`, log levels, TWDT panic once blocking calls are gone, `BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP`.
 
-### D. Battery (needs owner/hardware input)
+### D. Battery (needs owner/hardware input) — charger input policy fixed 2026-10-12 (see NIGHT-REPORT day 2); SOC falls back to the LFP voltage curve until the gauge is calibrated
 1. EV2400 + bqStudio: run GPCCHEM (the ESP can record the discharge log), program the LFP Chem ID, calibrate CC gain against a reference current, run the learning cycle (procedure in the audit §3.6), export the golden image; firmware replays the `.df.fs` per unit at the factory.
 2. Fallback if no EV2400: firmware-side SoC from coulomb counting + LFP rest-voltage table.
 3. Fix `learndis`/`learnrest` (floor above Term Voltage, charging re-enabled at floor, rest under load).

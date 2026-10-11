@@ -255,6 +255,10 @@ private:
     float currentPercentage;
     float currentTemperatureCelsius;
     uint32_t implausibleGaugeReads = 0;  // polls rejected by the plausibility check
+    bool gaugeSocTrusted = false;         // false: percentage comes from the LFP voltage curve
+    uint8_t rt6160MissCount = 0;          // consecutive failed presence probes
+    uint8_t chargerMissCount = 0;
+    uint8_t gaugeMissCount = 0;
     float currentSystemVoltage;
     float currentVbusVoltage;
     int currentBatteryCurrentMilliAmps;
@@ -472,6 +476,8 @@ public:
     // Cell temperature from the gauge's TS1 thermistor (°C) — drives the charge-current
     // temperature guard (datasheet charge window 0-60°C).
     float getTemperatureC() const { return currentTemperatureCelsius; }
+    bool isGaugeSocTrusted() const { return gaugeSocTrusted; }
+    int getBatteryCurrentMilliAmps() const { return currentBatteryCurrentMilliAmps; } // + charging, - discharging
     // Input current limit (IINDPM, REG06). 0 = clear override, restore the default and
     // let ICO adapt. Sticky against the periodic charger reconfiguration.
     bool setInputCurrentLimit(uint16_t milliAmps);

@@ -1,5 +1,6 @@
 #include "SleepController.h"
 #include "AudioController.h"
+#include "BatteryManagement.h"
 #include "FileManager.h"
 #include "Buttons.h"
 #include <esp_log.h>
@@ -115,6 +116,22 @@ bool SleepController::canEnterSleep() {
     
     FileManager& fileManager = FileManager::getInstance();
     AudioController& audio = AudioController::getInstance();
+
+    // Plugged in = awake. A docked toy shows its charge bar and stays reachable even when the
+    // cell is full; sleeping on USB power also left the gauge without rest periods it needs.
+    // Presence is debounced: the status bit blinks off while the battery task re-scans the bus
+    // every 5 s, so VBUS has to be gone for 30 s (status bit AND the VBUS ADC) before sleep.
+    {
+        BatteryManager& battery = BatteryManager::getInstance();
+        static unsigned long lastVbusSeenAt = 0;
+        if (battery.isVbusPresent() || battery.getVbusVoltage() > 4.0f) {
+            lastVbusSeenAt = currentTime == 0 ? 1 : currentTime;
+        }
+        if (lastVbusSeenAt != 0 && currentTime - lastVbusSeenAt < 30000UL) {
+            lastCheckResult = false;
+            return false;
+        }
+    }
     
     // Only an in-flight transfer holds off sleep. A non-empty queue must not: with WiFi down
     // or the server unreachable it would keep a battery-powered toy awake until the cell

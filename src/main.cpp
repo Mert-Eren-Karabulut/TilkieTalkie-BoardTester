@@ -762,25 +762,48 @@ static void superviseChargerOnUsb()
     static bool chargeSuspendedByTemp = false;
     static int tempOutOfWindowPolls = 0;
     static bool tempDerated = false;
+    // Input budget for sources without a PD contract. The charger's POR default (3.3 A + ICO
+    // probing upwards) collapses weak 5 V adapters and power banks: VBUS drops out, the charger
+    // stops, the source recovers, and the cycle repeats every few seconds (the red STAT LED
+    // blinking). 1 A is enough for the 1 A charge current of a 1S LiFePO4 pack, and a source
+    // that still drops out gets the limit halved for the rest of the session.
+    static uint16_t nonPdInputLimitMa = 1000;
+    static bool nonPdLimitApplied = false;
+    static uint8_t vbusDropouts = 0;
+    static unsigned long firstDropoutAt = 0;
 
     if (!battery.isVbusPresent())
     {
         if (wasVbusPresent)
         {
-            // Session ended: drop any PD-budget input limit and re-enable ICO so the
-            // next (possibly weaker, non-PD) source starts from default + adaptation.
             wasVbusPresent = false;
-            battery.setInputCurrentLimit(0);
-            battery.setIcoEnabled(true);
+            nonPdLimitApplied = false;
+            if (firstDropoutAt == 0 || millis() - firstDropoutAt > 120000UL)
+            {
+                firstDropoutAt = millis();
+                vbusDropouts = 0;
+            }
+            if (++vbusDropouts >= 3 && nonPdInputLimitMa > 500)
+            {
+                nonPdInputLimitMa = 500;
+                vbusDropouts = 0;
+                ESP_LOGW(TAG, "CHARGER: the source dropped out three times in two minutes - non-PD input limit now %u mA", nonPdInputLimitMa);
+            }
+            // The next session starts from the conservative budget, never from the 3.3 A default.
+            battery.setInputCurrentLimit(nonPdInputLimitMa);
+            battery.setIcoEnabled(false);
         }
         return;
     }
     if (!wasVbusPresent)
     {
-        // New VBUS session: give the CH224Q a few polls to finish its handshake.
+        // New VBUS session: conservative budget right away, then give the CH224Q a few polls
+        // to report a PD contract that may raise it.
         wasVbusPresent = true;
         pdBudgetChecksLeft = 5;
         lastPdBudgetCheck = 0;
+        battery.setInputCurrentLimit(nonPdInputLimitMa);
+        battery.setIcoEnabled(false);
     }
 
     if (gBringupPhase != BRINGUP_INACTIVE || gLearnDischarge || !battery.hasTelemetry())
@@ -884,16 +907,51 @@ static void superviseChargerOnUsb()
             }
             pdBudgetChecksLeft = 0;
         }
+        else if (pdBudgetChecksLeft == 0 && !nonPdLimitApplied)
+        {
+            nonPdLimitApplied = true;
+            ESP_LOGI(TAG, "CHARGER: no PD contract - input limit %u mA, ICO off.", nonPdInputLimitMa);
+        }
     }
 
     // Never "kick" after Charge Done: toggling EN_CHG there starts a fresh CC/CV cycle every
-    // 10 s, so the cell never rests at full (which the gauge needs to learn capacity).
-    if (!battery.getChargingStatus() && !battery.isChargeDone() && millis() - lastChargeKick > 10000)
+    // 10 s, so the cell never rests at full (which the gauge needs to learn capacity). The gauge
+    // is not calibrated (SOC reads 0 %), so "full" is judged from the cell: a LiFePO4 cell that
+    // rests at or above 3.40 V with no current is above ~95 %. And a charger that drops out
+    // three times in a row is not going to be fixed by a fourth kick: back off for an hour.
+    static uint8_t kicksInRow = 0;
+    static unsigned long kickBackoffUntil = 0;
+    const bool cellLooksFull = v >= 3.40f && fabsf((float)battery.getBatteryCurrentMilliAmps()) < 60.0f;
+    if (battery.getChargingStatus() && millis() - lastChargeKick > 60000)
+    {
+        kicksInRow = 0; // a full minute of charging after a kick: the kicks were useful
+    }
+    static unsigned long notChargingSince = 0;
+    if (battery.getChargingStatus())
+    {
+        notChargingSince = 0;
+    }
+    else if (notChargingSince == 0)
+    {
+        notChargingSince = millis();
+    }
+    const bool offLongEnough = notChargingSince != 0 && millis() - notChargingSince > 20000; // gauge sample is fresh by then
+    if (offLongEnough && !battery.isChargeDone() && !cellLooksFull &&
+        millis() >= kickBackoffUntil && millis() - lastChargeKick > 10000)
     {
         lastChargeKick = millis();
-        ESP_LOGW(TAG, "CHARGER: USB present but not charging — clearing faults + kicking charger.");
-        battery.clearChargerFaultHistory();
-        battery.restartChargeCycle();
+        if (++kicksInRow > 3)
+        {
+            kicksInRow = 0;
+            kickBackoffUntil = millis() + 60UL * 60UL * 1000UL;
+            ESP_LOGW(TAG, "CHARGER: three kicks did not keep the charger on (%.3fV) — backing off for an hour.", v);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "CHARGER: USB present but not charging — clearing faults + kicking charger (%u/3).", kicksInRow);
+            battery.clearChargerFaultHistory();
+            battery.restartChargeCycle();
+        }
     }
 }
 

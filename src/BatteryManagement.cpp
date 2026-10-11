@@ -586,23 +586,36 @@ void BatteryManager::refreshBatteryState() {
 }
 
 void BatteryManager::refreshDevicePresence() {
-    rt6160Present = probeDevice(RT6160_ADDRESS);
-    chargerPresent = probeDevice(BQ25792_ADDRESS);
-    if (!chargerPresent && !probeDevice(BQ28Z610_PRIMARY_ADDRESS) && !probeDevice(BQ28Z610_FALLBACK_ADDRESS)) {
+    // A single failed probe on the bit-banged bus is noise, not a missing chip: presence only
+    // drops after three misses in a row. A transient "charger absent" used to look like a USB
+    // session end (input budget reset, sleep countdown, extra reports) every few minutes.
+    bool rt6160Now = probeDevice(RT6160_ADDRESS);
+    bool chargerNow = probeDevice(BQ25792_ADDRESS);
+    bool gaugePrimaryNow = probeDevice(BQ28Z610_PRIMARY_ADDRESS);
+    bool gaugeFallbackNow = !gaugePrimaryNow && probeDevice(BQ28Z610_FALLBACK_ADDRESS);
+    if (!chargerNow && !gaugePrimaryNow && !gaugeFallbackNow) {
         // Nothing answers: assume a wedged bus rather than three missing chips, recover, retry once.
         i2cBusRecover();
-        rt6160Present = probeDevice(RT6160_ADDRESS);
-        chargerPresent = probeDevice(BQ25792_ADDRESS);
+        rt6160Now = probeDevice(RT6160_ADDRESS);
+        chargerNow = probeDevice(BQ25792_ADDRESS);
+        gaugePrimaryNow = probeDevice(BQ28Z610_PRIMARY_ADDRESS);
+        gaugeFallbackNow = !gaugePrimaryNow && probeDevice(BQ28Z610_FALLBACK_ADDRESS);
     }
+    rt6160MissCount = rt6160Now ? 0 : (uint8_t)(rt6160MissCount < 255 ? rt6160MissCount + 1 : 255);
+    chargerMissCount = chargerNow ? 0 : (uint8_t)(chargerMissCount < 255 ? chargerMissCount + 1 : 255);
+    gaugeMissCount = (gaugePrimaryNow || gaugeFallbackNow) ? 0 : (uint8_t)(gaugeMissCount < 255 ? gaugeMissCount + 1 : 255);
 
-    gaugePresent = false;
-    gaugeAddress = BQ28Z610_PRIMARY_ADDRESS;
-    if (probeDevice(BQ28Z610_PRIMARY_ADDRESS)) {
+    if (rt6160Now) rt6160Present = true; else if (rt6160MissCount >= 3) rt6160Present = false;
+    if (chargerNow) chargerPresent = true; else if (chargerMissCount >= 3) chargerPresent = false;
+    if (gaugePrimaryNow) {
         gaugePresent = true;
         gaugeAddress = BQ28Z610_PRIMARY_ADDRESS;
-    } else if (probeDevice(BQ28Z610_FALLBACK_ADDRESS)) {
+    } else if (gaugeFallbackNow) {
         gaugePresent = true;
         gaugeAddress = BQ28Z610_FALLBACK_ADDRESS;
+    } else if (gaugeMissCount >= 3) {
+        gaugePresent = false;
+        gaugeAddress = BQ28Z610_PRIMARY_ADDRESS;
     }
 }
 
@@ -1630,6 +1643,15 @@ bool BatteryManager::updateGaugeMeasurements(bool full) {
 
     currentVoltage = voltageMillivolts / 1000.0f;
     currentPercentage = constrain(relativeStateOfCharge > 100 ? (relativeStateOfCharge & 0xFF) : relativeStateOfCharge, 0, 100);
+    // The gauge still runs the Li-ion default chemistry and has not learned this pack (FCC of
+    // ~100 mAh against a 4000 mAh design, "fully discharged" at 3.25 V): until it is calibrated
+    // its SOC is meaningless. Fall back to the LFP open-circuit curve, corrected for the ~100 mOhm
+    // pack path, whenever the gauge's full-charge capacity is implausible.
+    gaugeSocTrusted = fullChargeCapacity >= 1000;
+    if (!gaugeSocTrusted) {
+        const float ocv = currentVoltage - (batteryCurrent / 1000.0f) * 0.10f;
+        currentPercentage = voltageToPercentage(ocv);
+    }
     currentTemperatureCelsius = tempC;
     currentBatteryCurrentMilliAmps = batteryCurrent;
     currentRemainingCapacityMilliAmpHours = remainingCapacity;

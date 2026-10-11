@@ -397,9 +397,9 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
             const char *pong = "{\"event\":\"pusher:pong\",\"data\":{}}";
             _ws->sendTXT(pong, strlen(pong));
         }
-        else if (strstr(payloadStr, "device.status.updated"))
+        else if (strstr(payloadStr, "device.status.updated") || strstr(payloadStr, "client-device-report"))
         {
-            // Ignore device status updates (these are our own reports bounced back)
+            // Our own report, relayed back (raw client event) or re-broadcast by the server.
         }
         else if (strstr(payloadStr, "device.command.sent"))
         {
@@ -512,16 +512,20 @@ void ReverbClient::sendDeviceReport(bool force)
         nfcCardId = nfc.currentNFCData().uidString;
     }
 
-    // Everything but the play position, quantised: a report goes out when this changes, every
-    // 5 s while playing (position), and at least every 60 s (heartbeat).
-    char signature[200];
-    snprintf(signature, sizeof(signature), "%d|%d|%d|%d|%u|%d|%s|%s|%d|%d|%d|%s",
-             isCharging ? 1 : 0, (int)lroundf(batteryPercent), (int)lroundf(batteryVoltage * 20.0f),
-             isFileSyncing ? 1 : 0, (unsigned)(sdFreeSpace >> 20), wifiRSSI / 5, audioStatus,
-             currentTrack.c_str(), currentVolume, volumeCeiling, isPogoActive ? 1 : 0, nfcCardId.c_str());
+    // A report goes out when something meaningful changed (with hysteresis on the analog values,
+    // so a cell voltage hovering on a boundary does not cause a report every poll), every 5 s
+    // while playing (position), and at least every 60 s (heartbeat).
+    char signature[160];
+    snprintf(signature, sizeof(signature), "%d|%d|%s|%s|%d|%d|%d|%s",
+             isCharging ? 1 : 0, isFileSyncing ? 1 : 0, audioStatus, currentTrack.c_str(),
+             currentVolume, volumeCeiling, isPogoActive ? 1 : 0, nfcCardId.c_str());
 
     unsigned long now = millis();
-    bool changed = (_lastReportSignature != signature);
+    bool changed = (_lastReportSignature != signature) ||
+                   fabsf(batteryPercent - _lastReportedPercent) >= 2.0f ||
+                   fabsf(batteryVoltage - _lastReportedVoltage) >= 0.10f ||
+                   abs(wifiRSSI - _lastReportedRssi) >= 10 ||
+                   (sdFreeSpace >> 20) != (_lastReportedSdFree >> 20);
     bool heartbeat = (now - _lastReportAt) >= 60000UL;
     bool position = (audioState == 1) && (now - _lastPositionReportAt) >= 5000UL;
     if (!force && !_reportDue && !changed && !heartbeat && !position)
@@ -529,11 +533,11 @@ void ReverbClient::sendDeviceReport(bool force)
         return;
     }
 
-    snprintf(channelBuffer, sizeof(channelBuffer), "device.%s", _deviceId.c_str());
+    snprintf(channelBuffer, sizeof(channelBuffer), "private-device.%s", _deviceId.c_str());
 
     int written = snprintf(jsonBuffer, sizeof(jsonBuffer),
                            "{"
-                           "\"event\":\"device-report\","
+                           "\"event\":\"client-device-report\","
                            "\"channel\":\"%s\","
                            "\"data\":{"
                            "\"device_report\":{"
@@ -592,6 +596,10 @@ void ReverbClient::sendDeviceReport(bool force)
         _lastReportAt = now;
         _lastPositionReportAt = now;
         _lastReportSignature = signature;
+        _lastReportedPercent = batteryPercent;
+        _lastReportedVoltage = batteryVoltage;
+        _lastReportedRssi = wifiRSSI;
+        _lastReportedSdFree = sdFreeSpace;
         _reportDue = false;
     }
 }
@@ -611,9 +619,8 @@ int ReverbClient::subscribeToPrivate()
         http.addHeader("Content-Type", "application/json");
         snprintf(headerBuffer, sizeof(headerBuffer), "Bearer %s", _authToken.c_str());
         http.addHeader("Authorization", headerBuffer);
-        http.addHeader("X-Client-Source", "esp32");
 
-        snprintf(channelBuffer, sizeof(channelBuffer), "device.%s", _deviceId.c_str());
+        snprintf(channelBuffer, sizeof(channelBuffer), "private-device.%s", _deviceId.c_str());
         snprintf(tempBuffer, sizeof(tempBuffer),
                  "{\"socket_id\":\"%s\",\"channel_name\":\"%s\"}",
                  _socketId.c_str(), channelBuffer);
