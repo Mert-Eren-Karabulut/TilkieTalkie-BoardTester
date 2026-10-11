@@ -641,6 +641,17 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
 // This function will be called ONLY ONCE when a new card is detected
 void afterNFCRead(const NFCData &nfcData)
 {
+    // A figure wobbling on the pogo pins (or a child tapping it repeatedly) must not fire a
+    // manifest request per bounce: the same UID within 1.5 s is one tap.
+    static String lastTapUid;
+    static unsigned long lastTapAt = 0;
+    if (nfcData.uidString == lastTapUid && millis() - lastTapAt < 1500)
+    {
+        ESP_LOGI(TAG, "Tap of %s ignored (debounce)", nfcData.uidString.c_str());
+        return;
+    }
+    lastTapUid = nfcData.uidString;
+    lastTapAt = millis();
     ESP_LOGI(TAG, "=== Hook: afterNFCRead ===");
     ESP_LOGI(TAG, "Card UID: %s", nfcData.uidString.c_str());
     ESP_LOGI(TAG, "Timestamp: %lu", nfcData.timestamp);

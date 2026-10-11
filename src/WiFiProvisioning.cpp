@@ -1,4 +1,6 @@
 #include "WiFiProvisioning.h"
+#include <esp_bt.h>
+#include <esp_heap_caps.h>
 #include <esp_event.h>
 
 WiFiProvisioningManager* WiFiProvisioningManager::instance = nullptr;
@@ -62,6 +64,14 @@ void WiFiProvisioningManager::begin() {
     
     if (provisioned) {
         Serial.println("Device is already provisioned - attempting WiFi connection...");
+        // BLE is only needed to provision, and re-provisioning goes through reset() + restart,
+        // so on a provisioned boot the controller's memory goes back to the scarce internal heap.
+        {
+            int before = (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            esp_err_t rel = esp_bt_mem_release(ESP_BT_MODE_BTDM);
+            Serial.printf("BT controller memory released: %s (%+d bytes internal)\n", esp_err_to_name(rel),
+                          (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL) - before);
+        }
         
         // First, try to get stored credentials from the provisioning manager
         wifi_config_t wifi_cfg;

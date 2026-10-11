@@ -241,12 +241,21 @@ void AudioController::audioTaskEntry(void* parameter) {
     AudioController* self = static_cast<AudioController*>(parameter);
 
     while (true) {
+        unsigned long sliceStart = millis();
         if (self && self->initialized) {
             bool locked = self->suspendBackgroundTaskForControl();
             if (locked) {
                 self->updatePlaybackSlice();
                 self->resumeBackgroundTaskForControl();
             }
+        }
+        unsigned long took = millis() - sliceStart;
+        if (took > 500) {
+            // A slice ran far longer than a few decode passes (SD stall, track change under
+            // memory pressure): log it and give the lower-priority tasks on this core a breather
+            // so the loop and the idle task are never starved.
+            Serial.printf("AudioController: slice took %lu ms\n", took);
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));

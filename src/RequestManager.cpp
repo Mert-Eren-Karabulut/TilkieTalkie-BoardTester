@@ -55,7 +55,7 @@ RequestManager &RequestManager::getInstance(const String &baseUrl)
 
 // Constructor
 RequestManager::RequestManager(const String &baseUrl)
-    : timeout(15000)
+    : timeout(8000)
     , lastStatusCode(0)
     , figureDownloadCompleteCallback(nullptr)
     , nvsHandle(0)
