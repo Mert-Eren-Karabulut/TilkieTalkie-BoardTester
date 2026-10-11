@@ -480,6 +480,14 @@ static void printEndpoints()
     ESP_LOGI(TAG, "Reverb:   %s://%s:%u (app key %s)", ep.reverbTls ? "wss" : "ws", ep.reverbHost.c_str(), ep.reverbPort, ep.appKey.c_str());
     ESP_LOGI(TAG, "%s", config.getString("ep_api", "").isEmpty() ? "(production defaults)" : "(bench override from NVS - 'endpoint clear' to revert)");
 }
+// The Arduino core marks a freshly booted OTA image valid inside initArduino() unless this
+// weak hook says otherwise; OtaManager confirms the image itself after 60 s of uptime so that a
+// crash before then still lets the bootloader fall back to the previous firmware.
+extern "C" bool verifyRollbackLater()
+{
+    return true;
+}
+
 // ReverbClient calls this when /broadcasting/auth rejects the stored hub token (revoked
 // server-side); the fresh token is persisted and shared with the API client.
 static String refreshHubTokenForReverb()
@@ -872,8 +880,9 @@ void setup()
 {
     if (DEBUG)
     {
+        Serial.setTxBufferSize(4096); // absorb boot-time bursts so lines are not dropped
         Serial.begin(115200);
-        Serial.setTxTimeoutMs(5); // a host that is not draining the USB console must not stall the loop
+        Serial.setTxTimeoutMs(30); // a host that is not draining the USB console must not stall the loop for long
         delay(1000); // Give serial time to initialize
     }
     ESP_LOGI(TAG, "=== TilkieTalkie Board Tester ===");

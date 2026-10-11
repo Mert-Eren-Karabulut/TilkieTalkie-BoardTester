@@ -26,6 +26,7 @@ const unsigned long MANDATORY_WAIT_MAX_MS = 60UL * 60UL * 1000UL;
 const unsigned long CONFIRM_AFTER_MS = 60UL * 1000UL;   // a crash before this rolls back (bootloader)
 const unsigned long STABLE_AFTER_MS = 5UL * 60UL * 1000UL; // crash counter resets after this uptime
 const char *NVS_OTA_REVERT = "ota_revert";   // set when the crash-loop guard switched partitions
+const char *NVS_OTA_LAST_REL = "ota_last_rel"; // last release that was applied successfully
 const uint32_t CRASH_MAGIC = 0x07A5EEDu;
 
 const char *stateName(OtaManager::State s)
@@ -162,7 +163,10 @@ void OtaManager::setState(State s, int progress, const String &error)
 void OtaManager::postStatus(const char *status, int progress, const String &error, uint32_t versionCode)
 {
     JsonDocument doc;
-    doc["release_id"] = _job.releaseId;
+    if (_job.releaseId)
+    {
+        doc["release_id"] = _job.releaseId; // optional server-side; 0 would fail validation
+    }
     doc["status"] = status;
     doc["progress"] = progress;
     if (error.length() > 0)
@@ -470,8 +474,10 @@ void OtaManager::update()
         g_otaCrashCount = 0;
     }
 
-    // 2. First network contact after a reboot: report how the previous update ended.
-    if (!_bootReported && WiFi.isConnected() && now - _bootAt > 8000)
+    // 2. Report how the previous update ended - for a pending image only once it is confirmed,
+    //    so a crash before that leaves the NVS record in place for the rolled-back firmware
+    //    to report.
+    if (!_bootReported && WiFi.isConnected() && now - _bootAt > 8000 && (!_pendingVerify || _bootHealthyMarked))
     {
         _bootReported = true;
         ConfigManager &cfg = ConfigManager::getInstance();
@@ -481,7 +487,15 @@ void OtaManager::update()
         {
             uint32_t want = (uint32_t)cfg.getInt(NVS_OTA_VCODE, 0);
             bool ok = !reverted && (want != 0 && want == firmwareVersionCode());
+            if (!rel && reverted)
+            {
+                rel = (uint32_t)cfg.getInt(NVS_OTA_LAST_REL, 0); // the image we just abandoned
+            }
             _job.releaseId = rel;
+            if (ok)
+            {
+                cfg.storeInt(NVS_OTA_LAST_REL, (int)rel);
+            }
             postStatus(ok ? "success" : "rolled_back", 100,
                        ok ? String()
                           : (reverted ? String("crash loop on the new image; reverted to the previous firmware")

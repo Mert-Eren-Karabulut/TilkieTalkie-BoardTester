@@ -16,6 +16,10 @@ Device: bench board on `/dev/cu.usbmodem21201`, pointed at the LAN bench portal 
 
 - OTA safety, learned the hard way: my first crash-test image confirmed itself the moment Reverb connected and then crashed, so the bootloader could not roll it back and the board crash-looped until I reflashed it over USB. Fixed in two layers: (1) a new image is only confirmed after 60 s of uptime (any reset before that → bootloader rollback), (2) a crash-loop guard in RTC memory: three crash resets in a row without 5 min of stable uptime switch the boot partition back to the previous firmware and report `rolled_back`. Both paths are exercised below.
 
+- Power observation (02:21–02:23 UTC): the board power-cycled 16 times in bursts of three ("Reset reason: power-on" every time, no crash dump) while idle on the bench, then recovered by itself. That is the power bank, not the firmware: it cuts the output when the load drops and re-enables it, and the board restarts each time. It also explains some odd gaps in my logs. For unattended runs the board should hang off a real USB supply, or the charger must keep drawing current early in boot (CE is only asserted ~1.3 s in).
+
+- OTA verification matrix (all on the bench, backend branch merged): good image 1.1.0→1.1.1 (success); dropped connection at 93 % resumed with a Range request (1.1.5, success); three forced crashes on a confirmed image → crash-loop guard switched back to the previous partition (1.1.5→1.1.4) and reported `rolled_back`; image crashing 20 s after boot → bootloader rollback (1.1.7→1.1.6); good image 1.1.8 → "pending verification", confirmed after 62 s, `success` reported only then. Note: the Arduino core auto-confirms new images in `initArduino()`; `verifyRollbackLater()` in main.cpp now returns true so our 60 s rule applies. Current device firmware: 1.1.8 on app1 (releases 2, 3, 5, 7 are the crash images and are revoked).
+
 ## Needs your decision (no action taken)
 (see the end of this file — filled in as the night goes on)
 
