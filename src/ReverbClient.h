@@ -12,12 +12,16 @@ public:
 
     void onChatMessage(std::function<void(const String &)> cb);
 
+    // apiOrigin: scheme+host(+port) of the Laravel app for /broadcasting/auth and /api/chat
+    // (production: https://portal.tilkietalkie.com; bench: http://192.168.x.x:8000).
     void begin(
         const char *host,
         uint16_t port,
         const char *appKey,
         const char *authToken,
-        const char *deviceId);
+        const char *deviceId,
+        bool useTls = true,
+        const char *apiOrigin = nullptr);
 
     void update();
     void cleanup();
@@ -36,6 +40,7 @@ private:
 
     // Private methods - declarations only
     void sendDeviceReport();
+    void startWebSocket();
     bool subscribeToPrivate();
     void handleDeviceCommand(const char *payloadStr);
     void executeCommand(const String &type, const String &value, bool hasValue);
@@ -44,9 +49,12 @@ private:
 
     // Member variables
     WebSocketsClient *_ws = nullptr;
-    WiFiClientSecure *_httpClient = nullptr;
+    WiFiClient *_httpClient = nullptr; // WiFiClientSecure (https API origin) or plain WiFiClient (bench http)
+    bool _httpSecure = true;
     String _host, _appKey, _authToken, _deviceId, _socketId;
     uint16_t _port;
+    bool _useTls = true;
+    String _apiOrigin;
     std::function<void(const String &)> _chatCb;
     bool _isConnected = false;
     bool _isPrivateSubscribed = false;

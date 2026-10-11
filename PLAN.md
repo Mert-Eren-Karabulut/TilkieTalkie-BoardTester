@@ -42,7 +42,7 @@ and sustains only ~0.3 MB/s; the portal currently returns an empty manifest for 
 3. Reconnect with exponential backoff; subscribe without the HTTPS auth POST inside the WS callback (public channel today); start services on GOT_IP (device stays offline forever if WiFi is late at boot); make `begin()` idempotent (the `reverbstart` leak).
 4. HTTPS for the API (CA bundle is compiled in; `MBEDTLS_EXTERNAL_MEM_ALLOC` now on) — owner agreed: HTTPS for API, HTTP for media with sha256.
 5. Deinit provisioning at PROV_END (BLE memory); per-unit PoP instead of `abcd1234`.
-6. Configurable API/Reverb host for local testing (see "Local portal" below).
+6. ~~Configurable API/Reverb host for local testing~~ done (`endpoint` command).
 7. Later: `esp_websocket_client` in a dedicated net task; device-scoped token (backend work).
 
 ### C. Power task / runtime
@@ -75,6 +75,5 @@ rollout %, admin upload page, device check endpoint (design in the audit §4). F
 ## Local portal for bench testing (proposal)
 Run the Laravel app on the Mac bound to the LAN (`php artisan serve --host 0.0.0.0 --port 8000`, `php artisan reverb:start
 --host 0.0.0.0 --port 8080`, `QUEUE_CONNECTION=sync`), seed a bench dataset (hub uuid = device eFuse MAC decimal, a bound user,
-unit `04-1F-76-D2-56-68-80` with a figure/content/episodes/tracks and MP3s in `storage/app/public`), and add firmware
-console commands `apihost <host:port>` / `reverbhost <host:port> [tls]` stored in NVS so the device targets the Mac
-(plain HTTP/WS). Media URLs follow `APP_URL`/request host, so they resolve to the Mac automatically.
+unit `04-1F-76-D2-56-68-80` with a figure/content/episodes/tracks and MP3s in `storage/app/public`), and point the device at the Mac with the firmware's
+`endpoint set http://<mac-ip>:8000/api <mac-ip> 8080 0 <local-reverb-key>` (NVS-backed, done; `endpoint clear` reverts to production). Media URLs follow `APP_URL`/request host, so they resolve to the Mac automatically.

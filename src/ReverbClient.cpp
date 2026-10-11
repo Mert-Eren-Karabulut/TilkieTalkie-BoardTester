@@ -31,12 +31,8 @@ void ReverbClient::onChatMessage(std::function<void(const String &)> cb)
     Serial.println("ReverbClient: Chat message callback registered");
 }
 
-void ReverbClient::begin(
-    const char *host,
-    uint16_t port,
-    const char *appKey,
-    const char *authToken,
-    const char *deviceId)
+void ReverbClient::begin(const char *host, uint16_t port, const char *appKey, const char *authToken,
+                         const char *deviceId, bool useTls, const char *apiOrigin)
 {
 
     _host = host;
@@ -44,13 +40,24 @@ void ReverbClient::begin(
     _appKey = appKey;
     _authToken = authToken;
     _deviceId = deviceId;
+    _useTls = useTls;
+    _apiOrigin = (apiOrigin && apiOrigin[0]) ? String(apiOrigin) : String(_useTls ? "https://" : "http://") + _host;
     _initialized = true;
 
-    // Pre-allocate all objects at once to minimize fragmentation
+    // HTTP client for /broadcasting/auth and chat: TLS or plain depending on the API origin.
     if (!_httpClient)
     {
-        _httpClient = new WiFiClientSecure();
-        ((WiFiClientSecure *)_httpClient)->setInsecure();
+        _httpSecure = _apiOrigin.startsWith("https://");
+        if (_httpSecure)
+        {
+            WiFiClientSecure *secure = new WiFiClientSecure();
+            secure->setInsecure();
+            _httpClient = secure;
+        }
+        else
+        {
+            _httpClient = new WiFiClient();
+        }
     }
 
     if (_ws == nullptr)
@@ -64,15 +71,29 @@ void ReverbClient::begin(
     _ws->setReconnectInterval(2000);      // Let library handle reconnection every 2 seconds
     _ws->enableHeartbeat(15000, 3000, 2); // 15s ping, 3s pong timeout, 2 retries
 
-    // Pre-build WebSocket path to avoid String concatenation during runtime
-    snprintf(urlBuffer, sizeof(urlBuffer), "/app/%s?protocol=7&client=esp32-client&version=1.0", _appKey.c_str());
-
-    Serial.println("ReverbClient: Initialized, will connect when WiFi is available");
+    Serial.printf("ReverbClient: Initialized (%s://%s:%u, api %s), will connect when WiFi is available\n",
+                  _useTls ? "wss" : "ws", _host.c_str(), _port, _apiOrigin.c_str());
 
     // Start connection if WiFi is already available
     if (WiFi.isConnected())
     {
-        _ws->beginSSL(_host.c_str(), _port, urlBuffer);
+        startWebSocket();
+    }
+}
+
+// The WebSocket path lives in its own buffer: urlBuffer is reused by the HTTP helpers, and a
+// reconnect after a WiFi drop used to pass the /broadcasting/auth URL as the WS path.
+void ReverbClient::startWebSocket()
+{
+    static char wsPathBuffer[128];
+    snprintf(wsPathBuffer, sizeof(wsPathBuffer), "/app/%s?protocol=7&client=esp32-client&version=1.0", _appKey.c_str());
+    if (_useTls)
+    {
+        _ws->beginSSL(_host.c_str(), _port, wsPathBuffer);
+    }
+    else
+    {
+        _ws->begin(_host.c_str(), _port, wsPathBuffer);
     }
 }
 
@@ -98,7 +119,7 @@ void ReverbClient::update()
     if (!_wsStarted && _initialized)
     {
         Serial.println("ReverbClient: Starting WebSocket connection");
-        _ws->beginSSL(_host.c_str(), _port, urlBuffer);
+        startWebSocket();
         _wsStarted = true;
     }
 
@@ -161,7 +182,7 @@ void ReverbClient::forceReconnect()
     if (WiFi.isConnected() && _initialized)
     {
         Serial.println("ReverbClient: Restarting WebSocket connection");
-        _ws->beginSSL(_host.c_str(), _port, urlBuffer);
+        startWebSocket();
         _wsStarted = true;
     }
 }
@@ -183,7 +204,7 @@ void ReverbClient::cleanup()
 
     if (_httpClient)
     {
-        delete _httpClient;
+        if (_httpSecure) { delete static_cast<WiFiClientSecure *>(_httpClient); } else { delete _httpClient; }
         _httpClient = nullptr;
     }
 }
@@ -198,7 +219,7 @@ bool ReverbClient::sendMessage(const String &text)
     }
 
     HTTPClient http;
-    snprintf(urlBuffer, sizeof(urlBuffer), "https://%s/api/chat/device/%s", _host.c_str(), _deviceId.c_str());
+    snprintf(urlBuffer, sizeof(urlBuffer), "%s/api/chat/device/%s", _apiOrigin.c_str(), _deviceId.c_str());
 
     if (http.begin(*_httpClient, urlBuffer))
     {
@@ -508,7 +529,7 @@ bool ReverbClient::subscribeToPrivate()
     }
 
     HTTPClient http;
-    snprintf(urlBuffer, sizeof(urlBuffer), "https://%s/broadcasting/auth", _host.c_str());
+    snprintf(urlBuffer, sizeof(urlBuffer), "%s/broadcasting/auth", _apiOrigin.c_str());
 
     if (http.begin(*_httpClient, urlBuffer))
     {

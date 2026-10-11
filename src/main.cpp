@@ -437,6 +437,53 @@ void updateBringup()
 const size_t CRITICAL_HEAP_THRESHOLD = 15000; // 15KB critical threshold
 const size_t WARNING_HEAP_THRESHOLD = 25000;  // 25KB warning threshold
 
+String getDeviceEfuseMacDecimal();
+void handleChatMessage(const String &message);
+
+// --- Backend endpoints (production by default; overridable in NVS for bench testing against a
+// local portal: `endpoint set <api_base> <reverb_host> <reverb_port> <tls 0|1> [app_key]`) ---
+struct Endpoints
+{
+    String apiBase;    // e.g. https://portal.tilkietalkie.com/api
+    String apiOrigin;  // apiBase without the trailing /api
+    String reverbHost;
+    uint16_t reverbPort;
+    bool reverbTls;
+    String appKey;
+};
+static Endpoints loadEndpoints()
+{
+    Endpoints ep;
+    ep.apiBase = config.getString("ep_api", "https://portal.tilkietalkie.com/api");
+    ep.reverbHost = config.getString("ep_rvhost", "portal.tilkietalkie.com");
+    int port = config.getInt("ep_rvport", 0);
+    ep.reverbPort = port > 0 ? (uint16_t)port : 443;
+    ep.reverbTls = config.getInt("ep_rvtls", 1) != 0;
+    ep.appKey = config.getString("ep_rvkey", "erko2001");
+    ep.apiOrigin = ep.apiBase;
+    if (ep.apiOrigin.endsWith("/api"))
+    {
+        ep.apiOrigin = ep.apiOrigin.substring(0, ep.apiOrigin.length() - 4);
+    }
+    return ep;
+}
+static void printEndpoints()
+{
+    Endpoints ep = loadEndpoints();
+    ESP_LOGI(TAG, "API base: %s", ep.apiBase.c_str());
+    ESP_LOGI(TAG, "Reverb:   %s://%s:%u (app key %s)", ep.reverbTls ? "wss" : "ws", ep.reverbHost.c_str(), ep.reverbPort, ep.appKey.c_str());
+    ESP_LOGI(TAG, "%s", config.getString("ep_api", "").isEmpty() ? "(production defaults)" : "(bench override from NVS - 'endpoint clear' to revert)");
+}
+static void startReverb()
+{
+    Endpoints ep = loadEndpoints();
+    const String token = config.getJWTToken();
+    String deviceId = getDeviceEfuseMacDecimal();
+    reverb.begin(ep.reverbHost.c_str(), ep.reverbPort, ep.appKey.c_str(), token.c_str(), deviceId.c_str(),
+                 ep.reverbTls, ep.apiOrigin.c_str());
+    reverb.onChatMessage(handleChatMessage);
+}
+
 String getDeviceEfuseMacDecimal()
 {
     char deviceId[21];
@@ -942,6 +989,9 @@ void startFullSystem()
     {
         ESP_LOGI(TAG, "WiFi is connected. Initializing network services...");
 
+        // Apply the configured API base (production unless overridden for the bench).
+        requestManager.setBaseUrl(loadEndpoints().apiBase);
+
         // Initialize request manager (needs WiFi)
         if (!requestManager.begin())
         {
@@ -953,20 +1003,7 @@ void startFullSystem()
             ESP_LOGI(TAG, "Request Manager initialized successfully");
         }
 
-        // Use your production credentials from your Laravel .env file
-        constexpr char HOST[] = "portal.tilkietalkie.com";
-        constexpr uint16_t PORT = 443;
-        constexpr char APP_KEY[] = "erko2001"; // Your REVERB_APP_KEY
-
-        const String token = config.getJWTToken();
-
-        // Generate a unique device ID from the ESP32's MAC address
-        String deviceId = getDeviceEfuseMacDecimal();
-
-        reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId.c_str());
-
-        // Register the callback function to handle incoming messages
-        reverb.onChatMessage(handleChatMessage);
+        startReverb();
     }
     else
     {
@@ -1153,6 +1190,7 @@ void loop()
             ESP_LOGI(TAG, "  testauth     - Test stored JWT token authorization with server");
             ESP_LOGI(TAG, "System Commands:");
             ESP_LOGI(TAG, "  restart - Restart the device");
+            ESP_LOGI(TAG, "  endpoint [set <api_base> <reverb_host> <port> <tls> [key] | clear] - backend endpoints (bench)");
             ESP_LOGI(TAG, "  config  - Show all configuration");
             ESP_LOGI(TAG, "  debug   - Show debug information");
             ESP_LOGI(TAG, "  efusemac - Show device efuse MAC in decimal and hex");
@@ -1278,15 +1316,7 @@ void loop()
             {
                 ESP_LOGI(TAG, "Starting Reverb client...");
 
-                constexpr char HOST[] = "portal.tilkietalkie.com";
-                constexpr uint16_t PORT = 443;
-                constexpr char APP_KEY[] = "erko2001";
-
-                const String token = config.getJWTToken();
-                const String deviceId = getDeviceEfuseMacDecimal();
-
-                reverb.begin(HOST, PORT, APP_KEY, token.c_str(), deviceId.c_str());
-                reverb.onChatMessage(handleChatMessage);
+                startReverb();
             }
             else
             {
@@ -2311,6 +2341,53 @@ void loop()
             battery.printBatteryInfo();
         }
         // System commands
+        else if (command.startsWith("endpoint"))
+        {
+            // endpoint | endpoint set <api_base> <reverb_host> <reverb_port> <tls 0|1> [app_key] | endpoint clear
+            String args = command.substring(8);
+            args.trim();
+            if (args.isEmpty())
+            {
+                printEndpoints();
+            }
+            else if (args == "clear")
+            {
+                config.deleteSetting("ep_api");
+                config.deleteSetting("ep_rvhost");
+                config.deleteSetting("ep_rvport");
+                config.deleteSetting("ep_rvtls");
+                config.deleteSetting("ep_rvkey");
+                ESP_LOGI(TAG, "Endpoints reset to production defaults - 'restart' to apply");
+            }
+            else if (args.startsWith("set "))
+            {
+                String rest = args.substring(4);
+                String parts[5];
+                int n = 0;
+                while (n < 5 && rest.length() > 0)
+                {
+                    int sp = rest.indexOf(' ');
+                    parts[n++] = sp > 0 ? rest.substring(0, sp) : rest;
+                    rest = sp > 0 ? rest.substring(sp + 1) : "";
+                    rest.trim();
+                }
+                if (n < 4)
+                {
+                    ESP_LOGI(TAG, "Usage: endpoint set <api_base> <reverb_host> <reverb_port> <tls 0|1> [app_key]");
+                    ESP_LOGI(TAG, "e.g.   endpoint set http://192.168.2.150:8000/api 192.168.2.150 8080 0 local-key");
+                }
+                else
+                {
+                    config.storeString("ep_api", parts[0]);
+                    config.storeString("ep_rvhost", parts[1]);
+                    config.storeInt("ep_rvport", parts[2].toInt());
+                    config.storeInt("ep_rvtls", parts[3].toInt() ? 1 : 0);
+                    if (n == 5) config.storeString("ep_rvkey", parts[4]); else config.deleteSetting("ep_rvkey");
+                    printEndpoints();
+                    ESP_LOGI(TAG, "'restart' to apply");
+                }
+            }
+        }
         else if (command == "restart")
         {
             ESP_LOGW(TAG, "Restarting device...");
