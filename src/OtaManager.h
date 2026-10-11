@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <functional>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -63,6 +64,7 @@ private:
     void runDownload();
     void setState(State s, int progress = -1, const String &error = String());
     void postStatus(const char *status, int progress, const String &error, uint32_t versionCode = 0);
+    void onCheckResult(JsonDocument &doc, int code); // loop task, answer to checkNow()
     String deviceId() const;
 
     volatile State _state = IDLE;

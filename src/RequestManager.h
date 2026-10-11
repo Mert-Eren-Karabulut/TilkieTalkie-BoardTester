@@ -13,6 +13,10 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <deque>
+#include <functional>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 class RequestManager
 {
@@ -38,6 +42,10 @@ private:
     
     // HTTP request helper - consolidates common request patterns
     JsonDocument executeHttpRequest(const String& endpoint, const String& method, const String* payload = nullptr);
+    // One HTTP exchange (serialized by httpLock). Returns the HTTP status (>0), an HTTPClient
+    // error (<0) or 0 when the request was not attempted; error carries the reason.
+    int performHttp(const String& endpoint, const String& method, const String* payload, String& body, String& error);
+    JsonDocument responseToDocument(int code, const String& body, const String& error);
 
     // Private constructor for singleton
     RequestManager(const String &baseUrl = "http://your-laravel-api.com/api");
@@ -60,6 +68,16 @@ public:
     void setBaseUrl(const String& url);
     void setAuthToken(const String& token);
     void setTimeout(int timeoutMs);
+
+    // Asynchronous requests: the HTTP exchange (DNS, TLS, 8 s timeout) runs on a short-lived
+    // worker task; the callback runs from update() on the loop task with the parsed body or
+    // {"error":true,"message":...}. Returns false when there is no network (no callback).
+    using AsyncCallback = std::function<void(JsonDocument &doc, int status)>;
+    bool requestAsync(const String &endpoint, const String &method, const String &payload, AsyncCallback cb);
+    bool getAsync(const String &endpoint, AsyncCallback cb) { return requestAsync(endpoint, "GET", String(), cb); }
+    bool postAsync(const String &endpoint, const JsonDocument &data, AsyncCallback cb);
+    bool hasPendingRequests();                      // queued, in flight or not yet dispatched
+    bool isRequestPending(const String &endpoint);  // the same endpoint is queued or in flight
 
     // HTTP Methods
     JsonDocument get(const String& endpoint);
@@ -200,6 +218,28 @@ private:
     void removeStaleAssets(const String &uid, const JsonDocument &currentManifest, const JsonDocument *previousManifest);
     void processOnlineFigureRequest(const String &uid, bool alreadyEmitted);
     void processOfflineFigureRequest(const String &uid);
+    void handleUnitManifest(const String &uid, bool alreadyEmitted, JsonDocument &doc); // loop task
+
+    // Request worker
+    struct AsyncJob {
+        String endpoint;
+        String method;
+        String payload;
+        AsyncCallback cb;
+        String body;
+        String error;
+        int status = 0;
+    };
+    std::deque<AsyncJob*> jobQueue;     // waiting for the worker
+    std::deque<AsyncJob*> jobDone;      // finished, callback not yet run
+    String activeEndpoint;              // what the worker is doing right now
+    unsigned long jobStartedAt = 0;
+    bool workerRunning = false;
+    SemaphoreHandle_t jobLock = nullptr;   // guards the deques + worker state
+    SemaphoreHandle_t httpLock = nullptr;  // recursive: one HTTP exchange at a time
+    static void workerEntry(void *arg);
+    void workerLoop();
+    void dispatchCompletedJobs();
 };
 
 #endif // REQUEST_MANAGER_H

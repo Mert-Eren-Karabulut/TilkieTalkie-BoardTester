@@ -1,5 +1,6 @@
 #include "FileManager.h"
 #include "BatteryManagement.h"
+#include "PsramJson.h"
 #include <SD_MMC.h>
 #include <AsyncTCP.h>
 #include <HTTPClient.h>
@@ -779,7 +780,7 @@ void FileManager::processDownloadQueue() {
     }
 }
 
-bool FileManager::addRequiredFile(const String& localPath, const String& url, const String& checksum) {
+bool FileManager::addRequiredFile(const String& localPath, const String& url, const String& checksum, bool persist) {
     for (auto& file : requiredFiles) {
         if (file.path == localPath) {
             bool changed = false;
@@ -795,10 +796,10 @@ bool FileManager::addRequiredFile(const String& localPath, const String& url, co
             }
 
             if (changed) {
-                saveRequiredFiles();
+                if (persist) {
+                    saveRequiredFiles();
+                }
                 Serial.printf("FileManager: Updated required file metadata: %s\n", localPath.c_str());
-            } else {
-                Serial.printf("FileManager: File already in required list: %s\n", localPath.c_str());
             }
 
             return true;
@@ -812,9 +813,9 @@ bool FileManager::addRequiredFile(const String& localPath, const String& url, co
     entry.checksum = checksum;
     
     requiredFiles.push_back(entry);
-    saveRequiredFiles();
-    
-    Serial.printf("FileManager: Added required file: %s\n", localPath.c_str());
+    if (persist) {
+        saveRequiredFiles(); // callers adding a whole manifest pass persist=false and flush once
+    }
     return true;
 }
 
@@ -1086,7 +1087,7 @@ String FileManager::getDownloadStatsString() {
 bool FileManager::saveDownloadQueue() {
     if (!sdCardInitialized) return false;
     
-    JsonDocument doc;
+    JsonDocument doc(&psramJsonAllocator);
     JsonArray arr = doc.to<JsonArray>();
     
     for (const auto& task : downloadQueue) {
@@ -1146,7 +1147,7 @@ bool FileManager::loadDownloadQueue() {
         return true;
     }
     
-    JsonDocument doc;
+    JsonDocument doc(&psramJsonAllocator);
     DeserializationError error = deserializeJson(doc, file);
     file.close();
     
@@ -1175,7 +1176,7 @@ bool FileManager::loadDownloadQueue() {
 bool FileManager::saveRequiredFiles() {
     if (!sdCardInitialized) return false;
     
-    JsonDocument doc;
+    JsonDocument doc(&psramJsonAllocator);
     JsonArray arr = doc.to<JsonArray>();
     
     for (const auto& entry : requiredFiles) {
@@ -1201,7 +1202,7 @@ bool FileManager::loadRequiredFiles() {
         return true;
     }
     
-    JsonDocument doc;
+    JsonDocument doc(&psramJsonAllocator);
     DeserializationError error = deserializeJson(doc, file);
     file.close();
     
@@ -1228,7 +1229,7 @@ bool FileManager::loadRequiredFiles() {
 bool FileManager::saveDownloadStats() {
     if (!sdCardInitialized) return false;
     
-    JsonDocument doc;
+    JsonDocument doc(&psramJsonAllocator);
     doc["totalDownloads"] = downloadStats.totalDownloads;
     doc["successfulDownloads"] = downloadStats.successfulDownloads;
     doc["failedDownloads"] = downloadStats.failedDownloads;
@@ -1246,7 +1247,7 @@ bool FileManager::loadDownloadStats() {
         return true;
     }
     
-    JsonDocument doc;
+    JsonDocument doc(&psramJsonAllocator);
     DeserializationError error = deserializeJson(doc, file);
     file.close();
     

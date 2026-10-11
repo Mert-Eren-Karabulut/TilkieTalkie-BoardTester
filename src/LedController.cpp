@@ -1,4 +1,6 @@
 #include "LedController.h"
+#include "Diag.h"
+#include <esp_timer.h>
 #include "ConfigManager.h"
 
 namespace {
@@ -59,6 +61,12 @@ void LedController::renderLoop() {
             xSemaphoreGive(lock);
             memcpy(leds, frame, sizeof(leds));
             FastLED.show();
+        }
+        {
+            static int64_t lastFrameUs = 0;
+            const int64_t t = esp_timer_get_time();
+            if (lastFrameUs && t - lastFrameUs > g_ledFrameMaxGapUs) g_ledFrameMaxGapUs = t - lastFrameUs;
+            lastFrameUs = t;
         }
         vTaskDelayUntil(&last, pdMS_TO_TICKS(20)); // 50 Hz
     }

@@ -1,6 +1,7 @@
 #include "RequestManager.h"
 #include "ReverbClient.h"
 #include "CaBundle.h"
+#include "PsramJson.h"
 
 // Initialize static members
 const char* RequestManager::NVS_NAMESPACE = "requestmgr";
@@ -10,6 +11,12 @@ const char* RequestManager::SD_MANIFEST_DIR = "/.requestmanager/manifests";
 const char* RequestManager::SD_PENDING_MANIFEST_DIR = "/.requestmanager/pending_manifests";
 
 namespace {
+struct LockGuard {
+    SemaphoreHandle_t m;
+    explicit LockGuard(SemaphoreHandle_t h) : m(h) { if (m) xSemaphoreTakeRecursive(m, portMAX_DELAY); }
+    ~LockGuard() { if (m) xSemaphoreGiveRecursive(m); }
+};
+
 String jsonValueToString(JsonVariantConst value)
 {
     if (value.isNull()) {
@@ -60,6 +67,8 @@ RequestManager::RequestManager(const String &baseUrl)
     , figureDownloadCompleteCallback(nullptr)
     , nvsHandle(0)
 {
+    httpLock = xSemaphoreCreateRecursiveMutex();
+    jobLock = xSemaphoreCreateRecursiveMutex();
     setBaseUrl(baseUrl);
     // Convert HTTPS to HTTP for memory efficiency
     this->baseUrl = baseUrl;
@@ -124,6 +133,7 @@ void RequestManager::setBaseUrl(const String &url)
 
 void RequestManager::setAuthToken(const String &token)
 {
+    LockGuard guard(httpLock); // the worker reads it while building headers
     this->authToken = token;
 }
 
@@ -134,6 +144,8 @@ void RequestManager::setTimeout(int timeoutMs)
 
 void RequestManager::update()
 {
+    dispatchCompletedJobs();
+
     if (!figureDownloadCompleteCallback || pendingCompletions.empty()) {
         return;
     }
@@ -172,14 +184,14 @@ void RequestManager::setDefaultHeaders()
 
 JsonDocument RequestManager::parseResponse(const String& response)
 {
-    JsonDocument doc;
+    JsonDocument doc(&psramJsonAllocator);
     DeserializationError error = deserializeJson(doc, response);
 
     if (error) {
         lastError = String("JSON parsing error: ") + error.c_str();
         Serial.println("RequestManager: " + lastError);
         
-        JsonDocument errorDoc;
+        JsonDocument errorDoc(&psramJsonAllocator);
         errorDoc["error"] = true;
         errorDoc["message"] = lastError;
         return errorDoc;
@@ -188,53 +200,60 @@ JsonDocument RequestManager::parseResponse(const String& response)
     return doc;
 }
 
-// Consolidated HTTP request execution
-JsonDocument RequestManager::executeHttpRequest(const String& endpoint, const String& method, const String* payload)
+// One HTTP exchange. Serialized by httpLock: the synchronous API runs it on the caller (boot,
+// token refresh), the asynchronous API on the request worker task - never two at once.
+int RequestManager::performHttp(const String& endpoint, const String& method, const String* payload, String& body, String& error)
 {
-    JsonDocument emptyDoc;
-
+    body = String();
+    error = String();
     if (!isNetworkReady()) {
-        lastError = "Network not ready";
-        emptyDoc["error"] = true;
-        emptyDoc["message"] = lastError;
-        return emptyDoc;
+        error = "Network not ready";
+        return 0;
     }
+    LockGuard guard(httpLock);
 
-    // Ensure we have auth token for protected endpoints
-    if (authToken.length() == 0 && !endpoint.endsWith("/token") && !endpoint.endsWith("/validate-token")) {
+    // Protected endpoints need the hub token first (the token endpoints themselves do not).
+    const bool tokenEndpoint = endpoint.endsWith("/token") || endpoint.endsWith("/validate-token");
+    if (authToken.length() == 0 && !tokenEndpoint) {
         initConnection();
         if (authToken.length() == 0) {
-            lastError = "Authentication failed";
-            emptyDoc["error"] = true;
-            emptyDoc["message"] = lastError;
-            return emptyDoc;
+            error = "Authentication failed";
+            return 0;
         }
     }
 
     String url = baseUrl + endpoint;
     http.end();
-    
     if (!http.begin(*client, url)) {
-        lastError = "Failed to connect to " + url;
-        emptyDoc["error"] = true;
-        emptyDoc["message"] = lastError;
-        return emptyDoc;
+        error = "Failed to connect to " + url;
+        return 0;
     }
 
     http.setTimeout(timeout);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     setDefaultHeaders();
 
-    int httpResponseCode;
-    if (method == "POST" && payload) {
-        httpResponseCode = http.POST(*payload);
-    } else {
-        httpResponseCode = http.GET();
-    }
-    
-    lastStatusCode = httpResponseCode;
+    int code = (method == "POST" && payload) ? http.POST(*payload) : http.GET();
 
-    if (httpResponseCode == 401 && !endpoint.endsWith("/token") && !endpoint.endsWith("/validate-token")) {
+    if (code == HTTPC_ERROR_CONNECTION_REFUSED || code == HTTPC_ERROR_SEND_HEADER_FAILED ||
+        code == HTTPC_ERROR_SEND_PAYLOAD_FAILED || code == HTTPC_ERROR_NOT_CONNECTED ||
+        code == HTTPC_ERROR_CONNECTION_LOST) {
+        // A kept-alive connection the server has since closed (nginx drops idle ones after
+        // 65 s) fails at the first write. Drop it and try once more on a fresh connection.
+        http.end();
+        client->stop();
+        Serial.printf("RequestManager: %s %s failed (%d) on a reused connection - retrying\n", method.c_str(), endpoint.c_str(), code);
+        if (!http.begin(*client, url)) {
+            error = "Failed to connect to " + url;
+            return 0;
+        }
+        http.setTimeout(timeout);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        setDefaultHeaders();
+        code = (method == "POST" && payload) ? http.POST(*payload) : http.GET();
+    }
+
+    if (code == 401 && !tokenEndpoint) {
         // Token revoked server-side (e.g. another hub of the same user fetched a new one):
         // re-acquire once and retry, instead of staying dead until the next reboot.
         static bool retrying = false;
@@ -245,48 +264,184 @@ JsonDocument RequestManager::executeHttpRequest(const String& endpoint, const St
             authToken = "";
             ConfigManager::getInstance().setJWTToken(String());
             initConnection();
-            JsonDocument retried = authToken.length() > 0 ? executeHttpRequest(endpoint, method, payload) : emptyDoc;
+            int retried = authToken.length() > 0 ? performHttp(endpoint, method, payload, body, error) : 0;
             retrying = false;
             if (authToken.length() > 0) {
                 return retried;
             }
         }
-        lastError = "Unauthorized";
-        emptyDoc["error"] = true;
-        emptyDoc["message"] = lastError;
-        return emptyDoc;
+        error = "Unauthorized";
+        return code;
     }
 
-    if (httpResponseCode > 0) {
-        String response = http.getString();
-        Serial.printf("RequestManager: %s %s -> %d (%u bytes)\n", method.c_str(), endpoint.c_str(), httpResponseCode, (unsigned)response.length());
-        if (response.length() < 600 && !endpoint.endsWith("/token")) {
-            Serial.println("RequestManager: body: " + response); // small bodies only (never the token)
+    if (code > 0) {
+        // 204/304 and Content-Length: 0 carry no body. Asking HTTPClient for one anyway makes it
+        // wait for the server to close the keep-alive connection: 65 s behind nginx.
+        if (code != 204 && code != 304 && http.getSize() != 0) {
+            body = http.getString();
+        }
+        Serial.printf("RequestManager: %s %s -> %d (%u bytes)\n", method.c_str(), endpoint.c_str(), code, (unsigned)body.length());
+        if (body.length() > 0 && body.length() < 600 && !endpoint.endsWith("/token")) {
+            Serial.println("RequestManager: body: " + body); // small bodies only (never the token)
         }
         http.end();
-        return parseResponse(response);
+        return code;
     }
 
-    // Error handling
     static const char* errorMessages[] = {
         "Connection refused", "Send header failed", "Send payload failed",
         "Not connected", "Connection lost", "No stream", "No HTTP server",
         "Too less RAM", "Encoding error", "Stream write error", "Read timeout"
     };
-    
     const char* errorDetail = "Unknown error";
-    int errorIndex = -httpResponseCode - 1;
+    int errorIndex = -code - 1;
     if (errorIndex >= 0 && errorIndex < 11) {
         errorDetail = errorMessages[errorIndex];
     }
-    
-    lastError = String("HTTP ") + method + " failed: " + String(httpResponseCode) + " (" + errorDetail + ")";
-    Serial.println("RequestManager: " + lastError);
-    
+    error = String("HTTP ") + method + " failed: " + String(code) + " (" + errorDetail + ")";
+    Serial.println("RequestManager: " + error);
     http.end();
-    emptyDoc["error"] = true;
-    emptyDoc["message"] = lastError;
-    return emptyDoc;
+    return code;
+}
+
+JsonDocument RequestManager::responseToDocument(int code, const String& body, const String& error)
+{
+    if (code > 0 && error.isEmpty()) {
+        if (body.isEmpty()) {
+            return JsonDocument(&psramJsonAllocator); // e.g. 204: nothing to parse, the status says it all
+        }
+        return parseResponse(body);
+    }
+    lastError = error.isEmpty() ? String("HTTP ") + String(code) : error;
+    JsonDocument errorDoc(&psramJsonAllocator);
+    errorDoc["error"] = true;
+    errorDoc["message"] = lastError;
+    return errorDoc;
+}
+
+// Synchronous request on the calling task (blocks it for up to the HTTP timeout).
+JsonDocument RequestManager::executeHttpRequest(const String& endpoint, const String& method, const String* payload)
+{
+    String body, error;
+    int code = performHttp(endpoint, method, payload, body, error);
+    lastStatusCode = code;
+    return responseToDocument(code, body, error);
+}
+
+// ---- Request worker -----------------------------------------------------------------------
+// Requests that nothing waits for (figure manifests, OTA checks, status posts) run on a
+// worker task that lives only while there is work; the loop task keeps the LEDs, audio and
+// the WebSocket alive meanwhile. Callbacks run on the loop task from update().
+
+bool RequestManager::requestAsync(const String &endpoint, const String &method, const String &payload, AsyncCallback cb)
+{
+    if (!isNetworkReady()) {
+        return false;
+    }
+    AsyncJob *job = new AsyncJob();
+    job->endpoint = endpoint;
+    job->method = method;
+    job->payload = payload;
+    job->cb = cb;
+    bool startWorker = false;
+    {
+        LockGuard guard(jobLock);
+        jobQueue.push_back(job);
+        if (!workerRunning) {
+            workerRunning = true;
+            startWorker = true;
+        }
+    }
+    if (startWorker && xTaskCreatePinnedToCore(workerEntry, "req", 8192, this, 4, nullptr, 0) != pdPASS) {
+        Serial.println("RequestManager: request worker could not start - running on the caller");
+        workerLoop(); // the old blocking behaviour, results still delivered through update()
+    }
+    return true;
+}
+
+bool RequestManager::postAsync(const String &endpoint, const JsonDocument &data, AsyncCallback cb)
+{
+    String jsonString;
+    serializeJson(data, jsonString);
+    return requestAsync(endpoint, "POST", jsonString, cb);
+}
+
+bool RequestManager::hasPendingRequests()
+{
+    LockGuard guard(jobLock);
+    return workerRunning || !jobQueue.empty() || !jobDone.empty();
+}
+
+bool RequestManager::isRequestPending(const String &endpoint)
+{
+    LockGuard guard(jobLock);
+    if (activeEndpoint == endpoint) {
+        return true;
+    }
+    for (const AsyncJob *job : jobQueue) {
+        if (job->endpoint == endpoint) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void RequestManager::workerEntry(void *arg)
+{
+    static_cast<RequestManager*>(arg)->workerLoop();
+    vTaskDelete(nullptr);
+}
+
+void RequestManager::workerLoop()
+{
+    for (;;) {
+        AsyncJob *job = nullptr;
+        {
+            LockGuard guard(jobLock);
+            if (jobQueue.empty()) {
+                workerRunning = false;
+                activeEndpoint = String();
+                break;
+            }
+            job = jobQueue.front();
+            jobQueue.pop_front();
+            activeEndpoint = job->endpoint;
+            jobStartedAt = millis();
+        }
+        job->status = performHttp(job->endpoint, job->method, job->method == "POST" ? &job->payload : nullptr, job->body, job->error);
+        {
+            LockGuard guard(jobLock);
+            jobDone.push_back(job);
+            activeEndpoint = String();
+            jobStartedAt = 0;
+        }
+    }
+}
+
+void RequestManager::dispatchCompletedJobs()
+{
+    for (;;) {
+        AsyncJob *job = nullptr;
+        {
+            LockGuard guard(jobLock);
+            if (jobDone.empty()) {
+                break;
+            }
+            job = jobDone.front();
+            jobDone.pop_front();
+        }
+        JsonDocument doc = responseToDocument(job->status, job->body, job->error);
+        lastStatusCode = job->status;
+        if (job->cb) {
+            job->cb(doc, job->status); // may queue further requests
+        }
+        delete job;
+    }
+    static unsigned long lastStuckLog = 0;
+    if (jobStartedAt && millis() - jobStartedAt > 30000 && millis() - lastStuckLog > 30000) {
+        lastStuckLog = millis();
+        Serial.printf("RequestManager: request %s busy for %lu s\n", activeEndpoint.c_str(), (millis() - jobStartedAt) / 1000);
+    }
 }
 
 // HTTP Methods - now simplified using executeHttpRequest
@@ -320,6 +475,7 @@ int RequestManager::getLastStatusCode()
 
 String RequestManager::getJWTToken()
 {
+    LockGuard guard(httpLock);
     uint64_t macAddress = ESP.getEfuseMac();
     
     String endpoint = "/hubs/" + String(macAddress, 10) + "/token";
@@ -345,6 +501,7 @@ String RequestManager::getJWTToken()
 
 bool RequestManager::validateToken(const String& token)
 {
+    LockGuard guard(httpLock);
     uint64_t macAddress = ESP.getEfuseMac();
     String endpoint = "/hubs/" + String(macAddress, 10) + "/validate-token";
     
@@ -367,6 +524,7 @@ bool RequestManager::validateToken(const String& token)
 
 void RequestManager::initConnection()
 {
+    LockGuard guard(httpLock);
     ConfigManager &config = ConfigManager::getInstance();
     String storedToken = config.getJWTToken();
 
@@ -406,10 +564,28 @@ void RequestManager::getCheckFigureTracks(const String &uid)
 
 void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyEmitted)
 {
-    JsonDocument doc = get("/units/" + uid);
+    // The manifest fetch runs on the request worker; handleUnitManifest() continues on the
+    // loop task once the answer is in. A tap repeated while the answer is pending is one request.
+    const String endpoint = "/units/" + uid;
+    if (isRequestPending(endpoint)) {
+        Serial.println("RequestManager: manifest request already pending for this figure");
+        return;
+    }
+    bool started = getAsync(endpoint, [this, uid, alreadyEmitted](JsonDocument &doc, int) {
+        handleUnitManifest(uid, alreadyEmitted, doc);
+    });
+    if (!started) {
+        JsonDocument doc(&psramJsonAllocator);
+        doc["error"] = true;
+        doc["message"] = "Network not ready";
+        handleUnitManifest(uid, alreadyEmitted, doc);
+    }
+}
 
+void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, JsonDocument &doc)
+{
     if (doc["error"].as<bool>()) {
-        Serial.printf("RequestManager: manifest fetch failed (%s)\n", lastError.c_str());
+        Serial.printf("RequestManager: manifest fetch failed (%s)\n", doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "?");
         if (!alreadyEmitted && figureDownloadCompleteCallback) {
             Figure emptyFigure;
             queueFigureDownloadCompletion(uid, "Unknown", false, "Backend unreachable and nothing cached", emptyFigure);
@@ -442,7 +618,7 @@ void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyE
 
     // Unchanged manifest (same manifest_checksum as the cached copy): nothing to re-save,
     // just make sure every asset is present.
-    JsonDocument previousManifest;
+    JsonDocument previousManifest(&psramJsonAllocator);
     String previousManifestJson;
     bool haveCached = loadUnitManifest(uid, previousManifest);
     const String newChecksum = doc["manifest_checksum"].as<String>();
@@ -464,7 +640,7 @@ void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyE
             continue;
         }
         trackPaths.push_back(storagePath);
-        fileManager.addRequiredFile(storagePath, url, checksum);
+        fileManager.addRequiredFile(storagePath, url, checksum, false); // flushed once below
         Serial.printf("RequestManager: asset %s (%s) %s\n", storagePath.c_str(), asset["asset_type"].as<const char*>() ? asset["asset_type"].as<const char*>() : "?",
                       fileManager.fileExists(storagePath) ? "present" : "missing");
         // Existence only: integrity was verified (sha256) when the file was downloaded.
@@ -478,6 +654,8 @@ void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyE
             assetsAlreadyCached++;
         }
     }
+
+    fileManager.flushRequiredFiles(); // one SD write for the whole manifest instead of one per asset
 
     if (unchanged && assetsToDownload == 0) {
         Serial.printf("RequestManager: manifest for %s unchanged, all %d assets present\n", figureName.c_str(), assetsAlreadyCached);
@@ -510,7 +688,7 @@ void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyE
 
 bool RequestManager::emitFromCache(const String &uid)
 {
-    JsonDocument manifest;
+    JsonDocument manifest(&psramJsonAllocator);
     if (!loadUnitManifest(uid, manifest)) {
         return false;
     }
@@ -784,7 +962,7 @@ bool RequestManager::saveUidMappings()
 {
     if (nvsHandle == 0) return false;
     
-    JsonDocument doc;
+    JsonDocument doc(&psramJsonAllocator);
     JsonObject mappings = doc.to<JsonObject>();
     
     for (const auto& pair : uidToFigureIdMap) {
@@ -819,7 +997,7 @@ bool RequestManager::loadUidMappings()
         return false;
     }
     
-    JsonDocument doc;
+    JsonDocument doc(&psramJsonAllocator);
     DeserializationError error = deserializeJson(doc, jsonString);
     heap_caps_free(jsonString);
     
@@ -974,7 +1152,7 @@ void RequestManager::finalizeTrackedManifest(FigureDownloadTracker &tracker, boo
         return;
     }
 
-    JsonDocument pendingManifest;
+    JsonDocument pendingManifest(&psramJsonAllocator);
     bool hasPendingManifestData = false;
 
     if (!tracker.pendingManifestJson.isEmpty()) {
@@ -994,7 +1172,7 @@ void RequestManager::finalizeTrackedManifest(FigureDownloadTracker &tracker, boo
         return;
     }
 
-    JsonDocument previousManifest;
+    JsonDocument previousManifest(&psramJsonAllocator);
     JsonDocument* previousManifestPtr = nullptr;
     if (!tracker.previousManifestJson.isEmpty()) {
         if (!deserializeJson(previousManifest, tracker.previousManifestJson)) {
@@ -1151,7 +1329,7 @@ std::vector<String> RequestManager::assetsReferencedByOtherUnits(const String &c
     while (entry) {
         String entryName = String(entry.name());
         if (!entry.isDirectory() && entryName != currentManifestFile) {
-            JsonDocument manifest;
+            JsonDocument manifest(&psramJsonAllocator);
             DeserializationError error = deserializeJson(manifest, entry);
             entry.close();
             if (!error) {

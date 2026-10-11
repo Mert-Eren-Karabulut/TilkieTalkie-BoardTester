@@ -177,9 +177,17 @@ void OtaManager::postStatus(const char *status, int progress, const String &erro
     {
         doc["version_code"] = versionCode;
     }
-    RequestManager &rm = RequestManager::getInstance();
-    rm.post("/hubs/" + deviceId() + "/firmware/status", doc);
-    Serial.printf("OTA: status '%s' %d%% -> HTTP %d\n", status, progress, rm.getLastStatusCode());
+    // Posted by the request worker; the loop task is not held up by a slow or dead portal.
+    const String statusCopy = status;
+    const int progressCopy = progress;
+    bool queued = RequestManager::getInstance().postAsync("/hubs/" + deviceId() + "/firmware/status", doc,
+        [statusCopy, progressCopy](JsonDocument &, int code) {
+            Serial.printf("OTA: status '%s' %d%% -> HTTP %d\n", statusCopy.c_str(), progressCopy, code);
+        });
+    if (!queued)
+    {
+        Serial.printf("OTA: status '%s' %d%% not sent (no network)\n", status, progress);
+    }
 }
 
 bool OtaManager::checkNow(uint32_t releaseId, const char *reason)
@@ -189,12 +197,16 @@ bool OtaManager::checkNow(uint32_t releaseId, const char *reason)
         Serial.println("OTA: check skipped, update in progress");
         return false;
     }
+    if (_state == CHECKING)
+    {
+        Serial.println("OTA: check already running");
+        return false;
+    }
     if (!WiFi.isConnected())
     {
         Serial.println("OTA: check skipped, no network");
         return false;
     }
-    _state = CHECKING;
     String endpoint = "/hubs/" + deviceId() + "/firmware/check?version_code=" + String(firmwareVersionCode()) +
                       "&version=" + String(firmwareVersion()) + "&hardware_rev=" + TT_HARDWARE_REV;
     if (releaseId)
@@ -202,23 +214,39 @@ bool OtaManager::checkNow(uint32_t releaseId, const char *reason)
         endpoint += "&release_id=" + String(releaseId);
     }
     Serial.printf("OTA: checking (%s)\n", reason);
-    RequestManager &rm = RequestManager::getInstance();
-    JsonDocument doc = rm.get(endpoint);
-    int code = rm.getLastStatusCode();
+    _state = CHECKING;
     _nextCheckAt = millis() + CHECK_INTERVAL_MS;
+    // The answer arrives in onCheckResult() on the loop task; the request runs on the worker.
+    bool started = RequestManager::getInstance().getAsync(endpoint, [this](JsonDocument &doc, int code) {
+        onCheckResult(doc, code);
+    });
+    if (!started)
+    {
+        Serial.println("OTA: check not started (network not ready)");
+        _nextCheckAt = millis() + CHECK_RETRY_MS;
+        _state = IDLE;
+    }
+    return started;
+}
 
+void OtaManager::onCheckResult(JsonDocument &doc, int code)
+{
+    if (_state != CHECKING)
+    {
+        return; // something else (a manual job) took over while the check was in flight
+    }
     if (code == 204)
     {
         Serial.println("OTA: up to date");
         _state = IDLE;
-        return true;
+        return;
     }
     if (code != 200 || !doc["release_id"].is<uint32_t>())
     {
         Serial.printf("OTA: check failed (HTTP %d)\n", code);
         _nextCheckAt = millis() + CHECK_RETRY_MS;
         _state = IDLE;
-        return false;
+        return;
     }
 
     Job job;
@@ -235,12 +263,11 @@ bool OtaManager::checkNow(uint32_t releaseId, const char *reason)
     {
         Serial.println("OTA: offer incomplete, ignored");
         _state = IDLE;
-        return false;
+        return;
     }
     _job = job;
     _state = WAITING;
     _waitingSince = millis();
-    return true;
 }
 
 bool OtaManager::startJob(const Job &job)
@@ -517,11 +544,20 @@ void OtaManager::update()
         }
     }
 
-    // 4. Reboot once the final status went out
+    // 4. Reboot once the final status went out (the worker gets up to 10 s to deliver it)
     if (_state == REBOOTING)
     {
-        delay(500);
-        ESP.restart();
+        static unsigned long rebootRequestedAt = 0;
+        if (!rebootRequestedAt)
+        {
+            rebootRequestedAt = now;
+        }
+        if (!RequestManager::getInstance().hasPendingRequests() || now - rebootRequestedAt > 10000)
+        {
+            delay(500);
+            ESP.restart();
+        }
+        return;
     }
 
     // 5. Start a known update when the toy is idle (mandatory ones stop waiting after an hour)

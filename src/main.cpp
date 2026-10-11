@@ -1381,6 +1381,27 @@ static void deriveLedScene()
     }
 }
 
+// `chargemon` console command: one charger/gauge line per second without holding the loop.
+static unsigned long gChargeMonStart = 0, gChargeMonNextAt = 0, gChargeMonUntil = 0;
+static void serviceChargeMonitor()
+{
+    if (!gChargeMonUntil)
+    {
+        return;
+    }
+    const unsigned long now = millis();
+    if ((long)(now - gChargeMonUntil) >= 0)
+    {
+        gChargeMonUntil = 0;
+        return;
+    }
+    if ((long)(now - gChargeMonNextAt) >= 0)
+    {
+        gChargeMonNextAt += 1000;
+        battery.printChargeMonitorLine((now - gChargeMonStart) / 1000);
+    }
+}
+
 void loop()
 {
     Diag::periodicReport(10000); // loop section timing + heap every 10 s
@@ -2123,18 +2144,15 @@ void loop()
         }
         else if (command.startsWith("chargemon"))
         {
-            // chargemon [seconds]: one line per second of charger + gauge state (blocks the loop)
+            // chargemon [seconds]: one line per second of charger + gauge state, printed from the loop
             String arg = command.substring(9);
             arg.trim();
             int seconds = arg.isEmpty() ? 30 : arg.toInt();
             if (seconds < 1) seconds = 1;
             if (seconds > 300) seconds = 300;
-            unsigned long start = millis();
-            for (int i = 0; i < seconds; ++i)
-            {
-                battery.printChargeMonitorLine((millis() - start) / 1000);
-                delay(1000);
-            }
+            gChargeMonStart = millis();
+            gChargeMonNextAt = gChargeMonStart;
+            gChargeMonUntil = gChargeMonStart + (unsigned long)seconds * 1000UL;
         }
         else if (command == "crash")
         {
@@ -3055,6 +3073,7 @@ void loop()
     // prevents the brown-out/reboot loop a depleted cell causes during WiFi bring-up.
     // Charger supervision runs in every phase (monitor AND full-run) while USB is present.
     TT_TIMED("charger", superviseChargerOnUsb());
+    TT_TIMED("chargemon", serviceChargeMonitor());
 
     if (gSystemPhase == PHASE_MONITOR)
     {

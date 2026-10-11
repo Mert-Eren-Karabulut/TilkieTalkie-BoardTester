@@ -50,3 +50,6 @@ namespace Diag
     } while (0)
 
 #endif // TT_DIAG_H
+
+// Longest gap between two LED frames (set by the LED task, printed and reset by Diag).
+extern volatile int64_t g_ledFrameMaxGapUs;

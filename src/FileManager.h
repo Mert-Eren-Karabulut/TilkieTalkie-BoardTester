@@ -262,7 +262,7 @@ public:
     bool hasActiveDownload() const { return downloadInProgress; } // a transfer is in flight (not merely queued)
 
     // Required files management
-    bool addRequiredFile(const String &localPath, const String &url, const String &checksum = "");
+    bool addRequiredFile(const String &localPath, const String &url, const String &checksum = "", bool persist = true);
     bool removeRequiredFile(const String &localPath, bool persist = true); // persist=false: caller calls flushRequiredFiles()
     void checkRequiredFiles();
     std::vector<String> getRequiredFilesByPattern(const String &pattern); // Get required files matching pattern

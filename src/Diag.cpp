@@ -5,6 +5,8 @@
 #include <esp_core_dump.h>
 #include <string.h>
 
+volatile int64_t g_ledFrameMaxGapUs = 0;
+
 static const char *TAG = "DIAG";
 
 namespace
@@ -136,8 +138,9 @@ void Diag::printSectionStats(bool reset)
                  s.count ? (s.sumUs / 1000.0) / s.count : 0.0, (unsigned)s.count, (unsigned)s.over20ms);
         if (reset) { s.maxUs = 0; s.sumUs = 0; s.count = 0; s.over20ms = 0; }
     }
-    ESP_LOGI(TAG, "  loop iterations=%u  max gap between iterations=%.2f ms", (unsigned)g_loopIters, g_loopMaxGapUs / 1000.0);
-    if (reset) { g_loopIters = 0; g_loopMaxGapUs = 0; }
+    ESP_LOGI(TAG, "  loop iterations=%u  max gap between iterations=%.2f ms | LED frame max gap %.1f ms (nominal 20)",
+             (unsigned)g_loopIters, g_loopMaxGapUs / 1000.0, g_ledFrameMaxGapUs / 1000.0);
+    if (reset) { g_loopIters = 0; g_loopMaxGapUs = 0; g_ledFrameMaxGapUs = 0; }
 }
 
 static bool g_verbose = false;
@@ -165,8 +168,9 @@ void Diag::periodicReport(uint32_t intervalMs)
     }
     else
     {
-        ESP_LOGI(TAG, "loop max gap %.0f ms", g_loopMaxGapUs / 1000.0);
+        ESP_LOGI(TAG, "loop max gap %.0f ms, LED frame max gap %.0f ms", g_loopMaxGapUs / 1000.0, g_ledFrameMaxGapUs / 1000.0);
         g_loopMaxGapUs = 0;
+        g_ledFrameMaxGapUs = 0;
     }
     ESP_LOGI(TAG, "  heap: internal free=%u largest=%u minfree=%u | psram free=%u | loop stack hwm=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),

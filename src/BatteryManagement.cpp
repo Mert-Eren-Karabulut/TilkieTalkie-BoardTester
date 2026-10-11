@@ -1943,7 +1943,7 @@ bool BatteryManager::setChargeEnabled(bool enable) {
     if (!chargerPresent) {
         return false;
     }
-    Serial.printf("BatteryManager: setChargeEnabled(%s)\n", enable ? "true" : "false");
+    log_d("setChargeEnabled(%s)", enable ? "true" : "false");
     uint8_t control0 = 0;
     if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
         return false;
@@ -1964,7 +1964,7 @@ bool BatteryManager::restartChargeCycle() {
     if (!chargerPresent) {
         return false;
     }
-    Serial.println("BatteryManager: restartChargeCycle()");
+    log_d("restartChargeCycle()");
 
     uint8_t control0 = 0;
     if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_0_REGISTER, control0)) {
