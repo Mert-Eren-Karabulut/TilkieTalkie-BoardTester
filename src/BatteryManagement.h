@@ -274,6 +274,7 @@ private:
 
     // Device state
     bool busInitialized;
+    bool busReleased = false;   // SDA/SCL floated for an external tool (bqStudio/EV2400)
     bool rt6160Present;
     bool chargerPresent;
     bool gaugePresent;
@@ -501,6 +502,10 @@ public:
     // Run the periodic poll on its own task (core 0). After this, update() calls from the loop
     // return immediately; the ~190 ms of bit-banged I2C per poll no longer stall the loop.
     void startTask();
+    // Hand the battery bus to an external I2C master (bqStudio through an EV2400): the pins
+    // float, polling stops and every register access fails fast until the bus is attached again.
+    void setBusReleased(bool released);
+    bool isBusReleased() const { return busReleased; }
     bool isTaskRunning() const { return pollTask != nullptr; }
     bool restoreGaugeFetControl();
     bool setGaugeSingleCellMode();

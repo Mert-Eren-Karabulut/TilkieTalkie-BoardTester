@@ -94,6 +94,10 @@ enum BringupPhase
 };
 static BringupPhase gBringupPhase = BRINGUP_INACTIVE;
 static const char *BRINGUP_NVS_KEY = "bringup_v1";
+// `gaugebus release`: the battery bus belongs to an external tool (bqStudio/EV2400) until
+// `gaugebus attach`. Persisted so a wake from deep sleep does not grab the bus back.
+static const char *GAUGEBUS_NVS_KEY = "gaugebus_rel";
+static bool gGaugeBusReleased = false;
 // Bring-up LED phase colors (documented in FACTORY_BRINGUP.md):
 static const uint32_t BRINGUP_LED_PROVISION = 0x0000FF; // solid BLUE   - provisioning
 static const uint32_t BRINGUP_LED_WAIT = 0xFF6000;      // pulsing AMBER - waiting for charge
@@ -773,6 +777,10 @@ static void superviseChargerOnUsb()
     static uint8_t vbusDropouts = 0;
     static unsigned long firstDropoutAt = 0;
 
+    if (gGaugeBusReleased)
+    {
+        return; // bqStudio session: the charger keeps the settings written at boot
+    }
     if (!battery.isVbusPresent())
     {
         if (wasVbusPresent)
@@ -999,6 +1007,15 @@ void setup()
     // isolated, the board runs unbuffered off USB, and it browns out during bring-up.
     battery.begin();
 
+    // The charger is configured (3.6 V LFP limits, watchdog off) by begin(); if an external
+    // tool owns the bus, let go of it right here and never touch it again this boot.
+    gGaugeBusReleased = config.getInt(GAUGEBUS_NVS_KEY, 0) != 0;
+    if (gGaugeBusReleased)
+    {
+        battery.setBusReleased(true);
+        ESP_LOGW(TAG, "GAUGEBUS: battery bus released for an external tool (gaugebus attach to end)");
+    }
+
     // If this boot is the timer wake of a sleep-current measurement, print its result.
     reportSleepTestIfAny();
 
@@ -1016,7 +1033,7 @@ void setup()
     // run the auto bring-up (LED-guided) and hold the charge current at a safe 300mA until
     // the gauge current sense is calibrated (an uncalibrated gauge over-reads and trips OCC).
     const bool bringupDone = config.getInt(BRINGUP_NVS_KEY, 0) != 0;
-    if (!bringupDone)
+    if (!bringupDone && !gGaugeBusReleased)
     {
         battery.setChargeCurrent(300);
         gBringupPhase = BRINGUP_PROVISION;
@@ -1472,6 +1489,8 @@ void loop()
             ESP_LOGI(TAG, "  batterycfg - Reapply 4V5 rail and charger defaults");
             ESP_LOGI(TAG, "  batteryclearflags - Clear latched BQ25792 charger/fault flags");
             ESP_LOGI(TAG, "  chargekick - Toggle BQ25792 EN_CHG off/on to restart charging");
+            ESP_LOGI(TAG, "  gaugebus [release|attach] - hand the charger/gauge bus to bqStudio (EV2400) and back; persists across reboots");
+            ESP_LOGI(TAG, "  sleep now - deep sleep unconditionally (also on USB)");
             ESP_LOGI(TAG, "  gaugefets - Re-enable gauge FET control if it is disabled");
             ESP_LOGI(TAG, "  gauge1s - Clear BQ28 DA Configuration CC0 to force 1-cell mode");
             ESP_LOGI(TAG, "  gaugeprog - Force generic gauge provisioning");
@@ -2153,6 +2172,35 @@ void loop()
             gChargeMonStart = millis();
             gChargeMonNextAt = gChargeMonStart;
             gChargeMonUntil = gChargeMonStart + (unsigned long)seconds * 1000UL;
+        }
+        else if (command == "gaugebus" || command.startsWith("gaugebus "))
+        {
+            String arg = command.substring(8);
+            arg.trim();
+            if (arg == "release")
+            {
+                config.storeInt(GAUGEBUS_NVS_KEY, 1);
+                gGaugeBusReleased = true;
+                battery.setBusReleased(true);
+                ESP_LOGW(TAG, "GAUGEBUS: released. Connect the EV2400 to BATT_SDA/BATT_SCL/GND. The charger keeps its current settings; the firmware will not poll or sleep on VBUS loss - use 'sleep now' for rest periods.");
+            }
+            else if (arg == "attach")
+            {
+                config.deleteSetting(GAUGEBUS_NVS_KEY);
+                gGaugeBusReleased = false;
+                battery.setBusReleased(false);
+                ESP_LOGI(TAG, "GAUGEBUS: attached, polling resumes");
+            }
+            else
+            {
+                ESP_LOGI(TAG, "GAUGEBUS: %s (gaugebus release | gaugebus attach)", gGaugeBusReleased ? "RELEASED to an external tool" : "attached (firmware owns the bus)");
+            }
+        }
+        else if (command == "sleep now")
+        {
+            ESP_LOGI(TAG, "Entering deep sleep unconditionally...");
+            delay(100);
+            sleepController.forceSleep();
         }
         else if (command == "crash")
         {

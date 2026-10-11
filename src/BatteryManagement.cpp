@@ -430,6 +430,9 @@ void BatteryManager::update() {
     if (pollTask && xTaskGetCurrentTaskHandle() != pollTask) {
         return; // the poll task owns the periodic work now
     }
+    if (busReleased) {
+        return; // an external tool owns the bus
+    }
     unsigned long currentTime = millis();
     
     // Update at specified interval
@@ -1057,6 +1060,10 @@ bool BatteryManager::verifyChargerVoltageSetting() {
 }
 
 void BatteryManager::printChargeMonitorLine(unsigned long t) {
+    if (busReleased) {
+        Serial.println("CM: battery bus released to an external tool - no readings");
+        return;
+    }
     refreshDiagnostics();
     uint8_t chg = (chargerStatus1 >> 5) & 0x07;
     uint8_t ctl0 = 0xFF;
@@ -2186,8 +2193,29 @@ struct BusGuard {
 };
 }
 
+void BatteryManager::setBusReleased(bool released) {
+    BusGuard guard(busLock);
+    if (released == busReleased) {
+        return;
+    }
+    busReleased = released;
+    if (released) {
+        // Plain inputs: the board's 4.7 k pull-ups keep the bus idle, the external tool drives it.
+        pinMode(BATTERY_I2C_SDA_PIN, INPUT);
+        pinMode(BATTERY_I2C_SCL_PIN, INPUT);
+        Serial.println("BatteryManager: battery bus RELEASED - charger/gauge polling stopped");
+    } else {
+        releaseSDA();
+        releaseSCL();
+        Serial.println("BatteryManager: battery bus attached - polling resumes");
+    }
+}
+
 void BatteryManager::i2cBusRecover() {
     BusGuard guard(busLock);
+    if (busReleased) {
+        return;
+    }
     releaseSDA();
     releaseSCL();
     waitForSCLHigh();
@@ -2308,7 +2336,7 @@ bool BatteryManager::probeDevice(uint8_t address) {
 
 bool BatteryManager::writeRegisters(uint8_t address, uint8_t startReg, const uint8_t *data, size_t length) {
     BusGuard guard(busLock);
-    if (!busInitialized) {
+    if (!busInitialized || busReleased) {
         return false;
     }
 
@@ -2324,7 +2352,7 @@ bool BatteryManager::writeRegisters(uint8_t address, uint8_t startReg, const uin
 
 bool BatteryManager::readRegisters(uint8_t address, uint8_t startReg, uint8_t *data, size_t length) {
     BusGuard guard(busLock);
-    if (!busInitialized) {
+    if (!busInitialized || busReleased) {
         return false;
     }
 
