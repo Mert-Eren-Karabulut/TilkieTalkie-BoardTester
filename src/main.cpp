@@ -806,7 +806,7 @@ static void superviseChargerOnUsb()
         battery.setInputCurrentLimit(nonPdInputLimitMa);
         battery.setIcoEnabled(false);
         fullHold = false;
-        battery.setChargeEnabled(true);
+        battery.setChargeEnabled(true); // a new session always charges (EN_CHG off sags VSYS on this board)
     }
 
     if (gBringupPhase != BRINGUP_INACTIVE || gLearnDischarge || !battery.hasTelemetry())
@@ -922,38 +922,19 @@ static void superviseChargerOnUsb()
     // retries once a second (the blinking STAT LED, the charging/discharging flips). Honour the
     // gauge (or the charger's own termination): disable charging and leave it off until the
     // cell has really come down. VSYS runs from VBUS meanwhile, so the cell rests.
-    // ...but only when the cell agrees. The gauge's learned capacity is bogus until it is
-    // calibrated (127 mAh against 4000), so it can set FC after a few minutes of charge. A
-    // "full" that the cell voltage does not corroborate is reseeded away (QMax + FC cleared,
-    // ~1 s, no brown-out on USB) and charging goes on; at most once a minute.
-    static unsigned long lastGaugeReseed = 0;
-    if (!fullHold && battery.isGaugeChargeInhibited() && !battery.isChargeDone())
-    {
-        const int iMa = battery.getBatteryCurrentMilliAmps();
-        const bool corroborated = (iMa > -100 && iMa < 100) ? v >= 3.38f : v >= 3.45f;
-        if (!corroborated && (lastGaugeReseed == 0 || millis() - lastGaugeReseed > 60000UL))
-        {
-            lastGaugeReseed = millis();
-            ESP_LOGW(TAG, "CHARGER: gauge says full at %.3fV (%+d mA) - not plausible, reseeding the gauge's learned capacity", v, iMa);
-            battery.resetGaugeLearningState();
-            return;
-        }
-    }
     if (!fullHold && (battery.isGaugeChargeInhibited() || battery.isChargeDone()))
     {
         fullHold = true;
-        battery.setChargeEnabled(false);
-        ESP_LOGI(TAG, "CHARGER: pack full (%s) at %.3fV - charging paused until the cell drops",
+        ESP_LOGI(TAG, "CHARGER: pack full (%s) at %.3fV - no more charge kicks until the cell drops",
                  battery.isGaugeChargeInhibited() ? "gauge FC" : "charger termination", v);
     }
     if (fullHold)
     {
         const bool cellDown = v < 3.30f || battery.getBatteryPercentage() < 90.0f;
-        if (cellDown && !battery.isGaugeChargeInhibited())
+        if (cellDown && !battery.isGaugeChargeInhibited() && !battery.isChargeDone())
         {
             fullHold = false;
-            battery.setChargeEnabled(true);
-            ESP_LOGI(TAG, "CHARGER: cell at %.3fV - charging resumed", v);
+            ESP_LOGI(TAG, "CHARGER: cell at %.3fV - normal charge supervision resumed", v);
         }
         return; // no tiering or kicking while holding
     }

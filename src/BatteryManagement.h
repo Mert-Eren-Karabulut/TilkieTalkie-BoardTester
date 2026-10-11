@@ -185,7 +185,7 @@ private:
     // nominal_3.2V / 10 = 4000 × 3.2 / 10 = 1280).
     static const uint16_t DEFAULT_GAUGE_DESIGN_CAPACITY_MAH = 4000;
     static const uint16_t DEFAULT_GAUGE_DESIGN_ENERGY_MWH = 1280;
-    static const uint8_t DEFAULT_GAUGE_FET_OPTIONS = 0x20;
+    static const uint8_t DEFAULT_GAUGE_FET_OPTIONS = 0x00; // FETs stay closed in every charging mode (was 0x20): at FC the gauge must not open the CHG FET, the charger terminates; safety faults still open the FETs
     static const uint8_t DEFAULT_GAUGE_I2C_GAUGING_CONFIGURATION = 0x04;
     static const uint8_t DEFAULT_GAUGE_I2C_CONFIGURATION = 0x00; // BCAST off: no smart charger on this bus, and the gauge
                                                                    // becoming bus master every pacing interval collides with the bit-bang
