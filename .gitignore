@@ -9,3 +9,8 @@ backups/
 
 # tools/release.sh output
 /releases
+
+# TI bqStudio files (licensed for use with bqStudio only) and anything derived from them
+docs/gauge/bqstudio-*
+docs/gauge/*.zip
+docs/gauge/lfp-chem-ids.txt
