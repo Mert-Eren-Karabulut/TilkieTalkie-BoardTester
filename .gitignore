@@ -14,3 +14,5 @@ backups/
 docs/gauge/bqstudio-*
 docs/gauge/*.zip
 docs/gauge/lfp-chem-ids.txt
+
+.DS_Store
