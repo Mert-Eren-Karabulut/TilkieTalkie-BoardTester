@@ -158,7 +158,7 @@ void handleChatMessage(const String &message)
 // Callback function for when figure download is complete
 void onFigureDownloadComplete(const String &uid, const String &figureName, bool success, const String &error, const RequestManager::Figure &figure, bool isUpdate)
 {
-    const bool mounted = nfcController.isCardPresent() && nfcController.currentNFCData().uidString == uid;
+    const bool mounted = nfcController.isCardPresent() && nfcController.currentUidCopy() == uid;
 
     if (!success)
     {
@@ -940,10 +940,14 @@ void loop()
     if (OtaManager::getInstance().consumeJustFailed())
     {
         const String err = OtaManager::getInstance().lastError();
-        const Fault f = err.indexOf("sha256") >= 0 ? Fault::OTA_SHA_MISMATCH
-                        : (err.indexOf("flash") >= 0 || err.indexOf("activate") >= 0) ? Fault::OTA_FLASH_FAILED
-                        : err.indexOf("prompt pack") >= 0 ? Fault::PROMPT_PACK_FAILED
-                        : Fault::OTA_DOWNLOAD_FAILED;
+        Fault f = Fault::OTA_DOWNLOAD_FAILED;
+        switch (OtaManager::getInstance().lastFailure())
+        {
+        case OtaManager::Failure::SHA: f = Fault::OTA_SHA_MISMATCH; break;
+        case OtaManager::Failure::FLASH: f = Fault::OTA_FLASH_FAILED; break;
+        case OtaManager::Failure::PROMPTS: f = Fault::PROMPT_PACK_FAILED; break;
+        default: break;
+        }
         Faults::raise(f, err.substring(0, 39).c_str());
     }
     TT_TIMED("led", deriveLedScene()); // the LED task renders the scene

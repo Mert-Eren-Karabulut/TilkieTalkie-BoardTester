@@ -254,25 +254,10 @@ void serviceUxPrompts()
     {
         gWifiLostAnnounced = false;
     }
-    // Figure on the pogo pins but no card read within 3 s.
-    static unsigned long pogoSince = 0;
-    static bool troubleSaid = false;
-    if (nfcController.isPogoSwitchActive())
+    // Figure on the pogo pins but no card read within 3 s (decided by NfcController, once per session).
+    if (nfcController.consumeReadTrouble())
     {
-        if (pogoSince == 0)
-        {
-            pogoSince = now;
-            troubleSaid = false;
-        }
-        if (!nfcController.isCardPresent() && !troubleSaid && now - pogoSince > 3000UL)
-        {
-            troubleSaid = true;
-            Faults::raise(Fault::NFC_READ_TROUBLE);
-        }
-    }
-    else
-    {
-        pogoSince = 0;
+        Faults::raise(Fault::NFC_READ_TROUBLE);
     }
 }
 
