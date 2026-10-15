@@ -1,8 +1,10 @@
 #include "Buttons.h"
+#include <esp_log.h>
+
+static const char *TAG = "btn";
 
 // Static member definitions
 const int ButtonController::BUTTON_PINS[MAX_BUTTONS] = {12, 13, 14, 21}; // GPIO pins for buttons 1-4 (ESP32-S3)
-volatile bool ButtonController::interruptFlag = false;
 
 ButtonController& ButtonController::getInstance() {
     static ButtonController instance;
@@ -22,7 +24,7 @@ void ButtonController::begin() {
     }
 
     // Note: Using polling instead of interrupts for better reliability across all GPIO pins
-    Serial.println("[BUTTONS] Button controller initialized (polling mode)");
+    ESP_LOGI(TAG, "Button controller initialized (polling mode)");
 }
 
 void ButtonController::update() {
@@ -112,7 +114,7 @@ void ButtonController::handleButtonPress(ButtonId button) {
     btn.singleClickPending = true;
     btn.processed = false;
     
-    Serial.printf("[BUTTONS] Button %d pressed\n", button + 1);
+    ESP_LOGI(TAG, "Button %d pressed", button + 1);
 }
 
 void ButtonController::handleButtonRelease(ButtonId button) {
@@ -120,7 +122,7 @@ void ButtonController::handleButtonRelease(ButtonId button) {
     ButtonState& btn = buttons[button];
     unsigned long pressDuration = currentTime - btn.pressStartTime;
     
-    Serial.printf("[BUTTONS] Button %d released (held for %lu ms)\n", button + 1, pressDuration);
+    ESP_LOGI(TAG, "Button %d released (held for %lu ms)", button + 1, pressDuration);
     
     // Handle hold end
     if (btn.isHolding) {
@@ -193,7 +195,7 @@ void ButtonController::updateCombo() {
             buttons[BUTTON_1].processed = true;
             buttons[BUTTON_4].processed = true;
             
-            Serial.println("[BUTTONS] Combo hold started (Button 1 + 4)");
+            ESP_LOGI(TAG, "Combo hold started (Button 1 + 4)");
         }
     }
     
@@ -216,7 +218,7 @@ void ButtonController::updateCombo() {
             buttons[BUTTON_2].processed = true;
             buttons[BUTTON_3].processed = true;
             
-            Serial.println("[BUTTONS] Combo2 hold started (Button 2 + 3)");
+            ESP_LOGI(TAG, "Combo2 hold started (Button 2 + 3)");
         }
     }
     
@@ -234,7 +236,7 @@ void ButtonController::updateCombo() {
                         holdStartCallback(static_cast<ButtonId>(i), currentTime - btn.pressStartTime);
                     }
                     
-                    Serial.printf("[BUTTONS] Button %d hold started\n", i + 1);
+                    ESP_LOGI(TAG, "Button %d hold started", i + 1);
                 }
             }
         }
@@ -250,7 +252,7 @@ void ButtonController::resetButton(ButtonId button) {
 
 void ButtonController::resetCombo() {
     if (comboActive) {
-        Serial.println("[BUTTONS] Combo hold ended");
+        ESP_LOGI(TAG, "Combo hold ended");
         comboActive = false;
         comboProcessed = false;
         
@@ -262,7 +264,7 @@ void ButtonController::resetCombo() {
 
 void ButtonController::resetCombo2() {
     if (combo2Active) {
-        Serial.println("[BUTTONS] Combo2 hold ended");
+        ESP_LOGI(TAG, "Combo2 hold ended");
         combo2Active = false;
         combo2Processed = false;
         
@@ -332,9 +334,4 @@ bool ButtonController::isHolding(ButtonId button) {
 
 bool ButtonController::isComboActive() {
     return comboActive;
-}
-
-// Interrupt handler
-void IRAM_ATTR ButtonController::handleInterrupt() {
-    interruptFlag = true;
 }

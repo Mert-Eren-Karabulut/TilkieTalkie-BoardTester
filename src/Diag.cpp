@@ -11,7 +11,7 @@ static const char *TAG = "DIAG";
 
 namespace
 {
-    constexpr uint8_t MAX_SECTIONS = 16;
+    constexpr uint8_t MAX_SECTIONS = 32; // 20 TT_TIMED sections in the loop today
     struct Section
     {
         const char *name = nullptr;
@@ -164,7 +164,7 @@ void Diag::periodicReport(uint32_t intervalMs)
     lastReport = now;
     if (g_verbose)
     {
-        printSectionStats(true); // ~16 lines over USB-CDC: only when asked for ('diag on')
+        printSectionStats(true); // ~20 lines over USB-CDC: only when asked for ('diag on')
     }
     else
     {

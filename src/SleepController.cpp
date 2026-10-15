@@ -5,10 +5,11 @@
 #include "BatteryManagement.h"
 #include "FileManager.h"
 #include "Buttons.h"
+#include "NfcController.h"
 #include <esp_log.h>
 #include <driver/gpio.h>
 
-static const char* TAG = "SLEEP";
+static const char* TAG = "sleep";
 
 // Magic number for RTC data validation
 #define RTC_MAGIC 0xABABABAB
@@ -31,9 +32,9 @@ const gpio_num_t SleepController::WAKEUP_POGO_PIN = GPIO_NUM_6;
 
 SleepController::SleepController() :
     sleepScheduled(false),
-    scheduledSleepTime(0),
-    lastActivityTime(0),
-    inactivityTimeout(30000), // Default 30 seconds inactivity
+    scheduledSleepAt(0),
+    scheduledSleepDelay(0),
+    inactivityTimeout(Policy::INACTIVITY_TIMEOUT_SHORT_MS), // setup() sets the real value
     wokenFromSleep(false),
     sleepCallback(nullptr),
     conditionsMetForSleep(false),
@@ -54,11 +55,9 @@ SleepController& SleepController::getInstance() {
 
 void SleepController::begin() {
     ESP_LOGI(TAG, "Initializing Sleep Controller...");
-    
-    // Enable peripheral power first (needed for SD card access)
-    enablePeripheralPower();
-    delay(500); // Let peripherals stabilize
-    
+    // The peripheral rail is powered by setup() (enablePeripheralPower) before any peripheral
+    // init; it used to be switched on (and waited for) a second time here.
+
     // Check if we woke up from deep sleep
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
     
@@ -210,8 +209,9 @@ void SleepController::enterDeepSleep() {
     // workarounds and leaves the memories half-selected at ~40mA all night (the
     // 5-day battery-depletion culprit). GPIO4 (and the NFC bus pins) are RTC-capable
     // pads whose gpio_hold_en persists through deep sleep natively, so the 4.5V rail
-    // still stays off without it. Cost: GPIO44/BATT_CE (digital pad) cannot be held —
-    // the charger CE line needs a board pulldown to stay defined during sleep.
+    // still stays off without it. Exception: on USB power the sleep callback (main.cpp) arms
+    // the global hold so GPIO44/BATT_CE (a digital pad) stays low and charging continues;
+    // VBUS pays the standby cost there. On battery CE is irrelevant and is left unheld.
 
     // Configure wake-up sources
     configureWakeupSources();
@@ -245,9 +245,27 @@ void SleepController::disablePeripheralPower() {
     gpio_hold_en((gpio_num_t)PERIPHERAL_POWER_PIN);
 }
 
+void SleepController::powerDownNfcForSleep() {
+    // Whatever the rail does (the 2026-10-11 audit reads RSTPD_N as following GPIO4 through
+    // R77; the PN532 supply itself is on the always-on 3.3 V rail), the measured fix for the
+    // ~40 mA sleep drain (5-day depletion incident) is the PN532 software power-down.
+    NfcController::getInstance().powerDown();
+    // Park the NFC I2C lines high and latch them through deep sleep. The pads get isolated in
+    // sleep and the pullups are internal-only, so the bus would float, which the powered PN532
+    // reads as endless phantom traffic (its wake source is I2C activity), defeating the
+    // power-down. Idle-high bus keeps it asleep. Released in NfcController::begin()/powerDown().
+    pinMode(NFC_SDA_PIN, OUTPUT);
+    digitalWrite(NFC_SDA_PIN, HIGH);
+    gpio_hold_en((gpio_num_t)NFC_SDA_PIN);
+    pinMode(NFC_SCL_PIN, OUTPUT);
+    digitalWrite(NFC_SCL_PIN, HIGH);
+    gpio_hold_en((gpio_num_t)NFC_SCL_PIN);
+}
+
 void SleepController::scheduleSleep(unsigned long timeoutMs) {
     sleepScheduled = true;
-    scheduledSleepTime = millis() + timeoutMs;
+    scheduledSleepAt = millis();
+    scheduledSleepDelay = timeoutMs;
     ESP_LOGI(TAG, "Sleep scheduled in %lu ms", timeoutMs);
 }
 
@@ -278,7 +296,7 @@ void SleepController::update() {
     unsigned long currentTime = millis();
     
     // Check scheduled sleep (explicit sleep command)
-    if (sleepScheduled && currentTime >= scheduledSleepTime) {
+    if (sleepScheduled && currentTime - scheduledSleepAt >= scheduledSleepDelay) { // wrap-safe
         sleepScheduled = false;
         ESP_LOGI(TAG, "Scheduled sleep time reached");
         checkAndSleep();

@@ -6,6 +6,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include "Policy.h"
 
 class BatteryManager {
 private:
@@ -179,7 +180,7 @@ private:
     // (~1A×3.1V charge + ~3W system < ~7.5W) so it won't starve SYS even at low SOC.
     // Could go to 2A with a stronger (PD 9V) input. NOTE: requires the gauge to be
     // current-calibrated first — on an uncalibrated gauge use 300mA (it over-reads ~4.5x).
-    static const uint16_t DEFAULT_CHARGE_CURRENT_MA = 1000;
+    static const uint16_t DEFAULT_CHARGE_CURRENT_MA = Policy::CHARGE_CURRENT_FAST_MA;
     static const uint16_t DEFAULT_INPUT_CURRENT_LIMIT_MA = 3000;
     // 4000mAh LiFePO4 1S cell. Design Energy is in 10mWh units (capacity_mAh ×
     // nominal_3.2V / 10 = 4000 × 3.2 / 10 = 1280).
@@ -269,7 +270,6 @@ private:
     uint16_t currentFullChargeCapacityMilliAmpHours;
     uint16_t gaugeDesignCapacityMilliAmpHours;
     bool isCharging;
-    bool isChargingPrevious;
     bool telemetryValid;
 
     // Device state
@@ -537,7 +537,7 @@ public:
     }
 
     // Battery status methods
-    bool isBatteryLow() const { return telemetryValid && currentPercentage < 15.0; }
+    bool isBatteryLow() const { return telemetryValid && currentPercentage < Policy::LOW_BATTERY_PERCENT; }
     bool isBatteryCritical() const { return telemetryValid && currentPercentage < 5.0; }
     bool isBatteryFull() const { return telemetryValid && currentPercentage >= 95.0 && isCharging; }
     
@@ -549,19 +549,6 @@ public:
     void printProtectionConfig();
     void printBusScan();
     
-    // Calibration methods
-    void calibrate(float actualVoltage);
-    void resetCalibration();
-    
-    // Event callbacks (optional)
-    typedef void (*BatteryEventCallback)(float voltage, float percentage, bool charging);
-    void setLowBatteryCallback(BatteryEventCallback callback);
-    void setChargingStateChangeCallback(BatteryEventCallback callback);
-    
-private:
-    BatteryEventCallback lowBatteryCallback;
-    BatteryEventCallback chargingStateChangeCallback;
-    bool lowBatteryCallbackTriggered;
 };
 
 #endif // BATTERYMANAGEMENT_H

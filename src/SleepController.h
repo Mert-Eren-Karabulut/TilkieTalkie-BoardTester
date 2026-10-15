@@ -5,6 +5,7 @@
 #include <functional>
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
+#include "Policy.h"
 
 // Minimal RTC Memory structure (just a flag to indicate we had a valid sleep)
 // RTC_DATA_ATTR variables survive deep sleep
@@ -46,12 +47,16 @@ public:
     unsigned long getInactivityTimeout() const { return inactivityTimeout; }
     
     // Peripheral power control pin
-    static const int PERIPHERAL_POWER_PIN = 4;
+    static const int PERIPHERAL_POWER_PIN = Policy::PERIPHERAL_POWER_GPIO;
 
     // 4V5 rail control (GPIO4 + deep-sleep latch). Public: used by the power serial
     // commands and by the gauge-based sleep-current measurement (`sleeptest`).
     void disablePeripheralPower();
     void enablePeripheralPower();
+
+    // PN532 software power-down + NFC I2C lines parked high and latched through deep sleep.
+    // Used by the sleep callback (main) and the bench `sleeptest`.
+    static void powerDownNfcForSleep();
 
 private:
     // Singleton instance
@@ -63,8 +68,8 @@ private:
 
     // Sleep state
     bool sleepScheduled;
-    unsigned long scheduledSleepTime;
-    unsigned long lastActivityTime;
+    unsigned long scheduledSleepAt;     // millis() when scheduleSleep() ran
+    unsigned long scheduledSleepDelay;  // wrap-safe: elapsed since scheduledSleepAt
     unsigned long inactivityTimeout;
     bool wokenFromSleep;
     SleepCallback sleepCallback;

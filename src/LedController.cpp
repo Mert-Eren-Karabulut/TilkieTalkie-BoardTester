@@ -2,6 +2,9 @@
 #include "Diag.h"
 #include <esp_timer.h>
 #include "ConfigManager.h"
+#include <esp_log.h>
+
+static const char *TAG = "led";
 
 namespace {
 const uint32_t COLOR_WARM = 0xFFB46E;
@@ -64,7 +67,7 @@ void LedController::showLeds() {
 
 void LedController::begin() {
     if (!rmtInit(LED_PIN, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_4, kRmtHz)) {
-        Serial.println("LedController: RMT init failed");
+        ESP_LOGE(TAG, "RMT init failed");
     }
     for (int i = 0; i < NUM_LEDS; ++i) leds[i] = CRGB(0, 0, 0);
     showLeds();
@@ -180,12 +183,6 @@ void LedController::turnOff() {
 void LedController::setMaxBrightness(int brightness) {
     maxBrightness = constrain(brightness, 0, LED_MAX_POWER);
     ConfigManager::getInstance().storeInt("max_brightness", maxBrightness);
-}
-
-void LedController::enableOperatingAnimation(bool enable) {
-    if (enable && scene == SCENE_MANUAL) {
-        setScene(SCENE_OFF); // the old idle sweep is gone: online idle is dark
-    }
 }
 
 void LedController::showChargeLevel(uint8_t percent, bool charging) {

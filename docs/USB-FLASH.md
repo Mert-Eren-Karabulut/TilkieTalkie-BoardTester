@@ -21,3 +21,8 @@ Without a browser: `esptool --chip esp32s3 --port /dev/cu.usbmodemXXXX write-fla
 
 First boot on a board whose gauge was never calibrated runs the bring-up (blue → green on USB
 power with a battery that is not full; see FACTORY_BRINGUP.md).
+
+Release images are always built from the production env (`esp32-s3-devkitc-1`). A bench
+board that needs the bench console commands (learning cycle, gauge data flash, `endpoint set`,
+...) is flashed with `pio run -e bench -t upload` instead; never ship that image. See
+docs/CONSOLE.md.

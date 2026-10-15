@@ -47,7 +47,6 @@ public:
 
     LedController();
     void begin();
-    void update() {}  // kept for the loop; rendering happens on the LED task
 
     // Scenes (idempotent) and the low-battery overlay (LED 0 breathes red on OFF/PLAYING/PAUSED)
     void setScene(Scene scene, int param = -1);
@@ -65,7 +64,6 @@ public:
     void turnOff();
     void setMaxBrightness(int brightness);
     int getMaxBrightness() const { return maxBrightness; }
-    void enableOperatingAnimation(bool enable = true);
     void showChargeLevel(uint8_t percent, bool charging);
     void stopChargeDisplay();
     bool isChargeDisplayActive() const { return scene == SCENE_CHARGING; }
