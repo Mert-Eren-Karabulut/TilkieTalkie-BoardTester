@@ -109,6 +109,9 @@ remotely, paired with firmware releases (portal docs/OTA.md "Voice prompt packs"
   another version next to `/sounds.old` and restores its own.
 - **Pack changed for the current release / card without a pack.** The device downloads it the
   same way and swaps it in as soon as no prompt is playing.
+- **Transport.** Pack files are fetched like story tracks, over plain HTTP on port 80 (sha256
+  verified); nginx must serve `/storage/prompts/` on port 80 without the HTTPS redirect, as it
+  does for `/storage/tracks/`. A redirect shows up as the pack's files staying "queued".
 - **If the pack cannot be downloaded** twice in a row, the image is installed anyway and the new
   firmware fetches its pack at its first check, so a broken pack never blocks a firmware update.
 
