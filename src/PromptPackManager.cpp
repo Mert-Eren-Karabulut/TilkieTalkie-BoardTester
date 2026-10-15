@@ -6,12 +6,14 @@
 #include "Version.h"
 #include "Faults.h"
 #include <SD_MMC.h>
+#include <esp_log.h>
 
 const char *PromptPackManager::SOUNDS_DIR = "/sounds";
 const char *PromptPackManager::STAGING_DIR = "/sounds.staging";
 
 namespace
 {
+const char *TAG = "pack";
 const unsigned long STAGING_WATCHDOG_MS = 45UL * 60UL * 1000UL; // a slow link gets this long for ~1 MB
 const char *OLD_DIR = "/sounds.old";
 }
@@ -22,18 +24,14 @@ PromptPackManager &PromptPackManager::getInstance()
     return inst;
 }
 
-bool PromptPackManager::parsePack(JsonVariantConst v, Pack &out)
+void PromptPackManager::parseFields(JsonVariantConst v, Pack &out)
 {
     out = Pack();
-    if (v.isNull() || !v.is<JsonObjectConst>())
-    {
-        return false;
-    }
     out.id = v["pack_id"] | 0U;
     out.name = v["name"].as<String>();
     out.checksum = v["checksum"].as<String>();
     out.checksum.toLowerCase();
-    out.baseUrl = v["base_url"].as<String>();
+    out.baseUrl = v["base_url"].as<String>();   // absent in pack.json
     for (JsonVariantConst f : v["files"].as<JsonArrayConst>())
     {
         PackFile pf;
@@ -46,6 +44,16 @@ bool PromptPackManager::parsePack(JsonVariantConst v, Pack &out)
         }
         out.files.push_back(pf);
     }
+}
+
+bool PromptPackManager::parsePack(JsonVariantConst v, Pack &out)
+{
+    out = Pack();
+    if (v.isNull() || !v.is<JsonObjectConst>())
+    {
+        return false;
+    }
+    parseFields(v, out);
     return out.valid();
 }
 
@@ -61,25 +69,10 @@ bool PromptPackManager::readPackJson(const String &dir, Pack &pack, String &forV
     f.close();
     if (err)
     {
-        Serial.printf("Prompts: %s/pack.json unreadable (%s)\n", dir.c_str(), err.c_str());
+        ESP_LOGW(TAG, "%s/pack.json unreadable (%s)", dir.c_str(), err.c_str());
         return false;
     }
-    pack = Pack();
-    pack.id = doc["pack_id"] | 0U;
-    pack.name = doc["name"].as<String>();
-    pack.checksum = doc["checksum"].as<String>();
-    pack.checksum.toLowerCase();
-    for (JsonVariantConst fv : doc["files"].as<JsonArrayConst>())
-    {
-        PackFile pf;
-        pf.path = fv["p"].as<String>();
-        pf.sha256 = fv["h"].as<String>();
-        pf.size = fv["s"] | 0U;
-        if (!pf.path.isEmpty())
-        {
-            pack.files.push_back(pf);
-        }
-    }
+    parseFields(doc.as<JsonVariantConst>(), pack);
     forVersion = doc["for_firmware"].as<String>();
     return pack.checksum.length() == 64;
 }
@@ -110,8 +103,8 @@ void PromptPackManager::begin()
         {
             // The active pack belongs to a firmware that did not survive its first boot (the
             // bootloader rolled back to us): put our own pack back, keep theirs staged.
-            Serial.printf("Prompts: active pack is for firmware %s - restoring the previous pack after the rollback\n",
-                          installedFor.c_str());
+            ESP_LOGW(TAG, "active pack is for firmware %s - restoring the previous pack after the rollback",
+                     installedFor.c_str());
             if (fm.fileExists(STAGING_DIR))
             {
                 deleteTree(STAGING_DIR);
@@ -122,12 +115,38 @@ void PromptPackManager::begin()
             }
             else
             {
-                Serial.println("Prompts: restore failed, keeping what is there");
+                ESP_LOGW(TAG, "restore failed, keeping what is there");
+                Faults::raise(Fault::PROMPT_PACK_ACTIVATE_FAILED, "restore");
+            }
+        }
+        else if (haveInstalled)
+        {
+            deleteTree(OLD_DIR); // an activation that was interrupted before the cleanup
+        }
+        else if (!fm.fileExists(SOUNDS_DIR))
+        {
+            // Power lost between "move /sounds aside" and "move the staged pack in": the
+            // previous pack is the only one there is. A staged pack for this firmware is
+            // activated below (it keeps /sounds.old until it is in place).
+            Pack staged;
+            String stagedFor;
+            if (!(readPackJson(STAGING_DIR, staged, stagedFor) && stagedFor == firmwareVersion()))
+            {
+                ESP_LOGW(TAG, "/sounds missing - restoring the previous pack from %s", OLD_DIR);
+                if (SD_MMC.rename(OLD_DIR, SOUNDS_DIR))
+                {
+                    haveInstalled = readPackJson(SOUNDS_DIR, installed, installedFor);
+                }
+                else
+                {
+                    Faults::raise(Fault::PROMPT_PACK_ACTIVATE_FAILED, "restore");
+                }
             }
         }
         else
         {
-            deleteTree(OLD_DIR); // an activation that was interrupted before the cleanup
+            // /sounds exists but carries no pack: /sounds.old stays until a pack is active.
+            ESP_LOGI(TAG, "/sounds has no pack - keeping %s", OLD_DIR);
         }
     }
     _installed = haveInstalled ? installed.checksum : String();
@@ -137,13 +156,24 @@ void PromptPackManager::begin()
     {
         if (forVersion == firmwareVersion())
         {
-            Serial.printf("Prompts: pack %.12s staged for this firmware - activating\n", staged.checksum.c_str());
+            ESP_LOGI(TAG, "pack %.12s staged for this firmware - activating", staged.checksum.c_str());
             activateStaging();
         }
         else
         {
-            Serial.printf("Prompts: pack %.12s staged for firmware %s, kept for that update\n",
-                          staged.checksum.c_str(), forVersion.c_str());
+            ESP_LOGI(TAG, "pack %.12s staged for firmware %s, kept for that update",
+                     staged.checksum.c_str(), forVersion.c_str());
+        }
+    }
+    if (!fm.fileExists(SOUNDS_DIR) && fm.fileExists(OLD_DIR))
+    {
+        // The staged pack could not be swapped in after an interrupted activation: never boot
+        // without prompts while the previous pack is on the card.
+        ESP_LOGW(TAG, "no /sounds after activation - restoring the previous pack");
+        if (SD_MMC.rename(OLD_DIR, SOUNDS_DIR))
+        {
+            String restoredFor;
+            _installed = readPackJson(SOUNDS_DIR, installed, restoredFor) ? installed.checksum : String();
         }
     }
     int missing = 0;
@@ -151,8 +181,8 @@ void PromptPackManager::begin()
     {
         if (!FileManager::getInstance().fileExists(String(SOUNDS_DIR) + "/" + p)) missing++;
     }
-    Serial.printf("Prompts: card pack %s, %d required file(s) missing\n",
-                  _installed.isEmpty() ? "none" : _installed.substring(0, 12).c_str(), missing);
+    ESP_LOGI(TAG, "card pack %s, %d required file(s) missing",
+             _installed.isEmpty() ? "none" : _installed.substring(0, 12).c_str(), missing);
     if (missing > 0)
     {
         char d[24];
@@ -170,7 +200,7 @@ void PromptPackManager::update()
     }
     if (_staging && millis() - _stagingSince > STAGING_WATCHDOG_MS)
     {
-        Serial.println("Prompts: pack download took too long - giving up for now");
+        ESP_LOGW(TAG, "pack download took too long - giving up for now");
         finishStaging(false);
     }
 }
@@ -205,11 +235,26 @@ bool PromptPackManager::stage(const Pack &pack, const String &forVersion, std::f
         if (_pack.checksum == pack.checksum)
         {
             _forVersion = forVersion; // same pack, maybe a different target: the manifest is written at the end
-            _cb = cb;
+            if (_cb && cb)
+            {
+                auto previous = _cb;
+                _cb = [previous, cb](bool ok) { previous(ok); cb(ok); }; // both waiters hear the result
+            }
+            else if (cb)
+            {
+                _cb = cb;
+            }
             return true;
         }
-        Serial.println("Prompts: a different pack was being staged - replaced");
+        ESP_LOGW(TAG, "a different pack was being staged - replaced");
+        cancelQueuedStaging();
         _staging = false;
+        if (_cb)
+        {
+            auto previous = _cb;
+            _cb = nullptr;
+            previous(false);
+        }
     }
     FileManager &fm = FileManager::getInstance();
     Pack staged;
@@ -238,8 +283,8 @@ bool PromptPackManager::stage(const Pack &pack, const String &forVersion, std::f
         fm.scheduleDownload(pack.baseUrl + pf.path, local, pf.sha256);
         _filesTotal++;
     }
-    Serial.printf("Prompts: staging pack %.12s (%s) for firmware %s: %d file(s) to download\n",
-                  pack.checksum.c_str(), pack.name.c_str(), forVersion.c_str(), _filesTotal);
+    ESP_LOGI(TAG, "staging pack %.12s (%s) for firmware %s: %d file(s) to download",
+             pack.checksum.c_str(), pack.name.c_str(), forVersion.c_str(), _filesTotal);
     if (_filesTotal == 0)
     {
         finishStaging(true);
@@ -252,13 +297,13 @@ bool PromptPackManager::stage(const Pack &pack, const String &forVersion, std::f
 
 void PromptPackManager::onFileDone(const String &path, bool success)
 {
-    if (!_staging || !path.startsWith(STAGING_DIR))
+    if (!_staging || !ownsStagingPath(path))
     {
-        return;
+        return; // not ours, or a late answer for a pack that was replaced
     }
     if (!success)
     {
-        Serial.printf("Prompts: %s could not be downloaded\n", path.c_str());
+        ESP_LOGW(TAG, "%s could not be downloaded", path.c_str());
         finishStaging(false);
         return;
     }
@@ -266,6 +311,41 @@ void PromptPackManager::onFileDone(const String &path, bool success)
     if (_filesDone >= _filesTotal)
     {
         finishStaging(true);
+    }
+}
+
+bool PromptPackManager::ownsStagingPath(const String &path) const
+{
+    if (!path.startsWith(STAGING_DIR))
+    {
+        return false;
+    }
+    for (const PackFile &pf : _pack.files)
+    {
+        if (path == String(STAGING_DIR) + "/" + pf.path)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The pack's downloads still waiting in the queue are dropped (the one in flight finishes and
+// is ignored by onFileDone): a failed or replaced staging stops costing bandwidth.
+void PromptPackManager::cancelQueuedStaging()
+{
+    FileManager &fm = FileManager::getInstance();
+    int cancelled = 0;
+    for (const PackFile &pf : _pack.files)
+    {
+        if (fm.cancelQueuedDownload(String(STAGING_DIR) + "/" + pf.path))
+        {
+            cancelled++;
+        }
+    }
+    if (cancelled)
+    {
+        ESP_LOGI(TAG, "%d queued pack download(s) cancelled", cancelled);
     }
 }
 
@@ -278,12 +358,13 @@ void PromptPackManager::finishStaging(bool ok)
         ok = filesComplete(STAGING_DIR, _pack, &missing) && writeStagingManifest();
         if (!ok)
         {
-            Serial.printf("Prompts: staging incomplete (%d file(s) missing or manifest not written)\n", missing);
+            ESP_LOGW(TAG, "staging incomplete (%d file(s) missing or manifest not written)", missing);
         }
     }
-    Serial.printf("Prompts: pack %.12s staging %s\n", _pack.checksum.c_str(), ok ? "complete" : "failed");
+    ESP_LOGI(TAG, "pack %.12s staging %s", _pack.checksum.c_str(), ok ? "complete" : "failed");
     if (!ok)
     {
+        cancelQueuedStaging();
         Faults::raise(Fault::PROMPT_PACK_FAILED, _pack.checksum.substring(0, 12).c_str());
     }
     if (ok && _forVersion == firmwareVersion())
@@ -325,60 +406,88 @@ bool PromptPackManager::activateStaging()
     String forVersion;
     if (!readPackJson(STAGING_DIR, staged, forVersion))
     {
+        ESP_LOGW(TAG, "staged pack has no readable pack.json, not activated");
+        Faults::raise(Fault::PROMPT_PACK_ACTIVATE_FAILED, "manifest");
         return false;
     }
     if (forVersion != firmwareVersion())
     {
-        Serial.printf("Prompts: staged pack is for firmware %s, not activated\n", forVersion.c_str());
+        ESP_LOGI(TAG, "staged pack is for firmware %s, not activated", forVersion.c_str());
         return false;
     }
     int missing = 0;
     if (!filesComplete(STAGING_DIR, staged, &missing))
     {
-        Serial.printf("Prompts: staged pack has %d file(s) missing, not activated\n", missing);
+        ESP_LOGW(TAG, "staged pack has %d file(s) missing, not activated", missing);
+        char d[24];
+        snprintf(d, sizeof(d), "missing=%d", missing);
+        Faults::raise(Fault::PROMPT_PACK_ACTIVATE_FAILED, d);
         return false;
     }
     FileManager &fm = FileManager::getInstance();
+    Pack current;
+    String currentFor;
+    const bool currentHasPack = readPackJson(SOUNDS_DIR, current, currentFor);
+    bool hadSounds = fm.fileExists(SOUNDS_DIR);
     if (fm.fileExists(OLD_DIR))
     {
-        deleteTree(OLD_DIR);
+        if (currentHasPack)
+        {
+            deleteTree(OLD_DIR); // superseded: the current pack becomes the fallback
+        }
+        else if (hadSounds)
+        {
+            // /sounds without a pack next to a real previous pack: the previous pack stays
+            // the fallback, the packless folder makes room for the new pack.
+            ESP_LOGI(TAG, "/sounds has no pack - keeping %s as the fallback", OLD_DIR);
+            deleteTree(SOUNDS_DIR);
+            hadSounds = false;
+        }
     }
-    const bool hadSounds = fm.fileExists(SOUNDS_DIR);
     if (hadSounds && !SD_MMC.rename(SOUNDS_DIR, OLD_DIR))
     {
-        Serial.println("Prompts: could not move the current /sounds aside - pack not activated");
+        ESP_LOGW(TAG, "could not move the current /sounds aside - pack not activated");
+        Faults::raise(Fault::PROMPT_PACK_ACTIVATE_FAILED, "move-aside");
         return false;
     }
     if (!SD_MMC.rename(STAGING_DIR, SOUNDS_DIR))
     {
-        Serial.println("Prompts: could not move the staged pack into place - restoring the old one");
+        ESP_LOGW(TAG, "could not move the staged pack into place - restoring the old one");
         Faults::raise(Fault::PROMPT_PACK_ACTIVATE_FAILED, "rename");
-        if (hadSounds)
+        if (fm.fileExists(OLD_DIR) && !fm.fileExists(SOUNDS_DIR))
         {
             SD_MMC.rename(OLD_DIR, SOUNDS_DIR);
         }
         return false;
     }
-    if (hadSounds && !_pendingVerify)
+    // A pack is active now: the fallback can go, unless this firmware may still be rolled back.
+    if (fm.fileExists(OLD_DIR))
     {
-        deleteTree(OLD_DIR);
-    }
-    else if (hadSounds)
-    {
-        Serial.println("Prompts: previous pack kept as /sounds.old until this firmware is confirmed");
+        if (!_pendingVerify)
+        {
+            deleteTree(OLD_DIR);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "previous pack kept as /sounds.old until this firmware is confirmed");
+        }
     }
     _installed = staged.checksum;
-    Serial.printf("Prompts: pack %.12s (%s) is now active\n", staged.checksum.c_str(), staged.name.c_str());
+    ESP_LOGI(TAG, "pack %.12s (%s) is now active", staged.checksum.c_str(), staged.name.c_str());
     return true;
 }
 
 void PromptPackManager::onFirmwareConfirmed()
 {
     _pendingVerify = false;
+    if (_installed.isEmpty())
+    {
+        return; // no pack in /sounds: /sounds.old (if any) is still the only real pack
+    }
     if (FileManager::getInstance().fileExists(OLD_DIR))
     {
         deleteTree(OLD_DIR);
-        Serial.println("Prompts: firmware confirmed, previous pack removed");
+        ESP_LOGI(TAG, "firmware confirmed, previous pack removed");
     }
 }
 
@@ -403,7 +512,7 @@ void PromptPackManager::discardStaleStaging()
         _activateWhenSilent = true; // a live sync interrupted by a reboot
         return;
     }
-    Serial.printf("Prompts: dropping the pack staged for firmware %s (no update on the way)\n", forVersion.c_str());
+    ESP_LOGI(TAG, "dropping the pack staged for firmware %s (no update on the way)", forVersion.c_str());
     deleteTree(STAGING_DIR);
 }
 

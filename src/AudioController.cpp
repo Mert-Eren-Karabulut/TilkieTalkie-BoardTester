@@ -1,6 +1,8 @@
 #include "AudioController.h"
 #include "ConfigManager.h"
 #include "NfcController.h"
+#include "VoicePrompts.h"
+#include <esp_log.h>
 #include <SD_MMC.h>
 #include <esp_heap_caps.h>
 
@@ -47,6 +49,32 @@ const int AudioController::HEADPHONE_CEILING_STEPS;
 // DACCONTROL3: bit5 soft ramp, bit1 mute
 #define ES8388_DAC_UNMUTE_RAMP  0x20
 #define ES8388_DAC_MUTE_RAMP    0x22
+
+
+namespace {
+const char* TAG = "audio";
+
+// Recursive audio lock for the lifetime of a scope (the audio task holds it for a decode slice,
+// control calls hold it while they change the player). No-op before begin() created the mutex.
+class AudioLock {
+public:
+    explicit AudioLock(SemaphoreHandle_t m)
+        : mutex(m), held(m && xSemaphoreTakeRecursive(m, portMAX_DELAY) == pdTRUE) {}
+    ~AudioLock() {
+        if (held) xSemaphoreGiveRecursive(mutex);
+    }
+    AudioLock(const AudioLock&) = delete;
+    AudioLock& operator=(const AudioLock&) = delete;
+private:
+    SemaphoreHandle_t mutex;
+    bool held;
+};
+
+const char* baseName(const String& path) {
+    const int slash = path.lastIndexOf('/');
+    return path.c_str() + (slash >= 0 ? slash + 1 : 0);
+}
+} // namespace
 
 AudioController::AudioController() :
     audioOutput(nullptr),
@@ -105,12 +133,12 @@ bool AudioController::begin() {
         return true;
     }
 
-    Serial.println("AudioController: Beginning initialization...");
+    ESP_LOGI(TAG, "Beginning initialization...");
 
     if (!audioMutex) {
         audioMutex = xSemaphoreCreateRecursiveMutex();
         if (!audioMutex) {
-            Serial.println("AudioController: Failed to create audio mutex");
+            ESP_LOGE(TAG, "Failed to create audio mutex");
             return false;
         }
     }
@@ -130,7 +158,7 @@ bool AudioController::begin() {
         audioOutput = new PersistentI2SOutput(0, AudioOutputI2S::EXTERNAL_I2S, 16, AudioOutputI2S::APLL_DISABLE);
         if (!audioOutput->SetMclk(true) ||
             !audioOutput->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN)) {
-            Serial.println("AudioController: Failed to configure I2S pins");
+            ESP_LOGE(TAG, "Failed to configure I2S pins");
             delete audioOutput;
             audioOutput = nullptr;
             return false;
@@ -139,17 +167,17 @@ bool AudioController::begin() {
         audioOutput->SetGain(1.0f);           // attenuation is done in the codec, not in software
     }
     if (!audioOutput->installed() && !audioOutput->begin()) {
-        Serial.println("AudioController: Failed to install the I2S driver");
+        ESP_LOGE(TAG, "Failed to install the I2S driver");
         return false;
     }
-    Serial.printf("AudioController: I2S up - BCLK:%d, LRCK:%d, DOUT:%d, MCLK:%d (16 DMA buffers, mono mix)\n",
-                  I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN);
+    ESP_LOGI(TAG, "I2S up - BCLK:%d, LRCK:%d, DOUT:%d, MCLK:%d (16 DMA buffers, mono mix)",
+             I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN, I2S_MCLK_PIN);
 
     if (!source) {
         source = new ReadAheadFileSource();
     }
     if (!source->begin()) {
-        Serial.println("AudioController: Failed to start the read-ahead source");
+        ESP_LOGE(TAG, "Failed to start the read-ahead source");
         return false;
     }
 
@@ -165,16 +193,16 @@ bool AudioController::begin() {
             where = "internal RAM";
         }
         if (!mp3Prealloc) {
-            Serial.println("AudioController: Failed to allocate the decoder workspace");
+            ESP_LOGE(TAG, "Failed to allocate the decoder workspace");
             return false;
         }
-        Serial.printf("AudioController: decoder workspace %d bytes (%s, allocated once)\n", mp3PreallocSize, where);
+        ESP_LOGI(TAG, "decoder workspace %d bytes (%s, allocated once)", mp3PreallocSize, where);
     }
 
     delay(50); // MCLK settles
 
     if (!initializeES8388()) {
-        Serial.println("AudioController: Failed to initialize ES8388");
+        ESP_LOGE(TAG, "Failed to initialize ES8388");
         return false;
     }
 
@@ -191,15 +219,15 @@ bool AudioController::begin() {
             1);
 
         if (taskCreated != pdPASS) {
-            Serial.println("AudioController: Failed to create background audio task, falling back to loop updates");
+            ESP_LOGW(TAG, "Failed to create background audio task, falling back to loop updates");
             audioTaskHandle = nullptr;
         } else {
-            Serial.println("AudioController: Background audio task created on Core 1 (priority 12)");
+            ESP_LOGI(TAG, "Background audio task created on Core 1 (priority 12)");
         }
     }
 
     applyCodecVolume();
-    Serial.printf("AudioController: Initialization complete - volume %d%% (ceiling %d%%)\n", currentVolume, volumeCeiling);
+    ESP_LOGI(TAG, "Initialization complete - volume %d%% (ceiling %d%%)", currentVolume, volumeCeiling);
     return true;
 }
 
@@ -226,23 +254,7 @@ void AudioController::end() {
     }
 
     initialized = false;
-    Serial.println("AudioController: powered down");
-}
-
-bool AudioController::suspendBackgroundTaskForControl() {
-    if (!audioMutex) {
-        return false;
-    }
-
-    return xSemaphoreTakeRecursive(audioMutex, portMAX_DELAY) == pdTRUE;
-}
-
-void AudioController::resumeBackgroundTaskForControl() {
-    if (!audioMutex) {
-        return;
-    }
-
-    xSemaphoreGiveRecursive(audioMutex);
+    ESP_LOGI(TAG, "powered down");
 }
 
 void AudioController::audioTaskEntry(void* parameter) {
@@ -251,18 +263,15 @@ void AudioController::audioTaskEntry(void* parameter) {
     while (true) {
         unsigned long sliceStart = millis();
         if (self && self->initialized) {
-            bool locked = self->suspendBackgroundTaskForControl();
-            if (locked) {
-                self->updatePlaybackSlice();
-                self->resumeBackgroundTaskForControl();
-            }
+            AudioLock lock(self->audioMutex);
+            self->updatePlaybackSlice();
         }
         unsigned long took = millis() - sliceStart;
         if (took > 500) {
             // A slice ran far longer than a few decode passes (SD stall, track change under
             // memory pressure): log it and give the lower-priority tasks on this core a breather
             // so the loop and the idle task are never starved.
-            Serial.printf("AudioController: slice took %lu ms\n", took);
+            ESP_LOGW(TAG, "slice took %lu ms", took);
             vTaskDelay(pdMS_TO_TICKS(20));
         }
 
@@ -300,7 +309,7 @@ void AudioController::applyAmp() {
     // Open-drain: HIGH releases the line (board pull-up / jack contact decide), LOW forces off.
     digitalWrite(AMP_MODE_PIN, desired ? HIGH : LOW);
     ampEnabled = desired;
-    Serial.printf("AudioController: amp %s\n", desired ? "released (on unless a plug is in)" : "off");
+    ESP_LOGI(TAG, "amp %s", desired ? "released (on unless a plug is in)" : "off");
 }
 
 void AudioController::pollHeadphone() {
@@ -312,7 +321,7 @@ void AudioController::pollHeadphone() {
     bool plugged = digitalRead(AMP_MODE_PIN) == LOW;
     if (plugged != headphonePlugged) {
         headphonePlugged = plugged;
-        Serial.printf("AudioController: headphone %s\n", plugged ? "plugged (speaker muted by the jack)" : "removed");
+        ESP_LOGI(TAG, "headphone %s", plugged ? "plugged (speaker muted by the jack)" : "removed");
     }
 }
 
@@ -330,7 +339,7 @@ bool AudioController::startDecoder(const String& filePath) {
     releaseDecoder();
 
     if (!source->open(filePath.c_str())) {
-        Serial.printf("AudioController: Failed to open file: %s\n", filePath.c_str());
+        ESP_LOGW(TAG, "Failed to open file: %s", filePath.c_str());
         return false;
     }
 
@@ -340,7 +349,7 @@ bool AudioController::startDecoder(const String& filePath) {
         return false;
     }
     if (!audioMP3->begin(source, audioOutput)) {
-        Serial.println("AudioController: Failed to start MP3 decoder");
+        ESP_LOGW(TAG, "Failed to start MP3 decoder");
         releaseDecoder();
         return false;
     }
@@ -358,226 +367,267 @@ void AudioController::releaseDecoder() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Faults found under the audio lock (often on the audio task) are queued and raised by the loop.
+// ---------------------------------------------------------------------------------------------
+
+void AudioController::queueFault(Fault f, const String& path, bool speak, const char* extra) {
+    AudioLock lock(audioMutex);
+    if (pendingFaultCount >= MAX_PENDING_FAULTS) {
+        return; // the loop drains every pass; a burst beyond this is the same story repeated
+    }
+    PendingFault& pf = pendingFaults[pendingFaultCount++];
+    pf.fault = f;
+    pf.speak = speak;
+    snprintf(pf.detail, sizeof(pf.detail), "%s%s%s", baseName(path), extra ? " " : "", extra ? extra : "");
+}
+
+void AudioController::raisePendingFaults() {
+    PendingFault copy[MAX_PENDING_FAULTS];
+    int n = 0;
+    {
+        AudioLock lock(audioMutex);
+        n = pendingFaultCount;
+        for (int i = 0; i < n; ++i) copy[i] = pendingFaults[i];
+        pendingFaultCount = 0;
+    }
+    for (int i = 0; i < n; ++i) {
+        Faults::raise(copy[i].fault, copy[i].detail, copy[i].speak);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Playback control
+// ---------------------------------------------------------------------------------------------
+
 bool AudioController::play(const String& filePath) {
-    bool taskSuspended = suspendBackgroundTaskForControl();
-    bool success = false;
+    AudioLock lock(audioMutex);
 
-    do {
-        if (!initialized) {
-            Serial.println("AudioController: Not initialized");
-            break;
-        }
-        // Handle playlist case
-        if (filePath.isEmpty()) {
-            if (!hasPlaylist()) {
-                Serial.println("AudioController: No playlist available");
-                break;
-            }
-
-            if (!isNfcSessionActive(playlistFigureUid)) {
-                Serial.println("AudioController: NFC session not active, clearing playlist");
-                clearPlaylist();
-                break;
-            }
-
-            if (playlistFinished || currentPlaylistIndex == -1) {
-                currentPlaylistIndex = 0;
-                playlistFinished = false;
-            }
-
-            if (currentPlaylistIndex >= (int)playlist.size()) {
-                Serial.println("AudioController: Playlist index out of range");
-                break;
-            }
-
-            String trackPath = playlist[currentPlaylistIndex];
-            Serial.printf("AudioController: Playing track %d: %s\n", currentPlaylistIndex, trackPath.c_str());
-            success = play(trackPath);
-            break;
-        }
-
-        if (!fileManager.fileExists(filePath)) {
-            Serial.println("AudioController: File does not exist");
-            break;
-        }
-
-        if (!isValidAudioFile(filePath)) {
-            Serial.println("AudioController: Invalid audio file");
-            break;
-        }
-
-        if (!startingPrompt) {
-            if (isPromptPlaying()) {
-                // Let the prompt finish its sentence; update() starts the story right after.
-                deferredPlayPath = filePath;
-                deferredPlayPending = true;
-                Serial.printf("AudioController: story %s waits for the prompt to finish\n", filePath.c_str());
-                success = true;
-                break;
-            }
-            transientPlayback = false; // a story start abandons any prompt bookkeeping
-            resumeAfterPrompt = false;
-        }
-
-        if (currentState != STOPPED) {
-            stop();
-        }
-
-        if (!startDecoder(filePath)) {
-            break;
-        }
-
-        currentTrackPath = filePath;
-        currentState = PLAYING;
-        trackStartTime = millis();
-        accumulatedPlayTime = 0.0f;
-        pauseStartTime = 0;
-        hasPausedTime = false;
-        setOutputsActive(true);
-
-        Serial.printf("AudioController: Successfully started playing: %s\n", filePath.c_str());
-        success = true;
-    } while (false);
-
-    if (taskSuspended) {
-        resumeBackgroundTaskForControl();
+    if (!initialized) {
+        ESP_LOGW(TAG, "Not initialized");
+        return false;
+    }
+    if (!filePath.isEmpty()) {
+        return playFile(filePath);
     }
 
-    return success;
+    // Playlist case
+    if (!hasPlaylist()) {
+        ESP_LOGI(TAG, "No playlist available");
+        return false;
+    }
+    if (!isNfcSessionActive(playlistFigureUid)) {
+        ESP_LOGI(TAG, "NFC session not active, clearing playlist");
+        clearPlaylist();
+        return false;
+    }
+    if (playlistFinished || currentPlaylistIndex == -1) {
+        currentPlaylistIndex = 0;
+        playlistFinished = false;
+    }
+    if (currentPlaylistIndex >= (int)playlist.size()) {
+        ESP_LOGW(TAG, "Playlist index out of range");
+        return false;
+    }
+
+    // A track that is not on the card is skipped (still downloading while the playlist is open,
+    // otherwise reported as TRACK_MISSING); one that cannot start decoding is reported as
+    // DECODER_FAILED and skipped. Each index is tried once; when none is left the playlist
+    // waits for the next download or ends, exactly as after its last track.
+    while (currentPlaylistIndex < (int)playlist.size()) {
+        const String trackPath = playlist[currentPlaylistIndex];
+        if (!fileManager.fileExists(trackPath)) {
+            ESP_LOGI(TAG, "skipping missing track %s", trackPath.c_str());
+            if (!playlistOpen) {
+                queueFault(Fault::TRACK_MISSING, trackPath, false);
+            }
+            currentPlaylistIndex++;
+            continue;
+        }
+        ESP_LOGI(TAG, "Playing track %d: %s", currentPlaylistIndex, trackPath.c_str());
+        if (playFile(trackPath)) {
+            waitingForTrack = false;
+            return true;
+        }
+        ESP_LOGW(TAG, "track %d could not be started - skipping it", currentPlaylistIndex);
+        currentPlaylistIndex++;
+    }
+    endOfCachedTracks();
+    return false;
+}
+
+// One file, story or prompt; the audio lock is held by the caller.
+bool AudioController::playFile(const String& filePath) {
+    if (!fileManager.fileExists(filePath)) {
+        ESP_LOGW(TAG, "File does not exist: %s", filePath.c_str());
+        if (!startingPrompt) {
+            queueFault(Fault::TRACK_MISSING, filePath, false);
+        }
+        return false;
+    }
+
+    if (!isValidAudioFile(filePath)) {
+        ESP_LOGW(TAG, "Invalid audio file: %s", filePath.c_str());
+        if (!startingPrompt) {
+            queueFault(Fault::DECODER_FAILED, filePath);
+        }
+        return false;
+    }
+
+    if (!startingPrompt) {
+        if (isPromptPlaying()) {
+            // Let the prompt finish its sentence; update() starts the story right after.
+            deferredPlayPath = filePath;
+            deferredPlayPending = true;
+            ESP_LOGI(TAG, "story %s waits for the prompt to finish", filePath.c_str());
+            return true;
+        }
+        transientPlayback = false; // a story start abandons any prompt bookkeeping
+        resumeAfterPrompt = false;
+    }
+
+    if (currentState != STOPPED) {
+        stopPlayback();
+    }
+
+    if (!startDecoder(filePath)) {
+        if (!startingPrompt) {
+            queueFault(Fault::DECODER_FAILED, filePath);
+        }
+        return false;
+    }
+
+    currentTrackPath = filePath;
+    currentState = PLAYING;
+    trackStartTime = millis();
+    accumulatedPlayTime = 0.0f;
+    pauseStartTime = 0;
+    hasPausedTime = false;
+    setOutputsActive(true);
+
+    ESP_LOGI(TAG, "Successfully started playing: %s", filePath.c_str());
+    return true;
 }
 
 bool AudioController::pause() {
-    bool taskSuspended = suspendBackgroundTaskForControl();
-    bool success = false;
+    AudioLock lock(audioMutex);
 
-    if (initialized && currentState == PLAYING && audioMP3 && audioMP3->isRunning()) {
-        float currentPlayTime = accumulatedPlayTime + ((millis() - trackStartTime) / 1000.0f);
-        pausedTimeSeconds = currentPlayTime;
-        hasPausedTime = true;
-        accumulatedPlayTime = currentPlayTime;
-        pauseStartTime = millis();
-
-        // The decoder simply stops being serviced: nothing is torn down, resume continues
-        // exactly where we were.
-        currentState = PAUSED;
-        setOutputsActive(false);
-        Serial.printf("AudioController: Paused at %.2f seconds\n", pausedTimeSeconds);
-        success = true;
+    if (!(initialized && currentState == PLAYING && audioMP3 && audioMP3->isRunning())) {
+        return false;
     }
+    float currentPlayTime = accumulatedPlayTime + ((millis() - trackStartTime) / 1000.0f);
+    pausedTimeSeconds = currentPlayTime;
+    hasPausedTime = true;
+    accumulatedPlayTime = currentPlayTime;
+    pauseStartTime = millis();
 
-    if (taskSuspended) {
-        resumeBackgroundTaskForControl();
-    }
-
-    return success;
+    // The decoder simply stops being serviced: nothing is torn down, resume continues
+    // exactly where we were.
+    currentState = PAUSED;
+    setOutputsActive(false);
+    ESP_LOGI(TAG, "Paused at %.2f seconds", pausedTimeSeconds);
+    return true;
 }
 
 bool AudioController::resume() {
-    bool taskSuspended = suspendBackgroundTaskForControl();
-    bool success = false;
+    AudioLock lock(audioMutex);
 
     if (initialized && currentState == PAUSED && audioMP3 && audioMP3->isRunning()) {
         currentState = PLAYING;
         trackStartTime = millis();
         setOutputsActive(true);
-        Serial.printf("AudioController: Resumed from %.2f seconds\n", accumulatedPlayTime);
-        success = true;
-    } else if (initialized && currentState == PAUSED) {
+        ESP_LOGI(TAG, "Resumed from %.2f seconds", accumulatedPlayTime);
+        return true;
+    }
+    if (initialized && currentState == PAUSED) {
         // Decoder went away (should not happen); restart the track from the paused position.
+        // The lock is held across play + seek, so the audio task cannot decode from byte 0.
         String path = currentTrackPath;
         float at = pausedTimeSeconds;
         currentState = STOPPED;
         if (!path.isEmpty() && play(path)) {
             if (at > 0.5f) seekTo(at);
-            success = true;
+            return true;
         }
     }
-
-    if (taskSuspended) {
-        resumeBackgroundTaskForControl();
-    }
-
-    return success;
+    return false;
 }
 
+// Decoder and outputs down. Used inside track changes; the prompt bookkeeping (a prompt that
+// is starting, the story to resume after it) is left alone.
+void AudioController::stopPlayback() {
+    if (!initialized || currentState == STOPPED) {
+        return;
+    }
+    setOutputsActive(false);
+    releaseDecoder();
+    currentState = STOPPED;
+    currentTrackPath = "";
+    pausedTimeSeconds = 0.0f;
+    hasPausedTime = false;
+    trackStartTime = 0;
+    accumulatedPlayTime = 0.0f;
+    pauseStartTime = 0;
+}
+
+// A deliberate stop (figure removed, safety net, console, sleep): whatever plays ends, and
+// nothing comes back by itself - no story resumed after a prompt, no deferred story start.
 bool AudioController::stop() {
-    bool taskSuspended = suspendBackgroundTaskForControl();
-    bool success = false;
-
-    if (initialized && currentState != STOPPED) {
-        setOutputsActive(false);
-        releaseDecoder();
-        currentState = STOPPED;
-        currentTrackPath = "";
-        pausedTimeSeconds = 0.0f;
-        hasPausedTime = false;
-        trackStartTime = 0;
-        accumulatedPlayTime = 0.0f;
-        pauseStartTime = 0;
-        success = true;
-    }
-
-    if (taskSuspended) {
-        resumeBackgroundTaskForControl();
-    }
-
-    return success;
+    AudioLock lock(audioMutex);
+    const bool wasPlaying = initialized && currentState != STOPPED;
+    stopPlayback();
+    transientPlayback = false;
+    resumeAfterPrompt = false;
+    deferredPlayPending = false;
+    promptEnded = false;
+    return wasPlaying;
 }
 
 bool AudioController::seekTo(float seconds) {
-    bool taskSuspended = suspendBackgroundTaskForControl();
-    bool success = false;
+    AudioLock lock(audioMutex);
 
-    do {
-        if (!initialized) {
-            Serial.println("AudioController: Cannot seek - not initialized");
-            break;
-        }
-
-        if (currentState == STOPPED || currentTrackPath.isEmpty() || !audioMP3 || !source->isOpen()) {
-            Serial.println("AudioController: Cannot seek - no track loaded");
-            break;
-        }
-
-        if (seconds < 0) {
-            seconds = 0;
-        }
-
-        // Byte estimate for our CBR content (96 kbps); libmad resyncs on the next frame header.
-        const uint32_t BYTES_PER_SECOND = 12000;
-        const uint32_t HEADER_OFFSET = 512;
-        uint32_t fileSize = source->getSize();
-        uint32_t target = (uint32_t)(seconds * BYTES_PER_SECOND) + HEADER_OFFSET;
-        if (fileSize > 1024 && target > fileSize - 1024) {
-            target = fileSize - 1024;
-        }
-
-        bool wasActive = outputsActive;
-        if (wasActive) muteES8388(true); // hide the resync glitch
-        if (!source->seek((int32_t)target, SEEK_SET)) {
-            Serial.println("AudioController: Seek failed");
-            if (wasActive) muteES8388(currentVolume == 0);
-            break;
-        }
-        audioMP3->desync();
-        if (wasActive) muteES8388(currentVolume == 0);
-
-        accumulatedPlayTime = seconds;
-        if (currentState == PLAYING) {
-            trackStartTime = millis();
-        } else {
-            pausedTimeSeconds = seconds;
-            hasPausedTime = true;
-        }
-        Serial.printf("AudioController: Seeked to %.2f s (byte %u of %u)\n", seconds, (unsigned)target, (unsigned)fileSize);
-        success = true;
-    } while (false);
-
-    if (taskSuspended) {
-        resumeBackgroundTaskForControl();
+    if (!initialized) {
+        ESP_LOGW(TAG, "Cannot seek - not initialized");
+        return false;
     }
 
-    return success;
+    if (currentState == STOPPED || currentTrackPath.isEmpty() || !audioMP3 || !source->isOpen()) {
+        ESP_LOGW(TAG, "Cannot seek - no track loaded");
+        return false;
+    }
+
+    if (seconds < 0) {
+        seconds = 0;
+    }
+
+    // Byte estimate for our CBR content (96 kbps); libmad resyncs on the next frame header.
+    const uint32_t BYTES_PER_SECOND = 12000;
+    const uint32_t HEADER_OFFSET = 512;
+    uint32_t fileSize = source->getSize();
+    uint32_t target = (uint32_t)(seconds * BYTES_PER_SECOND) + HEADER_OFFSET;
+    if (fileSize > 1024 && target > fileSize - 1024) {
+        target = fileSize - 1024;
+    }
+
+    bool wasActive = outputsActive;
+    if (wasActive) muteES8388(true); // hide the resync glitch
+    if (!source->seek((int32_t)target, SEEK_SET)) {
+        ESP_LOGW(TAG, "Seek failed");
+        if (wasActive) muteES8388(currentVolume == 0);
+        return false;
+    }
+    audioMP3->desync();
+    if (wasActive) muteES8388(currentVolume == 0);
+
+    accumulatedPlayTime = seconds;
+    if (currentState == PLAYING) {
+        trackStartTime = millis();
+    } else {
+        pausedTimeSeconds = seconds;
+        hasPausedTime = true;
+    }
+    ESP_LOGI(TAG, "Seeked to %.2f s (byte %u of %u)", seconds, (unsigned)target, (unsigned)fileSize);
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -614,36 +664,28 @@ bool AudioController::volumeDown() {
 }
 
 bool AudioController::setVolume(int volume, bool initialize /* = false */) {
-    bool taskSuspended = suspendBackgroundTaskForControl();
-    bool changed = false;
+    AudioLock lock(audioMutex);
 
-    do {
-        if (!initialized) {
-            Serial.printf("AudioController: Cannot set volume - not initialized\n");
-            break;
-        }
-
-        if (volume < MIN_VOLUME) volume = MIN_VOLUME;
-        if (volume > volumeCeiling) volume = volumeCeiling;
-
-        if (volume == currentVolume && !initialize) {
-            break;
-        }
-
-        currentVolume = volume;
-        applyCodecVolume();
-        if (!initialize) {
-            volumeDirty = true;
-            volumeDirtyAt = millis();
-        }
-        Serial.printf("AudioController: Volume %d%%\n", volume);
-        changed = true;
-    } while (false);
-
-    if (taskSuspended) {
-        resumeBackgroundTaskForControl();
+    if (!initialized) {
+        ESP_LOGW(TAG, "Cannot set volume - not initialized");
+        return false;
     }
-    return changed;
+
+    if (volume < MIN_VOLUME) volume = MIN_VOLUME;
+    if (volume > volumeCeiling) volume = volumeCeiling;
+
+    if (volume == currentVolume && !initialize) {
+        return false;
+    }
+
+    currentVolume = volume;
+    applyCodecVolume();
+    if (!initialize) {
+        volumeDirty = true;
+        volumeDirtyAt = millis();
+    }
+    ESP_LOGI(TAG, "Volume %d%%", volume);
+    return true;
 }
 
 void AudioController::applyCodecVolume() {
@@ -679,17 +721,41 @@ void AudioController::setVolumeCeiling(int ceiling) {
         setVolume(volumeCeiling);
     }
 
-    Serial.printf("AudioController: Volume ceiling set to %d%%\n", volumeCeiling);
+    ESP_LOGI(TAG, "Volume ceiling set to %d%%", volumeCeiling);
 }
 
 int AudioController::getVolumeCeiling() const {
     return volumeCeiling;
 }
 
-// Playlist management methods
+// ---------------------------------------------------------------------------------------------
+// Playlist
+// ---------------------------------------------------------------------------------------------
+
+String AudioController::getCurrentTrack() const {
+    AudioLock lock(audioMutex);
+    if (transientPlayback) {
+        return resumeAfterPrompt ? resumeTrackPath : String();
+    }
+    return currentTrackPath;
+}
+
+String AudioController::getPlaylistFigureUid() const {
+    AudioLock lock(audioMutex);
+    return playlistFigureUid;
+}
+
+bool AudioController::playlistContains(const String& path) const {
+    AudioLock lock(audioMutex);
+    for (const auto& p : playlist) {
+        if (p == path) return true;
+    }
+    return false;
+}
+
 void AudioController::setPlaylist(const std::vector<String>& trackPaths, const String& figureUid, bool moreComing) {
+    AudioLock lock(audioMutex);
     resumeAfterPrompt = false;
-    bool taskSuspended = suspendBackgroundTaskForControl();
     playlist = trackPaths;
     playlistFigureUid = figureUid;
     currentPlaylistIndex = -1; // Start at -1, first play() will set to 0
@@ -697,20 +763,15 @@ void AudioController::setPlaylist(const std::vector<String>& trackPaths, const S
     playlistOpen = moreComing;
     waitingForTrack = false;
 
-    Serial.printf("AudioController: Playlist set with %d tracks for figure UID: %s\n",
-                 playlist.size(), figureUid.c_str());
+    ESP_LOGI(TAG, "Playlist set with %u tracks for figure UID: %s", (unsigned)playlist.size(), figureUid.c_str());
 
     for (int i = 0; i < (int)playlist.size(); i++) {
-        Serial.printf("  Track %d: %s\n", i + 1, playlist[i].c_str());
-    }
-
-    if (taskSuspended) {
-        resumeBackgroundTaskForControl();
+        ESP_LOGI(TAG, "  Track %d: %s", i + 1, playlist[i].c_str());
     }
 }
 
 void AudioController::mergePlaylist(const std::vector<String>& trackPaths, const String& figureUid, bool moreComing) {
-    bool taskSuspended = suspendBackgroundTaskForControl();
+    AudioLock lock(audioMutex);
     playlistOpen = moreComing;
     if (figureUid != playlistFigureUid || playlist.empty()) {
         playlist = trackPaths;
@@ -762,28 +823,23 @@ void AudioController::mergePlaylist(const std::vector<String>& trackPaths, const
             playlistEnded = true;
         }
     }
-    Serial.printf("AudioController: playlist merged: %u tracks for %s (index %d%s%s)\n",
-                  (unsigned)playlist.size(), figureUid.c_str(), currentPlaylistIndex,
-                  moreComing ? ", more coming" : "", waitingForTrack ? ", waiting" : "");
-    if (taskSuspended) {
-        resumeBackgroundTaskForControl();
-    }
+    ESP_LOGI(TAG, "playlist merged: %u tracks for %s (index %d%s%s)",
+             (unsigned)playlist.size(), figureUid.c_str(), currentPlaylistIndex,
+             moreComing ? ", more coming" : "", waitingForTrack ? ", waiting" : "");
     if (resume) {
-        Serial.printf("AudioController: next track arrived - continuing with %s\n", playlist[currentPlaylistIndex].c_str());
+        ESP_LOGI(TAG, "next track arrived - continuing with %s", playlist[currentPlaylistIndex].c_str());
         play();
     }
 }
 
 bool AudioController::consumeWaitStarted() {
-    const bool v = waitStarted;
-    waitStarted = false;
-    return v;
+    return waitStarted.exchange(false);
 }
 
 void AudioController::clearPlaylist() {
+    AudioLock lock(audioMutex);
     resumeAfterPrompt = false;
     deferredPlayPending = false;
-    bool taskSuspended = suspendBackgroundTaskForControl();
     playlist.clear();
     currentPlaylistIndex = -1;
     playlistFigureUid = "";
@@ -791,22 +847,59 @@ void AudioController::clearPlaylist() {
     playlistOpen = false;
     waitingForTrack = false;
 
-    Serial.println("AudioController: Playlist cleared");
+    ESP_LOGI(TAG, "Playlist cleared");
+}
 
-    if (taskSuspended) {
-        resumeBackgroundTaskForControl();
+// Lock held. The playlist's figure must still be on the pins; otherwise the playlist goes.
+bool AudioController::playlistFigurePresent() {
+    if (!hasPlaylist()) {
+        ESP_LOGI(TAG, "No playlist available");
+        return false;
+    }
+    if (!isNfcSessionActive(playlistFigureUid)) {
+        ESP_LOGI(TAG, "Figure not present or different figure detected, clearing playlist");
+        clearPlaylist();
+        return false;
+    }
+    return true;
+}
+
+// Lock held. No playable track after the current one: wait for the figure's next download
+// (playlistOpen) or end the playlist. A prompt that is speaking finishes its sentence, but no
+// story is resumed or started after it.
+void AudioController::endOfCachedTracks() {
+    if (playlistOpen) {
+        // The figure's remaining tracks are still downloading: hold here instead of ending.
+        // mergePlaylist() continues with the next track as soon as it is on the card.
+        waitAfterPath = playlist.empty() ? String() : playlist.back();
+        currentPlaylistIndex = (int)playlist.size() - 1;
+        waitingForTrack = true;
+        waitingSince = millis();
+        waitStarted = true;
+        ESP_LOGI(TAG, "cached tracks finished, waiting for the next download");
+    } else {
+        ESP_LOGI(TAG, "Reached end of playlist");
+        playlistFinished = true;
+        playlistEnded = true;
+    }
+    if (isPromptPlaying()) {
+        resumeAfterPrompt = false;
+        deferredPlayPending = false;
+    } else {
+        stopPlayback();
     }
 }
 
 bool AudioController::nextTrack() {
-    if (!hasPlaylist()) {
-        Serial.println("AudioController: No playlist available");
+    AudioLock lock(audioMutex);
+    if (!playlistFigurePresent()) {
         return false;
     }
 
-    if (!isNfcSessionActive(playlistFigureUid)) {
-        Serial.println("AudioController: Figure not present or different figure detected, clearing playlist");
-        clearPlaylist();
+    if (waitingForTrack) {
+        // Already parked after the last cached track: Next changes nothing (and must not
+        // announce the wait again); the merge continues as soon as the download lands.
+        ESP_LOGI(TAG, "still waiting for the next download");
         return false;
     }
 
@@ -816,52 +909,25 @@ bool AudioController::nextTrack() {
         return play();
     }
 
-    // Move to the next track that actually exists on the card (tracks still downloading or
-    // permanently missing are skipped instead of ending the playlist).
+    // play() skips tracks that are not on the card (still downloading or missing) and tracks
+    // that cannot be decoded, and waits or ends the playlist when none is left.
     currentPlaylistIndex++;
-    while (currentPlaylistIndex < (int)playlist.size() && !fileManager.fileExists(playlist[currentPlaylistIndex])) {
-        Serial.printf("AudioController: skipping missing track %s\n", playlist[currentPlaylistIndex].c_str());
-        currentPlaylistIndex++;
-    }
-
     if (currentPlaylistIndex >= (int)playlist.size()) {
-        if (playlistOpen) {
-            // The figure's remaining tracks are still downloading: hold here instead of ending.
-            // mergePlaylist() continues with the next track as soon as it is on the card.
-            waitAfterPath = playlist.empty() ? String() : playlist.back();
-            currentPlaylistIndex = (int)playlist.size() - 1;
-            waitingForTrack = true;
-            waitStarted = true;
-            Serial.println("AudioController: cached tracks finished, waiting for the next download");
-            stop();
-            return false;
-        }
-        Serial.println("AudioController: Reached end of playlist");
-        playlistFinished = true;
-        playlistEnded = true;
-        stop();
+        endOfCachedTracks();
         return false;
     }
-
-    waitingForTrack = false;
     return play();
 }
 
 bool AudioController::prevTrack() {
-    if (!hasPlaylist()) {
-        Serial.println("AudioController: No playlist available");
-        return false;
-    }
-
-    if (!isNfcSessionActive(playlistFigureUid)) {
-        Serial.println("AudioController: Figure not present or different figure detected, clearing playlist");
-        clearPlaylist();
+    AudioLock lock(audioMutex);
+    if (!playlistFigurePresent()) {
         return false;
     }
 
     // More than 3 s in: restart the current track.
     if ((currentState == PLAYING || currentState == PAUSED) && (getCurrentTrackSeconds() > 3.0f)) {
-        Serial.println("AudioController: Restarting current track");
+        ESP_LOGI(TAG, "Restarting current track");
         String trackPath = currentTrackPath;
         if (trackPath.isEmpty()) {
             return false;
@@ -869,6 +935,7 @@ bool AudioController::prevTrack() {
         return play(trackPath);
     }
 
+    waitingForTrack = false;
     if (playlistFinished || currentPlaylistIndex <= 0) {
         currentPlaylistIndex = playlist.size() - 1;
         playlistFinished = false;
@@ -880,14 +947,8 @@ bool AudioController::prevTrack() {
 }
 
 bool AudioController::playTrack(const String& trackId) {
-    if (!hasPlaylist()) {
-        Serial.println("AudioController: No playlist available");
-        return false;
-    }
-
-    if (!isNfcSessionActive(playlistFigureUid)) {
-        Serial.println("AudioController: Figure not present or different figure detected, clearing playlist");
-        clearPlaylist();
+    AudioLock lock(audioMutex);
+    if (!playlistFigurePresent()) {
         return false;
     }
 
@@ -896,20 +957,31 @@ bool AudioController::playTrack(const String& trackId) {
 
     for (int i = 0; i < (int)playlist.size(); i++) {
         if (playlist[i].endsWith(suffix)) {
-            Serial.printf("AudioController: Found track ID %s at playlist index %d\n", trackId.c_str(), i);
+            ESP_LOGI(TAG, "Found track ID %s at playlist index %d", trackId.c_str(), i);
             currentPlaylistIndex = i;
             playlistFinished = false;
+            waitingForTrack = false;
             return play();
         }
     }
 
-    Serial.printf("AudioController: Track ID %s not found in current playlist\n", trackId.c_str());
+    ESP_LOGW(TAG, "Track ID %s not found in current playlist", trackId.c_str());
     return false;
 }
 
+// Audio task, lock held: the decoder reported the end of the file.
 void AudioController::finishTrack() {
     const bool wasTransient = transientPlayback;
-    stop();
+    if (!wasTransient && source) {
+        const uint32_t underruns = source->underruns(); // per track: reset when a file is opened
+        if (underruns > 0) {
+            totalUnderruns += underruns;
+            char extra[16];
+            snprintf(extra, sizeof(extra), "n=%u", (unsigned)underruns);
+            queueFault(Fault::AUDIO_UNDERRUN, currentTrackPath, false, extra);
+        }
+    }
+    stopPlayback();
     transientPlayback = false;
     if (wasTransient) {
         promptEnded = true; // the loop task resumes the interrupted track (update())
@@ -920,12 +992,15 @@ void AudioController::finishTrack() {
     }
 }
 
+// Prompts and the volume beep. One lock around the bookkeeping and the start, so the audio task
+// never sees a half-written prompt state.
 bool AudioController::playPrompt(const String& filePath) {
+    AudioLock lock(audioMutex);
     if (!initialized) {
         return false;
     }
     if (!fileManager.fileExists(filePath)) {
-        Serial.printf("AudioController: prompt file missing: %s\n", filePath.c_str());
+        ESP_LOGW(TAG, "prompt file missing: %s", filePath.c_str());
         return false;
     }
     if (isPromptPlaying()) {
@@ -941,7 +1016,7 @@ bool AudioController::playPrompt(const String& filePath) {
     promptEnded = false;
     transientPlayback = true;
     startingPrompt = true;
-    const bool ok = play(filePath);
+    const bool ok = playFile(filePath);
     startingPrompt = false;
     if (!ok) {
         transientPlayback = false;
@@ -952,11 +1027,10 @@ bool AudioController::playPrompt(const String& filePath) {
 }
 
 bool AudioController::consumePlaylistEnded() {
-    const bool v = playlistEnded;
-    playlistEnded = false;
-    return v;
+    return playlistEnded.exchange(false);
 }
 
+// Audio task, lock held.
 void AudioController::updatePlaybackSlice() {
     if (!initialized) {
         return;
@@ -968,7 +1042,7 @@ void AudioController::updatePlaybackSlice() {
         // Safety net only: the debounced detach (NfcController -> afterDetachNFC) is the real
         // stop path. A raw pin read here stopped playback on every wobble of the figure.
         if (hasPlaylist() && !NfcController::getInstance().isCardPresent()) {
-            Serial.println("AudioController: figure no longer present during playback");
+            ESP_LOGW(TAG, "figure no longer present during playback");
             stop();
             return;
         }
@@ -981,7 +1055,7 @@ void AudioController::updatePlaybackSlice() {
                 }
             }
         } else {
-            Serial.println("AudioController: Playback stopped unexpectedly");
+            ESP_LOGW(TAG, "Playback stopped unexpectedly");
             stop();
         }
     }
@@ -998,74 +1072,106 @@ void AudioController::update() {
         volumeDirty = false;
     }
     if (promptEnded) {
-        promptEnded = false;
-        if (deferredPlayPending) {
-            deferredPlayPending = false;
-            resumeAfterPrompt = false;
-            const String path = deferredPlayPath;
-            play(path);
-        } else if (resumeAfterPrompt) {
-            resumeAfterPrompt = false;
-            const bool figureStillThere = playlist.empty() || isNfcSessionActive(playlistFigureUid);
-            if (figureStillThere && fileManager.fileExists(resumeTrackPath) && play(resumeTrackPath)) {
-                if (resumeSeconds > 1.0f) {
-                    seekTo(resumeSeconds);
+        // One lock across play + seek (+ pause): the audio task cannot decode the first frames
+        // of the resumed story from byte 0 before the seek lands.
+        AudioLock lock(audioMutex);
+        if (promptEnded.exchange(false)) {
+            if (deferredPlayPending) {
+                deferredPlayPending = false;
+                resumeAfterPrompt = false;
+                const String path = deferredPlayPath;
+                // A playlist track goes through the playlist (skips a track that cannot start).
+                const bool isPlaylistTrack = currentPlaylistIndex >= 0 && currentPlaylistIndex < (int)playlist.size() &&
+                                             playlist[currentPlaylistIndex] == path;
+                if (isPlaylistTrack) {
+                    play();
+                } else {
+                    play(path);
                 }
-                if (resumeAsPaused) {
-                    pause();
+            } else if (resumeAfterPrompt) {
+                resumeAfterPrompt = false;
+                const bool figureStillThere = playlist.empty() || isNfcSessionActive(playlistFigureUid);
+                if (figureStillThere && fileManager.fileExists(resumeTrackPath) && play(resumeTrackPath)) {
+                    if (resumeSeconds > 1.0f) {
+                        seekTo(resumeSeconds);
+                    }
+                    if (resumeAsPaused) {
+                        pause();
+                    }
                 }
             }
         }
     }
+    if (waitingForTrack && millis() - waitingSince > DOWNLOAD_WAIT_MAX_MS) {
+        bool gaveUp = false;
+        String uid;
+        {
+            AudioLock lock(audioMutex);
+            if (waitingForTrack && millis() - waitingSince > DOWNLOAD_WAIT_MAX_MS) {
+                ESP_LOGW(TAG, "waited %lu min for the next download - ending the playlist",
+                         DOWNLOAD_WAIT_MAX_MS / 60000UL);
+                waitingForTrack = false;
+                playlistOpen = false;
+                playlistFinished = true;
+                playlistEnded = true;
+                uid = playlistFigureUid;
+                gaveUp = true;
+            }
+        }
+        if (gaveUp) {
+            Faults::raise(Fault::PLAYLIST_STUCK, uid.c_str());
+        }
+    }
+    raisePendingFaults();
     pollHeadphone();
     if (!audioTaskHandle) {
-        bool locked = suspendBackgroundTaskForControl();
+        AudioLock lock(audioMutex);
         updatePlaybackSlice();
-        if (locked) resumeBackgroundTaskForControl();
     }
 }
 
 void AudioController::volumeBeep() {
-    if (!initialized || currentState == PLAYING) {
-        return; // never interrupt a track
+    if (!initialized || currentState != STOPPED) {
+        return; // never interrupt a track (or a paused one)
     }
-
-    const String beepPath = "/sounds/beep.mp3";
-    if (!fileManager.fileExists(beepPath)) {
-        return;
-    }
-
-    transientPlayback = true; // the audio task must not advance the playlist when it ends
-    if (play(beepPath)) {
+    // Played as a prompt: transientPlayback survives the start, so the end of the beep never
+    // advances the playlist or re-arms a download wait.
+    if (playPrompt(VoicePrompts::kBeepPath)) {
         unsigned long start = millis();
-        while (currentState == PLAYING && millis() - start < 3000) {
+        while (isPromptPlaying() && millis() - start < 3000) {
             update();
             delay(10);
         }
     }
-    transientPlayback = false;
 }
 
 void AudioController::printStatus() {
     const char* stateName = currentState == PLAYING ? "PLAYING" : currentState == PAUSED ? "PAUSED" : "STOPPED";
-    Serial.printf("Audio: %s %s @ %.1fs | volume %d%% (ceiling %d%%) codec %s | amp %s (mode %s)%s | playlist %d/%d%s\n",
-                  stateName, currentTrackPath.isEmpty() ? "-" : currentTrackPath.c_str(), getCurrentTrackSeconds(),
-                  currentVolume, volumeCeiling, codecMuted ? "muted" : "live",
-                  ampEnabled ? "released" : "off",
-                  ampMode == AMP_AUTO ? "auto" : ampMode == AMP_FORCE_ON ? "on" : "off",
-                  headphonePlugged ? " headphone plugged" : "",
-                  currentPlaylistIndex + 1, (int)playlist.size(), playlistFinished ? " (finished)" : "");
-    Serial.printf("Audio: read-ahead %u/%u KB, underruns %u, decoder %s, I2S %s, AMP_CTRL level %d | heap int %u PSRAM %u\n",
-                  (unsigned)(getReadAheadFill() / 1024), (unsigned)(getReadAheadCapacity() / 1024), (unsigned)getUnderruns(),
-                  (audioMP3 && audioMP3->isRunning()) ? "running" : "idle",
-                  (audioOutput && audioOutput->installed()) ? "installed" : "released",
-                  digitalRead(AMP_MODE_PIN),
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    String track;
+    {
+        AudioLock lock(audioMutex);
+        track = currentTrackPath; // the file actually decoding (a prompt shows as itself here)
+    }
+    ESP_LOGI(TAG, "%s %s @ %.1fs | volume %d%% (ceiling %d%%) codec %s | amp %s (mode %s)%s | playlist %d/%d%s%s",
+             stateName, track.isEmpty() ? "-" : track.c_str(), getCurrentTrackSeconds(),
+             currentVolume, volumeCeiling, codecMuted ? "muted" : "live",
+             ampEnabled ? "released" : "off",
+             ampMode == AMP_AUTO ? "auto" : ampMode == AMP_FORCE_ON ? "on" : "off",
+             headphonePlugged ? " headphone plugged" : "",
+             currentPlaylistIndex + 1, (int)playlist.size(), playlistFinished ? " (finished)" : "",
+             isPromptPlaying() ? " | prompt playing" : "");
+    ESP_LOGI(TAG, "read-ahead %u/%u KB, underruns %u (since boot %u), decoder %s, I2S %s, AMP_CTRL level %d | heap int %u PSRAM %u",
+             (unsigned)(getReadAheadFill() / 1024), (unsigned)(getReadAheadCapacity() / 1024), (unsigned)getUnderruns(),
+             (unsigned)getTotalUnderruns(),
+             (audioMP3 && audioMP3->isRunning()) ? "running" : "idle",
+             (audioOutput && audioOutput->installed()) ? "installed" : "released",
+             digitalRead(AMP_MODE_PIN),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     uint8_t dacPower = readES8388Register(ES8388_DACPOWER);
     uint8_t dacControl3 = readES8388Register(ES8388_DACCONTROL3);
     uint8_t lout1 = readES8388Register(ES8388_LOUT1VOL);
     uint8_t lout2 = readES8388Register(ES8388_LOUT2VOL);
-    Serial.printf("Audio: ES8388 DACPOWER 0x%02X DACCONTROL3 0x%02X LOUT1VOL 0x%02X LOUT2VOL 0x%02X\n", dacPower, dacControl3, lout1, lout2);
+    ESP_LOGI(TAG, "ES8388 DACPOWER 0x%02X DACCONTROL3 0x%02X LOUT1VOL 0x%02X LOUT2VOL 0x%02X", dacPower, dacControl3, lout1, lout2);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1075,7 +1181,7 @@ void AudioController::printStatus() {
 // ---------------------------------------------------------------------------------------------
 
 bool AudioController::initializeES8388() {
-    Serial.println("AudioController: Initializing ES8388...");
+    ESP_LOGI(TAG, "Initializing ES8388...");
 
     writeES8388Register(ES8388_CONTROL1, 0x80);   // reset
     delay(50);
@@ -1116,15 +1222,15 @@ bool AudioController::initializeES8388() {
     uint8_t dacPower = readES8388Register(ES8388_DACPOWER);
     uint8_t dacControl3 = readES8388Register(ES8388_DACCONTROL3);
     uint8_t control1 = readES8388Register(ES8388_CONTROL1);
-    Serial.printf("AudioController: ES8388 verification - CONTROL1: 0x%02X, DACPOWER: 0x%02X, DACCONTROL3: 0x%02X\n",
-                  control1, dacPower, dacControl3);
+    ESP_LOGI(TAG, "ES8388 verification - CONTROL1: 0x%02X, DACPOWER: 0x%02X, DACCONTROL3: 0x%02X",
+             control1, dacPower, dacControl3);
 
     if (dacPower != ES8388_DACPOWER_ACTIVE || dacControl3 == 0xFF) {
-        Serial.println("AudioController: WARNING - ES8388 register verification failed, I2C communication issues");
+        ESP_LOGE(TAG, "WARNING - ES8388 register verification failed, I2C communication issues");
         return false;
     }
 
-    Serial.println(F("AudioController: ES8388 initialized and verified"));
+    ESP_LOGI(TAG, "ES8388 initialized and verified");
     return true;
 }
 
@@ -1145,8 +1251,8 @@ bool AudioController::writeES8388Register(uint8_t reg, uint8_t value) {
         if (attempt < maxRetries - 1) {
             delay(retryDelay);
         } else {
-            Serial.printf("AudioController: ES8388 write failed (reg=0x%02X, val=0x%02X, error=%d)\n",
-                         reg, value, result);
+            ESP_LOGE(TAG, "ES8388 write failed (reg=0x%02X, val=0x%02X, error=%d)",
+                     reg, value, result);
         }
     }
 
@@ -1206,16 +1312,16 @@ bool AudioController::isValidAudioFile(const String& filePath) {
     return lowerPath.endsWith(".mp3");
 }
 
+// Any task (the audio task during playback). The UID is copied under the NFC controller's lock.
 bool AudioController::isNfcSessionActive(const String& expectedUid) const {
     NfcController &nfc = NfcController::getInstance();
     if (!nfc.isCardPresent()) {
-        Serial.println("AudioController: no figure present");
+        ESP_LOGI(TAG, "no figure present");
         return false;
     }
-    String currentUid = nfc.currentNFCData().uidString;
+    const String currentUid = nfc.currentUidCopy();
     if (currentUid != expectedUid) {
-        Serial.printf("AudioController: figure UID mismatch (playlist %s, mounted %s)\n",
-                      expectedUid.c_str(), currentUid.c_str());
+        ESP_LOGW(TAG, "figure UID mismatch (playlist %s, mounted %s)", expectedUid.c_str(), currentUid.c_str());
         return false;
     }
     return true;

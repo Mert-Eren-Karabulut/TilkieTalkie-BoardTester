@@ -1,6 +1,7 @@
 #include "VoicePrompts.h"
 #include "AudioController.h"
 #include "FileManager.h"
+#include <esp_log.h>
 
 namespace
 {
@@ -19,7 +20,8 @@ const char kPromptSchema[] __attribute__((used)) =
     "TTPROMPTS1:" TT_SPEECH_PROMPTS(TT_SPEECH_PATH) TT_TONE_PROMPTS(TT_TONE_PATH) "beep.mp3";
 #undef TT_SPEECH_PATH
 #undef TT_TONE_PATH
-constexpr unsigned long kWaitForSilenceMaxMs = 30000; // a deferred prompt is dropped after this
+const char *TAG = "prompts";
+static_assert((int)Prompt::COUNT <= 32, "queuedMask holds one bit per prompt");
 }
 
 VoicePrompts &VoicePrompts::getInstance()
@@ -55,33 +57,35 @@ const char *VoicePrompts::name(Prompt p)
 
 const VoicePrompts::Policy &VoicePrompts::policy(Prompt p)
 {
-    // interrupt, dropWhilePlaying, minInterval
+    // interrupt, minInterval. Not interrupting = dropped while a story plays (the story wins).
+    // There is no "wait for silence" row: nothing needed it, and a prompt spoken minutes after
+    // its cause (a story can run for 20 min) would only confuse.
     static const Policy table[(int)Prompt::COUNT] = {
-        {false, true, 5000},      // SETUP_WELCOME
-        {false, true, 3000},      // SETUP_CONNECTING
-        {false, true, 10000},     // SETUP_SUCCESS
-        {false, true, 5000},      // SETUP_FAILED
-        {false, true, 60000},     // WIFI_LOST
-        {false, true, 60000},     // WIFI_RESET_HINT
-        {false, true, 0},         // WIFI_RESET_DONE (blocking)
-        {false, true, 30000},     // IDLE_HELLO
-        {false, true, 10000},     // NFC_READ_TROUBLE
-        {false, true, 5000},      // FIGURE_NO_CONTENT
-        {false, true, 5000},      // FIGURE_OFFLINE
-        {false, true, 5000},      // DOWNLOAD_START
-        {true, false, 3000},      // DOWNLOAD_DONE (spoken over the first second of the story)
-        {false, true, 10000},     // DOWNLOAD_FAILED
-        {false, true, 30000},     // DOWNLOAD_WAIT
-        {false, true, 5000},      // PLAYLIST_END
-        {true, false, 240000},    // BATTERY_LOW
-        {true, false, 0},         // BATTERY_CRITICAL (blocking)
-        {false, true, 3600000},   // CHARGE_FULL
-        {false, true, 60000},     // UPDATE_START
-        {false, true, 60000},     // UPDATE_DONE
-        {false, true, 60000},     // UPDATE_FAILED
-        {true, false, 1500},      // TONE_CHARGE_ON
-        {true, false, 1500},      // TONE_CHARGE_OFF
-        {true, false, 0},         // TONE_SLEEP (blocking)
+        {false, 5000},      // SETUP_WELCOME
+        {false, 3000},      // SETUP_CONNECTING
+        {false, 10000},     // SETUP_SUCCESS
+        {false, 5000},      // SETUP_FAILED
+        {false, 60000},     // WIFI_LOST
+        {false, 60000},     // WIFI_RESET_HINT
+        {false, 0},         // WIFI_RESET_DONE (blocking)
+        {false, 30000},     // IDLE_HELLO
+        {false, 10000},     // NFC_READ_TROUBLE
+        {false, 5000},      // FIGURE_NO_CONTENT
+        {false, 5000},      // FIGURE_OFFLINE
+        {false, 5000},      // DOWNLOAD_START
+        {true, 3000},       // DOWNLOAD_DONE (spoken over the first second of the story)
+        {false, 10000},     // DOWNLOAD_FAILED
+        {false, 30000},     // DOWNLOAD_WAIT
+        {false, 5000},      // PLAYLIST_END
+        {true, 240000},     // BATTERY_LOW
+        {true, 0},          // BATTERY_CRITICAL (blocking)
+        {false, 3600000},   // CHARGE_FULL
+        {false, 60000},     // UPDATE_START
+        {false, 60000},     // UPDATE_DONE
+        {false, 60000},     // UPDATE_FAILED
+        {true, 1500},       // TONE_CHARGE_ON
+        {true, 1500},       // TONE_CHARGE_OFF
+        {true, 0},          // TONE_SLEEP (blocking)
     };
     return table[(int)p];
 }
@@ -113,7 +117,7 @@ void VoicePrompts::begin()
     {
         if (available((Prompt)i)) present++;
     }
-    Serial.printf("VoicePrompts: %d/%d prompt files on the card (language %s)\n", present, (int)Prompt::COUNT, language.c_str());
+    ESP_LOGI(TAG, "%d/%d prompt files on the card (language %s)", present, (int)Prompt::COUNT, language.c_str());
 }
 
 void VoicePrompts::say(Prompt p)
@@ -123,20 +127,19 @@ void VoicePrompts::say(Prompt p)
         return;
     }
     const uint32_t bit = 1UL << (int)p;
-    if (queuedMask & bit)
+    // Claim the bit first: of two tasks saying the same prompt at once, exactly one queues it.
+    if (queuedMask.fetch_or(bit) & bit)
     {
         return; // already waiting
     }
     const Policy &pol = policy(p);
-    const unsigned long now = millis();
-    if (pol.minIntervalMs && lastSaidAt[(int)p] && now - lastSaidAt[(int)p] < pol.minIntervalMs)
-    {
-        return;
-    }
+    const uint32_t now = millis();
+    const uint32_t last = lastSaidAt[(int)p].load();
     uint8_t id = (uint8_t)p;
-    if (xQueueSend(queue, &id, 0) == pdTRUE)
+    const bool tooSoon = pol.minIntervalMs && last && now - last < pol.minIntervalMs;
+    if (tooSoon || xQueueSend(queue, &id, 0) != pdTRUE)
     {
-        queuedMask |= bit;
+        queuedMask.fetch_and(~bit); // not queued: release the claim
     }
 }
 
@@ -151,11 +154,12 @@ bool VoicePrompts::playNow(Prompt p)
     AudioController &audio = AudioController::getInstance();
     if (!audio.playPrompt(file))
     {
-        Serial.printf("VoicePrompts: cannot play %s\n", file.c_str());
+        ESP_LOGW(TAG, "cannot play %s", file.c_str());
         return false;
     }
-    lastSaidAt[(int)p] = millis() ? millis() : 1;
-    Serial.printf("VoicePrompts: %s\n", name(p));
+    const uint32_t now = millis();
+    lastSaidAt[(int)p].store(now ? now : 1);
+    ESP_LOGI(TAG, "%s", name(p));
     return true;
 }
 
@@ -191,28 +195,18 @@ void VoicePrompts::update()
     {
         return;
     }
-    if (waitingPrompt < 0)
+    uint8_t id;
+    if (xQueueReceive(queue, &id, 0) != pdTRUE)
     {
-        uint8_t id;
-        if (xQueueReceive(queue, &id, 0) != pdTRUE)
-        {
-            return;
-        }
-        queuedMask &= ~(1UL << id);
-        waitingPrompt = id;
-        waitingSince = millis();
-    }
-    const Prompt p = (Prompt)waitingPrompt;
-    const Policy &pol = policy(p);
-    const bool storyPlaying = audio.isPlaying() && !audio.isPromptPlaying();
-    if (storyPlaying && !pol.interrupt)
-    {
-        if (pol.dropWhilePlaying || millis() - waitingSince > kWaitForSilenceMaxMs)
-        {
-            waitingPrompt = -1; // a story is more important than this prompt
-        }
         return;
     }
-    waitingPrompt = -1;
+    queuedMask.fetch_and(~(1UL << id));
+    const Prompt p = (Prompt)id;
+    const bool storyPlaying = audio.isPlaying() && !audio.isPromptPlaying();
+    if (storyPlaying && !policy(p).interrupt)
+    {
+        ESP_LOGI(TAG, "%s dropped, a story is playing", name(p));
+        return; // a story is more important than this prompt
+    }
     playNow(p);
 }
