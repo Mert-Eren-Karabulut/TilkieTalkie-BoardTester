@@ -1653,8 +1653,10 @@ static void serviceUxPrompts()
             prompts.say(Prompt::IDLE_HELLO);
         }
     }
-    // Provisioned but no network for a minute.
-    if (provisioned && !WiFi.isConnected() && !wifiProv.isProvisioningManagerActive() && now - gFullSystemStartedAt > 60000UL)
+    // Provisioned, the home network is in range, but no link for a minute. Away from home
+    // (network not in range) the toy plays from the card and says nothing about it.
+    if (provisioned && !WiFi.isConnected() && !wifiProv.isProvisioningManagerActive() && wifiProv.isHomeNetworkVisible() &&
+        now - gFullSystemStartedAt > 60000UL)
     {
         if (!gWifiLostAnnounced || now - gWifiLostAnnouncedAt > 600000UL)
         {

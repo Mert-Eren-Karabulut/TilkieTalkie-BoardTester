@@ -19,6 +19,9 @@ private:
     int reconnectFailures = 0;        // consecutive background attempts without a link
     unsigned long offlineSince = 0;   // provisioned but no link since (0 = link up)
     std::function<bool()> idleCheck;  // the 15-minute restart only while the toy is idle
+    bool homeNetworkVisible = true;   // last scan saw the stored SSID (assumed until a scan says otherwise)
+    bool scanInFlight = false;
+    void attemptReconnect();
     
     static WiFiProvisioningManager* instance;
     static void onSysProvEvent(arduino_event_t *sys_event);
@@ -41,6 +44,9 @@ public:
     // plain reconnects fail, or when the link is up but nothing gets through.
     void resetRadio(const char *why);
     void setIdleCheck(std::function<bool()> fn) { idleCheck = fn; }
+    // False while the stored network is out of range (the toy is away from home, playing from
+    // the card): no reconnect churn, no escalation, no "I cannot connect" prompt.
+    bool isHomeNetworkVisible() const { return homeNetworkVisible; }
     
     // Query underlying library state
     bool isProvisioned();

@@ -49,6 +49,9 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
   every 4th failed attempt, idle restart after 15 min offline, radio reset when the link is up but
   the portal unreachable 10 min); loop watchdog 120 s (a hung loop used to need a battery pull);
   a token check without an answer no longer rotates the hub token.
+- 1.2.17: the WiFi recovery and the wifi_lost prompt apply only while the stored network is in range
+  (periodic scan for the SSID). Away from home the toy stays quiet, plays from the card and looks for
+  the network every 2 minutes; no radio resets, no restarts.
 - **Not yet run on hardware**: everything from 1.2.11 on (bench board away). First things to try:
   tap a new figure with 3+ tracks and let track 1 end before track 2 is down; delete a figure
   from the hub page and re-tap; change a track on the portal and watch the toy re-download.

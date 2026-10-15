@@ -281,37 +281,70 @@ void WiFiProvisioningManager::handleBackgroundReconnection() {
         connectedOnce = true;
         offlineSince = 0;
         reconnectFailures = 0;
+        homeNetworkVisible = true;
         return;
     }
     if (provisioningManagerInitialized || !isProvisioned()) {
         return;
     }
-    // Retry without blocking: every 10 s until the first connection of this boot, then every
-    // 30 s. The WiFi driver reports the result through the events; nothing is waited for here.
-    // Every 4th failed attempt restarts the radio outright: a toy whose reconnects failed for
-    // 16 minutes next to a working router came back within seconds of a reboot (2026-10-15).
     unsigned long currentTime = millis();
     if (!offlineSince) {
         offlineSince = currentTime;
+        homeNetworkVisible = true; // until a scan says otherwise
     }
-    const unsigned long interval = connectedOnce ? 30000UL : 10000UL;
+    // Is the home network around at all? A scan for the stored SSID decides. Out of range (the
+    // toy is used away from home, playing from the card) nothing is retried every few seconds,
+    // nothing is reset or restarted and nothing is said - the next look is in two minutes.
+    // In range but not connecting: retry every 10 s (30 s once connected this boot), every 4th
+    // failure restarts the radio (a toy stayed offline 16 min next to a working router until a
+    // reboot, 2026-10-15), and after 15 min the toy restarts itself while idle.
+    if (scanInFlight) {
+        int16_t n = WiFi.scanComplete();
+        if (n == WIFI_SCAN_RUNNING) {
+            return;
+        }
+        scanInFlight = false;
+        if (n >= 0) {
+            homeNetworkVisible = n > 0;
+            WiFi.scanDelete();
+            if (homeNetworkVisible) {
+                attemptReconnect();
+            } else {
+                reconnectFailures = 0;
+                Serial.println("WiFi: home network not in range - staying offline quietly");
+            }
+        } else {
+            attemptReconnect(); // scan failed: just try
+        }
+        return;
+    }
+    const unsigned long interval = homeNetworkVisible ? (connectedOnce ? 30000UL : 10000UL) : 120000UL;
     if (currentTime - lastReconnectAttempt >= interval) {
         lastReconnectAttempt = currentTime;
-        reconnectFailures++;
-        if (reconnectFailures >= 4 && (reconnectFailures % 4) == 0) {
-            resetRadio("reconnects keep failing");
+        const String ssid = config.getWiFiSSID();
+        int16_t r = ssid.isEmpty() ? WIFI_SCAN_FAILED : WiFi.scanNetworks(true, true, false, 120, 0, ssid.c_str());
+        if (r == WIFI_SCAN_RUNNING) {
+            scanInFlight = true; // the result decides (above)
         } else {
-            Serial.println("Attempting WiFi reconnection with stored credentials (background)...");
-            WiFi.begin(); // Use stored credentials
+            attemptReconnect(); // no SSID stored or the driver is busy: a plain attempt
         }
     }
-    // Still nothing after 15 minutes: a restart while the toy is idle is invisible and ends
-    // whatever state the driver got into.
-    if (currentTime - offlineSince > 15UL * 60UL * 1000UL && idleCheck && idleCheck()) {
-        Serial.println("WiFi: offline for 15 min although provisioned - restarting while idle");
+    if (homeNetworkVisible && reconnectFailures >= 8 && currentTime - offlineSince > 15UL * 60UL * 1000UL &&
+        idleCheck && idleCheck()) {
+        Serial.println("WiFi: home network in range but no link for 15 min - restarting while idle");
         delay(200);
         ESP.restart();
     }
+}
+
+void WiFiProvisioningManager::attemptReconnect() {
+    reconnectFailures++;
+    if (reconnectFailures >= 4 && (reconnectFailures % 4) == 0) {
+        resetRadio("reconnects keep failing");
+        return;
+    }
+    Serial.println("Attempting WiFi reconnection with stored credentials (background)...");
+    WiFi.begin(); // Use stored credentials
 }
 
 void WiFiProvisioningManager::resetRadio(const char *why) {

@@ -35,7 +35,7 @@ Until the factory writes the cards, a missing pack could also be fetched from th
 | setup_connecting | Teşekkürler! İnternete bağlanıyorum, birazcık bekle. | credentials received over BLE | |
 | setup_success | Harika, internete bağlandım! Şimdi ilk figürünü üzerime yerleştir. | provisioning ended with the network up | |
 | setup_failed | Bağlanamadım. Kablosuz ağ adını ve şifresini kontrol edip uygulamadan tekrar dene. Hata kodu: Üzüm. | credentials rejected | |
-| wifi_lost | İnternete bağlanamıyorum. Modemin açık olduğundan emin ol. Hata kodu: Portakal. | provisioned, no network 60 s after boot; again every 10 min | |
+| wifi_lost | İnternete bağlanamıyorum. Modemin açık olduğundan emin ol. Hata kodu: Portakal. | provisioned, the home network is in range (scan) but no link 60 s after boot; again every 10 min. Out of range (toy used away from home, playing from the card): silent | |
 | wifi_reset_hint | Kablosuz ağın değiştiyse iki ses tuşuna birlikte beş saniye basılı tut, sonra beni uygulamadan yeniden bağla. | right after wifi_lost | |
 | wifi_reset_done | Ağ ayarlarını sildim. Şimdi beni uygulamadan yeniden bağlayabilirsin. | volume buttons held 5 s (stories stay on the card) | blocking, then restart |
 | idle_hello | Merhaba! Bir hikâye dinlemek için figürünü üzerime koy. | provisioned boot, no figure on the pins (3 s in) | |
