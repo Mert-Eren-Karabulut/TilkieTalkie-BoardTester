@@ -338,9 +338,10 @@ void ConfigManager::deleteSetting(const String& keyname) {
     CfgLock g(lock);
     Preferences settingsPrefs;
     if (settingsPrefs.begin(SETTINGS_NAMESPACE, false)) {
-        bool result = settingsPrefs.remove(keyname.c_str());
-        if (!result) {
-            ESP_LOGW(TAG, "WARNING: Failed to delete setting or key not found: %s", keyname.c_str());
+        // Deleting a key that was never written is normal (OTA bookkeeping clears all its keys);
+        // Preferences::remove() logs an error for that, so check first.
+        if (settingsPrefs.isKey(keyname.c_str()) && !settingsPrefs.remove(keyname.c_str())) {
+            ESP_LOGW(TAG, "Failed to delete setting: %s", keyname.c_str());
         }
         settingsPrefs.end();
     } else {

@@ -57,8 +57,11 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
   split into modules, download give-ups complete the figure, batched queue writes, races closed, audio
   lock discipline and the volume-beep bug, skips for bad tracks, OTA check timeout, prompt pack
   power-loss safety, NFC 10-byte UIDs, WiFi credential writes only on change, tagged logging.
-- **Not yet run on hardware**: everything from 1.2.11 on (bench board away). 1.2.18 touches the
-  audio task, the SD path and WiFi: flash the bench board first when it is back, then the field unit. First things to try:
+- **Bench-validated 2026-10-16 on 1.2.18/1.2.19**: boot, WiFi, token, Reverb, fault events to the portal,
+  prompt pack staging + activation, OTA 1.2.18 -> 1.2.19 over the air (offer, prompt, download, activate,
+  reboot, confirm), figure tap -> download -> play, delete from the hub page -> re-tap -> re-download, 3-track
+  playback. Not exercised on the bench (link too fast): the download wait + volume beep path (desk-reviewed).
+  1.2.19 is on beta; promote to stable for the field unit. First things to try:
   tap a new figure with 3+ tracks and let track 1 end before track 2 is down; delete a figure
   from the hub page and re-tap; change a track on the portal and watch the toy re-download.
 
