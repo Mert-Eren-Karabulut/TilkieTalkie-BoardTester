@@ -4,6 +4,7 @@
 #include "PsramJson.h"
 #include "AudioController.h"
 #include "PromptPackManager.h"
+#include "Faults.h"
 #include <esp_random.h>
 #include <esp_task_wdt.h>
 #include <algorithm>
@@ -288,6 +289,7 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
             }
         }
         error = "Unauthorized";
+        Faults::raise(Fault::TOKEN_REJECTED, endpoint.substring(0, 39).c_str());
         return code;
     }
 
@@ -317,6 +319,11 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
     }
     error = String("HTTP ") + method + " failed: " + String(code) + " (" + errorDetail + ")";
     Serial.println("RequestManager: " + error);
+    {
+        char d[40];
+        snprintf(d, sizeof(d), "%d %.30s", code, endpoint.c_str());
+        Faults::raise(Fault::PORTAL_UNREACHABLE, d, false);
+    }
     http.end();
     return code;
 }

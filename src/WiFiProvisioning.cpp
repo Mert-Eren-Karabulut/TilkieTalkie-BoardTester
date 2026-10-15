@@ -1,4 +1,5 @@
 #include "WiFiProvisioning.h"
+#include "Faults.h"
 #include <esp_bt.h>
 #include <esp_heap_caps.h>
 #include <esp_event.h>
@@ -312,6 +313,7 @@ void WiFiProvisioningManager::handleBackgroundReconnection() {
             } else {
                 reconnectFailures = 0;
                 Serial.println("WiFi: home network not in range - staying offline quietly");
+                Faults::raise(Fault::WIFI_OUT_OF_RANGE);
             }
         } else {
             attemptReconnect(); // scan failed: just try
@@ -349,6 +351,7 @@ void WiFiProvisioningManager::attemptReconnect() {
 
 void WiFiProvisioningManager::resetRadio(const char *why) {
     Serial.printf("WiFi: radio reset (%s)\n", why);
+    Faults::raise(Fault::WIFI_RADIO_RESET, why);
     WiFi.disconnect(true, false); // radio off, credentials kept
     WiFi.mode(WIFI_OFF);
     delay(200);

@@ -36,7 +36,6 @@ private:
     static const char* SD_PENDING_MANIFEST_DIR;
     
     // Private helper methods
-    bool isNetworkReady();
     void setDefaultHeaders();
     JsonDocument parseResponse(const String& response);
     
@@ -88,6 +87,7 @@ public:
 
     // Utility methods
     bool isConnected();
+    bool isNetworkReady();   // WiFi up with an IP (no portal check)
     String getLastError();
     int getLastStatusCode();
     String getJWTToken();

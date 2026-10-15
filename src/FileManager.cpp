@@ -1,4 +1,5 @@
 #include "FileManager.h"
+#include "Faults.h"
 #include "BatteryManagement.h"
 #include "PsramJson.h"
 #include "RequestManager.h"
@@ -879,6 +880,7 @@ void FileManager::processDownloadQueue() {
         if (task.retryCount >= MAX_RETRY_COUNT) {
             // Gave up: the next tap of the figure re-queues whatever its manifest still needs.
             Serial.printf("FileManager: giving up on %s after %d attempts\n", task.url.c_str(), task.retryCount);
+            Faults::raise(Fault::DOWNLOAD_FAILED, task.localPath.substring(0, 39).c_str(), false);
             downloadQueue.erase(it);
             saveDownloadQueue();
             return;
@@ -896,6 +898,7 @@ void FileManager::processDownloadQueue() {
                 errorMsg.indexOf("open") >= 0) {
                 // A local path that cannot be created never will be; retrying only keeps "syncing" on.
                 Serial.println("FileManager: dropping the entry (local path error)");
+                Faults::raise(Fault::SD_WRITE_FAILED, task.localPath.substring(0, 39).c_str(), false);
                 downloadQueue.erase(it);
             }
         }

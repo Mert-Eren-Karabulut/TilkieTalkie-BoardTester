@@ -27,6 +27,7 @@
 #include "OtaManager.h"
 #include "VoicePrompts.h"
 #include "PromptPackManager.h"
+#include "Faults.h"
 #include "Version.h"
 
 // The espidf CMake build compiles every file in src/ regardless of build_src_filter,
@@ -614,20 +615,26 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
         if (mounted)
         {
             ledController.flash(LedController::FX_NO_CONTENT);
+            const String detail = "uid=" + uid;
             if (error.indexOf("unreachable") >= 0 || error.indexOf("Offline") >= 0)
             {
-                ReverbClient::setLastError("armut");
-                prompts.say(Prompt::FIGURE_OFFLINE);
+                Faults::raise(Fault::FIGURE_OFFLINE, detail.c_str());
             }
             else if (error.indexOf("downloaded") >= 0)
             {
-                ReverbClient::setLastError("kiraz");
-                prompts.say(Prompt::DOWNLOAD_FAILED);
+                Faults::raise(Fault::DOWNLOAD_FAILED, detail.c_str());
+            }
+            else if (error.indexOf("No figure") >= 0)
+            {
+                Faults::raise(Fault::FIGURE_UNKNOWN, detail.c_str());
+            }
+            else if (error.indexOf("asset_manifest") >= 0)
+            {
+                Faults::raise(Fault::MANIFEST_INVALID, detail.c_str());
             }
             else
             {
-                ReverbClient::setLastError("elma");
-                prompts.say(Prompt::FIGURE_NO_CONTENT);
+                Faults::raise(Fault::FIGURE_NO_CONTENT, detail.c_str());
             }
         }
         return;
@@ -659,7 +666,7 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
     }
 
     gFigureLoadingSince = 0;
-    ReverbClient::setLastError(""); // the figure works: the portal's error badge goes away
+    Faults::clearOn(FaultClear::ON_PLAY); // the figure works: its faults are over
     const bool moreComing = requestManager.isFigureDownloading(uid); // playlist waits at its end instead of finishing
     const bool samePlaylist = audioController.hasPlaylist() && audioController.getPlaylistFigureUid() == uid;
     if (isUpdate && samePlaylist)
@@ -1138,6 +1145,25 @@ void setup()
     ledController.begin();
     ledController.setScene(LedController::SCENE_BOOT); // "waking up" from the first second
     OtaManager::getInstance().begin();
+    // Fault catalogue (docs/FAULTS.md): reset classification, stored events, prompts for faults.
+    Faults::begin();
+    Faults::setSpeaker([](Fault f) {
+        switch (f)
+        {
+        case Fault::WIFI_AUTH_FAILED: prompts.say(Prompt::SETUP_FAILED); break;
+        case Fault::WIFI_NO_LINK: prompts.say(Prompt::WIFI_LOST); prompts.say(Prompt::WIFI_RESET_HINT); break;
+        case Fault::FIGURE_UNKNOWN:
+        case Fault::FIGURE_NO_CONTENT: prompts.say(Prompt::FIGURE_NO_CONTENT); break;
+        case Fault::FIGURE_OFFLINE: prompts.say(Prompt::FIGURE_OFFLINE); break;
+        case Fault::DOWNLOAD_FAILED: prompts.say(Prompt::DOWNLOAD_FAILED); break;
+        case Fault::OTA_DOWNLOAD_FAILED:
+        case Fault::OTA_FLASH_FAILED:
+        case Fault::OTA_SHA_MISMATCH: prompts.say(Prompt::UPDATE_FAILED); break;
+        case Fault::NFC_READ_TROUBLE: prompts.say(Prompt::NFC_READ_TROUBLE); break;
+        case Fault::BATTERY_LOW: prompts.say(Prompt::BATTERY_LOW); break;
+        default: break; // silent faults (muz: the toy cannot speak without the card anyway)
+        }
+    });
 
     // Loop watchdog. A hung loop task (2026-10-15: LEDs on, prompts playing, no network, no
     // buttons) stayed hung until someone pulled the battery; now it panics after 120 s and the
@@ -1295,6 +1321,7 @@ void startFullSystem()
     }
     else
     {
+        Faults::raise(Fault::SD_MOUNT_FAILED);
         ESP_LOGW(TAG, "File Manager initialization failed!");
         ESP_LOGW(TAG, "SD card functionality will not be available.");
     }
@@ -1313,6 +1340,7 @@ void startFullSystem()
     // Initialize audio controller
     if (!audioController.begin())
     {
+        Faults::raise(Fault::AUDIO_INIT_FAILED);
         ESP_LOGW(TAG, "Audio Controller initialization failed!");
         ESP_LOGW(TAG, "Audio functionality will not be available.");
     }
@@ -1336,6 +1364,7 @@ void startFullSystem()
     }
     else
     {
+        Faults::raise(Fault::NFC_INIT_FAILED);
         ESP_LOGE(TAG, "FATAL: NFC Controller initialization failed!");
         ESP_LOGE(TAG, "NFC functionality will not be available.");
         // Handle failure, maybe by pulsing an error color
@@ -1429,7 +1458,7 @@ void startFullSystem()
         switch (ev)
         {
         case WiFiProvisioningManager::ProvEvent::CRED_RECV: prompts.say(Prompt::SETUP_CONNECTING); break;
-        case WiFiProvisioningManager::ProvEvent::CRED_FAIL: prompts.say(Prompt::SETUP_FAILED); break;
+        case WiFiProvisioningManager::ProvEvent::CRED_FAIL: Faults::raise(Fault::WIFI_AUTH_FAILED); break;
         case WiFiProvisioningManager::ProvEvent::ENDED:
             if (WiFi.isConnected()) prompts.say(Prompt::SETUP_SUCCESS);
             break;
@@ -1482,7 +1511,7 @@ static void deriveLedScene()
         ledController.setScene(LedController::SCENE_OTA, gOtaProgress);
         return;
     }
-    if (gSystemError)
+    if (gSystemError || Faults::hasActive(Severity::CRITICAL))
     {
         ledController.setScene(LedController::SCENE_ERROR);
         return;
@@ -1614,9 +1643,14 @@ static void serviceUxPrompts()
     {
         prompts.say(Prompt::DOWNLOAD_WAIT); // the next story is still downloading; playback resumes by itself
     }
-    if (WiFi.isConnected() && strcmp(ReverbClient::lastError(), "portakal") == 0)
     {
-        ReverbClient::setLastError(""); // network is back
+        static bool wasConnected = false;
+        const bool connected = WiFi.isConnected();
+        if (connected && !wasConnected)
+        {
+            Faults::clearOn(FaultClear::ON_NETWORK); // network is back
+        }
+        wasConnected = connected;
     }
     static unsigned long lastCheck = 0;
     const unsigned long now = millis();
@@ -1662,9 +1696,7 @@ static void serviceUxPrompts()
         {
             gWifiLostAnnounced = true;
             gWifiLostAnnouncedAt = now;
-            ReverbClient::setLastError("portakal");
-            prompts.say(Prompt::WIFI_LOST);
-            prompts.say(Prompt::WIFI_RESET_HINT);
+            Faults::raise(Fault::WIFI_NO_LINK); // speaks wifi_lost + the reset hint
         }
     }
     else if (WiFi.isConnected())
@@ -1684,7 +1716,7 @@ static void serviceUxPrompts()
         if (!nfcController.isCardPresent() && !troubleSaid && now - pogoSince > 3000UL)
         {
             troubleSaid = true;
-            prompts.say(Prompt::NFC_READ_TROUBLE);
+            Faults::raise(Fault::NFC_READ_TROUBLE);
         }
     }
     else
@@ -1716,7 +1748,9 @@ static void updateBatteryUx()
     if (step < lastWarnStep)
     {
         lastWarnStep = step;
-        prompts.say(Prompt::BATTERY_LOW);
+        char d[16];
+        snprintf(d, sizeof(d), "pct=%d", pct);
+        Faults::raise(Fault::BATTERY_LOW, d);
     }
 }
 
@@ -1755,6 +1789,7 @@ void loop()
         if (stackHighWaterMark < 1000)
         { // Less than 1KB remaining
             ESP_LOGW(TAG, "WARNING: Low stack space remaining: %d bytes", stackHighWaterMark * sizeof(StackType_t));
+            Faults::raise(Fault::STACK_LOW);
         }
     }
 
@@ -3560,6 +3595,21 @@ void loop()
 #endif
     TT_TIMED("ota", OtaManager::getInstance().update());
     TT_TIMED("prompts", PromptPackManager::getInstance().update());
+    TT_TIMED("faults", Faults::update());
+    {
+        static unsigned long lastHeapCheck = 0;
+        if (millis() - lastHeapCheck > 30000)
+        {
+            lastHeapCheck = millis();
+            const uint32_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (freeInternal < 16000)
+            {
+                char d[24];
+                snprintf(d, sizeof(d), "free=%lu", (unsigned long)freeInternal);
+                Faults::raise(Fault::HEAP_LOW, d);
+            }
+        }
+    }
     gOtaProgress = OtaManager::getInstance().inProgress() ? OtaManager::getInstance().progress() : -1;
     {
         OtaManager &ota = OtaManager::getInstance();
@@ -3584,8 +3634,12 @@ void loop()
     gLastOtaProgress = gOtaProgress;
     if (OtaManager::getInstance().consumeJustFailed())
     {
-        ReverbClient::setLastError("karpuz");
-        prompts.say(Prompt::UPDATE_FAILED);
+        const String err = OtaManager::getInstance().lastError();
+        const Fault f = err.indexOf("sha256") >= 0 ? Fault::OTA_SHA_MISMATCH
+                        : (err.indexOf("flash") >= 0 || err.indexOf("activate") >= 0) ? Fault::OTA_FLASH_FAILED
+                        : err.indexOf("prompt pack") >= 0 ? Fault::PROMPT_PACK_FAILED
+                        : Fault::OTA_DOWNLOAD_FAILED;
+        Faults::raise(f, err.substring(0, 39).c_str());
     }
     TT_TIMED("led", deriveLedScene(); ledController.update());
 

@@ -13,10 +13,11 @@
 #include "CaBundle.h"
 #include "OtaManager.h"
 #include "PromptPackManager.h"
+#include "Faults.h"
 #include "RequestManager.h"
 
 // Define static members
-char ReverbClient::jsonBuffer[1024];
+char ReverbClient::jsonBuffer[1536];
 char ReverbClient::urlBuffer[128];
 char ReverbClient::headerBuffer[256];
 char ReverbClient::channelBuffer[64];
@@ -174,6 +175,12 @@ void ReverbClient::serviceSubscription()
     }
     _subscribeRetryAt = millis() + delayMs;
     Serial.printf("ReverbClient: channel auth failed (HTTP %d), retry in %lu s\n", code, delayMs / 1000);
+    if (code == 401 || code == 403)
+    {
+        char d[16];
+        snprintf(d, sizeof(d), "http=%d", code);
+        Faults::raise(Fault::WS_AUTH_FAILED, d);
+    }
 
     // 401/403 means the token is bad; a backend that answers 419/5xx twice in a row to the same
     // token is treated the same way (a revoked token produced 500s before the backend fix).
@@ -533,15 +540,18 @@ void ReverbClient::sendDeviceReport(bool force)
     // while playing (position), and at least every 60 s (heartbeat).
     PromptPackManager &ppm = PromptPackManager::getInstance();
     const String promptPack = ppm.installedChecksum().substring(0, 12);
+    const String faultsJson = Faults::reportJson();
+    strlcpy(_lastError, Faults::fruit(), sizeof(_lastError)); // older portal code reads the fruit
     char signature[220];
     snprintf(signature, sizeof(signature), "%d|%d|%d|%d|%s|%s|%d|%d|%d|%s|%s|%s",
              isCharging ? 1 : 0, isFileSyncing ? 1 : 0, pendingDownloads, downloadProgress / 10,
              audioStatus, currentTrack.c_str(),
              currentVolume, volumeCeiling, isPogoActive ? 1 : 0, nfcCardId.c_str(),
              ppm.stateName(), OtaManager::getInstance().stateName());
+    String signatureStr = String(signature) + "|" + faultsJson;
 
     unsigned long now = millis();
-    bool changed = (_lastReportSignature != signature) ||
+    bool changed = (_lastReportSignature != signatureStr) ||
                    fabsf(batteryPercent - _lastReportedPercent) >= 2.0f ||
                    fabsf(batteryVoltage - _lastReportedVoltage) >= 0.10f ||
                    abs(wifiRSSI - _lastReportedRssi) >= 10 ||
@@ -570,6 +580,7 @@ void ReverbClient::sendDeviceReport(bool force)
                            "\"last_error\":\"%s\","
                            "\"ota\":{\"state\":\"%s\",\"progress\":%d},"
                            "\"prompts\":{\"pack\":\"%s\",\"state\":\"%s\"},"
+                           "\"faults\":{%s},"
                            "\"battery\":{"
                            "\"status\":\"%s\","
                            "\"percent\":%.1f,"
@@ -604,6 +615,7 @@ void ReverbClient::sendDeviceReport(bool force)
                            OtaManager::getInstance().progress(),
                            promptPack.c_str(),
                            ppm.stateName(),
+                           faultsJson.c_str(),
                            isCharging ? "charging" : "discharging",
                            batteryPercent,
                            batteryVoltage,
@@ -634,7 +646,7 @@ void ReverbClient::sendDeviceReport(bool force)
     {
         _lastReportAt = now;
         _lastPositionReportAt = now;
-        _lastReportSignature = signature;
+        _lastReportSignature = signatureStr;
         _lastReportedPercent = batteryPercent;
         _lastReportedVoltage = batteryVoltage;
         _lastReportedRssi = wifiRSSI;

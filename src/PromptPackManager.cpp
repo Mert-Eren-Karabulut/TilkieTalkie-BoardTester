@@ -4,6 +4,7 @@
 #include "AudioController.h"
 #include "PsramJson.h"
 #include "Version.h"
+#include "Faults.h"
 #include <SD_MMC.h>
 
 const char *PromptPackManager::SOUNDS_DIR = "/sounds";
@@ -152,6 +153,12 @@ void PromptPackManager::begin()
     }
     Serial.printf("Prompts: card pack %s, %d required file(s) missing\n",
                   _installed.isEmpty() ? "none" : _installed.substring(0, 12).c_str(), missing);
+    if (missing > 0)
+    {
+        char d[24];
+        snprintf(d, sizeof(d), "missing=%d", missing);
+        Faults::raise(Fault::PROMPT_FILE_MISSING, d);
+    }
 }
 
 void PromptPackManager::update()
@@ -275,6 +282,10 @@ void PromptPackManager::finishStaging(bool ok)
         }
     }
     Serial.printf("Prompts: pack %.12s staging %s\n", _pack.checksum.c_str(), ok ? "complete" : "failed");
+    if (!ok)
+    {
+        Faults::raise(Fault::PROMPT_PACK_FAILED, _pack.checksum.substring(0, 12).c_str());
+    }
     if (ok && _forVersion == firmwareVersion())
     {
         _activateWhenSilent = true; // for the running firmware: swap in as soon as nothing speaks
@@ -341,6 +352,7 @@ bool PromptPackManager::activateStaging()
     if (!SD_MMC.rename(STAGING_DIR, SOUNDS_DIR))
     {
         Serial.println("Prompts: could not move the staged pack into place - restoring the old one");
+        Faults::raise(Fault::PROMPT_PACK_ACTIVATE_FAILED, "rename");
         if (hadSounds)
         {
             SD_MMC.rename(OLD_DIR, SOUNDS_DIR);

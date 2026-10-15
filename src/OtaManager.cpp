@@ -4,6 +4,7 @@
 #include "ConfigManager.h"
 #include "CaBundle.h"
 #include "PromptPackManager.h"
+#include "Faults.h"
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
@@ -101,6 +102,7 @@ void OtaManager::begin()
         if (other && esp_ota_get_partition_description(other, &desc) == ESP_OK)
         {
             Serial.printf("OTA: crash loop - reverting to %s (%s)\n", other->label, desc.version);
+            Faults::raise(Fault::OTA_CRASH_LOOP_REVERT, desc.version);
             ConfigManager::getInstance().storeInt(NVS_OTA_REVERT, 1);
             g_otaCrashCount = 0;
             if (esp_ota_set_boot_partition(other) == ESP_OK)
@@ -253,6 +255,11 @@ void OtaManager::onCheckResult(JsonDocument &doc, int code)
     if (code != 200)
     {
         Serial.printf("OTA: check failed (HTTP %d)\n", code);
+        {
+            char d[16];
+            snprintf(d, sizeof(d), "http=%d", code);
+            Faults::raise(Fault::OTA_CHECK_FAILED, d, false);
+        }
         _nextCheckAt = millis() + (code <= 0 ? CHECK_RETRY_SOON_MS : CHECK_RETRY_MS);
         _state = IDLE;
         return;
@@ -602,6 +609,10 @@ void OtaManager::update()
             {
                 cfg.storeInt(NVS_OTA_LAST_REL, (int)rel);
                 _justUpdated = true;
+            }
+            if (!ok)
+            {
+                Faults::raise(Fault::OTA_ROLLED_BACK, reverted ? "crash loop" : "image did not come up");
             }
             postStatus(ok ? "success" : "rolled_back", 100,
                        ok ? String()
