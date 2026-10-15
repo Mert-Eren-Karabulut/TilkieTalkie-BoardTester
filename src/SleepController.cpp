@@ -1,5 +1,6 @@
 #include "SleepController.h"
 #include "VoicePrompts.h"
+#include "OtaManager.h"
 #include "AudioController.h"
 #include "BatteryManagement.h"
 #include "FileManager.h"
@@ -135,6 +136,14 @@ bool SleepController::canEnterSleep() {
         }
     }
     
+    // A firmware update in flight must finish: a toy on battery used to deep-sleep in the middle
+    // of the download (the OTA task is not a FileManager download) and start over on the next wake.
+    if (OtaManager::getInstance().inProgress()) {
+        blockedReason = "firmware update in progress";
+        lastCheckResult = false;
+        return false;
+    }
+
     // Only an in-flight transfer holds off sleep. A non-empty queue must not: with WiFi down
     // or the server unreachable it would keep a battery-powered toy awake until the cell
     // is empty. The queue is persisted and resumes on the next wake with connectivity.

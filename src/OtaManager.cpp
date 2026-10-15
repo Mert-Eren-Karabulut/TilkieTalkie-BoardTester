@@ -293,6 +293,7 @@ bool OtaManager::startJob(const Job &job)
 void OtaManager::taskEntry(void *arg)
 {
     static_cast<OtaManager *>(arg)->runDownload();
+    WiFi.setSleep(true); // back to power saving
     static_cast<OtaManager *>(arg)->_task = nullptr;
     vTaskDelete(NULL);
 }
@@ -309,6 +310,9 @@ void OtaManager::runDownload()
     }
     WiFiClient &client = https ? static_cast<WiFiClient &>(secure) : plain;
 
+    // Full-throughput WiFi for the download: the default modem sleep (DTIM listen) roughly
+    // halves TCP throughput and stretches every retransmission on a weak link. Restored by taskEntry.
+    WiFi.setSleep(false);
     uint8_t *buf = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!buf)
     {
