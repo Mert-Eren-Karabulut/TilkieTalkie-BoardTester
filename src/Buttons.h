@@ -124,10 +124,6 @@ private:
     void resetCombo();
     void resetCombo2();
     bool readButtonRaw(ButtonId button);
-    
-    // Interrupt handlers (static methods)
-    static void IRAM_ATTR handleInterrupt();
-    static volatile bool interruptFlag;
 };
 
 #endif // BUTTONS_H

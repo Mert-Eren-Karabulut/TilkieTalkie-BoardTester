@@ -27,9 +27,7 @@ namespace Diag
     void printTaskStats();
 
     // Section timing primitives (used by the TT_TIMED macro).
-    void sectionEnter(uint8_t id);
-    void sectionLeave(uint8_t id);
-    uint8_t sectionId(const char *name); // registers name on first use, returns slot (max 16)
+    uint8_t sectionId(const char *name); // registers name on first use, returns slot (max 32)
 
     struct Scoped
     {

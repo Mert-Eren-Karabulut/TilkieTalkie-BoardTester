@@ -1,5 +1,8 @@
 #include "BatteryManagement.h"
 #include <driver/gpio.h>
+#include <esp_log.h>
+
+static const char *TAG = "batt";
 
 namespace {
 // Charge-current limit currently requested by the system (bring-up / deep-discharge
@@ -220,7 +223,6 @@ BatteryManager::BatteryManager()
     , currentFullChargeCapacityMilliAmpHours(0)
     , gaugeDesignCapacityMilliAmpHours(0)
     , isCharging(false)
-    , isChargingPrevious(false)
     , telemetryValid(false)
     , busInitialized(false)
     , rt6160Present(false)
@@ -280,9 +282,6 @@ BatteryManager::BatteryManager()
     , gaugeTrueFullChargeCapacityMilliAmpHours(0)
     , gaugeUpdateStatus(0)
     , lastDeviceScan(0)
-    , lowBatteryCallback(nullptr)
-    , chargingStateChangeCallback(nullptr)
-    , lowBatteryCallbackTriggered(false)
 {
     busLock = xSemaphoreCreateRecursiveMutex();
     // Initialize voltage buffer
@@ -299,7 +298,7 @@ BatteryManager& BatteryManager::getInstance() {
 }
 
 void BatteryManager::begin() {
-    Serial.println("Initializing Battery Manager...");
+    ESP_LOGI(TAG, "Initializing Battery Manager...");
 
     gpio_deep_sleep_hold_dis();
     gpio_hold_dis(static_cast<gpio_num_t>(BATTERY_CHARGER_ENABLE_PIN));
@@ -322,7 +321,7 @@ void BatteryManager::begin() {
     lastUpdate = millis() - UPDATE_INTERVAL;
     refreshBatteryState();
     
-    Serial.println("Battery Manager initialized successfully");
+    ESP_LOGI(TAG, "Battery Manager initialized successfully");
     printBatteryInfo();
 }
 
@@ -420,10 +419,10 @@ void BatteryManager::startTask() {
     if (pollTask) return;
     if (xTaskCreatePinnedToCore(pollTaskEntry, "battery", 4096, this, 4, &pollTask, 0) != pdPASS) {
         pollTask = nullptr;
-        Serial.println("BatteryManager: poll task creation failed, staying on the loop");
+        ESP_LOGW(TAG, "BatteryManager: poll task creation failed, staying on the loop");
         return;
     }
-    Serial.println("BatteryManager: polling on its own task (core 0)");
+    ESP_LOGI(TAG, "BatteryManager: polling on its own task (core 0)");
 }
 
 void BatteryManager::update() {
@@ -439,20 +438,6 @@ void BatteryManager::update() {
     if (currentTime - lastUpdate >= UPDATE_INTERVAL) {
         lastUpdate = currentTime;
         refreshBatteryState();
-        
-        // Handle callbacks
-        if (lowBatteryCallback && isBatteryLow() && !lowBatteryCallbackTriggered) {
-            lowBatteryCallback(currentVoltage, currentPercentage, isCharging);
-            lowBatteryCallbackTriggered = true;
-        } else if (!isBatteryLow()) {
-            lowBatteryCallbackTriggered = false;
-        }
-        
-        if (chargingStateChangeCallback && isCharging != isChargingPrevious) {
-            chargingStateChangeCallback(currentVoltage, currentPercentage, isCharging);
-        }
-        
-        isChargingPrevious = isCharging;
     }
 }
 
@@ -534,7 +519,7 @@ void BatteryManager::refreshBatteryState() {
         prevGaugePresent = gaugePresent;
         prevGaugeAddress = gaugeAddress;
         if (appeared) {
-            Serial.println("BatteryManager: bus device (re)appeared - applying power configuration");
+            ESP_LOGI(TAG, "BatteryManager: bus device (re)appeared - applying power configuration");
             applyPowerConfiguration(false);
         }
     }
@@ -542,7 +527,7 @@ void BatteryManager::refreshBatteryState() {
     if (chargerPresent && now - lastChargerSanityCheck >= CHARGER_SANITY_INTERVAL) {
         lastChargerSanityCheck = now;
         if (!verifyChargerVoltageSetting()) {
-            Serial.println("BatteryManager: charger configuration lost (VREG mismatch) - reconfiguring");
+            ESP_LOGW(TAG, "BatteryManager: charger configuration lost (VREG mismatch) - reconfiguring");
             chargerConfigured = configureChargerDefaults();
             chargerAdcEnabled = enableChargerAdc();
             if (verifyChargerVoltageSetting()) {
@@ -642,7 +627,7 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
             assertChargerEnablePin();
         } else {
             releaseChargerEnablePin();
-            Serial.println("BatteryManager: SAFETY - charge voltage not verified, charger held disabled (CE high)");
+            ESP_LOGE(TAG, "BatteryManager: SAFETY - charge voltage not verified, charger held disabled (CE high)");
             ok = false;
         }
     } else {
@@ -924,32 +909,6 @@ void BatteryManager::printBusScan() {
     Serial.println("-----------------------------\n");
 }
 
-void BatteryManager::calibrate(float actualVoltage) {
-    float measuredVoltage = currentVoltage - CALIBRATION_OFFSET;
-    float newOffset = actualVoltage - measuredVoltage;
-    
-    Serial.println("Battery calibration:");
-    Serial.println("Measured: " + String(measuredVoltage, 3) + "V");
-    Serial.println("Actual: " + String(actualVoltage, 3) + "V");
-    Serial.println("New offset: " + String(newOffset, 3) + "V");
-    
-    // You would need to store this offset in NVS for persistence
-    // For now, it's just used for this session
-}
-
-void BatteryManager::resetCalibration() {
-    // Reset calibration offset
-    Serial.println("Battery calibration reset");
-}
-
-void BatteryManager::setLowBatteryCallback(BatteryEventCallback callback) {
-    lowBatteryCallback = callback;
-}
-
-void BatteryManager::setChargingStateChangeCallback(BatteryEventCallback callback) {
-    chargingStateChangeCallback = callback;
-}
-
 bool BatteryManager::configureRt6160For4V5() {
     bool wroteVout1 = writeRegister8(RT6160_ADDRESS, RT6160_VOUT1_REGISTER, RT6160_4V5_SETTING);
     bool wroteVout2 = writeRegister8(RT6160_ADDRESS, RT6160_VOUT2_REGISTER, RT6160_4V5_SETTING);
@@ -1163,14 +1122,14 @@ bool BatteryManager::ensureGaugeLfpChargeProfile() {
         }
         if (gaugeSealed && !unsealed) {
             if (!unsealGauge()) {
-                Serial.println("BatteryManager: LFP profile - cannot unseal gauge");
+                ESP_LOGW(TAG, "BatteryManager: LFP profile - cannot unseal gauge");
                 return false;
             }
             unsealed = true;
         }
         const bool wrote = f.isByte ? writeGaugeDataFlashByte(f.address, static_cast<uint8_t>(f.value))
                                     : writeGaugeDataFlashWord(f.address, f.value);
-        Serial.printf("BatteryManager: LFP profile - %s 0x%04X: %u -> %u %s\n",
+        ESP_LOGI(TAG, "BatteryManager: LFP profile - %s 0x%04X: %u -> %u %s",
                       f.name, f.address, have, f.value, wrote ? "OK" : "FAILED");
         allOk = wrote && allOk;
         if (wrote) {
@@ -1182,7 +1141,7 @@ bool BatteryManager::ensureGaugeLfpChargeProfile() {
         gaugeSealed = true;
     }
     if (fixed > 0) {
-        Serial.printf("BatteryManager: LFP profile - %d field(s) corrected\n", fixed);
+        ESP_LOGI(TAG, "BatteryManager: LFP profile - %d field(s) corrected", fixed);
     }
     return allOk;
 }
@@ -1198,7 +1157,7 @@ bool BatteryManager::ensureGaugeBroadcastPacing() {
     if (pacing == DEFAULT_GAUGE_BROADCAST_PACING_S) {
         return true;
     }
-    Serial.printf("BatteryManager: gauge Broadcast Pacing is %u s (expected %u) - repairing\n",
+    ESP_LOGW(TAG, "BatteryManager: gauge Broadcast Pacing is %u s (expected %u) - repairing",
                   pacing, DEFAULT_GAUGE_BROADCAST_PACING_S);
     const bool wasSealed = gaugeSealed;
     if (gaugeSealed && !unsealGauge()) {
@@ -1212,7 +1171,7 @@ bool BatteryManager::ensureGaugeBroadcastPacing() {
         sealGauge();
         gaugeSealed = true;
     }
-    Serial.printf("BatteryManager: Broadcast Pacing repair %s\n", ok ? "OK" : "FAILED");
+    ESP_LOGI(TAG, "BatteryManager: Broadcast Pacing repair %s", ok ? "OK" : "FAILED");
     return ok;
 }
 
@@ -1322,7 +1281,7 @@ bool BatteryManager::ensureGaugeCuvLatch() {
     }
     uint8_t protCfg = 0;
     if (!readGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, protCfg)) {
-        Serial.println("ensureGaugeCuvLatch: failed to read Protection Configuration");
+        ESP_LOGW(TAG, "ensureGaugeCuvLatch: failed to read Protection Configuration");
         return false;
     }
     if (protCfg & 0x02) {
@@ -1333,7 +1292,7 @@ bool BatteryManager::ensureGaugeCuvLatch() {
     uint8_t verify = 0;
     readGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, verify);
     const bool stuck = (verify & 0x02) != 0;
-    Serial.printf("ensureGaugeCuvLatch: Protection Config 0x%02X -> wrote 0x%02X, read 0x%02X -> CUV latch %s\n",
+    ESP_LOGI(TAG, "ensureGaugeCuvLatch: Protection Config 0x%02X -> wrote 0x%02X, read 0x%02X -> CUV latch %s",
                   protCfg, desired, verify,
                   stuck ? "ENABLED" : "REJECTED (relying on firmware low-battery cutoff)");
     return stuck;
@@ -1359,7 +1318,7 @@ bool BatteryManager::enterShipMode() {
     // Exits on USB plug-in. On battery power this call does not return in any useful
     // sense: SYS collapses as soon as the BATFET opens.
     control2 = static_cast<uint8_t>((control2 & ~0x07) | (0x02 << 1) | 0x01);
-    Serial.println("SHIP MODE: disconnecting cell from SYS - plug USB to wake.");
+    ESP_LOGW(TAG, "SHIP MODE: disconnecting cell from SYS - plug USB to wake.");
     Serial.flush();
     delay(50);
     return writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, control2);
@@ -1387,7 +1346,7 @@ bool BatteryManager::ensureGaugeSleepConfig() {
     uint8_t verify = 0;
     readGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, verify);
     const bool stuck = verify == desired;
-    Serial.printf("ensureGaugeSleepConfig: DA Configuration 0x%02X -> wrote 0x%02X, read 0x%02X -> IN_SYSTEM_SLEEP %s\n",
+    ESP_LOGI(TAG, "ensureGaugeSleepConfig: DA Configuration 0x%02X -> wrote 0x%02X, read 0x%02X -> IN_SYSTEM_SLEEP %s",
                   da, desired, verify, stuck ? "ENABLED" : "REJECTED");
     if (stuck) {
         gaugeDaConfiguration = verify;
@@ -1658,7 +1617,7 @@ bool BatteryManager::updateGaugeMeasurements(bool full) {
     if (tempC < -30.0f || tempC > 100.0f || voltageMillivolts < 1500 || voltageMillivolts > 4500) {
         implausibleGaugeReads++;
         if (implausibleGaugeReads <= 5 || (implausibleGaugeReads % 50) == 0) {
-            Serial.printf("BatteryManager: implausible gauge poll ignored (%.1f C, %u mV, #%u)\n",
+            ESP_LOGW(TAG, "BatteryManager: implausible gauge poll ignored (%.1f C, %u mV, #%u)",
                           tempC, (unsigned)voltageMillivolts, (unsigned)implausibleGaugeReads);
         }
         return false;
@@ -1848,7 +1807,7 @@ bool BatteryManager::setGaugeSingleCellMode() {
         // Factory default is 2-cell (CC0=1); switch to 1-cell for this 1S pack.
         daConfiguration &= static_cast<uint8_t>(~0x01);
         bool wrote = writeGaugeDataFlashByte(BQ28Z610_DA_CONFIGURATION_ADDRESS, daConfiguration);
-        Serial.printf("setGaugeSingleCellMode: switching gauge to 1S -> %s\n",
+        ESP_LOGI(TAG, "setGaugeSingleCellMode: switching gauge to 1S -> %s",
                       wrote ? "OK" : "FAILED");
         ok = wrote && ok;
         if (ok) {
@@ -2211,11 +2170,11 @@ void BatteryManager::setBusReleased(bool released) {
         // Plain inputs: the board's 4.7 k pull-ups keep the bus idle, the external tool drives it.
         pinMode(BATTERY_I2C_SDA_PIN, INPUT);
         pinMode(BATTERY_I2C_SCL_PIN, INPUT);
-        Serial.println("BatteryManager: battery bus RELEASED - charger/gauge polling stopped");
+        ESP_LOGW(TAG, "BatteryManager: battery bus RELEASED - charger/gauge polling stopped");
     } else {
         releaseSDA();
         releaseSCL();
-        Serial.println("BatteryManager: battery bus attached - polling resumes");
+        ESP_LOGI(TAG, "BatteryManager: battery bus attached - polling resumes");
     }
 }
 
@@ -2716,7 +2675,7 @@ bool BatteryManager::calibrateCurrentSense() {
     if (!gaugePresent || !chargerPresent) {
         refreshDevicePresence();
         if (!gaugePresent || !chargerPresent) {
-            Serial.println("calibrateCurrentSense: gauge or charger not present");
+            ESP_LOGW(TAG, "calibrateCurrentSense: gauge or charger not present");
             return false;
         }
     }
@@ -2724,7 +2683,7 @@ bool BatteryManager::calibrateCurrentSense() {
     // Reference: BQ25792 IBAT ADC (factory-calibrated, 1mA/LSB, 2's complement).
     uint16_t ibatRaw = 0;
     if (!readRegister16BE(BQ25792_ADDRESS, BQ25792_IBAT_ADC_REGISTER, ibatRaw)) {
-        Serial.println("calibrateCurrentSense: failed to read charger IBAT");
+        ESP_LOGW(TAG, "calibrateCurrentSense: failed to read charger IBAT");
         return false;
     }
     int chargerCurrent = static_cast<int16_t>(ibatRaw); // mA
@@ -2733,16 +2692,16 @@ bool BatteryManager::calibrateCurrentSense() {
     updateGaugeMeasurements();
     int gaugeCurrent = currentBatteryCurrentMilliAmps; // mA
 
-    Serial.printf("calibrateCurrentSense: charger IBAT=%dmA, gauge=%dmA\n",
+    ESP_LOGI(TAG, "calibrateCurrentSense: charger IBAT=%dmA, gauge=%dmA",
                   chargerCurrent, gaugeCurrent);
 
     // Need a meaningful, same-direction current on both for a clean ratio.
     if (abs(chargerCurrent) < 150 || abs(gaugeCurrent) < 150) {
-        Serial.println("calibrateCurrentSense: need a steady current >150mA (charge at 300mA). Aborting.");
+        ESP_LOGW(TAG, "calibrateCurrentSense: need a steady current >150mA (charge at 300mA). Aborting.");
         return false;
     }
     if ((chargerCurrent > 0) != (gaugeCurrent > 0)) {
-        Serial.println("calibrateCurrentSense: charger/gauge current sign mismatch. Aborting.");
+        ESP_LOGW(TAG, "calibrateCurrentSense: charger/gauge current sign mismatch. Aborting.");
         return false;
     }
 
@@ -2755,7 +2714,7 @@ bool BatteryManager::calibrateCurrentSense() {
 
     float ccGain = 0.0f;
     if (!readGaugeDataFlashFloat(BQ28Z610_CC_GAIN_ADDRESS, ccGain)) {
-        Serial.println("calibrateCurrentSense: failed to read CC Gain");
+        ESP_LOGW(TAG, "calibrateCurrentSense: failed to read CC Gain");
         if (wasSealed) { sealGauge(); }
         return false;
     }
@@ -2765,7 +2724,7 @@ bool BatteryManager::calibrateCurrentSense() {
     if (newCcGain > 4.0f) newCcGain = 4.0f;
     float newCapacityGain = newCcGain * 298261.6178f; // datasheet 11.4.3
 
-    Serial.printf("calibrateCurrentSense: factor=%.4f, CC Gain %.5f -> %.5f\n",
+    ESP_LOGI(TAG, "calibrateCurrentSense: factor=%.4f, CC Gain %.5f -> %.5f",
                   factor, ccGain, newCcGain);
 
     bool ok = writeGaugeDataFlashFloat(BQ28Z610_CC_GAIN_ADDRESS, newCcGain);
@@ -2787,7 +2746,7 @@ bool BatteryManager::calibrateCurrentSense() {
         gaugeSealed = true;
     }
 
-    Serial.printf("calibrateCurrentSense: %s. Re-check: charger=%dmA vs gauge=%dmA\n",
+    ESP_LOGI(TAG, "calibrateCurrentSense: %s. Re-check: charger=%dmA vs gauge=%dmA",
                   ok ? "OK" : "FAILED", chargerCurrent, currentBatteryCurrentMilliAmps);
     return ok;
 }
