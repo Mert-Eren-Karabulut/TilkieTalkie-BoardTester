@@ -17,6 +17,7 @@
     "download_start": "Yeni bir figür! Hikâyelerini indiriyorum, hazır olunca sana haber vereceğim.",
     "download_done": "Hikâyelerin hazır!",
     "download_failed": "Hikâyeleri indiremedim, birazdan yeniden deneyeceğim. Hata kodu: Kiraz.",
+    "download_wait": "Sıradaki hikâye henüz inmedi. Hazır olunca kaldığımız yerden devam edeceğim.",
     "playlist_end": "Hikâyelerin sonuna geldik. Baştan dinlemek için figürü kaldırıp yeniden koy.",
     "battery_low": "Şarjım azalıyor, beni şarja takar mısın?",
     "battery_critical": "Şarjım bitti, uyuyorum. Beni şarja tak.",

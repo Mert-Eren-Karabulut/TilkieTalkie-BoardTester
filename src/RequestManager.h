@@ -44,7 +44,8 @@ private:
     JsonDocument executeHttpRequest(const String& endpoint, const String& method, const String* payload = nullptr);
     // One HTTP exchange (serialized by httpLock). Returns the HTTP status (>0), an HTTPClient
     // error (<0) or 0 when the request was not attempted; error carries the reason.
-    int performHttp(const String& endpoint, const String& method, const String* payload, String& body, String& error);
+    int performHttp(const String& endpoint, const String& method, const String* payload, String& body, String& error,
+                    const String& ifNoneMatch = String());
     JsonDocument responseToDocument(int code, const String& body, const String& error);
 
     // Private constructor for singleton
@@ -73,7 +74,9 @@ public:
     // worker task; the callback runs from update() on the loop task with the parsed body or
     // {"error":true,"message":...}. Returns false when there is no network (no callback).
     using AsyncCallback = std::function<void(JsonDocument &doc, int status)>;
-    bool requestAsync(const String &endpoint, const String &method, const String &payload, AsyncCallback cb);
+    // ifNoneMatch: a manifest checksum sent as If-None-Match; the portal answers 304 (no body) when unchanged.
+    bool requestAsync(const String &endpoint, const String &method, const String &payload, AsyncCallback cb,
+                      const String &ifNoneMatch = String());
     bool getAsync(const String &endpoint, AsyncCallback cb) { return requestAsync(endpoint, "GET", String(), cb); }
     bool postAsync(const String &endpoint, const JsonDocument &data, AsyncCallback cb);
     bool hasPendingRequests();                      // queued, in flight or not yet dispatched
@@ -148,6 +151,17 @@ public:
     void buildInventory();                   // maintenance task
     bool forgetFigure(const String &uid);    // delete a figure's cached stories + manifest (loop task)
     bool forgetTrack(const String &path);    // delete one cached track (loop task)
+
+    // Content sync (docs/CONTENT-SYNC.md): a cached unit is re-fetched on tap, on the portal's
+    // "sync-figure" command, and all cached units are re-checked (If-None-Match -> 304) a few
+    // minutes after boot and every 12 h. Changes are applied in the background: new or replaced
+    // tracks are downloaded, tracks no longer in the manifest are deleted.
+    void refreshUnit(const String &uid);     // "sync-figure": re-fetch one cached unit now (ignored when not cached)
+    bool isFigureDownloading(const String &uid) const; // a download tracker is open for this unit
+    // After a reboot: units whose download was interrupted (pending manifest on the card) get
+    // their tracker back, so the resumed downloads complete the manifest instead of leaving it
+    // invisible (no final manifest = "not cached" for the next offline tap and for the inventory).
+    void recoverPendingManifests();
 
     // Helper method to get figure ID from UID (for deletion purposes)
     String getFigureIdFromUid(const String &uid);
@@ -236,6 +250,7 @@ private:
         String endpoint;
         String method;
         String payload;
+        String ifNoneMatch;
         AsyncCallback cb;
         String body;
         String error;
@@ -251,6 +266,13 @@ private:
     static void workerEntry(void *arg);
     void workerLoop();
     void dispatchCompletedJobs();
+
+    // Periodic re-check of every cached unit (one request at a time, 304 when unchanged)
+    void serviceManifestRecheck();
+    void recheckUnit(const String &uid);
+    std::vector<String> recheckQueue;
+    unsigned long nextRecheckAt = 0;
+    void appendInventoryFigure(const String &uid, bool pending, size_t seq, size_t total, const char *sd);
 };
 
 #endif // REQUEST_MANAGER_H

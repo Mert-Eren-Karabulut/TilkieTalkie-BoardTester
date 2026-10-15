@@ -3,6 +3,8 @@
 #include "CaBundle.h"
 #include "PsramJson.h"
 #include "AudioController.h"
+#include <esp_random.h>
+#include <algorithm>
 
 // Initialize static members
 const char* RequestManager::NVS_NAMESPACE = "requestmgr";
@@ -10,6 +12,8 @@ const char* RequestManager::NVS_UID_MAPPING_KEY = "uid_mappings";
 const char* RequestManager::SD_DATA_DIR = "/.requestmanager";
 const char* RequestManager::SD_MANIFEST_DIR = "/.requestmanager/manifests";
 const char* RequestManager::SD_PENDING_MANIFEST_DIR = "/.requestmanager/pending_manifests";
+static const unsigned long RECHECK_FIRST_MS = 3UL * 60UL * 1000UL;        // after boot (plus up to 60 s jitter)
+static const unsigned long RECHECK_INTERVAL_MS = 12UL * 60UL * 60UL * 1000UL; // the portal also pushes sync-figure
 
 namespace {
 struct LockGuard {
@@ -146,6 +150,7 @@ void RequestManager::setTimeout(int timeoutMs)
 void RequestManager::update()
 {
     dispatchCompletedJobs();
+    serviceManifestRecheck();
 
     if (!figureDownloadCompleteCallback || pendingCompletions.empty()) {
         return;
@@ -203,7 +208,8 @@ JsonDocument RequestManager::parseResponse(const String& response)
 
 // One HTTP exchange. Serialized by httpLock: the synchronous API runs it on the caller (boot,
 // token refresh), the asynchronous API on the request worker task - never two at once.
-int RequestManager::performHttp(const String& endpoint, const String& method, const String* payload, String& body, String& error)
+int RequestManager::performHttp(const String& endpoint, const String& method, const String* payload, String& body, String& error,
+                                const String& ifNoneMatch)
 {
     body = String();
     error = String();
@@ -233,6 +239,9 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
     http.setTimeout(timeout);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     setDefaultHeaders();
+    if (ifNoneMatch.length() > 0) {
+        http.addHeader("If-None-Match", "\"" + ifNoneMatch + "\"");
+    }
 
     int code = (method == "POST" && payload) ? http.POST(*payload) : http.GET();
 
@@ -251,6 +260,9 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
         http.setTimeout(timeout);
         http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
         setDefaultHeaders();
+        if (ifNoneMatch.length() > 0) {
+            http.addHeader("If-None-Match", "\"" + ifNoneMatch + "\"");
+        }
         code = (method == "POST" && payload) ? http.POST(*payload) : http.GET();
     }
 
@@ -334,7 +346,8 @@ JsonDocument RequestManager::executeHttpRequest(const String& endpoint, const St
 // worker task that lives only while there is work; the loop task keeps the LEDs, audio and
 // the WebSocket alive meanwhile. Callbacks run on the loop task from update().
 
-bool RequestManager::requestAsync(const String &endpoint, const String &method, const String &payload, AsyncCallback cb)
+bool RequestManager::requestAsync(const String &endpoint, const String &method, const String &payload, AsyncCallback cb,
+                                  const String &ifNoneMatch)
 {
     if (!isNetworkReady()) {
         return false;
@@ -343,6 +356,7 @@ bool RequestManager::requestAsync(const String &endpoint, const String &method, 
     job->endpoint = endpoint;
     job->method = method;
     job->payload = payload;
+    job->ifNoneMatch = ifNoneMatch;
     job->cb = cb;
     bool startWorker = false;
     {
@@ -409,7 +423,8 @@ void RequestManager::workerLoop()
             activeEndpoint = job->endpoint;
             jobStartedAt = millis();
         }
-        job->status = performHttp(job->endpoint, job->method, job->method == "POST" ? &job->payload : nullptr, job->body, job->error);
+        job->status = performHttp(job->endpoint, job->method, job->method == "POST" ? &job->payload : nullptr, job->body, job->error,
+                                  job->ifNoneMatch);
         {
             LockGuard guard(jobLock);
             jobDone.push_back(job);
@@ -641,12 +656,27 @@ void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, 
             continue;
         }
         trackPaths.push_back(storagePath);
+        // A file replaced on the portal keeps its path but gets a new checksum: the copy on the
+        // card is stale. Unless it is the track playing right now, drop it and download again.
+        bool present = fileManager.fileExists(storagePath);
+        if (present && !checksum.isEmpty()) {
+            const String known = fileManager.requiredFileChecksum(storagePath);
+            if (!known.isEmpty() && known != checksum) {
+                if (AudioController::getInstance().getCurrentTrack() == storagePath) {
+                    Serial.printf("RequestManager: %s was replaced on the portal but is playing - refreshed on the next tap\n", storagePath.c_str());
+                } else {
+                    Serial.printf("RequestManager: %s was replaced on the portal - downloading the new file\n", storagePath.c_str());
+                    fileManager.deleteFile(storagePath); // also drops the old required-file entry
+                    present = false;
+                }
+            }
+        }
         fileManager.addRequiredFile(storagePath, url, checksum, false); // flushed once below
         Serial.printf("RequestManager: asset %s (%s) %s\n", storagePath.c_str(), asset["asset_type"].as<const char*>() ? asset["asset_type"].as<const char*>() : "?",
-                      fileManager.fileExists(storagePath) ? "present" : "missing");
+                      present ? "present" : "missing");
         // Existence only: integrity was verified (sha256) when the file was downloaded.
         // Re-hashing every cached track here used to block the loop for tens of seconds.
-        if (!fileManager.fileExists(storagePath)) {
+        if (!present) {
             if (url.length() > 0) {
                 fileManager.scheduleDownload(url, storagePath, checksum);
                 assetsToDownload++;
@@ -681,6 +711,9 @@ void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, 
 
     Figure figureData = buildFigureFromManifest(doc);
     startTrackingFigure(uid, figureName, figureId, trackPaths, figureData, hasPending, pendingManifestJson, previousManifestJson, alreadyEmitted);
+    if (hasPending) {
+        requestInventory(); // the portal's stories list shows the figure as downloading
+    }
 
     if (assetsToDownload > 0) {
         Serial.printf("RequestManager: %d asset(s) to download for %s (%d already cached)\n", assetsToDownload, figureName.c_str(), assetsAlreadyCached);
@@ -1161,6 +1194,7 @@ void RequestManager::finalizeTrackedManifest(FigureDownloadTracker &tracker, boo
 
     if (saveUnitManifest(tracker.uid, pendingManifest)) {
         deletePendingUnitManifest(tracker.uid);
+        requestInventory(); // queued behind the writes above: the portal sees the final state
     }
 
     tracker.hasPendingManifest = false;
@@ -1373,10 +1407,25 @@ void RequestManager::requestInventory()
 void RequestManager::buildInventory()
 {
     FileManager &fm = FileManager::getInstance();
+    // Final manifests (figures fully on the card) plus pending ones (figures still downloading).
     std::vector<String> uids;
+    std::vector<bool> pendingOnly;
     for (const String &name : fm.listFiles(SD_MANIFEST_DIR)) {
         if (name.endsWith(".json")) {
             uids.push_back(name.substring(0, name.length() - 5));
+            pendingOnly.push_back(false);
+        }
+    }
+    for (const String &name : fm.listFiles(SD_PENDING_MANIFEST_DIR)) {
+        if (!name.endsWith(".json")) continue;
+        const String uid = name.substring(0, name.length() - 5);
+        bool known = false;
+        for (size_t i = 0; i < uids.size(); ++i) {
+            if (uids[i] == uid) { known = true; pendingOnly[i] = true; break; } // being updated
+        }
+        if (!known) {
+            uids.push_back(uid);
+            pendingOnly.push_back(true);
         }
     }
     const uint32_t freeMb = fm.getSDCardFreeMB();
@@ -1387,58 +1436,72 @@ void RequestManager::buildInventory()
         ReverbClient::queueDeviceFiles(String("\"seq\":0,\"total\":0,") + sd + ",\"figure\":null");
         return;
     }
-    size_t seq = 0;
-    for (const String &uid : uids) {
-        JsonDocument manifest(&psramJsonAllocator);
-        const bool loaded = loadUnitManifest(uid, manifest);
-        JsonDocument out(&psramJsonAllocator);
-        out["seq"] = (int)++seq;
-        out["total"] = (int)uids.size();
-        JsonObject fig = out["figure"].to<JsonObject>();
-        fig["uid"] = uid;
-        fig["id"] = loaded ? jsonValueToString(manifest["figure"]["id"]) : String();
-        fig["name"] = loaded ? manifest["figure"]["name"].as<String>() : String("?");
-        JsonArray tracks = fig["tracks"].to<JsonArray>();
-        uint64_t bytes = 0;
-        int count = 0;
-        auto addTrack = [&](JsonObjectConst t) {
-            if (count >= 60) return;
-            String path = normalizeStoragePath(t["storage_path"].as<String>());
-            if (path.isEmpty()) return;
-            JsonObject o = tracks.add<JsonObject>();
-            o["id"] = jsonValueToString(t["id"]);
-            o["name"] = t["name"].as<String>();
-            o["path"] = path;
-            size_t size = 0;
-            bool cached = false;
-            if (!fm.isDeletePending(path)) {
-                File f = SD_MMC.open(path);
-                if (f) {
-                    size = f.size();
-                    cached = !f.isDirectory();
-                    f.close();
-                }
-            }
-            o["size"] = (uint32_t)size;
-            o["cached"] = cached;
-            bytes += size;
-            count++;
-        };
-        if (loaded) {
-            for (JsonVariantConst c : manifest["contents"].as<JsonArrayConst>())
-                for (JsonVariantConst e : c["episodes"].as<JsonArrayConst>())
-                    for (JsonVariantConst t : e["tracks"].as<JsonArrayConst>())
-                        addTrack(t.as<JsonObjectConst>());
-            for (JsonVariantConst t : manifest["custom_tracks"].as<JsonArrayConst>())
-                addTrack(t.as<JsonObjectConst>());
-        }
-        fig["bytes"] = (uint32_t)bytes;
-        String json;
-        serializeJson(out, json);
-        // "{...}" -> "..." so the sender can prepend device_id; sd is inserted here as text
-        String inner = json.substring(1, json.length() - 1);
-        ReverbClient::queueDeviceFiles(inner + "," + sd);
+    for (size_t i = 0; i < uids.size(); ++i) {
+        appendInventoryFigure(uids[i], pendingOnly[i], i + 1, uids.size(), sd);
     }
+}
+
+// One "client-device-files" fragment. pending: describe the manifest being downloaded (the
+// final one, if any, is what the figure played before the update).
+void RequestManager::appendInventoryFigure(const String &uid, bool pending, size_t seq, size_t total, const char *sd)
+{
+    FileManager &fm = FileManager::getInstance();
+    JsonDocument manifest(&psramJsonAllocator);
+    bool loaded = pending ? loadPendingUnitManifest(uid, manifest) : loadUnitManifest(uid, manifest);
+    if (!loaded && pending) {
+        loaded = loadUnitManifest(uid, manifest);
+    }
+    JsonDocument out(&psramJsonAllocator);
+    out["seq"] = (int)seq;
+    out["total"] = (int)total;
+    JsonObject fig = out["figure"].to<JsonObject>();
+    fig["uid"] = uid;
+    fig["id"] = loaded ? jsonValueToString(manifest["figure"]["id"]) : String();
+    fig["name"] = loaded ? manifest["figure"]["name"].as<String>() : String("?");
+    JsonArray tracks = fig["tracks"].to<JsonArray>();
+    uint64_t bytes = 0;
+    int count = 0, cachedCount = 0;
+    auto addTrack = [&](JsonObjectConst t) {
+        if (count >= 60) return;
+        String path = normalizeStoragePath(t["storage_path"].as<String>());
+        if (path.isEmpty()) return;
+        JsonObject o = tracks.add<JsonObject>();
+        o["id"] = jsonValueToString(t["id"]);
+        o["name"] = t["name"].as<String>();
+        o["path"] = path;
+        size_t size = 0;
+        bool cached = false;
+        if (!fm.isDeletePending(path)) {
+            File f = SD_MMC.open(path);
+            if (f) {
+                size = f.size();
+                cached = !f.isDirectory();
+                f.close();
+            }
+        }
+        o["size"] = (uint32_t)size;
+        o["cached"] = cached;
+        bytes += size;
+        count++;
+        if (cached) cachedCount++;
+    };
+    if (loaded) {
+        for (JsonVariantConst c : manifest["contents"].as<JsonArrayConst>())
+            for (JsonVariantConst e : c["episodes"].as<JsonArrayConst>())
+                for (JsonVariantConst t : e["tracks"].as<JsonArrayConst>())
+                    addTrack(t.as<JsonObjectConst>());
+        for (JsonVariantConst t : manifest["custom_tracks"].as<JsonArrayConst>())
+            addTrack(t.as<JsonObjectConst>());
+    }
+    fig["bytes"] = (uint32_t)bytes;
+    // downloading: the manifest is not final yet (tracks still arriving); partial: final but
+    // some tracks are missing (deleted from the portal page or a failed download); ready: all there.
+    fig["state"] = pending ? "downloading" : (count > 0 && cachedCount == count ? "ready" : "partial");
+    String json;
+    serializeJson(out, json);
+    // "{...}" -> "..." so the sender can prepend device_id; sd is inserted here as text
+    String inner = json.substring(1, json.length() - 1);
+    ReverbClient::queueDeviceFiles(inner + "," + String(sd));
 }
 
 bool RequestManager::forgetFigure(const String &uid)
@@ -1454,6 +1517,12 @@ bool RequestManager::forgetFigure(const String &uid)
     if (loadUnitManifest(uid, manifest)) {
         paths = extractAssetPaths(manifest);
     }
+    JsonDocument pending(&psramJsonAllocator);
+    if (loadPendingUnitManifest(uid, pending)) { // still downloading: its assets too
+        for (const String &p : extractAssetPaths(pending)) {
+            if (std::find(paths.begin(), paths.end(), p) == paths.end()) paths.push_back(p);
+        }
+    }
     const std::vector<String> keep = assetsReferencedByOtherUnits(uid);
     int deleted = 0;
     for (const String &path : paths) {
@@ -1462,8 +1531,11 @@ bool RequestManager::forgetFigure(const String &uid)
             if (k == path) { shared = true; break; }
         }
         if (shared) continue;
+        fileManager.cancelQueuedDownload(path);
         fileManager.removeRequiredFile(path, false);
-        fileManager.deleteFileDeferred(path);
+        if (fileManager.fileExists(path)) {
+            fileManager.deleteFileDeferred(path);
+        }
         deleted++;
     }
     fileManager.flushRequiredFiles();
@@ -1494,4 +1566,140 @@ bool RequestManager::forgetTrack(const String &path)
     fileManager.deleteFileDeferred(path);
     Serial.printf("RequestManager: forgot track %s\n", path.c_str());
     return true;
+}
+
+// ---- Content sync (docs/CONTENT-SYNC.md) ---------------------------------------------------
+
+bool RequestManager::isFigureDownloading(const String &uid) const
+{
+    for (const auto &tracker : activeDownloads) {
+        if (tracker.uid == uid && !tracker.completed) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void RequestManager::refreshUnit(const String &uid)
+{
+    FileManager &fm = FileManager::getInstance();
+    const bool cached = fm.fileExists(getUnitManifestPath(uid)) || fm.fileExists(getPendingUnitManifestPath(uid));
+    if (!cached) {
+        Serial.printf("RequestManager: sync-figure %s: not cached here, ignored\n", uid.c_str());
+        return;
+    }
+    if (!isNetworkReady()) {
+        Serial.printf("RequestManager: sync-figure %s: offline, the next re-check will do it\n", uid.c_str());
+        return;
+    }
+    Serial.printf("RequestManager: sync-figure %s: re-fetching the manifest\n", uid.c_str());
+    // alreadyEmitted=true: a background refresh - no prompts, no playback announcement for a
+    // figure that is not on the pins; a mounted figure merges the new list like a tap does.
+    processOnlineFigureRequest(uid, true);
+}
+
+void RequestManager::recoverPendingManifests()
+{
+    FileManager &fm = FileManager::getInstance();
+    fm.setDownloadCompleteCallback(staticFileDownloadCallback); // begin() repeats this later, harmless
+    if (!fm.fileExists(SD_PENDING_MANIFEST_DIR)) {
+        return;
+    }
+    int recovered = 0;
+    for (const String &name : fm.listFiles(SD_PENDING_MANIFEST_DIR)) {
+        if (!name.endsWith(".json")) continue;
+        const String uid = name.substring(0, name.length() - 5);
+        JsonDocument pending(&psramJsonAllocator);
+        if (!loadPendingUnitManifest(uid, pending)) {
+            deletePendingUnitManifest(uid); // unreadable: the next tap fetches a fresh one
+            continue;
+        }
+        String pendingJson;
+        serializeJson(pending, pendingJson);
+        JsonDocument previous(&psramJsonAllocator);
+        String previousJson;
+        if (loadUnitManifest(uid, previous)) {
+            serializeJson(previous, previousJson);
+        }
+        // The persisted download queue normally still holds the missing files; make sure.
+        std::vector<String> trackPaths;
+        for (JsonVariantConst asset : pending["asset_manifest"].as<JsonArrayConst>()) {
+            const String path = normalizeStoragePath(asset["storage_path"].as<String>());
+            if (path.isEmpty()) continue;
+            trackPaths.push_back(path);
+            const String url = asset["url"].as<String>();
+            const String checksum = asset["checksum"].as<String>();
+            fm.addRequiredFile(path, url, checksum, false);
+            if (!fm.fileExists(path) && url.length() > 0) {
+                fm.scheduleDownload(url, path, checksum);
+            }
+        }
+        fm.flushRequiredFiles();
+        Figure figureData = buildFigureFromManifest(pending);
+        JsonObjectConst figure = pending["figure"].as<JsonObjectConst>();
+        startTrackingFigure(uid, figure["name"].as<String>(), jsonValueToString(figure["id"]), trackPaths, figureData,
+                            true, pendingJson, previousJson, /*alreadyEmitted=*/true);
+        recovered++;
+    }
+    if (recovered > 0) {
+        Serial.printf("RequestManager: %d interrupted figure download(s) resumed\n", recovered);
+    }
+}
+
+void RequestManager::serviceManifestRecheck()
+{
+    const unsigned long now = millis();
+    if (nextRecheckAt == 0) {
+        nextRecheckAt = now + RECHECK_FIRST_MS + (esp_random() % 60000);
+        return;
+    }
+    if (!recheckQueue.empty()) {
+        if (hasPendingRequests() || !isNetworkReady()) {
+            return; // one request at a time, behind anything a tap needs
+        }
+        const String uid = recheckQueue.front();
+        recheckQueue.erase(recheckQueue.begin());
+        recheckUnit(uid);
+        return;
+    }
+    if ((long)(now - nextRecheckAt) < 0 || !isNetworkReady()) {
+        return;
+    }
+    nextRecheckAt = now + RECHECK_INTERVAL_MS;
+    for (const String &name : FileManager::getInstance().listFiles(SD_MANIFEST_DIR)) {
+        if (name.endsWith(".json")) {
+            recheckQueue.push_back(name.substring(0, name.length() - 5));
+        }
+    }
+    if (!recheckQueue.empty()) {
+        Serial.printf("RequestManager: checking %u cached figure(s) for content changes\n", (unsigned)recheckQueue.size());
+    }
+}
+
+void RequestManager::recheckUnit(const String &uid)
+{
+    if (isFigureDownloading(uid)) {
+        return; // its manifest was just fetched
+    }
+    JsonDocument manifest(&psramJsonAllocator);
+    if (!loadUnitManifest(uid, manifest)) {
+        return;
+    }
+    const String checksum = manifest["manifest_checksum"].as<String>();
+    const String endpoint = "/units/" + uid;
+    if (isRequestPending(endpoint)) {
+        return;
+    }
+    requestAsync(endpoint, "GET", String(), [this, uid](JsonDocument &doc, int status) {
+        if (status == 304) {
+            Serial.printf("RequestManager: %s unchanged\n", uid.c_str());
+            return;
+        }
+        if (status != 200) {
+            Serial.printf("RequestManager: re-check of %s failed (%d)\n", uid.c_str(), status);
+            return;
+        }
+        Serial.printf("RequestManager: %s changed on the portal - updating the cache\n", uid.c_str());
+        handleUnitManifest(uid, true, doc);
+    }, checksum);
 }

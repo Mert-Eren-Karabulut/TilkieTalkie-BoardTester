@@ -489,7 +489,12 @@ void ReverbClient::sendDeviceReport(bool force)
     bool isCharging = battery.getChargingStatus();
     float batteryPercent = battery.getBatteryPercentage();
     float batteryVoltage = battery.getBatteryVoltage();
-    bool isFileSyncing = fileManager.getPendingDownloadsCount() > 0;
+    const int pendingDownloads = fileManager.getPendingDownloadsCount();
+    bool isFileSyncing = pendingDownloads > 0;
+    const int downloadProgress = fileManager.getDownloadProgress(); // -1 when nothing is in flight
+    String downloadName = fileManager.getActiveDownloadPath();
+    downloadName = downloadName.substring(downloadName.lastIndexOf('/') + 1);
+    downloadName.replace("\"", "");
     uint32_t sdFreeSpace = fileManager.getSDCardFreeMB(); // reported as MB
     int wifiRSSI = WiFi.RSSI();
     int audioState = audio.getState();
@@ -524,9 +529,10 @@ void ReverbClient::sendDeviceReport(bool force)
     // A report goes out when something meaningful changed (with hysteresis on the analog values,
     // so a cell voltage hovering on a boundary does not cause a report every poll), every 5 s
     // while playing (position), and at least every 60 s (heartbeat).
-    char signature[160];
-    snprintf(signature, sizeof(signature), "%d|%d|%s|%s|%d|%d|%d|%s",
-             isCharging ? 1 : 0, isFileSyncing ? 1 : 0, audioStatus, currentTrack.c_str(),
+    char signature[200];
+    snprintf(signature, sizeof(signature), "%d|%d|%d|%d|%s|%s|%d|%d|%d|%s",
+             isCharging ? 1 : 0, isFileSyncing ? 1 : 0, pendingDownloads, downloadProgress / 10,
+             audioStatus, currentTrack.c_str(),
              currentVolume, volumeCeiling, isPogoActive ? 1 : 0, nfcCardId.c_str());
 
     unsigned long now = millis();
@@ -566,7 +572,10 @@ void ReverbClient::sendDeviceReport(bool force)
                            "\"files\":{"
                            "\"status\":\"%s\","
                            "\"sd_remaining\":%u,"
-                           "\"wifi_rssi\":%d"
+                           "\"wifi_rssi\":%d,"
+                           "\"pending\":%d,"
+                           "\"downloading\":\"%s\","
+                           "\"progress\":%d"
                            "},"
                            "\"audio\":{"
                            "\"current_track_status\":\"%s\""
@@ -593,6 +602,9 @@ void ReverbClient::sendDeviceReport(bool force)
                            isFileSyncing ? "syncing" : "in_sync",
                            sdFreeSpace,
                            wifiRSSI,
+                           pendingDownloads,
+                           downloadName.c_str(),
+                           downloadProgress,
                            audioStatus,
                            currentTrack.length() > 0 ? ",\"current_track_id\":\"" : "",
                            currentTrack.c_str(),
@@ -1077,6 +1089,17 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
         {
             RequestManager::getInstance().forgetTrack(value);
             RequestManager::getInstance().requestInventory();
+        }
+    }
+    else if (lowerType == "sync-figure")
+    {
+        if (!hasValue || value.isEmpty())
+        {
+            Serial.println("ReverbClient: sync-figure needs a figure uid");
+        }
+        else
+        {
+            RequestManager::getInstance().refreshUnit(value);
         }
     }
     else if (lowerType == "set-report-interval")

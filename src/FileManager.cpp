@@ -1454,6 +1454,39 @@ int FileManager::getPendingDownloadsCount() {
     return downloadQueue.size();
 }
 
+int FileManager::getDownloadProgress() const {
+    if (!downloadInProgress || asyncState.contentLength <= 0) {
+        return downloadInProgress ? 0 : -1;
+    }
+    uint64_t pct = (uint64_t)asyncState.totalDownloaded * 100ULL / (uint64_t)asyncState.contentLength;
+    return pct > 100 ? 100 : (int)pct;
+}
+
+String FileManager::requiredFileChecksum(const String &path) const {
+    for (const auto &file : requiredFiles) {
+        if (file.path == path) {
+            return file.checksum;
+        }
+    }
+    return String();
+}
+
+bool FileManager::cancelQueuedDownload(const String &path) {
+    bool removed = false;
+    for (auto it = downloadQueue.begin(); it != downloadQueue.end();) {
+        if (it->localPath == path && !(downloadInProgress && asyncState.localPath == path)) {
+            it = downloadQueue.erase(it);
+            removed = true;
+        } else {
+            ++it;
+        }
+    }
+    if (removed) {
+        saveDownloadQueue();
+    }
+    return removed;
+}
+
 void FileManager::cleanupTempFiles() {
     std::vector<String> tempFiles = listFiles("/temp");
     for (const auto& file : tempFiles) {

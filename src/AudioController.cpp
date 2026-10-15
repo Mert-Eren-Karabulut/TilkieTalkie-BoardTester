@@ -687,13 +687,15 @@ int AudioController::getVolumeCeiling() const {
 }
 
 // Playlist management methods
-void AudioController::setPlaylist(const std::vector<String>& trackPaths, const String& figureUid) {
+void AudioController::setPlaylist(const std::vector<String>& trackPaths, const String& figureUid, bool moreComing) {
     resumeAfterPrompt = false;
     bool taskSuspended = suspendBackgroundTaskForControl();
     playlist = trackPaths;
     playlistFigureUid = figureUid;
     currentPlaylistIndex = -1; // Start at -1, first play() will set to 0
     playlistFinished = false;
+    playlistOpen = moreComing;
+    waitingForTrack = false;
 
     Serial.printf("AudioController: Playlist set with %d tracks for figure UID: %s\n",
                  playlist.size(), figureUid.c_str());
@@ -707,13 +709,15 @@ void AudioController::setPlaylist(const std::vector<String>& trackPaths, const S
     }
 }
 
-void AudioController::mergePlaylist(const std::vector<String>& trackPaths, const String& figureUid) {
+void AudioController::mergePlaylist(const std::vector<String>& trackPaths, const String& figureUid, bool moreComing) {
     bool taskSuspended = suspendBackgroundTaskForControl();
+    playlistOpen = moreComing;
     if (figureUid != playlistFigureUid || playlist.empty()) {
         playlist = trackPaths;
         playlistFigureUid = figureUid;
         currentPlaylistIndex = -1;
         playlistFinished = false;
+        waitingForTrack = false;
     } else {
         int newIndex = -1;
         if (currentPlaylistIndex >= 0 && currentPlaylistIndex < (int)playlist.size()) {
@@ -735,11 +739,45 @@ void AudioController::mergePlaylist(const std::vector<String>& trackPaths, const
             currentPlaylistIndex = (int)playlist.size() - 1;
         }
     }
-    Serial.printf("AudioController: playlist merged: %u tracks for %s (index %d)\n",
-                  (unsigned)playlist.size(), figureUid.c_str(), currentPlaylistIndex);
+    // Waiting for a download: continue with the first cached track after the one we finished on.
+    bool resume = false;
+    if (waitingForTrack) {
+        int after = -1;
+        for (size_t i = 0; i < playlist.size(); ++i) {
+            if (playlist[i] == waitAfterPath) { after = (int)i; break; }
+        }
+        int next = after + 1; // the finished track vanished from the manifest: start over
+        while (next < (int)playlist.size() && !fileManager.fileExists(playlist[next])) {
+            next++;
+        }
+        if (next < (int)playlist.size()) {
+            currentPlaylistIndex = next;
+            waitingForTrack = false;
+            playlistFinished = false;
+            resume = true;
+        } else if (!moreComing) {
+            // Nothing after it and nothing more on the way: the stories are over.
+            waitingForTrack = false;
+            playlistFinished = true;
+            playlistEnded = true;
+        }
+    }
+    Serial.printf("AudioController: playlist merged: %u tracks for %s (index %d%s%s)\n",
+                  (unsigned)playlist.size(), figureUid.c_str(), currentPlaylistIndex,
+                  moreComing ? ", more coming" : "", waitingForTrack ? ", waiting" : "");
     if (taskSuspended) {
         resumeBackgroundTaskForControl();
     }
+    if (resume) {
+        Serial.printf("AudioController: next track arrived - continuing with %s\n", playlist[currentPlaylistIndex].c_str());
+        play();
+    }
+}
+
+bool AudioController::consumeWaitStarted() {
+    const bool v = waitStarted;
+    waitStarted = false;
+    return v;
 }
 
 void AudioController::clearPlaylist() {
@@ -750,6 +788,8 @@ void AudioController::clearPlaylist() {
     currentPlaylistIndex = -1;
     playlistFigureUid = "";
     playlistFinished = false;
+    playlistOpen = false;
+    waitingForTrack = false;
 
     Serial.println("AudioController: Playlist cleared");
 
@@ -785,6 +825,17 @@ bool AudioController::nextTrack() {
     }
 
     if (currentPlaylistIndex >= (int)playlist.size()) {
+        if (playlistOpen) {
+            // The figure's remaining tracks are still downloading: hold here instead of ending.
+            // mergePlaylist() continues with the next track as soon as it is on the card.
+            waitAfterPath = playlist.empty() ? String() : playlist.back();
+            currentPlaylistIndex = (int)playlist.size() - 1;
+            waitingForTrack = true;
+            waitStarted = true;
+            Serial.println("AudioController: cached tracks finished, waiting for the next download");
+            stop();
+            return false;
+        }
         Serial.println("AudioController: Reached end of playlist");
         playlistFinished = true;
         playlistEnded = true;
@@ -792,6 +843,7 @@ bool AudioController::nextTrack() {
         return false;
     }
 
+    waitingForTrack = false;
     return play();
 }
 

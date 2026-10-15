@@ -8,7 +8,7 @@ const char *const kNames[(int)Prompt::COUNT] = {
     "setup_welcome", "setup_connecting", "setup_success", "setup_failed",
     "wifi_lost", "wifi_reset_hint", "wifi_reset_done",
     "idle_hello", "nfc_read_trouble", "figure_no_content", "figure_offline",
-    "download_start", "download_done", "download_failed", "playlist_end",
+    "download_start", "download_done", "download_failed", "download_wait", "playlist_end",
     "battery_low", "battery_critical", "charge_full",
     "update_start", "update_done", "update_failed",
     "tone_charge_on", "tone_charge_off", "tone_sleep",
@@ -45,6 +45,7 @@ const VoicePrompts::Policy &VoicePrompts::policy(Prompt p)
         {false, true, 5000},      // DOWNLOAD_START
         {true, false, 3000},      // DOWNLOAD_DONE (spoken over the first second of the story)
         {false, true, 10000},     // DOWNLOAD_FAILED
+        {false, true, 30000},     // DOWNLOAD_WAIT
         {false, true, 5000},      // PLAYLIST_END
         {true, false, 240000},    // BATTERY_LOW
         {true, false, 0},         // BATTERY_CRITICAL (blocking)

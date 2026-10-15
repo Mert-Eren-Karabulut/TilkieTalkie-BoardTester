@@ -25,6 +25,7 @@ enum class Prompt : uint8_t
     DOWNLOAD_START,     // new figure, stories being downloaded
     DOWNLOAD_DONE,      // first story ready
     DOWNLOAD_FAILED,    // nothing could be downloaded (Kiraz)
+    DOWNLOAD_WAIT,      // the cached stories ended, the next one is still downloading
     PLAYLIST_END,       // last story finished
     BATTERY_LOW,        // on battery, 20 % and every 5 % below
     BATTERY_CRITICAL,   // shutting down

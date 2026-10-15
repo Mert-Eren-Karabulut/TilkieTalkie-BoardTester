@@ -281,6 +281,10 @@ public:
     int getPendingDownloadsCount();
     bool isDownloadInProgress() const { return downloadInProgress; }
     bool hasActiveDownload() const { return downloadInProgress; } // a transfer is in flight (not merely queued)
+    int getDownloadProgress() const;        // 0..100 of the transfer in flight, -1 when idle (for the device report)
+    String getActiveDownloadPath() const { return downloadInProgress ? asyncState.localPath : String(); }
+    String requiredFileChecksum(const String &path) const; // sha256 the file was downloaded against ("" if unknown)
+    bool cancelQueuedDownload(const String &path);         // drop a queued (not in-flight) download
 
     // Required files management
     bool addRequiredFile(const String &localPath, const String &url, const String &checksum = "", bool persist = true);

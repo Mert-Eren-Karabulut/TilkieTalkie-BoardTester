@@ -32,6 +32,18 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 - **The bench card has a 127 MB FAT volume on a 30 GB card**: reformat with `tools/sdcard-prepare.sh`.
   Production cards must be formatted full-size by the same script (factory step).
 
+## Added 2026-10-15 (1.2.11 – 1.2.14)
+- Portal hub page: live status, stories on the card (`list-files`, `delete-figure`, `delete-track`),
+  3 s reports while the page is open; OTA only on the dock; OTA state in the report.
+- Content sync (docs/CONTENT-SYNC.md): `sync-figure` push from the portal on content changes,
+  `If-None-Match` re-check of every cached unit after boot and every 12 h, replaced files re-downloaded.
+- Playlist waits for the next track when the figure is still downloading (prompt `download_wait`,
+  needs the new pack on the card) instead of ending after the cached ones.
+- Interrupted figure downloads are recovered after a reboot; inventory lists downloading figures.
+- **Not yet run on hardware**: everything from 1.2.11 on (bench board away). First things to try:
+  tap a new figure with 3+ tracks and let track 1 end before track 2 is down; delete a figure
+  from the hub page and re-tap; change a track on the portal and watch the toy re-download.
+
 ## Remaining before ship (firmware)
 0. Out-of-box run #2 with the prompts and the pack on the card (pairing, update, first figure, buttons, sleep).
 1. Deep sleep on battery and wake by button verified 2026-10-12 (sleep after 5 min idle; wake: LEDs at once, hello at 6.5 s, portal at ~11 s). Still open: sleep current (`sleeptest`).

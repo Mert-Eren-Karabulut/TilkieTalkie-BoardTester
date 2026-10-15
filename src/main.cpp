@@ -286,7 +286,7 @@ static bool chargeBarAllowed()
     {
         return false;
     }
-    if (audioController.isPlaying() || audioController.isPaused())
+    if (audioController.isPlaying() || audioController.isPaused() || audioController.isWaitingForTrack())
     {
         return false;
     }
@@ -657,6 +657,8 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
     }
 
     gFigureLoadingSince = 0;
+    ReverbClient::setLastError(""); // the figure works: the portal's error badge goes away
+    const bool moreComing = requestManager.isFigureDownloading(uid); // playlist waits at its end instead of finishing
     const bool samePlaylist = audioController.hasPlaylist() && audioController.getPlaylistFigureUid() == uid;
     if (isUpdate && samePlaylist)
     {
@@ -689,7 +691,7 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
         }
         if (keepPlaying)
         {
-            audioController.mergePlaylist(playlist, uid); // never interrupts the current track
+            audioController.mergePlaylist(playlist, uid, moreComing); // never interrupts the current track
             return;
         }
         ESP_LOGW(TAG, "Figure %s (%s): current content is not in the new manifest - restarting with the new content",
@@ -699,9 +701,9 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
     {
         return; // already playing this figure (e.g. a second tap event)
     }
-    audioController.setPlaylist(playlist, uid);
+    audioController.setPlaylist(playlist, uid, moreComing);
     audioController.play();
-    ESP_LOGI(TAG, "Started playing figure '%s'", figureName.c_str());
+    ESP_LOGI(TAG, "Started playing figure '%s'%s", figureName.c_str(), moreComing ? " (rest still downloading)" : "");
     if (gDownloadAnnouncedUid == uid)
     {
         gDownloadAnnouncedUid = "";
@@ -1256,7 +1258,13 @@ void startFullSystem()
     ESP_LOGI(TAG, "Battery ready (%.3fV) — starting full system.",
              battery.hasTelemetry() ? battery.getBatteryVoltage() : 0.0f);
 
-    if (!fileManager.begin())
+    if (fileManager.begin())
+    {
+        // Downloads interrupted by the reboot continue from the persisted queue; give their
+        // figures a tracker so the manifest is completed when they land.
+        requestManager.recoverPendingManifests();
+    }
+    else
     {
         ESP_LOGW(TAG, "File Manager initialization failed!");
         ESP_LOGW(TAG, "SD card functionality will not be available.");
@@ -1457,6 +1465,10 @@ static void deriveLedScene()
     {
         ledController.setScene(LedController::SCENE_PAUSED);
     }
+    else if (audioController.isWaitingForTrack())
+    {
+        ledController.setScene(LedController::SCENE_LOADING); // between stories, the next one is downloading
+    }
     else if (gFigureLoadingSince != 0 && millis() - gFigureLoadingSince < 30000UL)
     {
         ledController.setScene(LedController::SCENE_LOADING);
@@ -1543,6 +1555,14 @@ static void serviceUxPrompts()
     if (audioController.consumePlaylistEnded())
     {
         prompts.say(Prompt::PLAYLIST_END);
+    }
+    if (audioController.consumeWaitStarted())
+    {
+        prompts.say(Prompt::DOWNLOAD_WAIT); // the next story is still downloading; playback resumes by itself
+    }
+    if (WiFi.isConnected() && strcmp(ReverbClient::lastError(), "portakal") == 0)
+    {
+        ReverbClient::setLastError(""); // network is back
     }
     static unsigned long lastCheck = 0;
     const unsigned long now = millis();

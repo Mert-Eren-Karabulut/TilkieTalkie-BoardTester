@@ -7,6 +7,7 @@
 #include <freertos/task.h>
 #include <Wire.h>
 #include <vector>
+#include <functional>
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
 #include "ReadAheadFileSource.h"
@@ -82,11 +83,16 @@ public:
     bool nextTrack();
     bool prevTrack();
     bool playTrack(const String& trackId); // Jump to a specific track by backend ID
-    void setPlaylist(const std::vector<String>& trackPaths, const String& figureUid);
+    // moreComing: the figure's remaining tracks are still downloading. When the last cached
+    // track ends the playlist then waits (LED "loading", prompt) and continues with the next
+    // track as soon as mergePlaylist() brings it, instead of ending the playlist.
+    void setPlaylist(const std::vector<String>& trackPaths, const String& figureUid, bool moreComing = false);
     // Replace the playlist for the same figure without interrupting the current track
     // (tracks that finished downloading are added in order; the playing track keeps its slot).
-    void mergePlaylist(const std::vector<String>& trackPaths, const String& figureUid);
+    void mergePlaylist(const std::vector<String>& trackPaths, const String& figureUid, bool moreComing = false);
     void clearPlaylist();
+    bool isWaitingForTrack() const { return waitingForTrack; }
+    bool consumeWaitStarted();        // true once when the playlist started waiting for a download
 
     // Playlist information
     bool hasPlaylist() const { return !playlist.empty(); }
@@ -196,6 +202,10 @@ private:
     int currentPlaylistIndex;
     String playlistFigureUid; // UID of the figure associated with this playlist
     bool playlistFinished; // Track if playlist has finished playing
+    bool playlistOpen = false;        // more tracks of this figure are still downloading
+    bool waitingForTrack = false;     // the last cached track ended while playlistOpen
+    volatile bool waitStarted = false; // consumed by the loop task (prompt + LED)
+    String waitAfterPath;             // the track we finished on; playback resumes after it
 
     // ES8388 control
     bool initializeES8388();

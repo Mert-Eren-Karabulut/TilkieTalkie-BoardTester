@@ -45,6 +45,7 @@ Until the factory writes the cards, a missing pack could also be fetched from th
 | download_start | Yeni bir figür! Hikâyelerini indiriyorum, hazır olunca sana haber vereceğim. | nothing playable yet, downloads queued | |
 | download_done | Hikâyelerin hazır! | first story ready (spoken over its first second) | interrupt |
 | download_failed | Hikâyeleri indiremedim, birazdan yeniden deneyeceğim. Hata kodu: Kiraz. | no track could be downloaded | |
+| download_wait | Sıradaki hikâye henüz inmedi. Hazır olunca kaldığımız yerden devam edeceğim. | the cached stories ended while the rest is still downloading; playback continues by itself when the next track lands | 30 s apart |
 | playlist_end | Hikâyelerin sonuna geldik. Baştan dinlemek için figürü kaldırıp yeniden koy. | last story finished | |
 | battery_low | Şarjım azalıyor, beni şarja takar mısın? | on battery at 20 %, 15 %, 10 %, 5 % | interrupt, 4 min apart |
 | battery_critical | Şarjım bitti, uyuyorum. Beni şarja tak. | voltage cutoff on battery, before ship mode | blocking |
