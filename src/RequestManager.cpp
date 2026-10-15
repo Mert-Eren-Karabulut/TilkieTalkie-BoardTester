@@ -248,9 +248,9 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
         http.addHeader("If-None-Match", "\"" + ifNoneMatch + "\"");
     }
 
-    esp_task_wdt_reset(); // harmless on the worker task (not subscribed); matters on the loop task
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset(); // only the loop task is subscribed // harmless on the worker task (not subscribed); matters on the loop task
     int code = (method == "POST" && payload) ? http.POST(*payload) : http.GET();
-    esp_task_wdt_reset();
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset(); // only the loop task is subscribed
 
     if (code == HTTPC_ERROR_CONNECTION_REFUSED || code == HTTPC_ERROR_SEND_HEADER_FAILED ||
         code == HTTPC_ERROR_SEND_PAYLOAD_FAILED || code == HTTPC_ERROR_NOT_CONNECTED ||
@@ -557,9 +557,9 @@ bool RequestManager::validateToken(const String& token)
     http.setTimeout(timeout);
     setDefaultHeaders();
     http.addHeader("Authorization", "Bearer " + token);
-    esp_task_wdt_reset();
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset(); // only the loop task is subscribed
     int httpResponseCode = http.GET();
-    esp_task_wdt_reset();
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset(); // only the loop task is subscribed
     http.end();
     if (httpResponseCode <= 0) {
         // No answer (DNS not ready right after connecting, portal down): that says nothing about

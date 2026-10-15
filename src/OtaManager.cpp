@@ -399,7 +399,9 @@ void OtaManager::onPromptsStaged(bool ok)
 
 bool OtaManager::startJob(const Job &job)
 {
-    if (inProgress())
+    // PROMPTS -> DOWNLOADING is the normal hand-over from the pack staging; only a transfer or
+    // an activation already under way refuses a new job.
+    if (_state == DOWNLOADING || _state == APPLYING || _state == REBOOTING)
     {
         return false;
     }

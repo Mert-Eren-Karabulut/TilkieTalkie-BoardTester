@@ -242,7 +242,7 @@ void upload()
 {
     RequestManager &rm = RequestManager::getInstance();
     if (!rm.isNetworkReady() || !rm.isConnected()) {
-        g_uploadAt = millis() + UPLOAD_RETRY_MS;
+        g_uploadAt = millis() + 15000; // no network yet (typical right after boot): look again soon
         return;
     }
     JsonDocument doc(&psramJsonAllocator);
