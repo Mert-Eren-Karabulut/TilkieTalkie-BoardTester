@@ -1,6 +1,7 @@
 #include "ReadAheadFileSource.h"
 #include <SD_MMC.h>
 #include <esp_heap_caps.h>
+#include <esp_log.h>
 
 ReadAheadFileSource::ReadAheadFileSource(size_t ringBytes, size_t chunkBytes)
     : ringSize(ringBytes), chunkSize(chunkBytes) {}
@@ -48,20 +49,28 @@ void ReadAheadFileSource::readerTaskEntry(void* arg) {
 
 void ReadAheadFileSource::readerLoop() {
     for (;;) {
-        if (parkRequested.load() || !fileOpen || eof.load()) {
-            parked = true;
+        // Claim the File: IDLE -> BUSY. Fails while the owner holds it (PARKED) or asks for it.
+        uint8_t expected = READER_IDLE;
+        if (parkRequested.load() || !readerState.compare_exchange_strong(expected, READER_BUSY)) {
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
             continue;
         }
-        parked = false;
+        // BUSY: fileOpen, head/tail and eof are only changed by the owner while PARKED.
+        if (!fileOpen.load() || eof.load()) {
+            readerState.store(READER_IDLE);
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+            continue;
+        }
         uint32_t used = head.load() - tail.load();
         if (ringSize - used < chunkSize) {
+            readerState.store(READER_IDLE);
             xSemaphoreTake(spaceSem, pdMS_TO_TICKS(50));
             continue;
         }
         int n = file.read(bounce, chunkSize);
         if (n <= 0) {
             eof = true;
+            readerState.store(READER_IDLE);
             xSemaphoreGive(dataSem);
             continue;
         }
@@ -72,27 +81,38 @@ void ReadAheadFileSource::readerLoop() {
             memcpy(ring, bounce + first, n - first);
         }
         head += n;
+        readerState.store(READER_IDLE);
         xSemaphoreGive(dataSem);
     }
 }
 
-void ReadAheadFileSource::parkReader() {
+bool ReadAheadFileSource::parkReader() {
     parkRequested = true;
-    if (!task) return;
-    // A read in flight can sit on the card for a few seconds; wait for it (bounded).
-    for (int i = 0; i < 500 && !parked.load(); ++i) {
+    // A read in flight can sit on the card for a few seconds; wait for it (bounded). Once the
+    // reader is IDLE it cannot claim the File again (parkRequested), so the CAS wins.
+    const TickType_t start = xTaskGetTickCount();
+    for (;;) {
+        uint8_t expected = READER_IDLE;
+        if (readerState.compare_exchange_strong(expected, READER_PARKED) || expected == READER_PARKED) {
+            return true;
+        }
+        if (!task || xTaskGetTickCount() - start >= pdMS_TO_TICKS(PARK_TIMEOUT_MS)) {
+            ESP_LOGW("audio", "ReadAhead: reader did not let go of the file within %u ms", (unsigned)PARK_TIMEOUT_MS);
+            return false; // parkRequested stays set: the reader goes idle after its read
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 void ReadAheadFileSource::unparkReader() {
+    readerState.store(READER_IDLE);
     parkRequested = false;
     if (task) xTaskNotifyGive(task);
 }
 
 bool ReadAheadFileSource::open(const char* path) {
     if (!task) return false;
-    parkReader();
+    if (!parkReader()) return false;
     if (fileOpen) {
         file.close();
         fileOpen = false;
@@ -100,7 +120,7 @@ bool ReadAheadFileSource::open(const char* path) {
     file = SD_MMC.open(path, FILE_READ);
     if (!file || file.isDirectory()) {
         if (file) file.close();
-        return false;
+        return false; // stays parked: nothing open for the reader
     }
     fileSize = file.size();
     head = 0;
@@ -155,7 +175,12 @@ bool ReadAheadFileSource::seek(int32_t pos, int dir) {
     else if (dir == SEEK_END) target = (int64_t)fileSize + pos;
     if (target < 0) target = 0;
     if (target > fileSize) target = fileSize;
-    parkReader();
+    if (!parkReader()) {
+        // Could not stop the reader: resume as before and report the seek as failed.
+        parkRequested = false;
+        if (task) xTaskNotifyGive(task);
+        return false;
+    }
     bool ok = file.seek((uint32_t)target);
     if (ok) {
         head = (uint32_t)target;
@@ -168,7 +193,7 @@ bool ReadAheadFileSource::seek(int32_t pos, int dir) {
 
 bool ReadAheadFileSource::close() {
     if (!fileOpen) return true;
-    parkReader();
+    if (!parkReader()) return false; // the next open() parks (and closes) again
     file.close();
     fileOpen = false;
     head = 0;

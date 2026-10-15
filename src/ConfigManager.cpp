@@ -1,4 +1,15 @@
 #include "ConfigManager.h"
+#include <esp_log.h>
+
+static const char *TAG = "cfg";
+
+namespace {
+struct CfgLock {
+    SemaphoreHandle_t m;
+    explicit CfgLock(SemaphoreHandle_t h) : m(h) { if (m) xSemaphoreTakeRecursive(m, portMAX_DELAY); }
+    ~CfgLock() { if (m) xSemaphoreGiveRecursive(m); }
+};
+}
 
 // Static member definitions
 ConfigManager* ConfigManager::instance = nullptr;
@@ -20,18 +31,30 @@ ConfigManager::ConfigManager() {
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    lock = xSemaphoreCreateRecursiveMutex();
     
-    // Now initialize preferences
-    if (!preferences.begin(NAMESPACE, false)) {
-        Serial.println("ERROR: Failed to initialize preferences!");
-        // Try to recover by clearing and retrying
-        preferences.end();
-        nvs_flash_erase();
-        nvs_flash_init();
-        if (!preferences.begin(NAMESPACE, false)) {
-            Serial.println("FATAL: Unable to initialize NVS storage!");
-        }
+    // Now initialize preferences. A failure is NOT answered by erasing the whole NVS (that
+    // would also drop the WiFi credentials, the fault ring and the OTA state): it is logged,
+    // reported as CONFIG_CORRUPT once Faults is up, and begin() is retried on the next access.
+    opened = preferences.begin(NAMESPACE, false);
+    if (!opened) {
+        ESP_LOGE(TAG, "ERROR: Failed to initialize preferences!");
+        openFailed = true;
     }
+}
+
+bool ConfigManager::ensureOpen() {
+    if (!opened) {
+        opened = preferences.begin(NAMESPACE, false);
+    }
+    return opened;
+}
+
+bool ConfigManager::takeOpenFailure() {
+    CfgLock g(lock);
+    const bool failed = openFailed;
+    openFailed = false;
+    return failed;
 }
 
 ConfigManager::~ConfigManager() {
@@ -46,14 +69,16 @@ ConfigManager& ConfigManager::getInstance() {
 }
 
 String ConfigManager::getWiFiSSID() {
-    if (!preferences.isKey(WIFI_SSID_KEY)) {
+    CfgLock g(lock);
+    if (!ensureOpen() || !preferences.isKey(WIFI_SSID_KEY)) {
         return "";
     }
     return preferences.getString(WIFI_SSID_KEY, "");
 }
 
 String ConfigManager::getWiFiPassword() {
-    if (!preferences.isKey(WIFI_PASSWORD_KEY)) {
+    CfgLock g(lock);
+    if (!ensureOpen() || !preferences.isKey(WIFI_PASSWORD_KEY)) {
         return "";
     }
     return preferences.getString(WIFI_PASSWORD_KEY, "");
@@ -63,23 +88,29 @@ void ConfigManager::setWiFiCredentials(const String& ssid, const String& passwor
     if (ssid.length() == 0 || password.length() == 0) {
         return;
     }
-    
-    // Clear old values first
-    preferences.remove(WIFI_SSID_KEY);
-    preferences.remove(WIFI_PASSWORD_KEY);
-    
-    // Store new values
+    CfgLock g(lock);
+    if (!ensureOpen()) {
+        ESP_LOGE(TAG, "ERROR: Failed to store WiFi credentials");
+        return;
+    }
+    // Overwrite in place (no remove first: a reset between remove and put used to lose the
+    // credentials), and only when they changed (flash wear).
+    if (preferences.isKey(WIFI_SSID_KEY) && preferences.isKey(WIFI_PASSWORD_KEY) &&
+        preferences.getString(WIFI_SSID_KEY, "") == ssid && preferences.getString(WIFI_PASSWORD_KEY, "") == password) {
+        return;
+    }
     size_t ssidResult = preferences.putString(WIFI_SSID_KEY, ssid);
     size_t passResult = preferences.putString(WIFI_PASSWORD_KEY, password);
     
     if (ssidResult == 0 || passResult == 0) {
-        Serial.println(F("ERROR: Failed to store WiFi credentials"));
+        ESP_LOGE(TAG, "ERROR: Failed to store WiFi credentials");
     }
 }
 
 bool ConfigManager::hasWiFiCredentials() {
+    CfgLock g(lock);
     // Check if keys exist before trying to read them to avoid NVS errors
-    if (!preferences.isKey(WIFI_SSID_KEY) || !preferences.isKey(WIFI_PASSWORD_KEY)) {
+    if (!ensureOpen() || !preferences.isKey(WIFI_SSID_KEY) || !preferences.isKey(WIFI_PASSWORD_KEY)) {
         return false;
     }
     
@@ -91,36 +122,49 @@ bool ConfigManager::hasWiFiCredentials() {
 }
 
 void ConfigManager::clearWiFiCredentials() {
+    CfgLock g(lock);
+    if (!ensureOpen()) return;
     preferences.remove(WIFI_SSID_KEY);
     preferences.remove(WIFI_PASSWORD_KEY);
 }
 
+// Getters never write: the default is derived again on every read until something is set.
 String ConfigManager::getDeviceName() {
-    String deviceName = preferences.getString(DEVICE_NAME_KEY, "");
+    String deviceName;
+    {
+        CfgLock g(lock);
+        if (ensureOpen() && preferences.isKey(DEVICE_NAME_KEY)) {
+            deviceName = preferences.getString(DEVICE_NAME_KEY, "");
+        }
+    }
     if (deviceName.length() == 0) {
-        // Generate default device name and store it
         deviceName = String(F("TilkieTalkie_")) + String(ESP.getEfuseMac());
-        preferences.putString(DEVICE_NAME_KEY, deviceName);
     }
     return deviceName;
 }
 
 void ConfigManager::setDeviceName(const String& name) {
-    preferences.putString(DEVICE_NAME_KEY, name);
+    CfgLock g(lock);
+    if (ensureOpen()) preferences.putString(DEVICE_NAME_KEY, name);
 }
 
 String ConfigManager::getProvisioningPin() {
-    String pin = preferences.getString(PROVISIONING_PIN_KEY, "");
+    String pin;
+    {
+        CfgLock g(lock);
+        if (ensureOpen() && preferences.isKey(PROVISIONING_PIN_KEY)) {
+            pin = preferences.getString(PROVISIONING_PIN_KEY, "");
+        }
+    }
     if (pin.length() == 0) {
-        // Use default PIN and store it
         pin = F("abcd1234");
-        preferences.putString(PROVISIONING_PIN_KEY, pin);
     }
     return pin;
 }
 
 void ConfigManager::setProvisioningPin(const String& pin) {
-    preferences.putString(PROVISIONING_PIN_KEY, pin);
+    CfgLock g(lock);
+    if (ensureOpen()) preferences.putString(PROVISIONING_PIN_KEY, pin);
 }
 
 
@@ -131,37 +175,35 @@ void ConfigManager::storeCurrentWiFiCredentials() {
 }
 
 void ConfigManager::resetAll() {
-    preferences.clear();
+    CfgLock g(lock);
+    if (ensureOpen()) preferences.clear();
 }
 
 void ConfigManager::printAllSettings() {
-    Serial.println(F("=== Configuration Settings ==="));
-    Serial.print(F("WiFi SSID: ")); Serial.println(getWiFiSSID());
-    Serial.print(F("WiFi Password: ")); Serial.println(getWiFiPassword().length() > 0 ? F("***") : F("Not set"));
-    Serial.print(F("Device Name: ")); Serial.println(getDeviceName());
-    Serial.print(F("Provisioning PIN: ")); Serial.println(getProvisioningPin());
-    Serial.print(F("JWT Token: ")); Serial.println(getJWTToken().length() > 0 ? F("Set") : F("Not set"));
-    Serial.print(F("Config Valid: ")); Serial.println(isValid() ? F("Yes") : F("No"));
-    Serial.print(F("Free NVS Space: ")); Serial.print(getFreeSpace()); Serial.println(F(" bytes"));
+    CfgLock g(lock);
+    ESP_LOGI(TAG, "=== Configuration Settings ===");
+    ESP_LOGI(TAG, "WiFi SSID: %s", getWiFiSSID().c_str());
+    ESP_LOGI(TAG, "WiFi Password: %s", getWiFiPassword().length() > 0 ? "***" : "Not set");
+    ESP_LOGI(TAG, "Device Name: %s", getDeviceName().c_str());
+    ESP_LOGI(TAG, "Provisioning PIN: %s", getProvisioningPin().c_str());
+    ESP_LOGI(TAG, "JWT Token: %s", getJWTToken().length() > 0 ? "Set" : "Not set");
+    ESP_LOGI(TAG, "Config Valid: %s", isValid() ? "Yes" : "No");
+    ESP_LOGI(TAG, "Free NVS Space: %u bytes", (unsigned)getFreeSpace());
     
     // Settings namespace info
     Preferences settingsPrefs;
     if (settingsPrefs.begin(SETTINGS_NAMESPACE, true)) {
-        Serial.print(F("Settings Namespace Entries: ")); Serial.println(settingsPrefs.freeEntries());
+        ESP_LOGI(TAG, "Settings Namespace Entries: %u", (unsigned)settingsPrefs.freeEntries());
         settingsPrefs.end();
     }
     
     // Essential NVS statistics only
     nvs_stats_t nvs_stats;
     if (nvs_get_stats(NULL, &nvs_stats) == ESP_OK) {
-        Serial.print(F("NVS Stats: "));
-        Serial.print(nvs_stats.used_entries);
-        Serial.print(F(" used, "));
-        Serial.print(nvs_stats.free_entries);
-        Serial.println(F(" free"));
+        ESP_LOGI(TAG, "NVS Stats: %u used, %u free", (unsigned)nvs_stats.used_entries, (unsigned)nvs_stats.free_entries);
     }
     
-    Serial.println(F("=============================="));
+    ESP_LOGI(TAG, "==============================");
 }
 
 bool ConfigManager::isValid() {
@@ -171,88 +213,99 @@ bool ConfigManager::isValid() {
 }
 
 void ConfigManager::commit() {
-    // Silent commit - only essential error reporting
+    // Intentionally empty: Preferences::put* commits to flash before returning.
 }
 
 size_t ConfigManager::getFreeSpace() {
-    return preferences.freeEntries();
+    CfgLock g(lock);
+    return ensureOpen() ? preferences.freeEntries() : 0;
 }
 
 void ConfigManager::factoryReset() {
-    Serial.println("=== FACTORY RESET ===");
-    Serial.println("WARNING: This will erase ALL stored data!");
+    ESP_LOGI(TAG, "=== FACTORY RESET ===");
+    ESP_LOGW(TAG, "WARNING: This will erase ALL stored data!");
+    CfgLock g(lock);
     
     // Close preferences first
     preferences.end();
+    opened = false;
     
     // Erase entire NVS flash
     esp_err_t err = nvs_flash_erase();
     if (err != ESP_OK) {
-        Serial.println("ERROR: Failed to erase NVS flash");
-        Serial.println("Error code: " + String(err));
+        ESP_LOGE(TAG, "ERROR: Failed to erase NVS flash");
+        ESP_LOGE(TAG, "Error code: %d", (int)err);
     } else {
-        Serial.println("SUCCESS: NVS flash erased");
+        ESP_LOGI(TAG, "SUCCESS: NVS flash erased");
     }
     
     // Reinitialize NVS
     err = nvs_flash_init();
     if (err != ESP_OK) {
-        Serial.println("ERROR: Failed to reinitialize NVS");
-        Serial.println("Error code: " + String(err));
+        ESP_LOGE(TAG, "ERROR: Failed to reinitialize NVS");
+        ESP_LOGE(TAG, "Error code: %d", (int)err);
     } else {
-        Serial.println("SUCCESS: NVS reinitialized");
+        ESP_LOGI(TAG, "SUCCESS: NVS reinitialized");
     }
     
     // Reopen preferences
-    if (preferences.begin(NAMESPACE, false)) {
-        Serial.println("SUCCESS: Preferences reopened");
+    opened = preferences.begin(NAMESPACE, false);
+    if (opened) {
+        ESP_LOGI(TAG, "SUCCESS: Preferences reopened");
     } else {
-        Serial.println("ERROR: Failed to reopen preferences");
+        ESP_LOGE(TAG, "ERROR: Failed to reopen preferences");
     }
     
-    Serial.println("=== FACTORY RESET COMPLETE ===");
-    Serial.println("Device will restart in 3 seconds...");
+    ESP_LOGI(TAG, "=== FACTORY RESET COMPLETE ===");
+    ESP_LOGI(TAG, "Device will restart in 3 seconds...");
     delay(3000);
     ESP.restart();
 }
 
 String ConfigManager::getJWTToken() {
-    String token = preferences.getString(JWT_TOKEN_KEY, "");
-    return token;
+    CfgLock g(lock);
+    if (!ensureOpen() || !preferences.isKey(JWT_TOKEN_KEY)) {
+        return String();
+    }
+    return preferences.getString(JWT_TOKEN_KEY, "");
 }
 
 void ConfigManager::setJWTToken(const String &token) {
-    preferences.putString(JWT_TOKEN_KEY, token);
+    CfgLock g(lock);
+    if (ensureOpen()) preferences.putString(JWT_TOKEN_KEY, token);
 }
 
 // Simple settings storage methods
 void ConfigManager::storeInt(const String& keyname, int value) {
+    CfgLock g(lock);
     Preferences settingsPrefs;
     if (settingsPrefs.begin(SETTINGS_NAMESPACE, false)) {
         size_t result = settingsPrefs.putInt(keyname.c_str(), value);
         if (result == 0) {
-            Serial.println("ERROR: Failed to store int setting: " + keyname);
+            ESP_LOGE(TAG, "ERROR: Failed to store int setting: %s", keyname.c_str());
         }
         settingsPrefs.end();
     } else {
-        Serial.println("ERROR: Failed to open settings namespace for storing int");
+        ESP_LOGE(TAG, "ERROR: Failed to open settings namespace for storing int");
     }
 }
 
 void ConfigManager::storeString(const String& keyname, const String& value) {
+    CfgLock g(lock);
     Preferences settingsPrefs;
     if (settingsPrefs.begin(SETTINGS_NAMESPACE, false)) {
         size_t result = settingsPrefs.putString(keyname.c_str(), value);
         if (result == 0) {
-            Serial.println("ERROR: Failed to store string setting: " + keyname);
+            ESP_LOGE(TAG, "ERROR: Failed to store string setting: %s", keyname.c_str());
         }
         settingsPrefs.end();
     } else {
-        Serial.println("ERROR: Failed to open settings namespace for storing string");
+        ESP_LOGE(TAG, "ERROR: Failed to open settings namespace for storing string");
     }
 }
 
 int ConfigManager::getInt(const String& keyname, int defaultValue) {
+    CfgLock g(lock);
     Preferences settingsPrefs;
     int value = defaultValue;
     if (settingsPrefs.begin(SETTINGS_NAMESPACE, true)) {  // Read-only mode
@@ -261,12 +314,13 @@ int ConfigManager::getInt(const String& keyname, int defaultValue) {
         }
         settingsPrefs.end();
     } else {
-        Serial.println("ERROR: Failed to open settings namespace for reading int");
+        ESP_LOGE(TAG, "ERROR: Failed to open settings namespace for reading int");
     }
     return value;
 }
 
 String ConfigManager::getString(const String& keyname, const String& defaultValue) {
+    CfgLock g(lock);
     Preferences settingsPrefs;
     String value = defaultValue;
     if (settingsPrefs.begin(SETTINGS_NAMESPACE, true)) {  // Read-only mode
@@ -275,35 +329,37 @@ String ConfigManager::getString(const String& keyname, const String& defaultValu
         }
         settingsPrefs.end();
     } else {
-        Serial.println("ERROR: Failed to open settings namespace for reading string");
+        ESP_LOGE(TAG, "ERROR: Failed to open settings namespace for reading string");
     }
     return value;
 }
 
 void ConfigManager::deleteSetting(const String& keyname) {
+    CfgLock g(lock);
     Preferences settingsPrefs;
     if (settingsPrefs.begin(SETTINGS_NAMESPACE, false)) {
         bool result = settingsPrefs.remove(keyname.c_str());
         if (!result) {
-            Serial.println("WARNING: Failed to delete setting or key not found: " + keyname);
+            ESP_LOGW(TAG, "WARNING: Failed to delete setting or key not found: %s", keyname.c_str());
         }
         settingsPrefs.end();
     } else {
-        Serial.println("ERROR: Failed to open settings namespace for deleting setting");
+        ESP_LOGE(TAG, "ERROR: Failed to open settings namespace for deleting setting");
     }
 }
 
 void ConfigManager::deleteAllSettings() {
+    CfgLock g(lock);
     Preferences settingsPrefs;
     if (settingsPrefs.begin(SETTINGS_NAMESPACE, false)) {
         bool result = settingsPrefs.clear();
         if (result) {
-            Serial.println("SUCCESS: All settings cleared");
+            ESP_LOGI(TAG, "SUCCESS: All settings cleared");
         } else {
-            Serial.println("ERROR: Failed to clear all settings");
+            ESP_LOGE(TAG, "ERROR: Failed to clear all settings");
         }
         settingsPrefs.end();
     } else {
-        Serial.println("ERROR: Failed to open settings namespace for clearing all settings");
+        ESP_LOGE(TAG, "ERROR: Failed to open settings namespace for clearing all settings");
     }
 }

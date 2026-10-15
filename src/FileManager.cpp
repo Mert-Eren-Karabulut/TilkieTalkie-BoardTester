@@ -1,16 +1,22 @@
 #include "FileManager.h"
 #include "Faults.h"
-#include "BatteryManagement.h"
 #include "PsramJson.h"
 #include "RequestManager.h"
 #include <SD_MMC.h>
 #include <AsyncTCP.h>
-#include <HTTPClient.h>
-#include <WiFiClient.h>
-#include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
+#include <esp_log.h>
 #include <mbedtls/sha256.h>
 #include <algorithm>
+
+static const char *TAG = "files";
+
+// Fault details are short (the portal stores ~40 chars): keep the tail of a path, which
+// carries the file name.
+static String faultDetail(const String &path)
+{
+    return path.length() <= 39 ? path : path.substring(path.length() - 39);
+}
 
 // Initialize static members
 FileManager* FileManager::instance = nullptr;
@@ -22,12 +28,10 @@ const char* FileManager::SD_DOWNLOAD_STATS_FILE = "/.filemanager/download_stats.
 FileManager::FileManager() : 
     sdCardInitialized(false),
     downloadInProgress(false),
-    downloadProgressCallback(nullptr),
-    downloadCompleteCallback(nullptr),
-    fileSystemEventCallback(nullptr),
     persistentBufferA(nullptr),
     ringBuffer(nullptr),
-    buffersAllocated(false) {
+    buffersAllocated(false),
+    downloadCompleteCallback(nullptr) {
     // Initialize download stats
     downloadStats.totalDownloads = 0;
     downloadStats.successfulDownloads = 0;
@@ -43,7 +47,7 @@ FileManager& FileManager::getInstance() {
 }
 
 bool FileManager::begin() {
-    Serial.println("FileManager: Initializing...");
+    ESP_LOGI(TAG, "Initializing...");
     
     // One 32 KB internal DMA bounce buffer (SDMMC cannot DMA from PSRAM) and a 4 MB PSRAM
     // ring between the network and the card. Allocated once, never freed.
@@ -51,20 +55,20 @@ bool FileManager::begin() {
         persistentBufferA = (uint8_t*)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
         ringBuffer = (uint8_t*)heap_caps_malloc(RING_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!persistentBufferA || !ringBuffer) {
-            Serial.println("FileManager: CRITICAL: failed to allocate download buffers (32 KB internal + 4 MB PSRAM)");
+            ESP_LOGE(TAG, "CRITICAL: failed to allocate download buffers (32 KB internal + 4 MB PSRAM)");
             if (persistentBufferA) { free(persistentBufferA); persistentBufferA = nullptr; }
             if (ringBuffer) { free(ringBuffer); ringBuffer = nullptr; }
             buffersAllocated = false;
         } else {
             buffersAllocated = true;
-            Serial.printf("FileManager: download buffers ready (%u KB internal bounce, %u KB PSRAM ring)\n",
+            ESP_LOGI(TAG, "download buffers ready (%u KB internal bounce, %u KB PSRAM ring)",
                           (unsigned)(DOWNLOAD_BUFFER_SIZE / 1024), (unsigned)(RING_SIZE / 1024));
         }
     }
     
     // Initialize SD card first (needed for persistence)
     if (!initializeSDCard()) {
-        Serial.println("FileManager: Failed to initialize SD card");
+        ESP_LOGW(TAG, "Failed to initialize SD card");
         return false;
     }
     
@@ -76,7 +80,7 @@ bool FileManager::begin() {
     loadDownloadQueue();
     loadRequiredFiles();
     
-    Serial.println("FileManager: Initialization complete");
+    ESP_LOGI(TAG, "Initialization complete");
     return true;
 }
 
@@ -100,21 +104,21 @@ void FileManager::end() {
     // NOTE: We intentionally DO NOT free persistentBufferA/B here
     // They remain allocated for the lifetime of the device to prevent fragmentation
     
-    Serial.println("FileManager: Shutdown complete (persistent buffers remain allocated)");
+    ESP_LOGI(TAG, "Shutdown complete (persistent buffers remain allocated)");
 }
 
 void FileManager::benchmarkSDCard() {
-    Serial.println("\n=== SD Card Write Speed Benchmark ===");
+    ESP_LOGI(TAG, "=== SD Card Write Speed Benchmark ===");
     
     const size_t testSizes[] = {4096, 16384, 65536, 262144}; // 4KB, 16KB, 64KB, 256KB
     const int iterations = 10;
     
     // Test with Internal SRAM (DMA-aligned) - Sequential writes (simulating download)
-    Serial.println("\n--- Internal SRAM (DMA-aligned) - Download Simulation ---");
+    ESP_LOGI(TAG, "--- Internal SRAM (DMA-aligned) - Download Simulation ---");
     for (size_t testSize : testSizes) {
         uint8_t* testBuf = (uint8_t*)heap_caps_malloc(testSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
         if (!testBuf) {
-            Serial.printf("Failed to allocate %d byte buffer from internal SRAM\n", testSize);
+            ESP_LOGW(TAG, "Failed to allocate %d byte buffer from internal SRAM", testSize);
             continue;
         }
         
@@ -125,7 +129,7 @@ void FileManager::benchmarkSDCard() {
         // Open file ONCE and write multiple times (like download does)
         File testFile = SD_MMC.open("/sd_benchmark_download.tmp", FILE_WRITE);
         if (!testFile) {
-            Serial.println("Failed to create test file");
+            ESP_LOGW(TAG, "Failed to create test file");
             free(testBuf);
             continue;
         }
@@ -140,7 +144,7 @@ void FileManager::benchmarkSDCard() {
             unsigned long elapsed = micros() - start;
             
             if (written != testSize) {
-                Serial.printf("Write failed: %d/%d bytes\n", written, testSize);
+                ESP_LOGW(TAG, "Write failed: %d/%d bytes", written, testSize);
                 break;
             }
             
@@ -159,16 +163,16 @@ void FileManager::benchmarkSDCard() {
         float speedKBps = (testSize / 1024.0f) / (avgTimeMs / 1000.0f);
         float speedMbps = speedKBps * 8.0f / 1024.0f;
         
-        Serial.printf("%6d bytes: avg=%6.2f ms (min=%5.2f, max=%6.2f), %7.1f KB/s, %5.2f Mbps\n", 
+        ESP_LOGI(TAG, "%6d bytes: avg=%6.2f ms (min=%5.2f, max=%6.2f), %7.1f KB/s, %5.2f Mbps", 
                      testSize, avgTimeMs, minTimeMs, maxTimeMs, speedKBps, speedMbps);
     }
     
     // Test with PSRAM - Sequential writes
-    Serial.println("\n--- PSRAM - Download Simulation ---");
+    ESP_LOGI(TAG, "--- PSRAM - Download Simulation ---");
     for (size_t testSize : testSizes) {
         uint8_t* testBuf = (uint8_t*)ps_malloc(testSize);
         if (!testBuf) {
-            Serial.printf("Failed to allocate %d byte buffer from PSRAM\n", testSize);
+            ESP_LOGW(TAG, "Failed to allocate %d byte buffer from PSRAM", testSize);
             continue;
         }
         
@@ -178,7 +182,7 @@ void FileManager::benchmarkSDCard() {
         
         File testFile = SD_MMC.open("/sd_benchmark_psram_download.tmp", FILE_WRITE);
         if (!testFile) {
-            Serial.println("Failed to create test file");
+            ESP_LOGW(TAG, "Failed to create test file");
             free(testBuf);
             continue;
         }
@@ -193,7 +197,7 @@ void FileManager::benchmarkSDCard() {
             unsigned long elapsed = micros() - start;
             
             if (written != testSize) {
-                Serial.printf("Write failed: %d/%d bytes\n", written, testSize);
+                ESP_LOGW(TAG, "Write failed: %d/%d bytes", written, testSize);
                 break;
             }
             
@@ -212,86 +216,73 @@ void FileManager::benchmarkSDCard() {
         float speedKBps = (testSize / 1024.0f) / (avgTimeMs / 1000.0f);
         float speedMbps = speedKBps * 8.0f / 1024.0f;
         
-        Serial.printf("%6d bytes: avg=%6.2f ms (min=%5.2f, max=%6.2f), %7.1f KB/s, %5.2f Mbps\n", 
+        ESP_LOGI(TAG, "%6d bytes: avg=%6.2f ms (min=%5.2f, max=%6.2f), %7.1f KB/s, %5.2f Mbps", 
                      testSize, avgTimeMs, minTimeMs, maxTimeMs, speedKBps, speedMbps);
     }
     
-    Serial.println("\n=== Benchmark Complete ===\n");
-    Serial.println("Summary: This simulates download behavior (open once, write many times).");
-    Serial.println("Watch for increasing write times - this indicates FATFS overhead.\n");
+    ESP_LOGI(TAG, "=== Benchmark Complete ===");
+    ESP_LOGI(TAG, "Summary: This simulates download behavior (open once, write many times).");
+    ESP_LOGI(TAG, "Watch for increasing write times - this indicates FATFS overhead.");
 }
 
 bool FileManager::initializeSDCard() {
-    Serial.println("FileManager: Initializing SD card...");
+    ESP_LOGI(TAG, "Initializing SD card...");
     
-    Serial.printf("FileManager: Using SDMMC pins - CLK:%d, CMD:%d, D0:%d, D1:%d, D2:%d, D3:%d\n", 
+    ESP_LOGI(TAG, "Using SDMMC pins - CLK:%d, CMD:%d, D0:%d, D1:%d, D2:%d, D3:%d", 
                   SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN);
     
     // A failed SDMMC begin can leave the peripheral in a bad state on this board,
     // especially while WiFi/BLE provisioning is active. Try the normal 4-bit path first,
     // then fall back to 1-bit/default-speed to distinguish marginal data lines from a dead card.
-    Serial.println("FileManager: SD card initialization attempt 1/2 (4-bit)");
+    ESP_LOGI(TAG, "SD card initialization attempt 1/2 (4-bit)");
     SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN);
     bool sdInitialized = SD_MMC.begin("/sd", false, false, BOARD_MAX_SDMMC_FREQ);
     
     if (!sdInitialized) {
         SD_MMC.end();
-        Serial.println("FileManager: 4-bit SDMMC init failed, retrying in 1-bit mode at default speed");
-        Serial.println("FileManager: SD card initialization attempt 2/2 (1-bit fallback)");
+        ESP_LOGW(TAG, "4-bit SDMMC init failed, retrying in 1-bit mode at default speed");
+        ESP_LOGI(TAG, "SD card initialization attempt 2/2 (1-bit fallback)");
         sdInitialized = SD_MMC.begin("/sd", true, false, SDMMC_FREQ_DEFAULT);
     }
 
     if (!sdInitialized) {
         SD_MMC.end();
-        Serial.println("FileManager: SD card initialization failed in both 4-bit and 1-bit modes");
-        Serial.println("FileManager: Please check:");
-        Serial.println("  1. SD card is properly inserted");
-        Serial.println("  2. Wiring connections are correct");
-        Serial.println("  3. SD card is formatted as FAT32");
-        Serial.println("  4. CMD/D0 pull-ups are present and stable");
-        Serial.println("  5. Power supply is adequate");
+        ESP_LOGW(TAG, "SD card initialization failed in both 4-bit and 1-bit modes");
+        ESP_LOGI(TAG, "Please check:");
+        ESP_LOGI(TAG, "  1. SD card is properly inserted");
+        ESP_LOGI(TAG, "  2. Wiring connections are correct");
+        ESP_LOGI(TAG, "  3. SD card is formatted as FAT32");
+        ESP_LOGI(TAG, "  4. CMD/D0 pull-ups are present and stable");
+        ESP_LOGI(TAG, "  5. Power supply is adequate");
         return false;
     }
     
     // Check SD card type
     uint8_t cardType = SD_MMC.cardType();
     if (cardType == CARD_NONE) {
-        Serial.println("FileManager: No SD card attached");
+        ESP_LOGI(TAG, "No SD card attached");
         return false;
     }
     
-    Serial.print("FileManager: SD card type: ");
+    const char *typeName = "Unknown";
     switch (cardType) {
-        case CARD_MMC:
-            Serial.println("MMC");
-            break;
-        case CARD_SD:
-            Serial.println("SDSC");
-            break;
-        case CARD_SDHC:
-            Serial.println("SDHC");
-            break;
-        default:
-            Serial.println("Unknown");
-            break;
+        case CARD_MMC: typeName = "MMC"; break;
+        case CARD_SD: typeName = "SDSC"; break;
+        case CARD_SDHC: typeName = "SDHC"; break;
+        default: break;
     }
+    ESP_LOGI(TAG, "SD card type: %s", typeName);
     
     // Print SD card size
     uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
-    Serial.printf("FileManager: SD card size: %lluMB\n", cardSize);
+    ESP_LOGI(TAG, "SD card size: %lluMB", cardSize);
     
     sdCardInitialized = true;
+    createDirectory("/assets"); // story assets; sub-directories are created per download
+    // Orphaned partial downloads are swept before the first download starts (this sets the
+    // flag that holds downloads off, so it must precede the maintenance task's first job).
+    cleanupTempFiles();
     ensureMaintenanceTask(); // background deletes/writes + the first free-space count
-    
-    // Create necessary directories
-    createDirectory("/audio");
-    createDirectory("/temp");
-    createDirectory("/logs");
-    createDirectory("/images");
-    createDirectory("/figures");
-    createDirectory("/assets");
-    createDirectory("/assets/contents");
-    createDirectory("/assets/custom_tracks");
     
     return true;
 }
@@ -302,15 +293,6 @@ bool FileManager::checkConnectivity() {
     return WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0);
 }
 
-bool FileManager::pingGoogle() {
-    return checkConnectivity();
-}
-
-bool FileManager::isChargingRequired() {
-    BatteryManager& battery = BatteryManager::getInstance();
-    return battery.getChargingStatus();
-}
-
 void FileManager::update() {
     if (!sdCardInitialized) {
         return;
@@ -318,13 +300,19 @@ void FileManager::update() {
 
     // Completion of an in-flight download is handled here, on the loop task (owner of the
     // queue, the files and the callbacks), never inside the AsyncTCP callbacks.
-    if (downloadInProgress && asyncState.finishRequested) {
+    if (downloadInProgress && asyncState.finishState.load(std::memory_order_acquire) == FINISH_READY) {
         finalizeAsyncDownload();
     }
 
     // Process download queue if conditions are met
     if (!downloadInProgress && downloadQueue.size() > 0) {
             processDownloadQueue();
+    }
+
+    // Batched queue persistence (retry bookkeeping): at most every QUEUE_SAVE_INTERVAL_MS,
+    // at once when the queue has drained.
+    if (queueDirty && (downloadQueue.empty() || millis() - lastQueueSave >= QUEUE_SAVE_INTERVAL_MS)) {
+        saveDownloadQueue();
     }
     
     // Check for missing required files periodically
@@ -342,14 +330,10 @@ bool FileManager::deleteFile(const String& path) {
     
     bool success = SD_MMC.remove(path);
     
-    if (fileSystemEventCallback) {
-        fileSystemEventCallback("delete", path, success);
-    }
-    
     if (success) {
-        Serial.printf("FileManager: File deleted successfully: %s\n", path.c_str());
+        ESP_LOGI(TAG, "File deleted successfully: %s", path.c_str());
     } else {
-        Serial.printf("FileManager: Failed to delete file: %s\n", path.c_str());
+        ESP_LOGW(TAG, "Failed to delete file: %s", path.c_str());
     }
     
     return success;
@@ -418,7 +402,7 @@ bool FileManager::deleteFileDeferred(const String& path) {
         return false;
     }
     if (!enqueueJob(0, path, nullptr, 0)) {
-        Serial.printf("FileManager: delete queue full, deleting inline: %s\n", path.c_str());
+        ESP_LOGW(TAG, "delete queue full, deleting inline: %s", path.c_str());
         return deleteFile(path);
     }
     return true;
@@ -429,7 +413,7 @@ bool FileManager::writeFileDeferred(const String& path, const String& content) {
         return false;
     }
     if (!enqueueJob(1, path, content.c_str(), content.length())) {
-        Serial.printf("FileManager: write queue full, writing inline: %s\n", path.c_str());
+        ESP_LOGW(TAG, "write queue full, writing inline: %s", path.c_str());
         return writeFileNow(path.c_str(), content.c_str(), content.length());
     }
     return true;
@@ -443,7 +427,7 @@ bool FileManager::writeFileNow(const char* path, const char* data, size_t len) {
     }
     File file = SD_MMC.open(tmp, FILE_WRITE);
     if (!file) {
-        Serial.printf("FileManager: Failed to open %s for writing\n", tmp.c_str());
+        ESP_LOGW(TAG, "Failed to open %s for writing", tmp.c_str());
         return false;
     }
     size_t written = len ? file.write(reinterpret_cast<const uint8_t*>(data), len) : 0;
@@ -451,7 +435,7 @@ bool FileManager::writeFileNow(const char* path, const char* data, size_t len) {
     file.close();
     if (written != len) {
         SD_MMC.remove(tmp);
-        Serial.printf("FileManager: short write %u/%u to %s\n", (unsigned)written, (unsigned)len, path);
+        ESP_LOGW(TAG, "short write %u/%u to %s", (unsigned)written, (unsigned)len, path);
         return false;
     }
     if (SD_MMC.exists(path)) {
@@ -476,7 +460,7 @@ void FileManager::sdMaintenanceTask(void* parameter) {
             unsigned long t0 = millis();
             if (job->kind == 0) {
                 bool ok = SD_MMC.remove(job->path);
-                Serial.printf("FileManager: %s %s (%lu ms, background)\n", ok ? "deleted" : "failed to delete", job->path, millis() - t0);
+                ESP_LOGI(TAG, "%s %s (%lu ms, background)", ok ? "deleted" : "failed to delete", job->path, millis() - t0);
                 if (self->pendingLock) {
                     xSemaphoreTake(self->pendingLock, portMAX_DELAY);
                     for (auto it = self->pendingDeletePaths.begin(); it != self->pendingDeletePaths.end(); ++it) {
@@ -487,16 +471,21 @@ void FileManager::sdMaintenanceTask(void* parameter) {
             } else if (job->kind == 3) {
                 RequestManager::getInstance().buildInventory(); // stories on the card -> ReverbClient outbox
                 self->inventoryQueued = false;
+            } else if (job->kind == 4) {
+                self->sweepOrphanedTempFiles();
             } else if (job->kind == 1) {
                 bool ok = self->writeFileNow(job->path, job->data, job->len);
                 unsigned long dt = millis() - t0;
                 if (!ok || dt > 500) {
-                    Serial.printf("FileManager: %s %s (%u bytes, %lu ms, background)\n", ok ? "wrote" : "failed to write", job->path, (unsigned)job->len, dt);
+                    ESP_LOGI(TAG, "%s %s (%u bytes, %lu ms, background)", ok ? "wrote" : "failed to write", job->path, (unsigned)job->len, dt);
                 }
             } else {
                 self->refreshFreeSpaceCache();
                 self->freeRefreshInFlight = false;
             }
+        }
+        if (job->kind == 4) {
+            self->tmpSweepPending = false; // downloads may start again
         }
         const bool work = (job->kind == 0 || job->kind == 1);
         free(job->path);
@@ -509,13 +498,13 @@ void FileManager::sdMaintenanceTask(void* parameter) {
 
 bool FileManager::deleteFileAndRemoveFromRequired(const String& path) {
     if (!sdCardInitialized) {
-        Serial.println("FileManager: SD card not initialized");
+        ESP_LOGW(TAG, "SD card not initialized");
         return false;
     }
     
     // Validate that this is a file path, not a directory
     if (path.endsWith("/") || path.isEmpty()) {
-        Serial.printf("FileManager: Invalid file path (directories not allowed): %s\n", path.c_str());
+        ESP_LOGW(TAG, "Invalid file path (directories not allowed): %s", path.c_str());
         return false;
     }
     
@@ -524,8 +513,8 @@ bool FileManager::deleteFileAndRemoveFromRequired(const String& path) {
     if (fileOrDir) {
         if (fileOrDir.isDirectory()) {
             fileOrDir.close();
-            Serial.printf("FileManager: Cannot delete directory with deleteFileAndRemoveFromRequired: %s\n", path.c_str());
-            Serial.println("FileManager: Use removeDirectory() for directories");
+            ESP_LOGW(TAG, "Cannot delete directory with deleteFileAndRemoveFromRequired: %s", path.c_str());
+            ESP_LOGI(TAG, "Use removeDirectory() for directories");
             return false;
         }
         fileOrDir.close();
@@ -540,7 +529,7 @@ bool FileManager::deleteFileAndRemoveFromRequired(const String& path) {
     
     if (it != requiredFiles.end()) {
         wasRequired = true;
-        Serial.printf("FileManager: File is marked as required, removing from required list: %s\n", path.c_str());
+        ESP_LOGI(TAG, "File is marked as required, removing from required list: %s", path.c_str());
         requiredFiles.erase(it);
         saveRequiredFiles();
     }
@@ -550,7 +539,7 @@ bool FileManager::deleteFileAndRemoveFromRequired(const String& path) {
     auto queueIt = downloadQueue.begin();
     while (queueIt != downloadQueue.end()) {
         if (queueIt->localPath == path) {
-            Serial.printf("FileManager: Removing from download queue: %s\n", path.c_str());
+            ESP_LOGI(TAG, "Removing from download queue: %s", path.c_str());
             queueIt = downloadQueue.erase(queueIt);
             wasInQueue = true;
         } else {
@@ -565,27 +554,23 @@ bool FileManager::deleteFileAndRemoveFromRequired(const String& path) {
     // Attempt to delete the file
     bool success = SD_MMC.remove(path);
     
-    if (fileSystemEventCallback) {
-        fileSystemEventCallback("delete_smart", path, success);
-    }
-    
     if (success) {
-        Serial.printf("FileManager: File deleted successfully: %s\n", path.c_str());
+        ESP_LOGI(TAG, "File deleted successfully: %s", path.c_str());
         if (wasRequired) {
-            Serial.printf("FileManager: File removed from required list to prevent re-download\n");
+            ESP_LOGI(TAG, "File removed from required list to prevent re-download");
         }
         if (wasInQueue) {
-            Serial.printf("FileManager: File removed from download queue\n");
+            ESP_LOGI(TAG, "File removed from download queue");
         }
     } else {
-        Serial.printf("FileManager: Failed to delete file: %s\n", path.c_str());
+        ESP_LOGW(TAG, "Failed to delete file: %s", path.c_str());
         
         // If deletion failed but we removed it from required list, add it back
         if (wasRequired) {
             // We need to reconstruct the FileEntry, but we don't have the URL
             // Log a warning that manual re-addition might be needed
-            Serial.println("FileManager: WARNING - File was removed from required list but deletion failed");
-            Serial.println("FileManager: You may need to manually re-add it with addfile command if needed");
+            ESP_LOGW(TAG, "WARNING - File was removed from required list but deletion failed");
+            ESP_LOGI(TAG, "You may need to manually re-add it with addfile command if needed");
         }
     }
     
@@ -606,10 +591,6 @@ bool FileManager::createDirectory(const String& path) {
         if (dir) dir.close();
     }
     
-    if (fileSystemEventCallback) {
-        fileSystemEventCallback("mkdir", path, success);
-    }
-    
     return success;
 }
 
@@ -621,6 +602,10 @@ bool FileManager::fileExists(const String& path) {
     return SD_MMC.exists(path);
 }
 
+bool FileManager::isPresent(const String& path) {
+    return fileExists(path) && !isDeletePending(path);
+}
+
 std::vector<String> FileManager::listFiles(const String& directory) {
     std::vector<String> files;
     
@@ -630,7 +615,7 @@ std::vector<String> FileManager::listFiles(const String& directory) {
     
     File dir = SD_MMC.open(directory);
     if (!dir || !dir.isDirectory()) {
-        Serial.printf("FileManager: Failed to open directory: %s\n", directory.c_str());
+        ESP_LOGW(TAG, "Failed to open directory: %s", directory.c_str());
         return files;
     }
     
@@ -648,20 +633,30 @@ std::vector<String> FileManager::listFiles(const String& directory) {
     return files;
 }
 
-bool FileManager::scheduleDownload(const String& url, const String& localPath, const String& checksum) {
+bool FileManager::scheduleDownload(const String& url, const String& localPath, const String& checksum, bool persist) {
     // Check if already in queue
     for (const auto& task : downloadQueue) {
         if (task.url == url && task.localPath == localPath) {
-            Serial.println("FileManager: Download already scheduled");
+            ESP_LOGI(TAG, "Download already scheduled");
             return true;
         }
     }
     
     addToDownloadQueue(url, localPath, checksum);
-    saveDownloadQueue();
+    if (persist) {
+        saveDownloadQueue();
+    } else {
+        queueDirty = true; // the caller flushes once for the whole batch
+    }
     
-    Serial.printf("FileManager: Download scheduled: %s -> %s\n", url.c_str(), localPath.c_str());
+    ESP_LOGI(TAG, "Download scheduled: %s -> %s", url.c_str(), localPath.c_str());
     return true;
+}
+
+void FileManager::flushDownloadQueue() {
+    if (queueDirty) {
+        saveDownloadQueue();
+    }
 }
 
 void FileManager::addToDownloadQueue(const String& url, const String& localPath, const String& checksum) {
@@ -676,7 +671,9 @@ void FileManager::addToDownloadQueue(const String& url, const String& localPath,
     downloadQueue.push_back(task);
 }
 
-bool FileManager::downloadFileFromURL(const String& url, const String& localPath, const String& checksum, String& errorMsg) {
+bool FileManager::downloadFileFromURL(const String& url, const String& localPath, const String& checksum, String& errorMsg,
+                                      bool& pathError) {
+    pathError = false;
     if (downloadInProgress) {
         errorMsg = "Another download is in progress";
         return false;
@@ -716,10 +713,11 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     }
 
     downloadInProgress = true;
-    Serial.printf("FileManager: Starting async download: %s -> %s\n", httpUrl.c_str(), localPath.c_str());
+    ESP_LOGI(TAG, "Starting async download: %s -> %s", httpUrl.c_str(), localPath.c_str());
 
     if (!createDirectoryStructure(localPath)) {
         errorMsg = "Failed to create directory structure";
+        pathError = true;
         downloadInProgress = false;
         return false;
     }
@@ -731,11 +729,10 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     asyncState.checksum = checksum;
     asyncState.requestPath = path;
     asyncState.startTime = millis();
-    asyncState.lastDataTime = millis();
-    if (cachedFreeAt == 0 || millis() - cachedFreeAt > 60000) {
+    if (cachedFreeAt.load() == 0 || millis() - cachedFreeAt.load() > 60000) {
         refreshFreeSpaceCache();
     }
-    asyncState.freeBytesAtStart = cachedFreeBytes;
+    asyncState.freeBytesAtStart = cachedFreeBytes.load();
 
     if (!buffersAllocated || !persistentBufferA || !ringBuffer) {
         errorMsg = "Download buffer not available";
@@ -749,6 +746,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     asyncState.file = SD_MMC.open(asyncState.tempPath, FILE_WRITE);
     if (!asyncState.file) {
         errorMsg = "Failed to create temporary file";
+        pathError = true;
         downloadInProgress = false;
         return false;
     }
@@ -796,7 +794,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     asyncState.client->setRxTimeout(60);
     asyncState.client->setAckTimeout(5000);
 
-    Serial.printf("FileManager: Connecting to %s:%d\n", hostname.c_str(), port);
+    ESP_LOGI(TAG, "Connecting to %s:%d", hostname.c_str(), port);
     if (!asyncState.client->connect(hostname.c_str(), port)) {
         errorMsg = "Failed to start connection";
         abortAsyncStart();
@@ -854,6 +852,9 @@ void FileManager::processDownloadQueue() {
     if (!checkConnectivity()) {
         return; // nothing to do without WiFi; the queue persists and sleep is no longer held off by it
     }
+    if (tmpSweepPending.load()) {
+        return; // the boot sweep of orphaned *.tmp must not race a new temp file
+    }
 
     for (auto it = downloadQueue.begin(); it != downloadQueue.end(); ++it) {
         DownloadTask& task = *it;
@@ -869,9 +870,15 @@ void FileManager::processDownloadQueue() {
             }
         }
 
+        // A delete of the same path still queued on the maintenance task would erase the new
+        // file after it lands: wait for it.
+        if (isDeletePending(task.localPath)) {
+            continue;
+        }
+
         // Already present: integrity was verified when it was downloaded; trust it.
         if (fileExists(task.localPath)) {
-            Serial.printf("FileManager: File already exists: %s\n", task.localPath.c_str());
+            ESP_LOGI(TAG, "File already exists: %s", task.localPath.c_str());
             downloadQueue.erase(it);
             saveDownloadQueue();
             return;
@@ -879,31 +886,47 @@ void FileManager::processDownloadQueue() {
 
         if (task.retryCount >= MAX_RETRY_COUNT) {
             // Gave up: the next tap of the figure re-queues whatever its manifest still needs.
-            Serial.printf("FileManager: giving up on %s after %d attempts\n", task.url.c_str(), task.retryCount);
-            Faults::raise(Fault::DOWNLOAD_FAILED, task.localPath.substring(0, 39).c_str(), false);
-            downloadQueue.erase(it);
-            saveDownloadQueue();
+            ESP_LOGW(TAG, "giving up on %s after %d attempts", task.url.c_str(), task.retryCount);
+            giveUp(it, "Gave up after repeated attempts");
             return;
         }
 
         task.lastAttempt = millis();
         task.retryCount++;
-        Serial.printf("FileManager: Attempting download (attempt %d): %s\n", task.retryCount, task.url.c_str());
+        ESP_LOGI(TAG, "Attempting download (attempt %d): %s", task.retryCount, task.url.c_str());
 
         String errorMsg;
+        bool pathError = false;
         const String url = task.url, localPath = task.localPath, checksum = task.checksum;
-        if (!downloadFileFromURL(url, localPath, checksum, errorMsg)) {
-            Serial.printf("FileManager: Download failed to start: %s (%s)\n", url.c_str(), errorMsg.c_str());
-            if (errorMsg.indexOf("directory") >= 0 || errorMsg.indexOf("Failed to create") >= 0 ||
-                errorMsg.indexOf("open") >= 0) {
-                // A local path that cannot be created never will be; retrying only keeps "syncing" on.
-                Serial.println("FileManager: dropping the entry (local path error)");
-                Faults::raise(Fault::SD_WRITE_FAILED, task.localPath.substring(0, 39).c_str(), false);
-                downloadQueue.erase(it);
+        if (!downloadFileFromURL(url, localPath, checksum, errorMsg, pathError)) {
+            ESP_LOGW(TAG, "Download failed to start: %s (%s)", url.c_str(), errorMsg.c_str());
+            // Only a local path that cannot be created is terminal (a directory at once; a temp
+            // file after MAX_HARD_FAILURES, since a busy card can refuse one open). A semaphore,
+            // task, client or connection that could not be created is transient: retried.
+            if (pathError) {
+                Faults::raise(Fault::SD_WRITE_FAILED, faultDetail(localPath).c_str(), false);
+                if (errorMsg.indexOf("directory") >= 0 || ++task.hardFailures >= MAX_HARD_FAILURES) {
+                    ESP_LOGW(TAG, "dropping the entry (local path error)");
+                    giveUp(it, errorMsg.c_str());
+                    return;
+                }
             }
         }
-        saveDownloadQueue();
+        queueDirty = true; // retry bookkeeping: flushed by update()
         return; // one download at a time
+    }
+}
+
+// Terminal failure of a queued download: drop it, persist at once, report it and complete the
+// trackers waiting for it (a figure tracker or the playlist would otherwise wait forever).
+void FileManager::giveUp(std::vector<DownloadTask>::iterator it, const char *reason) {
+    const String url = it->url, path = it->localPath;
+    const String error = reason ? reason : "";
+    downloadQueue.erase(it);
+    saveDownloadQueue();
+    Faults::raise(Fault::DOWNLOAD_FAILED, faultDetail(path).c_str(), false);
+    if (downloadCompleteCallback) {
+        downloadCompleteCallback(url, path, false, error); // last: it may change the queue
     }
 }
 
@@ -926,7 +949,7 @@ bool FileManager::addRequiredFile(const String& localPath, const String& url, co
                 if (persist) {
                     saveRequiredFiles();
                 }
-                Serial.printf("FileManager: Updated required file metadata: %s\n", localPath.c_str());
+                ESP_LOGI(TAG, "Updated required file metadata: %s", localPath.c_str());
             }
 
             return true;
@@ -960,7 +983,7 @@ bool FileManager::removeRequiredFile(const String& localPath, bool persist) {
     if (persist) {
         saveRequiredFiles();
     }
-    Serial.printf("FileManager: Removed required file: %s\n", localPath.c_str());
+    ESP_LOGI(TAG, "Removed required file: %s", localPath.c_str());
     return true;
 }
 
@@ -969,10 +992,11 @@ void FileManager::checkRequiredFiles() {
     // library every 5 minutes on the loop task froze the device for seconds to minutes.
     for (const auto& file : requiredFiles) {
         if (!fileExists(file.path)) {
-            Serial.printf("FileManager: Required file missing, scheduling download: %s\n", file.path.c_str());
-            scheduleDownload(file.url, file.path, file.checksum);
+            ESP_LOGI(TAG, "Required file missing, scheduling download: %s", file.path.c_str());
+            scheduleDownload(file.url, file.path, file.checksum, false);
         }
     }
+    flushDownloadQueue(); // one write for the whole pass
 }
 
 std::vector<String> FileManager::getRequiredFilesByPattern(const String& pattern) {
@@ -984,7 +1008,7 @@ std::vector<String> FileManager::getRequiredFilesByPattern(const String& pattern
         }
     }
     
-    Serial.printf("FileManager: Found %d required files matching pattern: %s\n", 
+    ESP_LOGI(TAG, "Found %d required files matching pattern: %s", 
                   matchingFiles.size(), pattern.c_str());
     return matchingFiles;
 }
@@ -1012,7 +1036,7 @@ bool FileManager::createDirectoryRecursive(const String& path) {
     
     // Create this directory (returns false if already exists, which is OK)
     if (SD_MMC.mkdir(path)) {
-        Serial.printf("FileManager: Created directory: %s\n", path.c_str());
+        ESP_LOGI(TAG, "Created directory: %s", path.c_str());
         return true;
     }
     
@@ -1022,7 +1046,7 @@ bool FileManager::createDirectoryRecursive(const String& path) {
     if (dirFile) dirFile.close();
     
     if (!exists) {
-        Serial.printf("FileManager: Failed to create directory: %s\n", path.c_str());
+        ESP_LOGW(TAG, "Failed to create directory: %s", path.c_str());
     }
     return exists;
 }
@@ -1033,51 +1057,6 @@ String FileManager::getDirectoryFromPath(const String& path) {
         return "";
     }
     return path.substring(0, lastSlash);
-}
-
-bool FileManager::verifyFileIntegrity(const String& filePath, const String& expectedChecksum) {
-    if (expectedChecksum.isEmpty()) {
-        return true; // No checksum to verify
-    }
-    
-    String actualChecksum = calculateFileChecksum(filePath);
-    return actualChecksum.equalsIgnoreCase(expectedChecksum);
-}
-
-String FileManager::calculateFileChecksum(const String& filePath) {
-    File file = SD_MMC.open(filePath);
-    if (!file) {
-        return "";
-    }
-
-    mbedtls_sha256_context sha256;
-    mbedtls_sha256_init(&sha256);
-    mbedtls_sha256_starts(&sha256, 0);
-
-    uint8_t buffer[512];
-    uint8_t digest[32];
-
-    while (file.available()) {
-        size_t bytesRead = file.read(buffer, sizeof(buffer));
-        if (bytesRead == 0) {
-            break;
-        }
-        mbedtls_sha256_update(&sha256, buffer, bytesRead);
-    }
-
-    file.close();
-
-    mbedtls_sha256_finish(&sha256, digest);
-
-    mbedtls_sha256_free(&sha256);
-
-    char checksum[65];
-    for (size_t index = 0; index < sizeof(digest); ++index) {
-        snprintf(&checksum[index * 2], 3, "%02x", digest[index]);
-    }
-    checksum[64] = '\0';
-
-    return String(checksum);
 }
 
 size_t FileManager::getSDCardTotalSpace() {
@@ -1101,9 +1080,10 @@ void FileManager::refreshFreeSpaceCache() {
     }
     unsigned long t0 = millis();
     cachedFreeBytes = SD_MMC.totalBytes() - SD_MMC.usedBytes();
-    cachedFreeAt = millis();
-    if (cachedFreeAt - t0 > 100) {
-        Serial.printf("FileManager: free-space query took %lu ms\n", cachedFreeAt - t0);
+    const unsigned long t1 = millis();
+    cachedFreeAt = t1;
+    if (t1 - t0 > 100) {
+        ESP_LOGI(TAG, "free-space query took %lu ms", t1 - t0);
     }
 }
 
@@ -1114,10 +1094,10 @@ size_t FileManager::getSDCardFreeSpace() {
     // Never query the FAT while a download is writing (lock contention); otherwise refresh
     // at most once a minute, on the maintenance task. Callers only use this for the status
     // report and a sanity check.
-    if (!downloadInProgress && (cachedFreeAt == 0 || millis() - cachedFreeAt > 60000)) {
+    if (!downloadInProgress && (cachedFreeAt.load() == 0 || millis() - cachedFreeAt.load() > 60000)) {
         requestFreeSpaceRefresh();
     }
-    uint64_t freeBytes = cachedFreeBytes;
+    uint64_t freeBytes = cachedFreeBytes.load();
     if (downloadInProgress && freeBytes > static_cast<uint64_t>(asyncState.totalDownloaded)) {
         freeBytes -= asyncState.totalDownloaded;
     }
@@ -1160,10 +1140,10 @@ uint32_t FileManager::getSDCardFreeMB() {
     if (!sdCardInitialized) {
         return 0;
     }
-    if (!downloadInProgress && (cachedFreeAt == 0 || millis() - cachedFreeAt > 60000)) {
+    if (!downloadInProgress && (cachedFreeAt.load() == 0 || millis() - cachedFreeAt.load() > 60000)) {
         requestFreeSpaceRefresh();
     }
-    uint64_t freeBytes = cachedFreeBytes;
+    uint64_t freeBytes = cachedFreeBytes.load();
     if (downloadInProgress && freeBytes > static_cast<uint64_t>(asyncState.totalDownloaded)) {
         freeBytes -= asyncState.totalDownloaded;
     }
@@ -1214,29 +1194,29 @@ String FileManager::formatBytes(size_t bytes) {
 }
 
 void FileManager::printDownloadQueue() {
-    Serial.printf("Download queue (%d items):\n", downloadQueue.size());
+    ESP_LOGI(TAG, "Download queue (%d items):", downloadQueue.size());
     
     for (size_t i = 0; i < downloadQueue.size(); i++) {
         const auto& task = downloadQueue[i];
-        Serial.printf("  %d. %s -> %s\n", i + 1, task.url.c_str(), task.localPath.c_str());
-        Serial.printf("      Attempts: %d/%d\n", task.retryCount, MAX_RETRY_COUNT);
+        ESP_LOGI(TAG, "  %d. %s -> %s", i + 1, task.url.c_str(), task.localPath.c_str());
+        ESP_LOGI(TAG, "      Attempts: %d/%d", task.retryCount, MAX_RETRY_COUNT);
         
         if (task.lastAttempt > 0) {
             unsigned long timeSince = millis() - task.lastAttempt;
             if (timeSince < RETRY_DELAY_MS) {
-                Serial.printf("      Next retry in %lu seconds\n", (RETRY_DELAY_MS - timeSince) / 1000);
+                ESP_LOGI(TAG, "      Next retry in %lu seconds", (RETRY_DELAY_MS - timeSince) / 1000);
             }
         }
     }
 }
 
 void FileManager::printRequiredFiles() {
-    Serial.printf("Required files (%d items):\n", requiredFiles.size());
+    ESP_LOGI(TAG, "Required files (%d items):", requiredFiles.size());
     
     for (size_t i = 0; i < requiredFiles.size(); i++) {
         const auto& file = requiredFiles[i];
         bool exists = fileExists(file.path);
-        Serial.printf("  %d. %s (exists: %s)\n", 
+        ESP_LOGI(TAG, "  %d. %s (exists: %s)", 
                       i + 1, file.path.c_str(), exists ? "yes" : "no");
     }
 }
@@ -1269,9 +1249,11 @@ bool FileManager::saveDownloadQueue() {
         obj["path"] = task.localPath;
         obj["retries"] = task.retryCount;
         obj["hard"] = task.hardFailures;
-        obj["lastAttempt"] = task.lastAttempt;
         obj["checksum"] = task.checksum;
     }
+    // lastAttempt is a millis() of this boot: meaningless after a reboot, not persisted.
+    queueDirty = false;
+    lastQueueSave = millis();
     return writeJsonAtomic(SD_DOWNLOAD_QUEUE_FILE, doc);
 }
 
@@ -1312,7 +1294,8 @@ bool FileManager::loadDownloadQueue() {
     file.close();
     
     if (error) {
-        Serial.printf("FileManager: Failed to parse download queue: %s\n", error.c_str());
+        ESP_LOGW(TAG, "Failed to parse download queue: %s", error.c_str());
+        quarantineCorrupt(SD_DOWNLOAD_QUEUE_FILE);
         return false;
     }
     
@@ -1324,12 +1307,12 @@ bool FileManager::loadDownloadQueue() {
         task.localPath = obj["path"].as<String>();
         task.retryCount = obj["retries"] | 0;
         task.hardFailures = obj["hard"] | 0;
-        task.lastAttempt = obj["lastAttempt"] | 0;
+        task.lastAttempt = 0; // a previous boot's millis(): the backoff restarts with this boot
         task.checksum = obj["checksum"].as<String>();
         downloadQueue.push_back(task);
     }
     
-    Serial.printf("FileManager: Loaded %d items from download queue\n", downloadQueue.size());
+    ESP_LOGI(TAG, "Loaded %d items from download queue", downloadQueue.size());
     return true;
 }
 
@@ -1349,7 +1332,7 @@ bool FileManager::saveRequiredFiles() {
     if (!writeJsonAtomic(SD_REQUIRED_FILES_FILE, doc)) {
         return false;
     }
-    Serial.printf("FileManager: Saved %d required files to SD card\n", requiredFiles.size());
+    ESP_LOGI(TAG, "Saved %d required files to SD card", requiredFiles.size());
     return true;
 }
 
@@ -1358,7 +1341,7 @@ bool FileManager::loadRequiredFiles() {
     
     File file;
     if (!openJsonForRead(SD_REQUIRED_FILES_FILE, file)) {
-        Serial.println("FileManager: No saved required files found");
+        ESP_LOGI(TAG, "No saved required files found");
         return true;
     }
     
@@ -1367,7 +1350,8 @@ bool FileManager::loadRequiredFiles() {
     file.close();
     
     if (error) {
-        Serial.printf("FileManager: Failed to parse required files: %s\n", error.c_str());
+        ESP_LOGW(TAG, "Failed to parse required files: %s", error.c_str());
+        quarantineCorrupt(SD_REQUIRED_FILES_FILE);
         return false;
     }
     
@@ -1382,7 +1366,7 @@ bool FileManager::loadRequiredFiles() {
         requiredFiles.push_back(entry);
     }
     
-    Serial.printf("FileManager: Loaded %d required files from SD card\n", requiredFiles.size());
+    ESP_LOGI(TAG, "Loaded %d required files from SD card", requiredFiles.size());
     return true;
 }
 
@@ -1401,8 +1385,8 @@ bool FileManager::saveDownloadStats() {
 bool FileManager::loadDownloadStats() {
     if (!sdCardInitialized) return false;
     
-    File file = SD_MMC.open(SD_DOWNLOAD_STATS_FILE, FILE_READ);
-    if (!file) {
+    File file;
+    if (!openJsonForRead(SD_DOWNLOAD_STATS_FILE, file)) {
         // No saved stats, start with defaults (already initialized in constructor)
         return true;
     }
@@ -1412,7 +1396,7 @@ bool FileManager::loadDownloadStats() {
     file.close();
     
     if (error) {
-        Serial.printf("FileManager: Failed to parse download stats: %s\n", error.c_str());
+        ESP_LOGW(TAG, "Failed to parse download stats: %s", error.c_str());
         return false;
     }
     
@@ -1424,33 +1408,38 @@ bool FileManager::loadDownloadStats() {
     return true;
 }
 
-// Callback setters
-void FileManager::setDownloadProgressCallback(DownloadProgressCallback callback) {
-    downloadProgressCallback = callback;
+// An unparseable list is kept as "<file>.bad" (the previous one is replaced) for a post-mortem,
+// so the next save starts a fresh file instead of overwriting the evidence.
+void FileManager::quarantineCorrupt(const char *path) {
+    String src = path;
+    if (!SD_MMC.exists(src)) {
+        src += ".tmp"; // openJsonForRead fell back to the temp file
+        if (!SD_MMC.exists(src)) {
+            return;
+        }
+    }
+    const String bad = String(path) + ".bad";
+    if (SD_MMC.exists(bad)) {
+        SD_MMC.remove(bad);
+    }
+    const bool moved = SD_MMC.rename(src, bad);
+    ESP_LOGW(TAG, "%s unreadable, %s", src.c_str(), moved ? "kept as .bad" : "could not be moved");
+    if (!moved) {
+        SD_MMC.remove(src);
+    }
+    const char *name = strrchr(path, '/');
+    Faults::raise(Fault::SD_FILE_CORRUPT, name ? name + 1 : path, false);
 }
 
 void FileManager::setDownloadCompleteCallback(DownloadCompleteCallback callback) {
     downloadCompleteCallback = callback;
 }
 
-void FileManager::setFileSystemEventCallback(FileSystemEventCallback callback) {
-    fileSystemEventCallback = callback;
-}
-
 // Additional utility methods
 void FileManager::cancelAllDownloads() {
     downloadQueue.clear();
     saveDownloadQueue();
-    Serial.println("FileManager: All downloads cancelled");
-}
-
-void FileManager::retryFailedDownloads() {
-    for (auto& task : downloadQueue) {
-        task.retryCount = 0;
-        task.lastAttempt = 0;
-    }
-    saveDownloadQueue();
-    Serial.println("FileManager: All downloads reset for retry");
+    ESP_LOGI(TAG, "All downloads cancelled");
 }
 
 int FileManager::getPendingDownloadsCount() {
@@ -1491,13 +1480,58 @@ bool FileManager::cancelQueuedDownload(const String &path) {
 }
 
 void FileManager::cleanupTempFiles() {
-    std::vector<String> tempFiles = listFiles("/temp");
-    for (const auto& file : tempFiles) {
-        String fullPath = "/temp/" + file;
-        if (file.endsWith(".tmp") || file.endsWith(".partial")) {
-            deleteFile(fullPath);
-            Serial.printf("FileManager: Cleaned up temp file: %s\n", fullPath.c_str());
+    if (!sdCardInitialized || tmpSweepPending.load()) {
+        return;
+    }
+    tmpSweepPending = true; // holds new downloads off until the sweep is done
+    if (!enqueueJob(4, "/assets", nullptr, 0)) {
+        tmpSweepPending = false;
+        ESP_LOGW(TAG, "temp-file sweep could not be queued");
+    }
+}
+
+// Maintenance task. A "*.tmp" under /assets is a download cut by a reset or power loss (a
+// finished download is renamed); none is being written while tmpSweepPending is set.
+void FileManager::sweepOrphanedTempFiles() {
+    int removed = 0;
+    unsigned long t0 = millis();
+    sweepTempDir("/assets", 0, removed);
+    if (removed > 0) {
+        ESP_LOGI(TAG, "removed %d orphaned temp file(s) (%lu ms)", removed, millis() - t0);
+    }
+}
+
+void FileManager::sweepTempDir(const String &dir, int depth, int &removed) {
+    if (depth > 6) {
+        return;
+    }
+    File d = SD_MMC.open(dir);
+    if (!d || !d.isDirectory()) {
+        if (d) d.close();
+        return;
+    }
+    std::vector<String> subdirs;
+    std::vector<String> temps;
+    for (File e = d.openNextFile(); e; e = d.openNextFile()) {
+        String full = dir;
+        if (!full.endsWith("/")) full += "/";
+        full += e.name();
+        if (e.isDirectory()) {
+            subdirs.push_back(full);
+        } else if (full.endsWith(".tmp")) {
+            temps.push_back(full);
         }
+        e.close();
+    }
+    d.close();
+    for (const String &t : temps) {
+        if (SD_MMC.remove(t)) {
+            removed++;
+            ESP_LOGI(TAG, "Cleaned up temp file: %s", t.c_str());
+        }
+    }
+    for (const String &sub : subdirs) {
+        sweepTempDir(sub, depth + 1, removed);
     }
 }
 
@@ -1507,27 +1541,23 @@ void FileManager::resetDownloadStats() {
     downloadStats.failedDownloads = 0;
     downloadStats.totalBytesDownloaded = 0;
     saveDownloadStats();
-    Serial.println("FileManager: Download statistics reset");
+    ESP_LOGI(TAG, "Download statistics reset");
 }
 
 bool FileManager::removeDirectory(const String& path) {
     bool success = SD_MMC.rmdir(path);
     
-    if (fileSystemEventCallback) {
-        fileSystemEventCallback("rmdir", path, success);
-    }
-    
     if (success) {
-        Serial.printf("FileManager: Directory removed successfully: %s\n", path.c_str());
+        ESP_LOGI(TAG, "Directory removed successfully: %s", path.c_str());
     } else {
-        Serial.printf("FileManager: Failed to remove directory: %s\n", path.c_str());
+        ESP_LOGW(TAG, "Failed to remove directory: %s", path.c_str());
     }
     
     return success;
 }
 
 void FileManager::printFileTree() {
-    Serial.println("=== SD Card File Tree ===");
+    ESP_LOGI(TAG, "=== SD Card File Tree ===");
 
     std::function<void(const String&, int)> printTree = [&](const String& dir, int depth) {
         File dirFile = SD_MMC.open(dir);
@@ -1540,17 +1570,18 @@ void FileManager::printFileTree() {
             File entry = dirFile.openNextFile();
             if (!entry) break;
 
-            for (int i = 0; i < depth; ++i) Serial.print("  ");
+            String indent;
+            for (int i = 0; i < depth; ++i) indent += "  ";
             String name = entry.name();
             if (entry.isDirectory()) {
-                Serial.printf("%s/\n", name.c_str());
+                ESP_LOGI(TAG, "%s%s/", indent.c_str(), name.c_str());
                 String subDir = dir;
                 if (!subDir.endsWith("/")) subDir += "/";
                 subDir += name;
                 entry.close();
                 printTree(subDir, depth + 1);
             } else {
-                Serial.println(name);
+                ESP_LOGI(TAG, "%s%s", indent.c_str(), name.c_str());
                 entry.close();
             }
         }
@@ -1558,17 +1589,17 @@ void FileManager::printFileTree() {
     };
 
     printTree("/", 0);
-    Serial.println("==========================");
+    ESP_LOGI(TAG, "==========================");
 }
 
 void FileManager::formatSDCard() {
-    Serial.println("=== Formatting SD Card ===");
+    ESP_LOGI(TAG, "=== Formatting SD Card ===");
     
     if (!sdCardInitialized) {
-        Serial.println("SD card not initialized - run sddiag first");
+        ESP_LOGW(TAG, "SD card not initialized - run sddiag first");
         return;
     }
-    Serial.println("Formatting...");
+    ESP_LOGI(TAG, "Formatting...");
 
     // Remove all files and directories recursively
     std::function<void(const String&)> removeAll = [&](const String& dir) {
@@ -1598,18 +1629,14 @@ void FileManager::formatSDCard() {
 
     removeAll("/");
 
-    // Optionally recreate standard directories
-    createDirectory("/audio");
-    createDirectory("/temp");
-    createDirectory("/logs");
-    createDirectory("/images");
+    createDirectory("/assets");
 
-    Serial.println("Format complete. All files and directories removed.");
+    ESP_LOGI(TAG, "Format complete. All files and directories removed.");
 }
 
 // Bulk deletion methods implementation
 void FileManager::clearAllRequiredFiles() {
-    Serial.println("FileManager: Clearing all required files from NVS and storage...");
+    ESP_LOGI(TAG, "Clearing all required files from NVS and storage...");
     
     int filesDeleted = 0;
     int filesNotFound = 0;
@@ -1619,13 +1646,13 @@ void FileManager::clearAllRequiredFiles() {
         if (fileExists(file.path)) {
             if (deleteFile(file.path)) {
                 filesDeleted++;
-                Serial.printf("Deleted: %s\n", file.path.c_str());
+                ESP_LOGI(TAG, "Deleted: %s", file.path.c_str());
             } else {
-                Serial.printf("Failed to delete: %s\n", file.path.c_str());
+                ESP_LOGW(TAG, "Failed to delete: %s", file.path.c_str());
             }
         } else {
             filesNotFound++;
-            Serial.printf("File not found: %s\n", file.path.c_str());
+            ESP_LOGI(TAG, "File not found: %s", file.path.c_str());
         }
     }
     
@@ -1637,75 +1664,15 @@ void FileManager::clearAllRequiredFiles() {
     downloadQueue.clear();
     saveDownloadQueue();
     
-    Serial.printf("FileManager: Cleared all required files. Deleted %d files, %d were already missing.\n", 
+    ESP_LOGI(TAG, "Cleared all required files. Deleted %d files, %d were already missing.", 
                  filesDeleted, filesNotFound);
-}
-
-bool FileManager::deleteFigureFiles(const String& figureId) {
-    Serial.printf("FileManager: Deleting all files for figure ID: %s\n", figureId.c_str());
-    
-    String figureDir = "/figures/" + figureId;
-    int filesDeleted = 0;
-    int requiredFilesRemoved = 0;
-    
-    // Remove files from required files list that belong to this figure
-    auto it = requiredFiles.begin();
-    while (it != requiredFiles.end()) {
-        if (it->path.startsWith(figureDir)) {
-            Serial.printf("Removing from required list: %s\n", it->path.c_str());
-            it = requiredFiles.erase(it);
-            requiredFilesRemoved++;
-        } else {
-            ++it;
-        }
-    }
-    
-    // Remove from download queue as well
-    auto queueIt = downloadQueue.begin();
-    while (queueIt != downloadQueue.end()) {
-        if (queueIt->localPath.startsWith(figureDir)) {
-            Serial.printf("Removing from download queue: %s\n", queueIt->localPath.c_str());
-            queueIt = downloadQueue.erase(queueIt);
-        } else {
-            ++queueIt;
-        }
-    }
-    
-    // Delete the entire figure directory from storage
-    if (fileExists(figureDir)) {
-        // List all files in the figure directory recursively and delete them
-        std::vector<String> allFiles = listFiles(figureDir);
-        for (const String& file : allFiles) {
-            String fullPath = figureDir + "/" + file;
-            if (deleteFile(fullPath)) {
-                filesDeleted++;
-                Serial.printf("Deleted file: %s\n", fullPath.c_str());
-            }
-        }
-        
-        // Try to remove the directory structure
-        if (removeDirectory(figureDir)) {
-            Serial.printf("Removed directory: %s\n", figureDir.c_str());
-        }
-    } else {
-        Serial.printf("Figure directory does not exist: %s\n", figureDir.c_str());
-    }
-    
-    // Save updated required files and download queue
-    saveRequiredFiles();
-    saveDownloadQueue();
-    
-    Serial.printf("FileManager: Figure deletion complete. Removed %d required file entries, deleted %d files.\n", 
-                 requiredFilesRemoved, filesDeleted);
-    
-    return true;
 }
 
 // Sequential write benchmark with per-write timing. No network involved: isolates the
 // card's own behaviour (e.g. periodic multi-second pauses) from the download pipeline.
 void FileManager::benchmarkSequentialWrite(size_t chunkBytes, int count) {
     if (!sdCardInitialized || downloadInProgress || !persistentBufferA) {
-        Serial.println("FileManager: bench unavailable (SD not ready or download in progress)");
+        ESP_LOGI(TAG, "bench unavailable (SD not ready or download in progress)");
         return;
     }
     if (chunkBytes == 0 || chunkBytes > DOWNLOAD_BUFFER_SIZE) {
@@ -1714,14 +1681,14 @@ void FileManager::benchmarkSequentialWrite(size_t chunkBytes, int count) {
     if (count <= 0) {
         count = 64;
     }
-    const char* path = "/temp/bench.bin";
-    createDirectory("/temp");
+    createDirectory(SD_DATA_DIR);
+    const char* path = "/.filemanager/bench.bin";
     if (SD_MMC.exists(path)) {
         SD_MMC.remove(path);
     }
     File f = SD_MMC.open(path, FILE_WRITE);
     if (!f) {
-        Serial.println("FileManager: bench: cannot open file");
+        ESP_LOGW(TAG, "bench: cannot open file");
         return;
     }
     for (size_t i = 0; i < chunkBytes; ++i) {
@@ -1735,7 +1702,7 @@ void FileManager::benchmarkSequentialWrite(size_t chunkBytes, int count) {
         size_t written = f.write(persistentBufferA, chunkBytes);
         unsigned long dt = micros() - ws;
         if (written != chunkBytes) {
-            Serial.printf("FileManager: bench: short write at #%d (%u/%u)\n", i, (unsigned)written, (unsigned)chunkBytes);
+            ESP_LOGW(TAG, "bench: short write at #%d (%u/%u)", i, (unsigned)written, (unsigned)chunkBytes);
             break;
         }
         if (dt < minUs) minUs = dt;
@@ -1743,7 +1710,7 @@ void FileManager::benchmarkSequentialWrite(size_t chunkBytes, int count) {
         sumUs += dt;
         if (dt > 300000) {
             slow++;
-            Serial.printf("FileManager: bench: write #%d took %lu ms\n", i, dt / 1000);
+            ESP_LOGI(TAG, "bench: write #%d took %lu ms", i, dt / 1000);
         }
     }
     unsigned long fs = micros();
@@ -1752,7 +1719,7 @@ void FileManager::benchmarkSequentialWrite(size_t chunkBytes, int count) {
     f.close();
     unsigned long total = millis() - t0;
     SD_MMC.remove(path);
-    Serial.printf("FileManager: bench: %d x %u KB: min %.1f ms, avg %.1f ms, max %.1f ms, >300ms: %d, flush %lu ms, total %lu ms = %.2f MB/s\n",
+    ESP_LOGI(TAG, "bench: %d x %u KB: min %.1f ms, avg %.1f ms, max %.1f ms, >300ms: %d, flush %lu ms, total %lu ms = %.2f MB/s",
                   count, (unsigned)(chunkBytes / 1024), minUs / 1000.0, (sumUs / 1000.0) / count, maxUs / 1000.0,
                   slow, flushUs / 1000, total, total > 0 ? (count * (double)chunkBytes) / (total / 1000.0) / 1048576.0 : 0.0);
 }
@@ -1766,24 +1733,28 @@ void FileManager::benchmarkSequentialWrite(size_t chunkBytes, int count) {
 // deleted on a 200 ms timer: `assert failed: xQueueGenericSend queue.c:936`, reproducible on
 // every multi-megabyte download).
 
-void FileManager::requestAsyncFinish(bool success, const char *error, bool permanent) {
-    if (asyncState.finishRequested) {
+// Called from the async_tcp task and from the SD writer: the first caller wins the
+// compare-exchange; the loop task only reads the result after FINISH_READY is published.
+void FileManager::requestAsyncFinish(bool success, const char *error, bool permanent, uint8_t kind) {
+    uint8_t expected = FINISH_NONE;
+    if (!asyncState.finishState.compare_exchange_strong(expected, FINISH_CLAIMED, std::memory_order_acq_rel)) {
         return;
     }
     asyncState.finishSuccess = success;
     asyncState.permanentFailure = permanent;
+    asyncState.finishKind = kind;
     strncpy(asyncState.finishError, error ? error : "", sizeof(asyncState.finishError) - 1);
     asyncState.finishError[sizeof(asyncState.finishError) - 1] = '\0';
-    asyncState.finishRequested = true;
+    asyncState.finishState.store(FINISH_READY, std::memory_order_release);
 }
 
 void FileManager::onAsyncConnect(void* arg, AsyncClient* client) {
     FileManager* self = static_cast<FileManager*>(arg);
-    if (self->asyncState.finishRequested) {
+    if (self->asyncState.finishState.load(std::memory_order_acquire) != FINISH_NONE) {
         return;
     }
     self->asyncState.connectTime = millis() - self->asyncState.startTime;
-    Serial.printf("FileManager: Connected in %lu ms\n", self->asyncState.connectTime);
+    ESP_LOGI(TAG, "Connected in %lu ms", self->asyncState.connectTime);
 
     String hostname = self->asyncState.url;
     if (hostname.startsWith("http://")) {
@@ -1800,20 +1771,18 @@ void FileManager::onAsyncConnect(void* arg, AsyncClient* client) {
     request += "User-Agent: TilkieTalkie/1.0 (ESP32-S3)\r\n";
     request += "\r\n";
     client->write(request.c_str(), request.length());
-    self->asyncState.lastDataTime = millis();
 }
 
 void FileManager::onAsyncData(void* arg, AsyncClient* client, void* data, size_t len) {
     FileManager* self = static_cast<FileManager*>(arg);
-    if (self->asyncState.finishRequested) {
+    if (self->asyncState.finishState.load(std::memory_order_acquire) != FINISH_NONE) {
         return; // finishing; ignore whatever else the server sends
     }
     unsigned long dataCallbackStart = millis();
-    self->asyncState.lastDataTime = dataCallbackStart;
 
     auto bufferBodyData = [&](const uint8_t* chunk, size_t chunkLen) -> bool {
         if (!self->ringPush(chunk, chunkLen)) {
-            self->requestAsyncFinish(false, "SD writer stalled (ring full)");
+            self->requestAsyncFinish(false, "SD writer stalled (ring full)", false, FK_STALLED);
             return false;
         }
         return true;
@@ -1861,10 +1830,10 @@ void FileManager::onAsyncData(void* arg, AsyncClient* client, void* data, size_t
         const char* contentLengthPtr = strcasestr(self->asyncState.headerBuffer, "content-length:");
         if (contentLengthPtr) {
             self->asyncState.contentLength = atoi(contentLengthPtr + 15);
-            Serial.printf("FileManager: Content-Length: %d bytes\n", self->asyncState.contentLength);
+            ESP_LOGI(TAG, "Content-Length: %d bytes", self->asyncState.contentLength);
             if (self->asyncState.contentLength > 0 &&
                 static_cast<uint64_t>(self->asyncState.contentLength) + (1024 * 1024) > self->asyncState.freeBytesAtStart) {
-                self->requestAsyncFinish(false, "Insufficient SD card space");
+                self->requestAsyncFinish(false, "Insufficient SD card space", false, FK_NO_SPACE);
                 return;
             }
         }
@@ -1889,7 +1858,7 @@ void FileManager::onAsyncData(void* arg, AsyncClient* client, void* data, size_t
 
     unsigned long callbackDuration = millis() - dataCallbackStart;
     if (callbackDuration > 500) {
-        Serial.printf("FileManager: slow onData callback: %lu ms (%u bytes)\n", callbackDuration, (unsigned)len);
+        ESP_LOGI(TAG, "slow onData callback: %lu ms (%u bytes)", callbackDuration, (unsigned)len);
     }
 
     if (self->asyncState.contentLength > 0) {
@@ -1898,13 +1867,9 @@ void FileManager::onAsyncData(void* arg, AsyncClient* client, void* data, size_t
             self->asyncState.lastReportedProgress = progress;
             unsigned long elapsed = millis() - self->asyncState.startTime;
             float mbps = elapsed > 0 ? (self->asyncState.totalDownloaded * 8.0f) / (elapsed / 1000.0f) / 1e6f : 0;
-            Serial.printf("FileManager: progress %d%% (%d/%d bytes) %.2f Mbps, %d SD writes\n",
-                          progress, self->asyncState.totalDownloaded, self->asyncState.contentLength,
+            ESP_LOGI(TAG, "progress %d%% (%u/%d bytes) %.2f Mbps, %d SD writes",
+                          progress, (unsigned)self->asyncState.totalDownloaded, self->asyncState.contentLength,
                           mbps, self->asyncState.writeCount);
-            if (self->downloadProgressCallback) {
-                self->downloadProgressCallback(self->asyncState.url, self->asyncState.localPath, progress,
-                                               self->asyncState.totalDownloaded, self->asyncState.contentLength);
-            }
         }
     }
 }
@@ -1925,7 +1890,7 @@ void FileManager::onAsyncError(void* arg, AsyncClient* client, int8_t error) {
 
 void FileManager::onAsyncTimeout(void* arg, AsyncClient* client, uint32_t time) {
     FileManager* self = static_cast<FileManager*>(arg);
-    self->requestAsyncFinish(false, "Network timeout");
+    self->requestAsyncFinish(false, "Network timeout", false, FK_STALLED);
 }
 
 // Hand the full network buffer to the SD writer (called from onAsyncData). Waits for the
@@ -1946,13 +1911,14 @@ bool FileManager::ringPush(const uint8_t* data, size_t len) {
             continue;
         }
         size_t n = len < space ? len : space;
-        size_t headIdx = asyncState.ringHead % RING_SIZE;
+        const size_t head = asyncState.ringHead.load(std::memory_order_relaxed); // only this task writes it
+        size_t headIdx = head % RING_SIZE;
         size_t first = (RING_SIZE - headIdx) < n ? (RING_SIZE - headIdx) : n;
         memcpy(ringBuffer + headIdx, data, first);
         if (n > first) {
             memcpy(ringBuffer, data + first, n - first);
         }
-        asyncState.ringHead += n;
+        asyncState.ringHead.store(head + n, std::memory_order_release); // bytes visible before the index
         asyncState.totalDownloaded += n;
         data += n;
         len -= n;
@@ -1976,7 +1942,8 @@ void FileManager::sdWriteTask(void* parameter) {
         }
         if (avail >= DOWNLOAD_BUFFER_SIZE || flushTail) {
             size_t n = avail < DOWNLOAD_BUFFER_SIZE ? avail : DOWNLOAD_BUFFER_SIZE;
-            size_t tailIdx = self->asyncState.ringTail % RING_SIZE;
+            const size_t tail = self->asyncState.ringTail.load(std::memory_order_relaxed); // only this task writes it
+            size_t tailIdx = tail % RING_SIZE;
             size_t first = (RING_SIZE - tailIdx) < n ? (RING_SIZE - tailIdx) : n;
             memcpy(self->persistentBufferA, self->ringBuffer + tailIdx, first);
             if (n > first) {
@@ -1989,20 +1956,23 @@ void FileManager::sdWriteTask(void* parameter) {
                 mbedtls_sha256_update(&self->asyncState.sha, self->persistentBufferA, written);
             }
             self->asyncState.totalWriteTime += (writeTime / 1000);
+            if (writeTime / 1000 > self->asyncState.maxWriteMs) {
+                self->asyncState.maxWriteMs = writeTime / 1000; // SD_SLOW is raised by the loop task
+            }
             self->asyncState.writeCount++;
             if (writeTime > 300000) {
-                Serial.printf("FileManager: slow SD write #%d: %lu ms for %u bytes (ring backlog %u KB)\n",
+                ESP_LOGI(TAG, "slow SD write #%d: %lu ms for %u bytes (ring backlog %u KB)",
                               self->asyncState.writeCount, writeTime / 1000, (unsigned)n,
                               (unsigned)(self->ringAvailable() / 1024));
             }
             if (written != n) {
-                Serial.printf("FileManager: SD write #%d short: %u/%u bytes\n",
+                ESP_LOGW(TAG, "SD write #%d short: %u/%u bytes",
                               self->asyncState.writeCount, (unsigned)written, (unsigned)n);
-                self->requestAsyncFinish(false, "SD write failed");
+                self->requestAsyncFinish(false, "SD write failed", false, FK_SD_WRITE);
                 self->asyncState.discardRing = true;
                 break;
             }
-            self->asyncState.ringTail += n;
+            self->asyncState.ringTail.store(tail + n, std::memory_order_release); // slot free for the producer
             continue;
         }
         if (!self->asyncState.writeTaskRunning && avail == 0) {
@@ -2067,7 +2037,7 @@ void FileManager::finalizeAsyncDownload() {
             delay(10);
         }
         if (!asyncState.writerExited) {
-            Serial.println("FileManager: SD writer did not exit; leaking its semaphore rather than crashing");
+            ESP_LOGW(TAG, "SD writer did not exit; leaking its semaphore rather than crashing");
             asyncState.dataAvailable = nullptr;
         }
         asyncState.writeTaskHandle = nullptr;
@@ -2106,9 +2076,13 @@ void FileManager::finalizeAsyncDownload() {
         if (bytesWritten == 0) {
             success = false;
             errorMsg = "No data received";
-        } else if (asyncState.contentLength > 0 && bytesWritten != static_cast<size_t>(asyncState.contentLength)) {
+        } else if (asyncState.contentLength > 0 && bytesWritten < static_cast<size_t>(asyncState.contentLength)) {
+            // The server closed early (proxy timeout, link drop): transient, retried with backoff.
             success = false;
-            hardFailure = true;
+            errorMsg = "Incomplete: wrote " + String(bytesWritten) + " expected " + String(asyncState.contentLength);
+        } else if (asyncState.contentLength > 0 && bytesWritten > static_cast<size_t>(asyncState.contentLength)) {
+            success = false;
+            hardFailure = true; // more bytes than announced: the server is broken, not the link
             errorMsg = "Size mismatch: wrote " + String(bytesWritten) + " expected " + String(asyncState.contentLength);
         } else if (!asyncState.checksum.isEmpty() && !actualSha.equalsIgnoreCase(asyncState.checksum)) {
             success = false;
@@ -2123,6 +2097,22 @@ void FileManager::finalizeAsyncDownload() {
         if (!SD_MMC.rename(asyncState.tempPath, asyncState.localPath)) {
             success = false;
             errorMsg = "Failed to rename temp file";
+            Faults::raise(Fault::SD_WRITE_FAILED, faultDetail(asyncState.localPath).c_str(), false);
+        }
+    }
+    // Faults are raised here, on the loop task (Faults is not thread-safe); the callbacks and
+    // the SD writer only record what happened.
+    if (asyncState.maxWriteMs > SD_SLOW_WRITE_MS) {
+        char d[24];
+        snprintf(d, sizeof(d), "write=%lums", asyncState.maxWriteMs);
+        Faults::raise(Fault::SD_SLOW, d, false);
+    }
+    if (!success) {
+        switch (asyncState.finishKind) {
+        case FK_STALLED: Faults::raise(Fault::DOWNLOAD_STALLED, faultDetail(asyncState.localPath).c_str(), false); break;
+        case FK_NO_SPACE: Faults::raise(Fault::SD_FULL, faultDetail(asyncState.localPath).c_str()); break;
+        case FK_SD_WRITE: Faults::raise(Fault::SD_WRITE_FAILED, faultDetail(asyncState.localPath).c_str(), false); break;
+        default: break;
         }
     }
     if (!success && SD_MMC.exists(asyncState.tempPath)) {
@@ -2139,15 +2129,17 @@ void FileManager::finalizeAsyncDownload() {
         downloadStats.totalBytesDownloaded += bytesWritten;
         unsigned long totalTime = millis() - asyncState.startTime;
         float mbps = totalTime > 0 ? (bytesWritten * 8.0f) / (totalTime / 1000.0f) / 1e6f : 0;
-        Serial.printf("FileManager: Download completed: %s (%u bytes, %.2f Mbps, %d SD writes, %lu ms in SD writes)%s\n",
+        ESP_LOGI(TAG, "Download completed: %s (%u bytes, %.2f Mbps, %d SD writes, %lu ms in SD writes)%s",
                       asyncState.localPath.c_str(), (unsigned)bytesWritten, mbps, asyncState.writeCount,
                       asyncState.totalWriteTime, asyncState.checksum.isEmpty() ? "" : ", sha256 verified");
         if (it != downloadQueue.end()) {
             downloadQueue.erase(it);
             saveDownloadQueue();
         }
-        if (cachedFreeBytes > bytesWritten) {
-            cachedFreeBytes -= bytesWritten;
+        uint64_t freeNow = cachedFreeBytes.load();
+        while (freeNow > bytesWritten &&
+               !cachedFreeBytes.compare_exchange_weak(freeNow, freeNow - bytesWritten)) {
+            // the maintenance task refreshed it meanwhile: retry against the new value
         }
         const String url = asyncState.url, path = asyncState.localPath;
         downloadInProgress = false;
@@ -2170,17 +2162,22 @@ void FileManager::finalizeAsyncDownload() {
         }
         if (terminal) {
             downloadQueue.erase(it);
+            saveDownloadQueue();
+        } else {
+            queueDirty = true; // retry bookkeeping: flushed by update()
         }
-        saveDownloadQueue();
     } else {
         terminal = true; // ad-hoc download (not queued): nothing will retry it
     }
-    Serial.printf("FileManager: Download failed: %s (%s)%s\n", asyncState.localPath.c_str(), errorMsg.c_str(),
+    ESP_LOGW(TAG, "Download failed: %s (%s)%s", asyncState.localPath.c_str(), errorMsg.c_str(),
                   terminal ? " - giving up" : " - will retry");
     const String url = asyncState.url, path = asyncState.localPath;
     downloadInProgress = false;
     asyncState.reset();
     saveDownloadStats();
+    if (terminal) {
+        Faults::raise(Fault::DOWNLOAD_FAILED, faultDetail(path).c_str(), false);
+    }
     if (terminal && downloadCompleteCallback) {
         downloadCompleteCallback(url, path, false, errorMsg);
     }

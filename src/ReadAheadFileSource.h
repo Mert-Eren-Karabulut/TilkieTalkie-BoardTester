@@ -22,7 +22,7 @@ public:
     uint32_t read(void* data, uint32_t len) override;
     bool seek(int32_t pos, int dir) override;
     bool close() override;
-    bool isOpen() override { return fileOpen; }
+    bool isOpen() override { return fileOpen.load(); }
     uint32_t getSize() override { return fileSize; }
     uint32_t getPos() override { return tail.load(); }
 
@@ -34,7 +34,13 @@ public:
 private:
     static void readerTaskEntry(void* arg);
     void readerLoop();
-    void parkReader();    // make the reader let go of the file (open/seek/close)
+    // Park handshake. The reader owns the File only while it holds READER_BUSY; open/seek/close
+    // run only after winning READER_IDLE -> READER_PARKED, so they never touch the File while
+    // the reader is inside read(). parkReader() gives up after PARK_TIMEOUT_MS (a card stuck
+    // for that long) and the operation fails instead of racing the reader.
+    enum : uint8_t { READER_IDLE = 0, READER_BUSY = 1, READER_PARKED = 2 };
+    static const uint32_t PARK_TIMEOUT_MS = 5000;
+    bool parkReader();    // true: parked (the caller owns the File and the indices)
     void unparkReader();
 
     const size_t ringSize;
@@ -42,13 +48,13 @@ private:
     uint8_t* ring = nullptr;      // PSRAM
     uint8_t* bounce = nullptr;    // internal, DMA-capable (SD reads)
     File file;
-    volatile bool fileOpen = false;
+    std::atomic<bool> fileOpen{false};
     uint32_t fileSize = 0;
     std::atomic<uint32_t> head{0};  // file offset of the next byte the reader stores
     std::atomic<uint32_t> tail{0};  // file offset of the next byte the decoder reads
     std::atomic<bool> eof{false};
-    std::atomic<bool> parkRequested{true};
-    std::atomic<bool> parked{true};
+    std::atomic<bool> parkRequested{true};          // owner wants the File: the reader stops claiming it
+    std::atomic<uint8_t> readerState{READER_PARKED}; // see the handshake above
     std::atomic<uint32_t> underrunCount{0};
     TaskHandle_t task = nullptr;
     SemaphoreHandle_t dataSem = nullptr;   // reader -> decoder: bytes arrived / eof

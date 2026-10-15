@@ -7,7 +7,10 @@
 #include "Faults.h"
 #include <esp_random.h>
 #include <esp_task_wdt.h>
+#include <esp_log.h>
 #include <algorithm>
+
+static const char *TAG = "api";
 
 // Initialize static members
 const char* RequestManager::NVS_NAMESPACE = "requestmgr";
@@ -71,18 +74,12 @@ RequestManager &RequestManager::getInstance(const String &baseUrl)
 // Constructor
 RequestManager::RequestManager(const String &baseUrl)
     : timeout(8000)
-    , lastStatusCode(0)
-    , figureDownloadCompleteCallback(nullptr)
     , nvsHandle(0)
+    , figureDownloadCompleteCallback(nullptr)
 {
     httpLock = xSemaphoreCreateRecursiveMutex();
     jobLock = xSemaphoreCreateRecursiveMutex();
-    setBaseUrl(baseUrl);
-    // Convert HTTPS to HTTP for memory efficiency
-    this->baseUrl = baseUrl;
-    if (this->baseUrl.startsWith("https://")) {
-        this->baseUrl.replace("https://", "http://");
-    }
+    setBaseUrl(baseUrl); // https:// stays https:// (verified against the CA bundle)
 }
 
 // Destructor
@@ -102,14 +99,19 @@ RequestManager::~RequestManager()
 // Initialization
 bool RequestManager::begin()
 {
-    Serial.println(F("RequestManager: Initializing..."));
+    ESP_LOGI(TAG, "Initializing...");
     
     if (!initializeNVS()) {
-        Serial.println(F("RequestManager: Failed to initialize NVS"));
+        ESP_LOGW(TAG, "Failed to initialize NVS");
         return false;
     }
     
     loadUidMappings();
+
+    // NVS could not be opened by ConfigManager at boot (it ran before Faults existed).
+    if (ConfigManager::getInstance().takeOpenFailure()) {
+        Faults::raise(Fault::CONFIG_CORRUPT, "config");
+    }
     
     FileManager &fileManager = FileManager::getInstance();
     fileManager.createDirectory(SD_DATA_DIR);
@@ -119,8 +121,7 @@ bool RequestManager::begin()
 
     initConnection();
 
-    Serial.println(authToken.length() > 0 ? F("RequestManager: Initialized with token") 
-                                           : F("RequestManager: No token available"));
+    ESP_LOGI(TAG, "%s", authToken.length() > 0 ? "Initialized with token" : "No token available");
     return authToken.length() > 0;
 }
 
@@ -135,7 +136,7 @@ void RequestManager::setBaseUrl(const String &url)
     } else {
         client = &plainClient;
     }
-    Serial.printf("RequestManager: API base %s (%s)\n", baseUrl.c_str(),
+    ESP_LOGI(TAG, "API base %s (%s)", baseUrl.c_str(),
                   client == &secureClient ? "TLS, CA bundle" : "plain HTTP");
 }
 
@@ -152,6 +153,7 @@ void RequestManager::setTimeout(int timeoutMs)
 
 void RequestManager::update()
 {
+    raiseDeferredFaults();
     dispatchCompletedJobs();
     serviceManifestRecheck();
 
@@ -197,12 +199,12 @@ JsonDocument RequestManager::parseResponse(const String& response)
     DeserializationError error = deserializeJson(doc, response);
 
     if (error) {
-        lastError = String("JSON parsing error: ") + error.c_str();
-        Serial.println("RequestManager: " + lastError);
+        const String message = String("JSON parsing error: ") + error.c_str();
+        ESP_LOGE(TAG, "%s", message.c_str());
         
         JsonDocument errorDoc(&psramJsonAllocator);
         errorDoc["error"] = true;
-        errorDoc["message"] = lastError;
+        errorDoc["message"] = message;
         return errorDoc;
     }
 
@@ -257,7 +259,7 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
         // 65 s) fails at the first write. Drop it and try once more on a fresh connection.
         http.end();
         client->stop();
-        Serial.printf("RequestManager: %s %s failed (%d) on a reused connection - retrying\n", method.c_str(), endpoint.c_str(), code);
+        ESP_LOGW(TAG, "%s %s failed (%d) on a reused connection - retrying", method.c_str(), endpoint.c_str(), code);
         if (!http.begin(*client, url)) {
             error = "Failed to connect to " + url;
             return 0;
@@ -278,7 +280,7 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
         http.end();
         if (!retrying) {
             retrying = true;
-            Serial.println("RequestManager: 401 - refreshing hub token and retrying once");
+            ESP_LOGI(TAG, "401 - refreshing hub token and retrying once");
             authToken = "";
             ConfigManager::getInstance().setJWTToken(String());
             initConnection();
@@ -289,7 +291,7 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
             }
         }
         error = "Unauthorized";
-        Faults::raise(Fault::TOKEN_REJECTED, endpoint.substring(0, 39).c_str());
+        deferFault((uint16_t)Fault::TOKEN_REJECTED, endpoint.substring(0, 39).c_str(), true);
         return code;
     }
 
@@ -299,9 +301,9 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
         if (code != 204 && code != 304 && http.getSize() != 0) {
             body = http.getString();
         }
-        Serial.printf("RequestManager: %s %s -> %d (%u bytes)\n", method.c_str(), endpoint.c_str(), code, (unsigned)body.length());
+        ESP_LOGI(TAG, "%s %s -> %d (%u bytes)", method.c_str(), endpoint.c_str(), code, (unsigned)body.length());
         if (body.length() > 0 && body.length() < 600 && !endpoint.endsWith("/token")) {
-            Serial.println("RequestManager: body: " + body); // small bodies only (never the token)
+            ESP_LOGD(TAG, "body: %s", body.c_str()); // small bodies only (never the token)
         }
         http.end();
         return code;
@@ -318,11 +320,11 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
         errorDetail = errorMessages[errorIndex];
     }
     error = String("HTTP ") + method + " failed: " + String(code) + " (" + errorDetail + ")";
-    Serial.println("RequestManager: " + error);
+    ESP_LOGW(TAG, "%s", error.c_str());
     {
         char d[40];
         snprintf(d, sizeof(d), "%d %.30s", code, endpoint.c_str());
-        Faults::raise(Fault::PORTAL_UNREACHABLE, d, false);
+        deferFault((uint16_t)Fault::PORTAL_UNREACHABLE, d, false);
     }
     http.end();
     return code;
@@ -336,10 +338,9 @@ JsonDocument RequestManager::responseToDocument(int code, const String& body, co
         }
         return parseResponse(body);
     }
-    lastError = error.isEmpty() ? String("HTTP ") + String(code) : error;
     JsonDocument errorDoc(&psramJsonAllocator);
     errorDoc["error"] = true;
-    errorDoc["message"] = lastError;
+    errorDoc["message"] = error.isEmpty() ? String("HTTP ") + String(code) : error;
     return errorDoc;
 }
 
@@ -348,8 +349,34 @@ JsonDocument RequestManager::executeHttpRequest(const String& endpoint, const St
 {
     String body, error;
     int code = performHttp(endpoint, method, payload, body, error);
-    lastStatusCode = code;
     return responseToDocument(code, body, error);
+}
+
+void RequestManager::deferFault(uint16_t code, const char *detail, bool speak)
+{
+    DeferredFault f;
+    f.code = code;
+    strlcpy(f.detail, detail ? detail : "", sizeof(f.detail));
+    f.speak = speak;
+    LockGuard guard(jobLock);
+    if (deferredFaults.size() < 8) { // Faults dedupes repeats anyway; never grow without bound
+        deferredFaults.push_back(f);
+    }
+}
+
+void RequestManager::raiseDeferredFaults()
+{
+    std::vector<DeferredFault> pending;
+    {
+        LockGuard guard(jobLock);
+        if (deferredFaults.empty()) {
+            return;
+        }
+        pending.swap(deferredFaults);
+    }
+    for (const DeferredFault &f : pending) {
+        Faults::raise(static_cast<Fault>(f.code), f.detail[0] ? f.detail : nullptr, f.speak);
+    }
 }
 
 // ---- Request worker -----------------------------------------------------------------------
@@ -379,7 +406,7 @@ bool RequestManager::requestAsync(const String &endpoint, const String &method, 
         }
     }
     if (startWorker && xTaskCreatePinnedToCore(workerEntry, "req", 8192, this, 4, nullptr, 0) != pdPASS) {
-        Serial.println("RequestManager: request worker could not start - running on the caller");
+        ESP_LOGW(TAG, "request worker could not start - running on the caller");
         workerLoop(); // the old blocking behaviour, results still delivered through update()
     }
     return true;
@@ -458,46 +485,34 @@ void RequestManager::dispatchCompletedJobs()
             jobDone.pop_front();
         }
         JsonDocument doc = responseToDocument(job->status, job->body, job->error);
-        lastStatusCode = job->status;
         if (job->cb) {
             job->cb(doc, job->status); // may queue further requests
         }
         delete job;
     }
     static unsigned long lastStuckLog = 0;
-    if (jobStartedAt && millis() - jobStartedAt > 30000 && millis() - lastStuckLog > 30000) {
-        lastStuckLog = millis();
-        Serial.printf("RequestManager: request %s busy for %lu s\n", activeEndpoint.c_str(), (millis() - jobStartedAt) / 1000);
+    if (millis() - lastStuckLog > 30000) {
+        // The worker writes both under jobLock: copy them out under it.
+        String endpoint;
+        unsigned long startedAt = 0;
+        {
+            LockGuard guard(jobLock);
+            startedAt = jobStartedAt;
+            if (startedAt) {
+                endpoint = activeEndpoint;
+            }
+        }
+        if (startedAt && millis() - startedAt > 30000) {
+            lastStuckLog = millis();
+            ESP_LOGI(TAG, "request %s busy for %lu s", endpoint.c_str(), (millis() - startedAt) / 1000);
+        }
     }
-}
-
-// HTTP Methods - now simplified using executeHttpRequest
-JsonDocument RequestManager::get(const String &endpoint)
-{
-    return executeHttpRequest(endpoint, "GET");
-}
-
-JsonDocument RequestManager::post(const String &endpoint, const JsonDocument &data)
-{
-    String jsonString;
-    serializeJson(data, jsonString);
-    return executeHttpRequest(endpoint, "POST", &jsonString);
 }
 
 // Utility methods
 bool RequestManager::isConnected()
 {
     return WiFi.status() == WL_CONNECTED;
-}
-
-String RequestManager::getLastError()
-{
-    return lastError;
-}
-
-int RequestManager::getLastStatusCode()
-{
-    return lastStatusCode;
 }
 
 String RequestManager::getJWTToken()
@@ -507,7 +522,7 @@ String RequestManager::getJWTToken()
     
     String endpoint = "/hubs/" + String(macAddress, 10) + "/token";
     //print endpoint being accessed
-    Serial.println("RequestManager: Requesting JWT token from endpoint: " + endpoint);
+    ESP_LOGI(TAG, "Requesting JWT token from endpoint: %s", endpoint.c_str());
     
     // Temporarily clear auth token so executeHttpRequest doesn't try to init connection
     String savedToken = authToken;
@@ -518,11 +533,11 @@ String RequestManager::getJWTToken()
     authToken = savedToken;
     
     if (doc["status"] == "success") {
-        Serial.println(F("RequestManager: JWT token obtained"));
+        ESP_LOGI(TAG, "JWT token obtained");
         return doc["token"].as<String>();
     }
     
-    lastError = doc["message"].as<String>();
+    ESP_LOGW(TAG, "JWT token request failed: %s", doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "?");
     return String();
 }
 
@@ -550,7 +565,7 @@ bool RequestManager::validateToken(const String& token)
         // No answer (DNS not ready right after connecting, portal down): that says nothing about
         // the token. Keep it; a token the portal really rejects fails with 401 later and is
         // refreshed then. Fetching a new token here revoked a good one on every flaky boot.
-        Serial.printf("RequestManager: token check got no answer (%d) - keeping the stored token\n", httpResponseCode);
+        ESP_LOGI(TAG, "token check got no answer (%d) - keeping the stored token", httpResponseCode);
         return true;
     }
     return httpResponseCode == 200;
@@ -563,7 +578,7 @@ void RequestManager::initConnection()
     String storedToken = config.getJWTToken();
 
     if (storedToken.length() > 0 && validateToken(storedToken)) {
-        Serial.println(F("RequestManager: Using stored JWT token"));
+        ESP_LOGI(TAG, "Using stored JWT token");
         setAuthToken(storedToken);
         return;
     }
@@ -572,7 +587,7 @@ void RequestManager::initConnection()
     
     String newToken = getJWTToken();
     if (newToken.length() > 0) {
-        Serial.println(F("RequestManager: New JWT token obtained"));
+        ESP_LOGI(TAG, "New JWT token obtained");
         config.setJWTToken(newToken);
         setAuthToken(newToken);
     } else {
@@ -582,7 +597,7 @@ void RequestManager::initConnection()
 
 void RequestManager::getCheckFigureTracks(const String &uid)
 {
-    Serial.println(F("RequestManager: Processing figure tracks request"));
+    ESP_LOGI(TAG, "Processing figure tracks request");
 
     // Cache-first: whatever is already on the card plays immediately; the backend is then
     // asked for changes. A down portal, an expired token or slow WiFi must never keep a
@@ -602,7 +617,7 @@ void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyE
     // loop task once the answer is in. A tap repeated while the answer is pending is one request.
     const String endpoint = "/units/" + uid;
     if (isRequestPending(endpoint)) {
-        Serial.println("RequestManager: manifest request already pending for this figure");
+        ESP_LOGI(TAG, "manifest request already pending for this figure");
         return;
     }
     bool started = getAsync(endpoint, [this, uid, alreadyEmitted](JsonDocument &doc, int) {
@@ -619,7 +634,7 @@ void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyE
 void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, JsonDocument &doc)
 {
     if (doc["error"].as<bool>()) {
-        Serial.printf("RequestManager: manifest fetch failed (%s)\n", doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "?");
+        ESP_LOGW(TAG, "manifest fetch failed (%s)", doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "?");
         if (!alreadyEmitted && figureDownloadCompleteCallback) {
             Figure emptyFigure;
             queueFigureDownloadCompletion(uid, "Unknown", false, "Backend unreachable and nothing cached", emptyFigure);
@@ -676,27 +691,31 @@ void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, 
         trackPaths.push_back(storagePath);
         // A file replaced on the portal keeps its path but gets a new checksum: the copy on the
         // card is stale. Unless it is the track playing right now, drop it and download again.
-        bool present = fileManager.fileExists(storagePath);
+        // A file queued for deletion counts as absent (it is downloaded again once it is gone).
+        bool present = fileManager.isPresent(storagePath);
         if (present && !checksum.isEmpty()) {
             const String known = fileManager.requiredFileChecksum(storagePath);
             if (!known.isEmpty() && known != checksum) {
                 if (AudioController::getInstance().getCurrentTrack() == storagePath) {
-                    Serial.printf("RequestManager: %s was replaced on the portal but is playing - refreshed on the next tap\n", storagePath.c_str());
+                    ESP_LOGI(TAG, "%s was replaced on the portal but is playing - refreshed on the next tap", storagePath.c_str());
                 } else {
-                    Serial.printf("RequestManager: %s was replaced on the portal - downloading the new file\n", storagePath.c_str());
-                    fileManager.deleteFile(storagePath); // also drops the old required-file entry
+                    ESP_LOGI(TAG, "%s was replaced on the portal - downloading the new file", storagePath.c_str());
+                    // deleteFile() removes the file only: drop the stale entry explicitly; it is
+                    // re-added with the new checksum just below.
+                    fileManager.removeRequiredFile(storagePath, false);
+                    fileManager.deleteFile(storagePath);
                     present = false;
                 }
             }
         }
         fileManager.addRequiredFile(storagePath, url, checksum, false); // flushed once below
-        Serial.printf("RequestManager: asset %s (%s) %s\n", storagePath.c_str(), asset["asset_type"].as<const char*>() ? asset["asset_type"].as<const char*>() : "?",
+        ESP_LOGI(TAG, "asset %s (%s) %s", storagePath.c_str(), asset["asset_type"].as<const char*>() ? asset["asset_type"].as<const char*>() : "?",
                       present ? "present" : "missing");
         // Existence only: integrity was verified (sha256) when the file was downloaded.
         // Re-hashing every cached track here used to block the loop for tens of seconds.
         if (!present) {
             if (url.length() > 0) {
-                fileManager.scheduleDownload(url, storagePath, checksum);
+                fileManager.scheduleDownload(url, storagePath, checksum, false); // flushed once below
                 assetsToDownload++;
             }
         } else {
@@ -705,9 +724,10 @@ void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, 
     }
 
     fileManager.flushRequiredFiles(); // one SD write for the whole manifest instead of one per asset
+    fileManager.flushDownloadQueue();
 
     if (unchanged && assetsToDownload == 0) {
-        Serial.printf("RequestManager: manifest for %s unchanged, all %d assets present\n", figureName.c_str(), assetsAlreadyCached);
+        ESP_LOGI(TAG, "manifest for %s unchanged, all %d assets present", figureName.c_str(), assetsAlreadyCached);
         if (!alreadyEmitted) {
             // Nothing was playable from the cache (should not happen when all assets exist) - announce now.
             Figure figureData = buildFigureFromManifest(doc, true);
@@ -723,7 +743,7 @@ void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, 
         serializeJson(doc, pendingManifestJson);
         hasPending = savePendingUnitManifest(uid, doc);
         if (!hasPending) {
-            Serial.println("RequestManager: failed to cache pending manifest (continuing without stale-asset cleanup)");
+            ESP_LOGW(TAG, "failed to cache pending manifest (continuing without stale-asset cleanup)");
         }
     }
 
@@ -734,7 +754,7 @@ void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, 
     }
 
     if (assetsToDownload > 0) {
-        Serial.printf("RequestManager: %d asset(s) to download for %s (%d already cached)\n", assetsToDownload, figureName.c_str(), assetsAlreadyCached);
+        ESP_LOGI(TAG, "%d asset(s) to download for %s (%d already cached)", assetsToDownload, figureName.c_str(), assetsAlreadyCached);
         if (!alreadyEmitted && figureEventCallback) {
             figureEventCallback(uid, FigureEvent::DOWNLOADS_STARTED);
         }
@@ -751,7 +771,7 @@ bool RequestManager::emitFromCache(const String &uid)
     if (cached.contents.empty() && cached.customTracks.empty()) {
         return false;
     }
-    Serial.printf("RequestManager: cache hit for %s (%s) - playing what is on the card\n",
+    ESP_LOGI(TAG, "cache hit for %s (%s) - playing what is on the card",
                   uid.c_str(), cached.name.c_str());
     queueFigureDownloadCompletion(uid, cached.name, true, "", cached, false);
     return true;
@@ -773,7 +793,7 @@ RequestManager::Figure RequestManager::filterExisting(const Figure &figure) cons
             Episode e = episode;
             e.tracks.clear();
             for (const auto &track : episode.tracks) {
-                if (fileManager.fileExists(track.localPath)) {
+                if (fileManager.isPresent(track.localPath)) {
                     e.tracks.push_back(track);
                 }
             }
@@ -786,7 +806,7 @@ RequestManager::Figure RequestManager::filterExisting(const Figure &figure) cons
         }
     }
     for (const auto &track : figure.customTracks) {
-        if (fileManager.fileExists(track.localPath)) {
+        if (fileManager.isPresent(track.localPath)) {
             out.customTracks.push_back(track);
         }
     }
@@ -799,12 +819,12 @@ bool RequestManager::firstTrackExists(const Figure &figure) const
     for (const auto &content : figure.contents) {
         for (const auto &episode : content.episodes) {
             for (const auto &track : episode.tracks) {
-                return fileManager.fileExists(track.localPath);
+                return fileManager.isPresent(track.localPath);
             }
         }
     }
     if (!figure.customTracks.empty()) {
-        return fileManager.fileExists(figure.customTracks.front().localPath);
+        return fileManager.isPresent(figure.customTracks.front().localPath);
     }
     return false;
 }
@@ -822,7 +842,7 @@ void RequestManager::emitTrackerState(FigureDownloadTracker &tracker)
 void RequestManager::processOfflineFigureRequest(const String &uid)
 {
     // Only reached when there is no network AND emitFromCache() found nothing playable.
-    Serial.println(F("RequestManager: offline and nothing cached for this figure"));
+    ESP_LOGI(TAG, "offline and nothing cached for this figure");
     Figure emptyFigure;
     queueFigureDownloadCompletion(uid, "Unknown", false, "Offline and no cached tracks", emptyFigure);
 }
@@ -877,13 +897,13 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
     
     FileManager &fileManager = FileManager::getInstance();
     for (const String &path : trackPaths) {
-        if (fileManager.fileExists(path)) {
+        if (fileManager.isPresent(path)) {
             tracker.tracksReady++;
         }
     }
     
     bool allReady = (tracker.tracksReady >= tracker.totalTracks && tracker.totalTracks > 0);
-    Serial.printf("RequestManager: tracking %s: %d asset(s), %d present, pending manifest %s, announced %s\n",
+    ESP_LOGI(TAG, "tracking %s: %d asset(s), %d present, pending manifest %s, announced %s",
                   figureName.c_str(), tracker.totalTracks, tracker.tracksReady,
                   hasPendingManifest ? "yes" : "no", alreadyEmitted ? "yes" : "no");
     
@@ -899,7 +919,7 @@ void RequestManager::startTrackingFigure(const String &uid, const String &figure
         // than playing stale content. Revisit once the API carries an explicit "revoked" state.
         tracker.completed = true;
         finalizeTrackedManifest(tracker, false);
-        Serial.printf("RequestManager: WARNING backend reports no assets for %s (%s); cached content kept\n",
+        ESP_LOGW(TAG, "WARNING backend reports no assets for %s (%s); cached content kept",
                       figureName.c_str(), uid.c_str());
         if (!tracker.emittedAny) {
             queueFigureDownloadCompletion(uid, figureName, false, "Figure has no tracks", figureData);
@@ -924,7 +944,7 @@ void RequestManager::checkFigureDownloadStatus(const String &uid)
                 finalizeTrackedManifest(tracker, anyReady);
                 if (anyReady) {
                     if (tracker.tracksFailed > 0) {
-                        Serial.printf("RequestManager: %s: %d track(s) could not be downloaded, playing the rest\n",
+                        ESP_LOGW(TAG, "%s: %d track(s) could not be downloaded, playing the rest",
                                       tracker.figureName.c_str(), tracker.tracksFailed);
                     }
                     emitTrackerState(tracker);
@@ -1011,7 +1031,7 @@ bool RequestManager::initializeNVS()
     
     err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvsHandle);
     if (err != ESP_OK) {
-        Serial.printf("RequestManager: Failed to open NVS: %s\n", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
         return false;
     }
     
@@ -1068,7 +1088,7 @@ bool RequestManager::loadUidMappings()
         uidToFigureIdMap[String(pair.key().c_str())] = pair.value().as<String>();
     }
     
-    Serial.printf("RequestManager: Loaded %d UID mappings\n", uidToFigureIdMap.size());
+    ESP_LOGI(TAG, "Loaded %d UID mappings", uidToFigureIdMap.size());
     return true;
 }
 
@@ -1079,15 +1099,15 @@ bool RequestManager::saveUnitManifest(const String &uid, const JsonDocument &man
     fileManager.createDirectory(SD_MANIFEST_DIR);
     String json;
     if (serializeJson(manifest, json) == 0) {
-        Serial.printf("RequestManager: Failed to serialize manifest for unit: %s\n", uid.c_str());
+        ESP_LOGW(TAG, "Failed to serialize manifest for unit: %s", uid.c_str());
         return false;
     }
     // Written by the SD maintenance task (tmp + rename); the loop never waits for the card.
     if (!fileManager.writeFileDeferred(getUnitManifestPath(uid), json)) {
-        Serial.printf("RequestManager: Failed to queue manifest for unit: %s\n", uid.c_str());
+        ESP_LOGW(TAG, "Failed to queue manifest for unit: %s", uid.c_str());
         return false;
     }
-    Serial.printf("RequestManager: Saved manifest for unit: %s\n", uid.c_str());
+    ESP_LOGI(TAG, "Saved manifest for unit: %s", uid.c_str());
     return true;
 }
 
@@ -1098,30 +1118,30 @@ bool RequestManager::savePendingUnitManifest(const String &uid, const JsonDocume
     fileManager.createDirectory(SD_PENDING_MANIFEST_DIR);
     String json;
     if (serializeJson(manifest, json) == 0) {
-        Serial.printf("RequestManager: Failed to serialize pending manifest for unit: %s\n", uid.c_str());
+        ESP_LOGW(TAG, "Failed to serialize pending manifest for unit: %s", uid.c_str());
         return false;
     }
     // Written by the SD maintenance task (tmp + rename); the loop never waits for the card.
     if (!fileManager.writeFileDeferred(getPendingUnitManifestPath(uid), json)) {
-        Serial.printf("RequestManager: Failed to queue pending manifest for unit: %s\n", uid.c_str());
+        ESP_LOGW(TAG, "Failed to queue pending manifest for unit: %s", uid.c_str());
         return false;
     }
-    Serial.printf("RequestManager: Saved pending manifest for unit: %s\n", uid.c_str());
+    ESP_LOGI(TAG, "Saved pending manifest for unit: %s", uid.c_str());
     return true;
 }
 
 bool RequestManager::loadUnitManifest(const String &uid, JsonDocument &manifest)
 {
-    File file = SD_MMC.open(getUnitManifestPath(uid), FILE_READ);
-    if (!file) {
-        return false;
+    File file;
+    if (!FileManager::getInstance().openJsonForRead(getUnitManifestPath(uid).c_str(), file)) {
+        return false; // neither the manifest nor its .tmp (crash between remove and rename)
     }
 
     DeserializationError error = deserializeJson(manifest, file);
     file.close();
 
     if (error) {
-        Serial.printf("RequestManager: Failed to parse cached manifest for %s: %s\n", uid.c_str(), error.c_str());
+        ESP_LOGW(TAG, "Failed to parse cached manifest for %s: %s", uid.c_str(), error.c_str());
         return false;
     }
 
@@ -1136,8 +1156,8 @@ bool RequestManager::deletePendingUnitManifest(const String &uid)
 
 bool RequestManager::loadPendingUnitManifest(const String &uid, JsonDocument &manifest)
 {
-    File file = SD_MMC.open(getPendingUnitManifestPath(uid), FILE_READ);
-    if (!file) {
+    File file;
+    if (!FileManager::getInstance().openJsonForRead(getPendingUnitManifestPath(uid).c_str(), file)) {
         return false;
     }
 
@@ -1145,7 +1165,7 @@ bool RequestManager::loadPendingUnitManifest(const String &uid, JsonDocument &ma
     file.close();
 
     if (error) {
-        Serial.printf("RequestManager: Failed to parse pending manifest for %s: %s\n", uid.c_str(), error.c_str());
+        ESP_LOGW(TAG, "Failed to parse pending manifest for %s: %s", uid.c_str(), error.c_str());
         return false;
     }
 
@@ -1191,14 +1211,14 @@ void RequestManager::finalizeTrackedManifest(FigureDownloadTracker &tracker, boo
     if (!tracker.pendingManifestJson.isEmpty()) {
         DeserializationError pendingError = deserializeJson(pendingManifest, tracker.pendingManifestJson);
         if (pendingError) {
-            Serial.printf("RequestManager: Failed to parse in-memory pending manifest for %s: %s\n", tracker.uid.c_str(), pendingError.c_str());
+            ESP_LOGW(TAG, "Failed to parse in-memory pending manifest for %s: %s", tracker.uid.c_str(), pendingError.c_str());
         } else {
             hasPendingManifestData = true;
         }
     }
 
     if (!hasPendingManifestData && !loadPendingUnitManifest(tracker.uid, pendingManifest)) {
-        Serial.printf("RequestManager: Missing pending manifest while finalizing unit %s\n", tracker.uid.c_str());
+        ESP_LOGI(TAG, "Missing pending manifest while finalizing unit %s", tracker.uid.c_str());
         tracker.hasPendingManifest = false;
         tracker.pendingManifestJson = String();
         tracker.previousManifestJson = String();
@@ -1270,7 +1290,7 @@ RequestManager::Figure RequestManager::buildFigureFromManifest(const JsonDocumen
                 track.checksum = trackObject["checksum"].as<String>();
                 track.localPath = normalizeStoragePath(trackObject["storage_path"].as<String>());
 
-                if (existingFilesOnly && !fileManager.fileExists(track.localPath)) {
+                if (existingFilesOnly && !fileManager.isPresent(track.localPath)) {
                     continue;
                 }
 
@@ -1300,7 +1320,7 @@ RequestManager::Figure RequestManager::buildFigureFromManifest(const JsonDocumen
         track.checksum = customTrackObject["checksum"].as<String>();
         track.localPath = normalizeStoragePath(customTrackObject["storage_path"].as<String>());
 
-        if (existingFilesOnly && !fileManager.fileExists(track.localPath)) {
+        if (existingFilesOnly && !fileManager.isPresent(track.localPath)) {
             continue;
         }
 
@@ -1411,7 +1431,7 @@ void RequestManager::removeStaleAssets(const String &uid, const JsonDocument &cu
         if (fileManager.fileExists(oldPath)) {
             fileManager.deleteFileDeferred(oldPath);
         }
-        Serial.printf("RequestManager: stale asset queued for deletion: %s\n", oldPath.c_str());
+        ESP_LOGI(TAG, "stale asset queued for deletion: %s", oldPath.c_str());
     }
     if (requiredChanged) {
         fileManager.flushRequiredFiles();
@@ -1570,7 +1590,7 @@ bool RequestManager::forgetFigure(const String &uid)
     if (uidToFigureIdMap.erase(uid) > 0) {
         saveUidMappings();
     }
-    Serial.printf("RequestManager: forgot figure %s (%d file(s) queued for deletion, %u shared kept)\n",
+    ESP_LOGI(TAG, "forgot figure %s (%d file(s) queued for deletion, %u shared kept)",
                   uid.c_str(), deleted, (unsigned)keep.size());
     return true;
 }
@@ -1587,7 +1607,7 @@ bool RequestManager::forgetTrack(const String &path)
     }
     fileManager.removeRequiredFile(path, true);
     fileManager.deleteFileDeferred(path);
-    Serial.printf("RequestManager: forgot track %s\n", path.c_str());
+    ESP_LOGI(TAG, "forgot track %s", path.c_str());
     return true;
 }
 
@@ -1608,14 +1628,14 @@ void RequestManager::refreshUnit(const String &uid)
     FileManager &fm = FileManager::getInstance();
     const bool cached = fm.fileExists(getUnitManifestPath(uid)) || fm.fileExists(getPendingUnitManifestPath(uid));
     if (!cached) {
-        Serial.printf("RequestManager: sync-figure %s: not cached here, ignored\n", uid.c_str());
+        ESP_LOGI(TAG, "sync-figure %s: not cached here, ignored", uid.c_str());
         return;
     }
     if (!isNetworkReady()) {
-        Serial.printf("RequestManager: sync-figure %s: offline, the next re-check will do it\n", uid.c_str());
+        ESP_LOGI(TAG, "sync-figure %s: offline, the next re-check will do it", uid.c_str());
         return;
     }
-    Serial.printf("RequestManager: sync-figure %s: re-fetching the manifest\n", uid.c_str());
+    ESP_LOGI(TAG, "sync-figure %s: re-fetching the manifest", uid.c_str());
     // alreadyEmitted=true: a background refresh - no prompts, no playback announcement for a
     // figure that is not on the pins; a mounted figure merges the new list like a tap does.
     processOnlineFigureRequest(uid, true);
@@ -1653,11 +1673,12 @@ void RequestManager::recoverPendingManifests()
             const String url = asset["url"].as<String>();
             const String checksum = asset["checksum"].as<String>();
             fm.addRequiredFile(path, url, checksum, false);
-            if (!fm.fileExists(path) && url.length() > 0) {
-                fm.scheduleDownload(url, path, checksum);
+            if (!fm.isPresent(path) && url.length() > 0) {
+                fm.scheduleDownload(url, path, checksum, false);
             }
         }
         fm.flushRequiredFiles();
+        fm.flushDownloadQueue();
         Figure figureData = buildFigureFromManifest(pending);
         JsonObjectConst figure = pending["figure"].as<JsonObjectConst>();
         startTrackingFigure(uid, figure["name"].as<String>(), jsonValueToString(figure["id"]), trackPaths, figureData,
@@ -1665,7 +1686,7 @@ void RequestManager::recoverPendingManifests()
         recovered++;
     }
     if (recovered > 0) {
-        Serial.printf("RequestManager: %d interrupted figure download(s) resumed\n", recovered);
+        ESP_LOGI(TAG, "%d interrupted figure download(s) resumed", recovered);
     }
 }
 
@@ -1695,7 +1716,7 @@ void RequestManager::serviceManifestRecheck()
         }
     }
     if (!recheckQueue.empty()) {
-        Serial.printf("RequestManager: checking %u cached figure(s) for content changes\n", (unsigned)recheckQueue.size());
+        ESP_LOGI(TAG, "checking %u cached figure(s) for content changes", (unsigned)recheckQueue.size());
     }
 }
 
@@ -1715,14 +1736,17 @@ void RequestManager::recheckUnit(const String &uid)
     }
     requestAsync(endpoint, "GET", String(), [this, uid](JsonDocument &doc, int status) {
         if (status == 304) {
-            Serial.printf("RequestManager: %s unchanged\n", uid.c_str());
+            ESP_LOGI(TAG, "%s unchanged", uid.c_str());
             return;
         }
         if (status != 200) {
-            Serial.printf("RequestManager: re-check of %s failed (%d)\n", uid.c_str(), status);
+            ESP_LOGW(TAG, "re-check of %s failed (%d)", uid.c_str(), status);
+            char d[40];
+            snprintf(d, sizeof(d), "%.24s http=%d", uid.c_str(), status);
+            Faults::raise(Fault::CONTENT_SYNC_FAILED, d, false);
             return;
         }
-        Serial.printf("RequestManager: %s changed on the portal - updating the cache\n", uid.c_str());
+        ESP_LOGI(TAG, "%s changed on the portal - updating the cache", uid.c_str());
         handleUnitManifest(uid, true, doc);
     }, checksum);
 }
