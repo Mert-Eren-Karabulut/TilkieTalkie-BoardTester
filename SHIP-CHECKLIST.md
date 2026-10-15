@@ -52,7 +52,13 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 - 1.2.17: the WiFi recovery and the wifi_lost prompt apply only while the stored network is in range
   (periodic scan for the SSID). Away from home the toy stays quiet, plays from the card and looks for
   the network every 2 minutes; no radio resets, no restarts.
-- **Not yet run on hardware**: everything from 1.2.11 on (bench board away). First things to try:
+- 1.2.18: fault codes (docs/FAULTS.md) end to end; the audit's safe fixes (docs/AUDIT-2026-10-16.md):
+  console in Console.cpp with bench commands behind -DTT_BENCH (env:bench, never shipped), main.cpp
+  split into modules, download give-ups complete the figure, batched queue writes, races closed, audio
+  lock discipline and the volume-beep bug, skips for bad tracks, OTA check timeout, prompt pack
+  power-loss safety, NFC 10-byte UIDs, WiFi credential writes only on change, tagged logging.
+- **Not yet run on hardware**: everything from 1.2.11 on (bench board away). 1.2.18 touches the
+  audio task, the SD path and WiFi: flash the bench board first when it is back, then the field unit. First things to try:
   tap a new figure with 3+ tracks and let track 1 end before track 2 is down; delete a figure
   from the hub page and re-tap; change a track on the portal and watch the toy re-download.
 
