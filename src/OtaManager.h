@@ -5,6 +5,7 @@
 #include <functional>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include "PromptPackManager.h"
 
 // Over-the-air updates.
 //  - The backend decides what a device should run: GET /hubs/{uuid}/firmware/check returns
@@ -23,6 +24,7 @@ public:
         IDLE,
         CHECKING,
         WAITING,      // update known, waiting for an idle moment / enough battery
+        PROMPTS,      // the release's voice prompt pack is being staged (before the image)
         DOWNLOADING,
         APPLYING,
         REBOOTING,
@@ -38,6 +40,8 @@ public:
         String sha256;
         size_t size = 0;
         bool mandatory = false;
+        bool hasPrompts = false;          // the portal pairs a prompt pack with this release
+        PromptPackManager::Pack prompts;  // staged into /sounds.staging before the image downloads
     };
 
     static OtaManager &getInstance();
@@ -51,7 +55,7 @@ public:
     State state() const { return _state; }
     const char *stateName() const;   // "idle", "waiting", "downloading", ... for reports
     int progress() const { return _progress; }
-    bool inProgress() const { return _state == DOWNLOADING || _state == APPLYING || _state == REBOOTING; }
+    bool inProgress() const { return _state == PROMPTS || _state == DOWNLOADING || _state == APPLYING || _state == REBOOTING; }
     const Job &job() const { return _job; }
     String lastError() const { return _error; }
     void printStatus();
@@ -69,6 +73,10 @@ private:
     void setState(State s, int progress = -1, const String &error = String());
     void postStatus(const char *status, int progress, const String &error, uint32_t versionCode = 0);
     void onCheckResult(JsonDocument &doc, int code); // loop task, answer to checkNow()
+    void beginJob();                                 // WAITING -> PROMPTS (pack staging) or DOWNLOADING
+    void onPromptsStaged(bool ok);                   // loop task, from PromptPackManager
+    int _promptSyncFailures = 0;
+    unsigned long _failedAt = 0;
     String deviceId() const;
 
     volatile State _state = IDLE;

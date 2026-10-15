@@ -40,6 +40,9 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 - Playlist waits for the next track when the figure is still downloading (prompt `download_wait`,
   needs the new pack on the card) instead of ending after the cached ones.
 - Interrupted figure downloads are recovered after a reboot; inventory lists downloading figures.
+- Prompt packs (1.2.15, docs/VOICE-PROMPTS.md "Remote update"): the portal pairs a pack with each release,
+  the device stages it before an update and activates it on the new firmware's first boot; rollback-safe.
+  First use on an existing device: its card has no pack.json → it downloads the pack once (~1 MB) and swaps it in.
 - **Not yet run on hardware**: everything from 1.2.11 on (bench board away). First things to try:
   tap a new figure with 3+ tracks and let track 1 end before track 2 is down; delete a figure
   from the hub page and re-tap; change a track on the portal and watch the toy re-download.

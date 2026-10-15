@@ -12,6 +12,7 @@
 #include "ConfigManager.h"
 #include "CaBundle.h"
 #include "OtaManager.h"
+#include "PromptPackManager.h"
 #include "RequestManager.h"
 
 // Define static members
@@ -529,11 +530,14 @@ void ReverbClient::sendDeviceReport(bool force)
     // A report goes out when something meaningful changed (with hysteresis on the analog values,
     // so a cell voltage hovering on a boundary does not cause a report every poll), every 5 s
     // while playing (position), and at least every 60 s (heartbeat).
-    char signature[200];
-    snprintf(signature, sizeof(signature), "%d|%d|%d|%d|%s|%s|%d|%d|%d|%s",
+    PromptPackManager &ppm = PromptPackManager::getInstance();
+    const String promptPack = ppm.installedChecksum().substring(0, 12);
+    char signature[220];
+    snprintf(signature, sizeof(signature), "%d|%d|%d|%d|%s|%s|%d|%d|%d|%s|%s|%s",
              isCharging ? 1 : 0, isFileSyncing ? 1 : 0, pendingDownloads, downloadProgress / 10,
              audioStatus, currentTrack.c_str(),
-             currentVolume, volumeCeiling, isPogoActive ? 1 : 0, nfcCardId.c_str());
+             currentVolume, volumeCeiling, isPogoActive ? 1 : 0, nfcCardId.c_str(),
+             ppm.stateName(), OtaManager::getInstance().stateName());
 
     unsigned long now = millis();
     bool changed = (_lastReportSignature != signature) ||
@@ -564,6 +568,7 @@ void ReverbClient::sendDeviceReport(bool force)
                            "\"device_id\":\"%s\","
                            "\"last_error\":\"%s\","
                            "\"ota\":{\"state\":\"%s\",\"progress\":%d},"
+                           "\"prompts\":{\"pack\":\"%s\",\"state\":\"%s\"},"
                            "\"battery\":{"
                            "\"status\":\"%s\","
                            "\"percent\":%.1f,"
@@ -596,6 +601,8 @@ void ReverbClient::sendDeviceReport(bool force)
                            _lastError,
                            OtaManager::getInstance().stateName(),
                            OtaManager::getInstance().progress(),
+                           promptPack.c_str(),
+                           ppm.stateName(),
                            isCharging ? "charging" : "discharging",
                            batteryPercent,
                            batteryVoltage,

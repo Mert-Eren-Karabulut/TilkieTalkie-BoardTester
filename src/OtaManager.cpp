@@ -3,6 +3,7 @@
 #include "RequestManager.h"
 #include "ConfigManager.h"
 #include "CaBundle.h"
+#include "PromptPackManager.h"
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
@@ -26,6 +27,7 @@ const unsigned long FIRST_CHECK_DELAY_MS = 90UL * 1000UL;
 const unsigned long MANDATORY_WAIT_MAX_MS = 60UL * 60UL * 1000UL;
 const unsigned long CONFIRM_AFTER_MS = 60UL * 1000UL;   // a crash before this rolls back (bootloader)
 const unsigned long STABLE_AFTER_MS = 5UL * 60UL * 1000UL; // crash counter resets after this uptime
+const unsigned long FAILED_RETRY_MS = 10UL * 60UL * 1000UL;  // after a failed attempt, back to periodic checks
 const char *NVS_OTA_REVERT = "ota_revert";   // set when the crash-loop guard switched partitions
 const char *NVS_OTA_LAST_REL = "ota_last_rel"; // last release that was applied successfully
 const uint32_t CRASH_MAGIC = 0x07A5EEDu;
@@ -37,6 +39,7 @@ const char *stateName(OtaManager::State s)
     case OtaManager::IDLE: return "idle";
     case OtaManager::CHECKING: return "checking";
     case OtaManager::WAITING: return "waiting";
+    case OtaManager::PROMPTS: return "prompts";
     case OtaManager::DOWNLOADING: return "downloading";
     case OtaManager::APPLYING: return "applying";
     case OtaManager::REBOOTING: return "rebooting";
@@ -131,6 +134,7 @@ void OtaManager::confirmImage()
                       err == ESP_OK ? "rollback cancelled" : esp_err_to_name(err));
         _pendingVerify = false;
     }
+    PromptPackManager::getInstance().onFirmwareConfirmed(); // the previous prompt pack can go
 }
 
 void OtaManager::setState(State s, int progress, const String &error)
@@ -148,9 +152,10 @@ void OtaManager::setState(State s, int progress, const String &error)
     const char *status = nullptr;
     switch (s)
     {
+    case PROMPTS: status = "prompts"; break;
     case DOWNLOADING: status = "downloading"; break;
     case APPLYING: status = "applying"; break;
-    case FAILED: status = "failed"; _justFailed = true; break;
+    case FAILED: status = "failed"; _justFailed = true; _failedAt = millis(); break;
     default: break;
     }
     if (status)
@@ -209,8 +214,10 @@ bool OtaManager::checkNow(uint32_t releaseId, const char *reason)
         Serial.println("OTA: check skipped, no network");
         return false;
     }
+    PromptPackManager &ppm = PromptPackManager::getInstance();
     String endpoint = "/hubs/" + deviceId() + "/firmware/check?version_code=" + String(firmwareVersionCode()) +
-                      "&version=" + String(firmwareVersion()) + "&hardware_rev=" + TT_HARDWARE_REV;
+                      "&version=" + String(firmwareVersion()) + "&hardware_rev=" + TT_HARDWARE_REV +
+                      "&prompts=1&prompt_pack=" + ppm.installedChecksum() + "&prompt_state=" + ppm.stateName();
     if (releaseId)
     {
         endpoint += "&release_id=" + String(releaseId);
@@ -243,11 +250,36 @@ void OtaManager::onCheckResult(JsonDocument &doc, int code)
         _state = IDLE;
         return;
     }
-    if (code != 200 || !doc["release_id"].is<uint32_t>())
+    if (code != 200)
     {
         Serial.printf("OTA: check failed (HTTP %d)\n", code);
         _nextCheckAt = millis() + (code <= 0 ? CHECK_RETRY_SOON_MS : CHECK_RETRY_MS);
         _state = IDLE;
+        return;
+    }
+    // With prompts=1 the portal always answers 200: release_id null = nothing to install, and
+    // "prompts" names the voice pack paired with the offered release, or with the running one.
+    PromptPackManager &ppm = PromptPackManager::getInstance();
+    PromptPackManager::Pack pack;
+    const bool hasPack = PromptPackManager::parsePack(doc["prompts"], pack);
+    if (!doc["release_id"].is<uint32_t>())
+    {
+        Serial.println("OTA: up to date");
+        _state = IDLE;
+        if (hasPack)
+        {
+            ppm.noteRequired(pack.checksum);
+            if (pack.checksum != ppm.installedChecksum())
+            {
+                Serial.printf("OTA: prompt pack %.12s (%s) differs from the card (%s) - syncing it\n", pack.checksum.c_str(),
+                              pack.name.c_str(), ppm.installedChecksum().isEmpty() ? "none" : ppm.installedChecksum().substring(0, 12).c_str());
+                ppm.stage(pack, firmwareVersion(), [](bool ok) {
+                    Serial.printf("OTA: prompt pack sync %s\n", ok ? "complete - activated when nothing speaks" : "failed, retried at the next check");
+                });
+                return;
+            }
+        }
+        ppm.discardStaleStaging();
         return;
     }
 
@@ -259,8 +291,11 @@ void OtaManager::onCheckResult(JsonDocument &doc, int code)
     job.sha256 = doc["sha256"].as<String>();
     job.size = doc["file_size"].as<size_t>();
     job.mandatory = doc["mandatory"].as<bool>();
-    Serial.printf("OTA: release %u offered: %s (code %u, %u bytes%s)\n", (unsigned)job.releaseId, job.version.c_str(),
-                  (unsigned)job.versionCode, (unsigned)job.size, job.mandatory ? ", mandatory" : "");
+    job.hasPrompts = hasPack;
+    job.prompts = pack;
+    Serial.printf("OTA: release %u offered: %s (code %u, %u bytes%s%s)\n", (unsigned)job.releaseId, job.version.c_str(),
+                  (unsigned)job.versionCode, (unsigned)job.size, job.mandatory ? ", mandatory" : "",
+                  hasPack ? (pack.checksum == ppm.installedChecksum() ? ", prompts up to date" : ", new prompt pack") : "");
     if (job.url.isEmpty() || job.sha256.length() != 64 || job.size == 0)
     {
         Serial.println("OTA: offer incomplete, ignored");
@@ -270,6 +305,44 @@ void OtaManager::onCheckResult(JsonDocument &doc, int code)
     _job = job;
     _state = WAITING;
     _waitingSince = millis();
+}
+
+// Prompts first: the pack paired with the release is staged into /sounds.staging while the
+// old prompts stay in use; the new firmware activates it at its first boot. If the pack cannot
+// be fetched twice in a row the image is installed anyway (that firmware then syncs its pack
+// itself at its first check), so a bad pack never blocks a firmware update for good.
+void OtaManager::beginJob()
+{
+    PromptPackManager &ppm = PromptPackManager::getInstance();
+    if (_job.hasPrompts && _job.prompts.checksum != ppm.installedChecksum() && _promptSyncFailures < 2)
+    {
+        _error = "";
+        setState(PROMPTS, 0);
+        const bool started = ppm.stage(_job.prompts, _job.version, [this](bool ok) { onPromptsStaged(ok); });
+        if (!started)
+        {
+            onPromptsStaged(false);
+        }
+        return;
+    }
+    startJob(_job);
+}
+
+void OtaManager::onPromptsStaged(bool ok)
+{
+    if (_state != PROMPTS)
+    {
+        return;
+    }
+    if (ok)
+    {
+        _promptSyncFailures = 0;
+        Serial.println("OTA: prompt pack staged - downloading the image");
+        startJob(_job);
+        return;
+    }
+    _promptSyncFailures++;
+    setState(FAILED, 0, "voice prompt pack could not be downloaded");
 }
 
 bool OtaManager::startJob(const Job &job)
@@ -574,8 +647,19 @@ void OtaManager::update()
         bool forced = _job.mandatory && now - _waitingSince > MANDATORY_WAIT_MAX_MS;
         if (idle || forced)
         {
-            startJob(_job);
+            beginJob();
         }
+    }
+    if (_state == PROMPTS)
+    {
+        _progress = PromptPackManager::getInstance().stagingProgress();
+    }
+    // A failed attempt goes back to the periodic checks after a while (the portal's push
+    // "ota-update" also restarts it any time).
+    if (_state == FAILED && now - _failedAt > FAILED_RETRY_MS)
+    {
+        _state = IDLE;
+        _nextCheckAt = now;
     }
 
     // 6. Periodic check

@@ -232,7 +232,6 @@ private:
     static void sdMaintenanceTask(void* parameter);
     bool ensureMaintenanceTask();
     bool enqueueJob(uint8_t kind, const String& path, const char* data, size_t len);
-    bool writeFileNow(const char* path, const char* data, size_t len); // tmp + rename, any task
     bool ringPush(const uint8_t* data, size_t len);
     size_t ringAvailable() const { return asyncState.ringHead - asyncState.ringTail; }
     size_t ringFree() const { return RING_SIZE - ringAvailable() - 1; }
@@ -281,6 +280,7 @@ public:
     int getPendingDownloadsCount();
     bool isDownloadInProgress() const { return downloadInProgress; }
     bool hasActiveDownload() const { return downloadInProgress; } // a transfer is in flight (not merely queued)
+    bool writeFileNow(const char* path, const char* data, size_t len); // tmp + rename, any task (small files)
     int getDownloadProgress() const;        // 0..100 of the transfer in flight, -1 when idle (for the device report)
     String getActiveDownloadPath() const { return downloadInProgress ? asyncState.localPath : String(); }
     String requiredFileChecksum(const String &path) const; // sha256 the file was downloaded against ("" if unknown)

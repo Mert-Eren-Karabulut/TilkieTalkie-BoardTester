@@ -25,6 +25,7 @@
 #include "Diag.h"
 #include "OtaManager.h"
 #include "VoicePrompts.h"
+#include "PromptPackManager.h"
 #include "Version.h"
 
 // The espidf CMake build compiles every file in src/ regardless of build_src_filter,
@@ -1260,6 +1261,10 @@ void startFullSystem()
 
     if (fileManager.begin())
     {
+        // A voice prompt pack staged for this firmware by the previous one becomes active now,
+        // before the first word is spoken (docs/VOICE-PROMPTS.md "Remote update").
+        PromptPackManager::getInstance().setPendingVerify(OtaManager::getInstance().bootedFromUpdate());
+        PromptPackManager::getInstance().begin();
         // Downloads interrupted by the reboot continue from the persisted queue; give their
         // figures a tracker so the manifest is completed when they land.
         requestManager.recoverPendingManifests();
@@ -3502,6 +3507,7 @@ void loop()
     }
 #endif
     TT_TIMED("ota", OtaManager::getInstance().update());
+    TT_TIMED("prompts", PromptPackManager::getInstance().update());
     gOtaProgress = OtaManager::getInstance().inProgress() ? OtaManager::getInstance().progress() : -1;
     {
         OtaManager &ota = OtaManager::getInstance();

@@ -76,7 +76,44 @@ column + show on the hub page).
 | karpuz | firmware update failed | update_failed |
 | muz | SD card problem (reserved; the toy cannot speak without the card) | LED red |
 
+## Remote update: prompt packs
+
+Since firmware 1.2.15 the sound files are a *prompt pack* that the portal can replace
+remotely, paired with firmware releases (portal docs/OTA.md "Voice prompt packs").
+
+- **Identity.** `sounds/pack.json` carries the pack checksum: sha256 of the sorted
+  `path:sha256` lines of every mp3 under `sounds/` (json files and dotfiles excluded), joined
+  with `\n` plus a trailing `\n`. `tools/sounds/gen_prompts.py` writes it and also produces
+  `releases/prompts-<id>.zip`, the file to upload on the portal's Firmware page ("Voice prompt
+  packs"). `tools/sdcard-prepare.sh` copies `pack.json` to the card, so a factory card reports
+  the pack it carries. The same zip serves as the flasher page's `sounds.zip`.
+- **No ambiguity about the files.** The firmware embeds the exact list it expects
+  (`TTPROMPTS1:tr/setup_welcome.mp3,...,beep.mp3`, generated from the prompt list in
+  VoicePrompts.h). The portal reads it from the uploaded `.bin` and only lets a pack be assigned
+  to a release when it contains every file; on upload it auto-assigns the newest pack that does.
+- **How the device learns.** Every firmware check (`/firmware/check?prompts=1&prompt_pack=<card
+  checksum>`) answers with the pack paired with the offered release, or with the running one
+  when nothing is to install. The device reports the card's pack and a state
+  (`ok / outdated / syncing / missing / unknown`) in its device report; the hub page shows it.
+- **Update flow (PromptPackManager + OtaManager).** When a release is offered whose pack differs
+  from the card: "Kendimi güncelliyorum…" (from the old pack) → the pack is downloaded into
+  `/sounds.staging` (sha256 per file, OTA state `prompts`) → the image downloads → reboot → the
+  new firmware finds `/sounds.staging/pack.json` with `for_firmware` equal to its own version
+  and swaps it in before its first word. `/sounds` is never touched by the old firmware, so a
+  failed or interrupted image download leaves old prompts with old firmware; the staging folder
+  is reused on the next attempt and dropped when no update is on the way any more.
+- **Rollback.** The new firmware keeps the previous pack as `/sounds.old` until the image is
+  confirmed (60 s). If the bootloader rolls back, the previous firmware finds a pack marked for
+  another version next to `/sounds.old` and restores its own.
+- **Pack changed for the current release / card without a pack.** The device downloads it the
+  same way and swaps it in as soon as no prompt is playing.
+- **If the pack cannot be downloaded** twice in a row, the image is installed anyway and the new
+  firmware fetches its pack at its first check, so a broken pack never blocks a firmware update.
+
 ## Changing a text
 
-Edit `PROMPTS` in `tools/sounds/gen_prompts.py`, run it, rewrite the card. The names must stay
-in sync with `kNames` in `src/VoicePrompts.cpp`.
+Edit `PROMPTS` in `tools/sounds/gen_prompts.py`, run it, upload `releases/prompts-<id>.zip` on
+the Firmware page and assign it to the release(s); devices pick it up at their next check.
+A new prompt also needs an entry in the list in `src/VoicePrompts.h` (enum, file name) and a
+policy row in `VoicePrompts.cpp`; the embedded schema then requires it, and the portal refuses
+packs that lack the file.

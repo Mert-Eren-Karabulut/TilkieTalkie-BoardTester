@@ -1,0 +1,136 @@
+{
+  "checksum": "5f8400b67996b82ab6f3a3d132683416cd4703a4c35532509d5619c3f1d8f04d",
+  "language": "tr",
+  "files": [
+    {
+      "p": "beep.mp3",
+      "h": "c970beb7cdf7ecaf14bc34af050de2b3f8ed7f29faec28e23b9ae783b21d7be1",
+      "s": 2089
+    },
+    {
+      "p": "tone_charge_off.mp3",
+      "h": "2c0b7e6ec761a687f578b405da28e00cf4dd3cbf19043d02f80ef82dcdbd4fa0",
+      "s": 3970
+    },
+    {
+      "p": "tone_charge_on.mp3",
+      "h": "4d2a1f6b931ac2947634c33804812b595223742e4c02fa291c5e5525fd98ac76",
+      "s": 3970
+    },
+    {
+      "p": "tone_sleep.mp3",
+      "h": "a5e9a604a9fafdd07f586c62294e573c97be39f2ec3ce7e148c5d9fb1c7ea1b5",
+      "s": 6269
+    },
+    {
+      "p": "tr/battery_critical.mp3",
+      "h": "5597010f94c5a7329e631b831087618d3ec934495dee56cf3608c6ea571d5611",
+      "s": 31555
+    },
+    {
+      "p": "tr/battery_low.mp3",
+      "h": "42ece8fdb15436c1ab030bcde95cd0dabeeb178a48dc40508c1f9bcecff44562",
+      "s": 30302
+    },
+    {
+      "p": "tr/charge_full.mp3",
+      "h": "b752cd029aae76a01901a1ae5bf78448656152bc7bfad8eb32d92ffb5227a7be",
+      "s": 13583
+    },
+    {
+      "p": "tr/download_done.mp3",
+      "h": "93269e13095a2f88546e4a8f19d23dfaac450fe6603424aea50e43f9ff479599",
+      "s": 16509
+    },
+    {
+      "p": "tr/download_failed.mp3",
+      "h": "a951fc2e2d387865b2e023e3bcf5adf8376291298258b75018471b51e2b136ad",
+      "s": 49528
+    },
+    {
+      "p": "tr/download_start.mp3",
+      "h": "3fe5073e8b49795245bfdc68014c4282b83f56f0c7ed977fa08345899b7f17ec",
+      "s": 47856
+    },
+    {
+      "p": "tr/download_wait.mp3",
+      "h": "c3bebff90100d1873d1bc559d6a8bc2adc88d673e29bb3e06bfd5ca2cd3519c8",
+      "s": 47856
+    },
+    {
+      "p": "tr/figure_no_content.mp3",
+      "h": "904ea359440b1f03c65534f8d3736548161c153d0785af9a8bfd29d592e7212b",
+      "s": 33854
+    },
+    {
+      "p": "tr/figure_offline.mp3",
+      "h": "57e44b6696d0091cc3981c70ede75b0c42bec8f7de040b03b99367d4eeed54b9",
+      "s": 49737
+    },
+    {
+      "p": "tr/idle_hello.mp3",
+      "h": "c9f0e6f1659df3b0bb458ec579ca7a45d74ecbd5865b3f8884fa8f06b24a9e23",
+      "s": 36780
+    },
+    {
+      "p": "tr/nfc_read_trouble.mp3",
+      "h": "53745694bac6ddbc4d55a1996fc56f55dfe6564ff1b38e9618eae4fb2be250ee",
+      "s": 38034
+    },
+    {
+      "p": "tr/playlist_end.mp3",
+      "h": "ce2e929664a3236c726486d3285660ebee5e1943c8de5b55d44c41dec941450d",
+      "s": 50155
+    },
+    {
+      "p": "tr/setup_connecting.mp3",
+      "h": "55de005d4a852dbae11d652e54bd271f8c1033fcca38e6dbbcdf59d7f5225b8a",
+      "s": 38870
+    },
+    {
+      "p": "tr/setup_failed.mp3",
+      "h": "120a01e1998cd77be253a3531b545900194920e17f2fe230cc595df5e4c5d6d0",
+      "s": 64783
+    },
+    {
+      "p": "tr/setup_success.mp3",
+      "h": "3c6b692e342acc730044382552cfac530818e6a011d757213eb829ec4c188a64",
+      "s": 45975
+    },
+    {
+      "p": "tr/setup_welcome.mp3",
+      "h": "7c90a5469dc96baa136de91f6468b978ef1b2539522a81655973580595d0dd68",
+      "s": 71262
+    },
+    {
+      "p": "tr/update_done.mp3",
+      "h": "c28da81e2e4e0437fbabbc81a9366b01b623bc6556bc0db0712be1114e2080c6",
+      "s": 19017
+    },
+    {
+      "p": "tr/update_failed.mp3",
+      "h": "86731750172337830368189fbaac8db61d50e614ab379211876c537e03647947",
+      "s": 53498
+    },
+    {
+      "p": "tr/update_start.mp3",
+      "h": "1bdac09c7e6a3ddda1104dc2da1205bccdc9f6e67ff7de0f15eb0ddcb6f2ca21",
+      "s": 47647
+    },
+    {
+      "p": "tr/wifi_lost.mp3",
+      "h": "11fbfcd82782793a7eee940510db3f5ac8b9e106d0e18f19a1f74479082711f6",
+      "s": 53916
+    },
+    {
+      "p": "tr/wifi_reset_done.mp3",
+      "h": "5749f64e89a78eb7c39e9f36440095787304b717d7151f6f691cdc4f1acf2e52",
+      "s": 43258
+    },
+    {
+      "p": "tr/wifi_reset_hint.mp3",
+      "h": "02e43d075ec2ad8dac4e93f3274a639878343dbf2957b1f2ad7f7b7e2734caf6",
+      "s": 67082
+    }
+  ]
+}

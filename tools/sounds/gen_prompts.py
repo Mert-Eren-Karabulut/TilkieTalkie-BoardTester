@@ -12,6 +12,7 @@ The prompt names must match VoicePrompts.cpp (kNames); the texts are documented 
 docs/VOICE-PROMPTS.md.
 """
 import array
+import hashlib
 import json
 import math
 import os
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import wave
+import zipfile
 
 try:
     import lameenc
@@ -139,6 +141,48 @@ def main():
     with open(os.path.join(OUT_TR, "prompts.json"), "w", encoding="utf-8") as f:
         json.dump({"language": "tr", "voice": VOICE, "version": 1, "prompts": PROMPTS}, f, ensure_ascii=False, indent=2)
     print(f"total {total // 1024} KB -> {os.path.relpath(OUT_TONES, ROOT)}/")
+    write_pack()
+
+
+def pack_files():
+    """(path, sha256, size) of every sound file, path relative to sounds/ (json and dotfiles excluded)."""
+    out = []
+    for dirpath, _, names in os.walk(OUT_TONES):
+        for n in names:
+            if n.startswith(".") or not n.lower().endswith(".mp3"):
+                continue  # only the sound files count (same rule as the portal's PromptPackChecksum)
+            full = os.path.join(dirpath, n)
+            rel = os.path.relpath(full, OUT_TONES).replace(os.sep, "/")
+            with open(full, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            out.append((rel, digest, os.path.getsize(full)))
+    return sorted(out)
+
+
+def write_pack():
+    """Pack identity shared with the portal (PromptPackChecksum) and the firmware (PromptPackManager):
+    sha256 of the sorted "path:sha256" lines joined by \n with a trailing \n. Writes sounds/pack.json
+    (so a card written from sdcard/ reports the pack it carries) and releases/prompts-<id>.zip for the
+    portal's Firmware page."""
+    files = pack_files()
+    lines = sorted(f"{p}:{h}" for p, h, _ in files)
+    checksum = hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest()
+    with open(os.path.join(OUT_TONES, "pack.json"), "w") as f:
+        json.dump({"checksum": checksum, "language": "tr",
+                   "files": [{"p": p, "h": h, "s": s} for p, h, s in files]}, f, indent=2)
+    zpath = os.path.join(ROOT, "releases", f"prompts-{checksum[:12]}.zip")
+    os.makedirs(os.path.dirname(zpath), exist_ok=True)
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        for p, _, _ in files:
+            z.write(os.path.join(OUT_TONES, p), "sounds/" + p)
+        z.write(os.path.join(OUT_TR, "prompts.json"), "sounds/tr/prompts.json")
+        z.write(os.path.join(OUT_TONES, "pack.json"), "sounds/pack.json")
+    print(f"pack {checksum[:12]} ({len(files)} files) -> {os.path.relpath(zpath, ROOT)}  (upload on the portal's Firmware page)")
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--pack-only":
+    write_pack()
+    sys.exit(0)
 
 
 if __name__ == "__main__":

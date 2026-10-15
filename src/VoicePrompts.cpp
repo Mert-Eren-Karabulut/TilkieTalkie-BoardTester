@@ -5,14 +5,20 @@
 namespace
 {
 const char *const kNames[(int)Prompt::COUNT] = {
-    "setup_welcome", "setup_connecting", "setup_success", "setup_failed",
-    "wifi_lost", "wifi_reset_hint", "wifi_reset_done",
-    "idle_hello", "nfc_read_trouble", "figure_no_content", "figure_offline",
-    "download_start", "download_done", "download_failed", "download_wait", "playlist_end",
-    "battery_low", "battery_critical", "charge_full",
-    "update_start", "update_done", "update_failed",
-    "tone_charge_on", "tone_charge_off", "tone_sleep",
+#define TT_PROMPT_NAME(id, name) name,
+    TT_SPEECH_PROMPTS(TT_PROMPT_NAME)
+    TT_TONE_PROMPTS(TT_PROMPT_NAME)
+#undef TT_PROMPT_NAME
 };
+// Embedded in the image: the portal's PromptSchema::fromImage() reads this NUL-terminated
+// marker from the uploaded .bin, so a prompt pack can be checked against exactly what this
+// firmware plays. Keep the prefix and the format (comma-separated paths under /sounds).
+#define TT_SPEECH_PATH(id, name) "tr/" name ".mp3,"
+#define TT_TONE_PATH(id, name) name ".mp3,"
+const char kPromptSchema[] __attribute__((used)) =
+    "TTPROMPTS1:" TT_SPEECH_PROMPTS(TT_SPEECH_PATH) TT_TONE_PROMPTS(TT_TONE_PATH) "beep.mp3";
+#undef TT_SPEECH_PATH
+#undef TT_TONE_PATH
 constexpr unsigned long kWaitForSilenceMaxMs = 30000; // a deferred prompt is dropped after this
 }
 
@@ -20,6 +26,26 @@ VoicePrompts &VoicePrompts::getInstance()
 {
     static VoicePrompts instance;
     return instance;
+}
+
+const char *VoicePrompts::schema()
+{
+    return kPromptSchema + 11; // after "TTPROMPTS1:"
+}
+
+std::vector<String> VoicePrompts::requiredPaths()
+{
+    std::vector<String> out;
+    String all = schema();
+    int start = 0;
+    while (start < (int)all.length())
+    {
+        int comma = all.indexOf(',', start);
+        if (comma < 0) comma = all.length();
+        if (comma > start) out.push_back(all.substring(start, comma));
+        start = comma + 1;
+    }
+    return out;
 }
 
 const char *VoicePrompts::name(Prompt p)

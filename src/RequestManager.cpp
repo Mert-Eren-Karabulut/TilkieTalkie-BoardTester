@@ -3,6 +3,7 @@
 #include "CaBundle.h"
 #include "PsramJson.h"
 #include "AudioController.h"
+#include "PromptPackManager.h"
 #include <esp_random.h>
 #include <algorithm>
 
@@ -956,6 +957,11 @@ void RequestManager::onTrackDownloadComplete(const String &path, bool success)
 
 void RequestManager::staticFileDownloadCallback(const String& url, const String& path, bool success, const String& error)
 {
+    if (path.startsWith(PromptPackManager::STAGING_DIR))
+    {
+        PromptPackManager::getInstance().onFileDone(path, success); // voice prompt pack, not a story
+        return;
+    }
     RequestManager &instance = RequestManager::getInstance("http://portal.tilkietalkie.com/api");
     instance.onTrackDownloadComplete(path, success);
 }
