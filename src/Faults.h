@@ -11,7 +11,7 @@
 // X(code, NAME, SEVERITY, fruit, CLEAR, description, remedy)
 #define TT_FAULT_LIST(X)                                                                                              \
     X(101, WIFI_NOT_PROVISIONED, INFO, "", EVENT, "Boot without WiFi credentials", "Pair the toy with the app")       \
-    X(102, WIFI_AUTH_FAILED, ERROR, "uzum", EVENT, "WiFi credentials rejected during pairing", "Check the network name and password in the app") \
+    X(102, WIFI_AUTH_FAILED, ERROR, "üzüm", EVENT, "WiFi credentials rejected during pairing", "Check the network name and password in the app") \
     X(103, WIFI_NO_LINK, ERROR, "portakal", ON_NETWORK, "Home network in range but no link", "Restart the router; check the password; the toy retries by itself") \
     X(104, WIFI_OUT_OF_RANGE, INFO, "", ON_NETWORK, "Provisioned network not in range", "Normal away from home; the toy plays from the card") \
     X(105, WIFI_RADIO_RESET, WARNING, "", EVENT, "Reconnects kept failing, radio was reset", "If it repeats at home, check the router (band steering, DHCP)") \

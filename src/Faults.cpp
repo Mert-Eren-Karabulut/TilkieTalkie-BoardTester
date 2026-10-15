@@ -267,6 +267,13 @@ void upload()
             for (int k = 0; k < g_ring.used; ++k) {
                 if (!g_ring.e[k].sent) { g_uploadAt = millis() + 1000; break; }
             }
+        } else if (code == 422 || code == 400) {
+            // The portal refused the batch itself (not a transport problem): keeping it would block
+            // every later event behind it. Drop it and move on.
+            markSent(sent);
+            save();
+            g_uploadAt = 0;
+            Serial.printf("Faults: portal rejected %d event(s) (HTTP %d), dropped\n", sent, code);
         } else {
             g_uploadAt = millis() + UPLOAD_RETRY_MS;
             Serial.printf("Faults: upload failed (HTTP %d), retry in %lu s\n", code, UPLOAD_RETRY_MS / 1000);
