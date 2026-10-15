@@ -1,7 +1,6 @@
 #ifndef WIFI_PROVISIONING_H
 #define WIFI_PROVISIONING_H
 
-#include <WiFiProv.h>
 #include <esp_event.h>
 #include <functional>
 #include <WiFi.h>
@@ -21,7 +20,15 @@ private:
     std::function<bool()> idleCheck;  // the 15-minute restart only while the toy is idle
     bool homeNetworkVisible = true;   // last scan saw the stored SSID (assumed until a scan says otherwise)
     bool scanInFlight = false;
-    void attemptReconnect();
+    unsigned long lastBeginAt = 0;    // last WiFi.begin() of ours (a connect may still be running)
+    bool attemptedSinceOffline = false; // a WiFi.begin() of ours has had its chance in this outage
+    unsigned long idleSeenAt = 0;     // WL_IDLE_STATUS (associated, no IP yet) first seen
+    // countFailure: a scan saw the home network after our previous attempt and there is still no
+    // link - a real failure. A plain retry (scan failed, no SSID stored) is not counted.
+    void attemptReconnect(bool countFailure);
+    void beginStored();
+    // Credentials are mirrored into ConfigManager; NVS is written only when they differ.
+    void storeCredentialsIfChanged(const String &ssid, const String &password);
     
     static WiFiProvisioningManager* instance;
     static void onSysProvEvent(arduino_event_t *sys_event);
@@ -41,8 +48,9 @@ public:
     void reset();
     void handleBackgroundReconnection();
     // Full radio restart (off, on, connect with the stored credentials): the escalation when
-    // plain reconnects fail, or when the link is up but nothing gets through.
-    void resetRadio(const char *why);
+    // plain reconnects fail, or when the link is up but nothing gets through. Refused (false)
+    // while a firmware update is in progress.
+    bool resetRadio(const char *why);
     void setIdleCheck(std::function<bool()> fn) { idleCheck = fn; }
     // False while the stored network is out of range (the toy is away from home, playing from
     // the card): no reconnect churn, no escalation, no "I cannot connect" prompt.
@@ -52,7 +60,7 @@ public:
     bool isProvisioned();
     bool isProvisioningManagerActive();
     
-    // Callback for provisioning events
+    // Arduino STA events (got IP, disconnected); provisioning events come from the IDF (below)
     void handleProvisioningEvent(arduino_event_t *sys_event);
 
     enum class ProvEvent { CRED_RECV, CRED_FAIL, CRED_SUCCESS, ENDED };
@@ -60,9 +68,9 @@ public:
     void onProvisioningEvent(std::function<void(ProvEvent)> cb) { eventCb = cb; }
 private:
     std::function<void(ProvEvent)> eventCb;
-    // The IDF provisioning manager posts WIFI_PROV_EVENT on the default event loop; the Arduino
-    // ARDUINO_EVENT_PROV_* translation only exists when the Arduino WiFiProv wrapper is used,
-    // which this firmware does not. So we listen to the IDF events ourselves.
+    // The IDF provisioning manager posts WIFI_PROV_EVENT on the default event loop (the Arduino
+    // ARDUINO_EVENT_PROV_* translation needs the WiFiProv wrapper, which this firmware does not
+    // use), so we listen to the IDF events ourselves.
     static void provEventHandler(void *arg, esp_event_base_t base, int32_t id, void *data);
     volatile bool provEndPending = false;   // WIFI_PROV_END seen; finish on the loop task
     bool provEventsRegistered = false;

@@ -16,14 +16,17 @@
 #include <esp_heap_caps.h>
 #include <mbedtls/sha256.h>
 #include <ArduinoJson.h>
+#include <esp_log.h>
 
 namespace
 {
+const char *TAG = "ota";
 const char *NVS_OTA_RELEASE = "ota_rel";   // release we rebooted into (set right before the reboot)
 const char *NVS_OTA_VCODE = "ota_vcode";   // version_code that image should report
 const unsigned long CHECK_INTERVAL_MS = 60UL * 60UL * 1000UL; // the portal also pushes ota-update when a release is published
 const unsigned long CHECK_RETRY_MS = 60UL * 60UL * 1000UL;
 const unsigned long CHECK_RETRY_SOON_MS = 2UL * 60UL * 1000UL; // connection-level failure
+const unsigned long CHECK_TIMEOUT_MS = 60UL * 1000UL;  // no answer to a check: back to IDLE
 const unsigned long FIRST_CHECK_DELAY_MS = 90UL * 1000UL;
 const unsigned long MANDATORY_WAIT_MAX_MS = 60UL * 60UL * 1000UL;
 const unsigned long CONFIRM_AFTER_MS = 60UL * 1000UL;   // a crash before this rolls back (bootloader)
@@ -77,7 +80,7 @@ void OtaManager::begin()
         _pendingVerify = (imgState == ESP_OTA_IMG_PENDING_VERIFY);
         _bootedFromOta = _pendingVerify;
     }
-    Serial.printf("OTA: firmware %s (code %u, %s) on %s%s\n", firmwareVersion(), (unsigned)firmwareVersionCode(),
+    ESP_LOGI(TAG, "firmware %s (code %u, %s) on %s%s", firmwareVersion(), (unsigned)firmwareVersionCode(),
                   TT_HARDWARE_REV, running ? running->label : "?", _pendingVerify ? " - pending verification" : "");
 
     // Crash-loop guard for images that were already confirmed: three crash resets in a row
@@ -93,7 +96,7 @@ void OtaManager::begin()
     g_otaCrashCount = crashed ? g_otaCrashCount + 1 : 0;
     if (crashed)
     {
-        Serial.printf("OTA: crash reset #%u (reason %d)\n", (unsigned)g_otaCrashCount, (int)reason);
+        ESP_LOGW(TAG, "crash reset #%u (reason %d)", (unsigned)g_otaCrashCount, (int)reason);
     }
     if (g_otaCrashCount >= 3 && !_pendingVerify)
     {
@@ -101,7 +104,7 @@ void OtaManager::begin()
         esp_app_desc_t desc;
         if (other && esp_ota_get_partition_description(other, &desc) == ESP_OK)
         {
-            Serial.printf("OTA: crash loop - reverting to %s (%s)\n", other->label, desc.version);
+            ESP_LOGW(TAG, "crash loop - reverting to %s (%s)", other->label, desc.version);
             Faults::raise(Fault::OTA_CRASH_LOOP_REVERT, desc.version);
             ConfigManager::getInstance().storeInt(NVS_OTA_REVERT, 1);
             g_otaCrashCount = 0;
@@ -110,7 +113,7 @@ void OtaManager::begin()
                 delay(200);
                 esp_restart();
             }
-            Serial.println("OTA: revert failed, the other partition does not hold a valid image");
+            ESP_LOGW(TAG, "revert failed, the other partition does not hold a valid image");
         }
     }
 }
@@ -132,23 +135,48 @@ void OtaManager::confirmImage()
     if (_pendingVerify)
     {
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-        Serial.printf("OTA: new image confirmed after %lu s (%s)\n", millis() / 1000,
+        ESP_LOGI(TAG, "new image confirmed after %lu s (%s)", millis() / 1000,
                       err == ESP_OK ? "rollback cancelled" : esp_err_to_name(err));
         _pendingVerify = false;
     }
     PromptPackManager::getInstance().onFirmwareConfirmed(); // the previous prompt pack can go
 }
 
-void OtaManager::setState(State s, int progress, const String &error)
+void OtaManager::copyText(char *dst, const char *src)
 {
-    _state = s;
+    // Callers pass one of the ERROR_LEN buffers (or _pendingStatus, 16 bytes, with a short literal).
+    const size_t cap = (dst == _pendingStatus) ? sizeof(_pendingStatus) : ERROR_LEN;
+    strlcpy(dst, src ? src : "", cap);
+}
+
+String OtaManager::lastError() const
+{
+    char copy[ERROR_LEN];
+    if (_textLock) xSemaphoreTake(_textLock, portMAX_DELAY);
+    memcpy(copy, _error, sizeof(copy));
+    if (_textLock) xSemaphoreGive(_textLock);
+    copy[ERROR_LEN - 1] = 0;
+    return String(copy);
+}
+
+const char *OtaManager::failureName(Failure f)
+{
+    switch (f)
+    {
+    case Failure::DOWNLOAD: return "download";
+    case Failure::FLASH: return "flash";
+    case Failure::SHA: return "sha";
+    case Failure::PROMPTS: return "prompts";
+    default: return "none";
+    }
+}
+
+// Any task (the download task reports progress and the result through here).
+void OtaManager::setState(State s, int progress, const char *error, Failure failure)
+{
     if (progress >= 0)
     {
         _progress = progress;
-    }
-    if (error.length() > 0)
-    {
-        _error = error;
     }
     // Status for the backend is posted by the loop task (RequestManager is not thread safe).
     const char *status = nullptr;
@@ -157,16 +185,32 @@ void OtaManager::setState(State s, int progress, const String &error)
     case PROMPTS: status = "prompts"; break;
     case DOWNLOADING: status = "downloading"; break;
     case APPLYING: status = "applying"; break;
-    case FAILED: status = "failed"; _justFailed = true; _failedAt = millis(); break;
+    case FAILED: status = "failed"; break;
     default: break;
+    }
+    if (_textLock) xSemaphoreTake(_textLock, portMAX_DELAY);
+    if (error && error[0])
+    {
+        copyText(_error, error);
     }
     if (status)
     {
-        _pendingStatus = status;
+        copyText(_pendingStatus, status);
+        copyText(_pendingError, error);
         _pendingProgress = _progress;
-        _pendingError = error;
+    }
+    if (_textLock) xSemaphoreGive(_textLock);
+    if (s == FAILED)
+    {
+        _failure = (failure == Failure::NONE) ? Failure::DOWNLOAD : failure;
+        _failedAt = millis();
+        _justFailed = true;
+    }
+    if (status)
+    {
         _statusDirty = true;
     }
+    _state = s; // last: the loop sees the new state only with its texts in place
 }
 
 void OtaManager::postStatus(const char *status, int progress, const String &error, uint32_t versionCode)
@@ -191,11 +235,11 @@ void OtaManager::postStatus(const char *status, int progress, const String &erro
     const int progressCopy = progress;
     bool queued = RequestManager::getInstance().postAsync("/hubs/" + deviceId() + "/firmware/status", doc,
         [statusCopy, progressCopy](JsonDocument &, int code) {
-            Serial.printf("OTA: status '%s' %d%% -> HTTP %d\n", statusCopy.c_str(), progressCopy, code);
+            ESP_LOGI(TAG, "status '%s' %d%% -> HTTP %d", statusCopy.c_str(), progressCopy, code);
         });
     if (!queued)
     {
-        Serial.printf("OTA: status '%s' %d%% not sent (no network)\n", status, progress);
+        ESP_LOGW(TAG, "status '%s' %d%% not sent (no network)", status, progress);
     }
 }
 
@@ -203,17 +247,17 @@ bool OtaManager::checkNow(uint32_t releaseId, const char *reason)
 {
     if (inProgress())
     {
-        Serial.println("OTA: check skipped, update in progress");
+        ESP_LOGI(TAG, "check skipped, update in progress");
         return false;
     }
     if (_state == CHECKING)
     {
-        Serial.println("OTA: check already running");
+        ESP_LOGI(TAG, "check already running");
         return false;
     }
     if (!WiFi.isConnected())
     {
-        Serial.println("OTA: check skipped, no network");
+        ESP_LOGI(TAG, "check skipped, no network");
         return false;
     }
     PromptPackManager &ppm = PromptPackManager::getInstance();
@@ -224,8 +268,9 @@ bool OtaManager::checkNow(uint32_t releaseId, const char *reason)
     {
         endpoint += "&release_id=" + String(releaseId);
     }
-    Serial.printf("OTA: checking (%s)\n", reason);
+    ESP_LOGI(TAG, "checking (%s)", reason);
     _state = CHECKING;
+    _checkStartedAt = millis();
     _nextCheckAt = millis() + CHECK_INTERVAL_MS;
     // The answer arrives in onCheckResult() on the loop task; the request runs on the worker.
     bool started = RequestManager::getInstance().getAsync(endpoint, [this](JsonDocument &doc, int code) {
@@ -233,7 +278,7 @@ bool OtaManager::checkNow(uint32_t releaseId, const char *reason)
     });
     if (!started)
     {
-        Serial.println("OTA: check not started (network not ready)");
+        ESP_LOGI(TAG, "check not started (network not ready)");
         _nextCheckAt = millis() + CHECK_RETRY_MS;
         _state = IDLE;
     }
@@ -248,13 +293,13 @@ void OtaManager::onCheckResult(JsonDocument &doc, int code)
     }
     if (code == 204)
     {
-        Serial.println("OTA: up to date");
+        ESP_LOGI(TAG, "up to date");
         _state = IDLE;
         return;
     }
     if (code != 200)
     {
-        Serial.printf("OTA: check failed (HTTP %d)\n", code);
+        ESP_LOGW(TAG, "check failed (HTTP %d)", code);
         {
             char d[16];
             snprintf(d, sizeof(d), "http=%d", code);
@@ -271,17 +316,17 @@ void OtaManager::onCheckResult(JsonDocument &doc, int code)
     const bool hasPack = PromptPackManager::parsePack(doc["prompts"], pack);
     if (!doc["release_id"].is<uint32_t>())
     {
-        Serial.println("OTA: up to date");
+        ESP_LOGI(TAG, "up to date");
         _state = IDLE;
         if (hasPack)
         {
             ppm.noteRequired(pack.checksum);
             if (pack.checksum != ppm.installedChecksum())
             {
-                Serial.printf("OTA: prompt pack %.12s (%s) differs from the card (%s) - syncing it\n", pack.checksum.c_str(),
+                ESP_LOGI(TAG, "prompt pack %.12s (%s) differs from the card (%s) - syncing it", pack.checksum.c_str(),
                               pack.name.c_str(), ppm.installedChecksum().isEmpty() ? "none" : ppm.installedChecksum().substring(0, 12).c_str());
                 ppm.stage(pack, firmwareVersion(), [](bool ok) {
-                    Serial.printf("OTA: prompt pack sync %s\n", ok ? "complete - activated when nothing speaks" : "failed, retried at the next check");
+                    ESP_LOGI(TAG, "prompt pack sync %s", ok ? "complete - activated when nothing speaks" : "failed, retried at the next check");
                 });
                 return;
             }
@@ -300,12 +345,12 @@ void OtaManager::onCheckResult(JsonDocument &doc, int code)
     job.mandatory = doc["mandatory"].as<bool>();
     job.hasPrompts = hasPack;
     job.prompts = pack;
-    Serial.printf("OTA: release %u offered: %s (code %u, %u bytes%s%s)\n", (unsigned)job.releaseId, job.version.c_str(),
+    ESP_LOGI(TAG, "release %u offered: %s (code %u, %u bytes%s%s)", (unsigned)job.releaseId, job.version.c_str(),
                   (unsigned)job.versionCode, (unsigned)job.size, job.mandatory ? ", mandatory" : "",
                   hasPack ? (pack.checksum == ppm.installedChecksum() ? ", prompts up to date" : ", new prompt pack") : "");
     if (job.url.isEmpty() || job.sha256.length() != 64 || job.size == 0)
     {
-        Serial.println("OTA: offer incomplete, ignored");
+        ESP_LOGI(TAG, "offer incomplete, ignored");
         _state = IDLE;
         return;
     }
@@ -323,7 +368,7 @@ void OtaManager::beginJob()
     PromptPackManager &ppm = PromptPackManager::getInstance();
     if (_job.hasPrompts && _job.prompts.checksum != ppm.installedChecksum() && _promptSyncFailures < 2)
     {
-        _error = "";
+        clearError();
         setState(PROMPTS, 0);
         const bool started = ppm.stage(_job.prompts, _job.version, [this](bool ok) { onPromptsStaged(ok); });
         if (!started)
@@ -344,12 +389,12 @@ void OtaManager::onPromptsStaged(bool ok)
     if (ok)
     {
         _promptSyncFailures = 0;
-        Serial.println("OTA: prompt pack staged - downloading the image");
+        ESP_LOGI(TAG, "prompt pack staged - downloading the image");
         startJob(_job);
         return;
     }
     _promptSyncFailures++;
-    setState(FAILED, 0, "voice prompt pack could not be downloaded");
+    setState(FAILED, 0, "voice prompt pack could not be downloaded", Failure::PROMPTS);
 }
 
 bool OtaManager::startJob(const Job &job)
@@ -359,12 +404,12 @@ bool OtaManager::startJob(const Job &job)
         return false;
     }
     _job = job;
-    _error = "";
+    clearError();
     setState(DOWNLOADING, 0);
     if (xTaskCreatePinnedToCore(taskEntry, "ota", 8192, this, 5, &_task, 0) != pdPASS)
     {
         _task = nullptr;
-        setState(FAILED, 0, "could not start the update task");
+        setState(FAILED, 0, "could not start the update task", Failure::DOWNLOAD);
         return false;
     }
     return true;
@@ -380,7 +425,7 @@ void OtaManager::taskEntry(void *arg)
 
 void OtaManager::runDownload()
 {
-    Serial.printf("OTA: downloading %s\n", _job.url.c_str());
+    ESP_LOGI(TAG, "downloading %s", _job.url.c_str());
     const bool https = _job.url.startsWith("https://");
     WiFiClient plain;
     WiFiClientSecure secure;
@@ -396,7 +441,7 @@ void OtaManager::runDownload()
     uint8_t *buf = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!buf)
     {
-        setState(FAILED, _progress, "no memory for the download buffer");
+        setState(FAILED, _progress, "no memory for the download buffer", Failure::DOWNLOAD);
         return;
     }
 
@@ -409,6 +454,7 @@ void OtaManager::runDownload()
     bool flashStarted = false;
     int lastReported = -1;
     String failure;
+    Failure failureKind = Failure::NONE;   // classified where it happens; FLASH ends the retries
     const int maxAttempts = 6;
 
     // The image is fetched in one or more HTTP requests: a dropped connection resumes with a
@@ -418,7 +464,7 @@ void OtaManager::runDownload()
     {
         if (attempt > 1)
         {
-            Serial.printf("OTA: resuming at %u bytes (attempt %d)\n", (unsigned)received, attempt);
+            ESP_LOGI(TAG, "resuming at %u bytes (attempt %d)", (unsigned)received, attempt);
             vTaskDelay(pdMS_TO_TICKS(1500 * attempt));
         }
         HTTPClient http;
@@ -468,6 +514,7 @@ void OtaManager::runDownload()
             {
                 http.end();
                 failure = String("flash: ") + Update.errorString();
+                failureKind = Failure::FLASH;
                 break;
             }
             flashStarted = true;
@@ -507,6 +554,7 @@ void OtaManager::runDownload()
             if (Update.write(buf, (size_t)n) != (size_t)n)
             {
                 failure = String("flash write: ") + Update.errorString();
+                failureKind = Failure::FLASH;
                 break;
             }
             mbedtls_sha256_update(&sha, buf, (size_t)n);
@@ -523,7 +571,7 @@ void OtaManager::runDownload()
             }
         }
         http.end();
-        if (failure.startsWith("flash"))
+        if (failureKind == Failure::FLASH)
         {
             break; // retrying will not help
         }
@@ -540,7 +588,8 @@ void OtaManager::runDownload()
         {
             Update.abort();
         }
-        setState(FAILED, _progress, failure.length() ? failure : String("incomplete download"));
+        setState(FAILED, _progress, failure.length() ? failure.c_str() : "incomplete download",
+                 failureKind == Failure::FLASH ? Failure::FLASH : Failure::DOWNLOAD);
         return;
     }
 
@@ -554,21 +603,21 @@ void OtaManager::runDownload()
     if (expected != hex)
     {
         Update.abort();
-        setState(FAILED, _progress, "sha256 mismatch");
+        setState(FAILED, _progress, "sha256 mismatch", Failure::SHA);
         return;
     }
 
     setState(APPLYING, 100);
     if (!Update.end(true))
     {
-        setState(FAILED, 100, String("activate: ") + Update.errorString());
+        setState(FAILED, 100, (String("activate: ") + Update.errorString()).c_str(), Failure::FLASH);
         return;
     }
     // Remember what we expect to boot into so the result can be reported after the restart.
     ConfigManager &cfg = ConfigManager::getInstance();
     cfg.storeInt(NVS_OTA_RELEASE, (int)_job.releaseId);
     cfg.storeInt(NVS_OTA_VCODE, (int)_job.versionCode);
-    Serial.printf("OTA: image %s verified and activated, rebooting\n", _job.version.c_str());
+    ESP_LOGI(TAG, "image %s verified and activated, rebooting", _job.version.c_str());
     _state = REBOOTING;
 }
 
@@ -626,13 +675,32 @@ void OtaManager::update()
     }
 
     // 3. Status changes made by the download task
-    if (_statusDirty)
+    if (_statusDirty.exchange(false))
     {
-        _statusDirty = false;
+        char status[sizeof(_pendingStatus)];
+        char error[ERROR_LEN];
+        int progress;
+        if (_textLock) xSemaphoreTake(_textLock, portMAX_DELAY);
+        memcpy(status, _pendingStatus, sizeof(status));
+        memcpy(error, _pendingError, sizeof(error));
+        progress = _pendingProgress;
+        if (_textLock) xSemaphoreGive(_textLock);
+        status[sizeof(status) - 1] = 0;
+        error[sizeof(error) - 1] = 0;
         if (WiFi.isConnected())
         {
-            postStatus(_pendingStatus.c_str(), _pendingProgress, _pendingError);
+            postStatus(status, progress, String(error));
         }
+    }
+
+    // 3b. A check whose answer never came (worker stuck, request dropped): back to IDLE so the
+    //     periodic checks and the portal's push can start a new one. A late answer is ignored.
+    if (_state == CHECKING && now - _checkStartedAt > CHECK_TIMEOUT_MS)
+    {
+        ESP_LOGW(TAG, "check timed out after %lu s", CHECK_TIMEOUT_MS / 1000);
+        Faults::raise(Fault::OTA_CHECK_FAILED, "timeout", false);
+        _nextCheckAt = now + CHECK_RETRY_SOON_MS;
+        _state = IDLE;
     }
 
     // 4. Reboot once the final status went out (the worker gets up to 10 s to deliver it)
@@ -682,19 +750,21 @@ void OtaManager::update()
 
 void OtaManager::printStatus()
 {
+    const String err = lastError();
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
-    Serial.printf("OTA: firmware %s code %u hw %s | partition %s (next %s)%s | state %s %d%%%s%s\n",
+    ESP_LOGI(TAG, "firmware %s code %u hw %s | partition %s (next %s)%s | state %s %d%%%s%s%s%s%s",
                   firmwareVersion(), (unsigned)firmwareVersionCode(), TT_HARDWARE_REV,
                   running ? running->label : "?", next ? next->label : "?",
                   _pendingVerify ? " pending-verify" : (_bootHealthyMarked ? " confirmed" : ""), ::stateName(_state), (int)_progress,
-                  _error.length() ? " error: " : "", _error.c_str());
+                  err.length() ? " error: " : "", err.c_str(), err.length() ? " (" : "",
+                  err.length() ? failureName(lastFailure()) : "", err.length() ? ")" : "");
     if (_job.releaseId)
     {
-        Serial.printf("OTA: job release %u %s (code %u) %u bytes %s\n", (unsigned)_job.releaseId, _job.version.c_str(),
+        ESP_LOGI(TAG, "job release %u %s (code %u) %u bytes %s", (unsigned)_job.releaseId, _job.version.c_str(),
                       (unsigned)_job.versionCode, (unsigned)_job.size, _job.url.c_str());
     }
-    Serial.printf("OTA: next periodic check in %ld s, crash resets in a row %u, network %s\n",
+    ESP_LOGI(TAG, "next periodic check in %ld s, crash resets in a row %u, network %s",
                   (long)((long)_nextCheckAt - (long)millis()) / 1000, (unsigned)g_otaCrashCount, _networkHealthy ? "ok" : "not yet");
 }
 
@@ -707,9 +777,15 @@ bool OtaManager::consumeJustUpdated()
 
 bool OtaManager::consumeJustFailed()
 {
-    const bool v = _justFailed;
-    _justFailed = false;
-    return v;
+    return _justFailed.exchange(false);
+}
+
+void OtaManager::clearError()
+{
+    if (_textLock) xSemaphoreTake(_textLock, portMAX_DELAY);
+    _error[0] = 0;
+    if (_textLock) xSemaphoreGive(_textLock);
+    _failure = Failure::NONE;
 }
 
 const char *OtaManager::stateName() const

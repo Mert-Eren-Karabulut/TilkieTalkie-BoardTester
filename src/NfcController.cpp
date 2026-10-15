@@ -1,5 +1,29 @@
 #include "NfcController.h"
+#include "Faults.h"
 #include <driver/gpio.h>
+#include <esp_log.h>
+
+namespace
+{
+const char *TAG = "nfc";
+
+// RAII for the data lock (no-op if the mutex could not be created).
+class DataLock
+{
+public:
+    explicit DataLock(SemaphoreHandle_t m) : mutex(m), held(m && xSemaphoreTake(m, portMAX_DELAY) == pdTRUE) {}
+    ~DataLock()
+    {
+        if (held) xSemaphoreGive(mutex);
+    }
+    DataLock(const DataLock &) = delete;
+    DataLock &operator=(const DataLock &) = delete;
+
+private:
+    SemaphoreHandle_t mutex;
+    bool held;
+};
+} // namespace
 
 // Constructor: Initialize the TwoWire object for I2C bus 1 (Wire1)
 // and pass its address to the Adafruit_PN532 constructor.
@@ -10,13 +34,13 @@ NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
                                  cardPresent(false),
                                  cardReadInSession(false),
                                  lastDebounceTime(0),
-                                 lastPogoState(false),
                                  pendingPogoState(false),
                                  lastNFCReadAttempt(0),
-                                 lastSuccessfulNFCRead(0),
                                  consecutiveFailures(0)
 {
-    // The afterNFCReadCallback and afterDetachNFCCallback are initialized to nullptr by default
+    // The UID is read by the audio task (isNfcSessionActive) and the network code while the
+    // loop task replaces it: a String copy needs a real mutex (it allocates).
+    dataLock = xSemaphoreCreateMutex();
 }
 
 bool NfcController::begin()
@@ -29,8 +53,7 @@ bool NfcController::begin()
 
     // Configure the pogo sense pin.
     pinMode(POGO_SWITCH_PIN, INPUT);
-    lastPogoState = digitalRead(POGO_SWITCH_PIN);
-    pendingPogoState = lastPogoState;
+    pendingPogoState = digitalRead(POGO_SWITCH_PIN);
 
     // Initialize our dedicated I2C bus with custom pins
     I2C_NFC.begin(NFC_SDA_PIN, NFC_SCL_PIN);
@@ -41,31 +64,26 @@ bool NfcController::begin()
     {
         nfc.begin();
         delay(50); // Brief delay between attempts
-        
+
         uint32_t versiondata = nfc.getFirmwareVersion();
         if (versiondata)
         {
-            // Print firmware version
-            Serial.print("Found chip PN5");
-            Serial.print((versiondata >> 16) & 0xFF, HEX);
-            Serial.print(".");
-            Serial.println((versiondata >> 8) & 0xFF, HEX);
+            ESP_LOGI(TAG, "Found chip PN5%X.%X", (unsigned)((versiondata >> 16) & 0xFF), (unsigned)((versiondata >> 8) & 0xFF));
 
             // Configure board to read RFID tags
             nfc.SAMConfig();
-            
+
             nfcReady = true;
-            lastSuccessfulNFCRead = millis(); // Initialize watchdog timer
             consecutiveFailures = 0;
             return true;
         }
-        
-        Serial.printf("NFC init attempt %d failed, retrying...\n", attempts + 1);
+
+        ESP_LOGW(TAG, "NFC init attempt %d failed, retrying...", attempts + 1);
         delay(100);
     }
 
-    Serial.printf("ERROR: PN532 not found on Wire1 after 3 attempts! Check wiring on SDA=%d, SCL=%d, reset GPIO=%d.\n",
-                  NFC_SDA_PIN, NFC_SCL_PIN, NFC_RESET_PIN);
+    ESP_LOGE(TAG, "ERROR: PN532 not found on Wire1 after 3 attempts! Check wiring on SDA=%d, SCL=%d, reset GPIO=%d.",
+             NFC_SDA_PIN, NFC_SCL_PIN, NFC_RESET_PIN);
     nfcReady = false;
     return false;
 }
@@ -77,12 +95,42 @@ void NfcController::update()
         return;
     }
     handlePogoSwitch();
-    
+
     // Only attempt NFC reading while the pogo contacts are shorted.
     if (pogoActive && !cardReadInSession)
     {
         handleNFCReading();
     }
+
+    // A figure on the pins whose card is not read within NFC_READ_TROUBLE_MS: flagged once
+    // per session for the loop (NFC_READ_TROUBLE prompt and fault).
+    if (pogoActive && !readTroubleChecked && millis() - pogoEngagedAt > NFC_READ_TROUBLE_MS)
+    {
+        readTroubleChecked = true;
+        if (!cardPresent)
+        {
+            readTroublePending = true;
+        }
+    }
+}
+
+bool NfcController::consumeReadTrouble()
+{
+    const bool v = readTroublePending;
+    readTroublePending = false;
+    return v;
+}
+
+void NfcController::setDockedCard(const NFCData &data)
+{
+    DataLock lock(dataLock);
+    dockedCardData = data;
+}
+
+void NfcController::invalidateDockedCard()
+{
+    DataLock lock(dataLock);
+    dockedCardData.isValid = false;
 }
 
 void NfcController::handlePogoSwitch()
@@ -107,16 +155,18 @@ void NfcController::handlePogoSwitch()
             if (pogoActive)
             {
                 // New session starts
-                Serial.println("Pogo switch engaged. NFC session started.");
+                ESP_LOGI(TAG, "Pogo switch engaged. NFC session started.");
                 cardReadInSession = false; // Reset session flag
                 lastReadUID = "";          // Clear last read UID for the new session
                 consecutiveFailures = 0;   // Reset failure count for fresh start
-                lastSuccessfulNFCRead = millis(); // the watchdog counts from the session start, not from a read hours ago
+                pogoEngagedAt = millis();
+                readTroubleChecked = false;
+                readTroublePending = false;
             }
             else
             {
                 // Session ends
-                Serial.println("Pogo switch released. NFC session ended.");
+                ESP_LOGI(TAG, "Pogo switch released. NFC session ended.");
                 if (cardReadInSession && afterDetachNFCCallback)
                 {
                     // Only call the detach hook if a card was actually read
@@ -124,23 +174,19 @@ void NfcController::handlePogoSwitch()
                 }
                 cardPresent = false;            // Card is no longer considered present
                 cardReadInSession = false;      // Reset session flag
-                dockedCardData.isValid = false; // Invalidate the docked card data
+                readTroublePending = false;
+                invalidateDockedCard();
             }
         }
     }
-
-    lastPogoState = currentPogoState;
 }
 
 void NfcController::handleNFCReading()
 {
-    // Optimized NFC reading with adaptive timing to reduce I2C Error 263 timeouts.
-    // Uses progressive backoff when no card is present to minimize I2C bus traffic.
-    // Reduces timeout from 50ms to 25ms to fail faster and prevent bus blocking.
-    
-    // Only attempt NFC reading at intervals to avoid blocking the main thread
+    // Adaptive timing: progressive backoff while nothing is read, to keep I2C traffic (and
+    // the I2C error 263 timeouts) down.
     unsigned long currentTime = millis();
-    
+
     // Dynamic read interval based on consecutive failures to reduce I2C traffic
     unsigned long readInterval = NFC_READ_INTERVAL;
     if (consecutiveFailures > 50)
@@ -150,7 +196,7 @@ void NfcController::handleNFCReading()
     }
     else if (consecutiveFailures > 20)
     {
-        // After 20 failures (2 seconds), slow down to every 300ms  
+        // After 20 failures (2 seconds), slow down to every 300ms
         readInterval = 300;
     }
     else if (consecutiveFailures > 10)
@@ -158,86 +204,99 @@ void NfcController::handleNFCReading()
         // After 10 failures (1 second), slow down to every 200ms
         readInterval = 200;
     }
-    
+
     if (currentTime - lastNFCReadAttempt < readInterval)
     {
         return; // Too soon for another read attempt
     }
-    
-    // Check for NFC watchdog timeout - reinitialize if stuck
-    if (lastSuccessfulNFCRead > 0 && (currentTime - lastSuccessfulNFCRead) > NFC_WATCHDOG_TIMEOUT)
-    {
-        Serial.println("WARNING: NFC watchdog timeout, attempting recovery...");
-        consecutiveFailures = 0;
-        lastSuccessfulNFCRead = currentTime; // Reset to prevent spam
-        // Could add nfc.begin() here for full recovery if needed
-    }
-    
     lastNFCReadAttempt = currentTime;
 
-    uint8_t success;
-    uint8_t uid[MAX_UID_LENGTH] = {0}; // Buffer to store the returned UID
-    uint8_t uidLength;                 // Length of the UID (4 or 7 bytes)
+    // The library writes as many UID bytes as the response's length byte says (up to 255):
+    // read into a buffer that cannot overflow, keep the UID only once its length is valid.
+    uint8_t raw[256] = {0};
+    uint8_t uidLength = 0;
+    const bool success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, raw, &uidLength, 70);
 
-    success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 70);
-
-    if (success)
-    {
-        cardPresent = true;
-        consecutiveFailures = 0;
-        lastSuccessfulNFCRead = currentTime;
-        
-        // Validate UID length
-        if (uidLength > MAX_UID_LENGTH)
-        {
-            Serial.printf("ERROR: UID length %d exceeds maximum %d\n", uidLength, MAX_UID_LENGTH);
-            return;
-        }
-        
-        String currentUID;
-        currentUID.reserve(uidLength * 3); // Pre-allocate memory
-        for (uint8_t i = 0; i < uidLength; i++)
-        {
-            if (i > 0)
-                currentUID += "-";
-            if (uid[i] < 0x10)
-                currentUID += "0";
-            currentUID += String(uid[i], HEX);
-        }
-        currentUID.toUpperCase();
-
-        // Check if this is a new card in this session
-        if (currentUID != lastReadUID)
-        {
-            Serial.println("Found new card!");
-            lastReadUID = currentUID; // Update the last read UID
-            cardReadInSession = true; // Mark that a card has been read in this session
-
-            // Populate the data structure
-            memcpy(dockedCardData.uid, uid, uidLength);
-            dockedCardData.uidLength = uidLength;
-            dockedCardData.uidString = currentUID;
-            dockedCardData.timestamp = millis();
-            dockedCardData.isValid = true;
-
-            // Trigger the callback
-            if (afterNFCReadCallback)
-            {
-                afterNFCReadCallback(dockedCardData);
-            }
-        }
-    }
-    else
+    if (!success)
     {
         consecutiveFailures++;
         // Reduce logging frequency to avoid serial spam
-        if (consecutiveFailures % 200 == 0)  // Every 200 failures instead of 100
+        if (consecutiveFailures % 200 == 0)
         {
-            Serial.printf("WARNING: %u consecutive NFC read failures (using %lums interval)\n", 
-                         consecutiveFailures, readInterval);
+            ESP_LOGW(TAG, "WARNING: %u consecutive NFC read failures (using %lums interval)",
+                     consecutiveFailures, readInterval);
+        }
+        if (consecutiveFailures % NFC_REINIT_AFTER_FAILURES == 0)
+        {
+            reinitReader();
+        }
+        return;
+    }
+
+    if (uidLength == 0 || uidLength > MAX_UID_LENGTH)
+    {
+        consecutiveFailures++;
+        if (consecutiveFailures == 1 || consecutiveFailures % 200 == 0)
+        {
+            ESP_LOGE(TAG, "ERROR: UID length %d outside 1..%d - ignored", uidLength, MAX_UID_LENGTH);
+        }
+        return;
+    }
+    cardPresent = true;
+    consecutiveFailures = 0;
+
+    String currentUID;
+    currentUID.reserve(uidLength * 3); // Pre-allocate memory
+    for (uint8_t i = 0; i < uidLength; i++)
+    {
+        if (i > 0)
+            currentUID += "-";
+        if (raw[i] < 0x10)
+            currentUID += "0";
+        currentUID += String(raw[i], HEX);
+    }
+    currentUID.toUpperCase();
+
+    // Check if this is a new card in this session
+    if (currentUID != lastReadUID)
+    {
+        ESP_LOGI(TAG, "Found new card!");
+        lastReadUID = currentUID; // Update the last read UID
+        cardReadInSession = true; // Mark that a card has been read in this session
+
+        NFCData data;
+        memcpy(data.uid, raw, uidLength);
+        data.uidLength = uidLength;
+        data.uidString = currentUID;
+        data.timestamp = millis();
+        data.isValid = true;
+        setDockedCard(data);
+
+        // The callback gets our copy; the lock is not held while it runs.
+        if (afterNFCReadCallback)
+        {
+            afterNFCReadCallback(data);
         }
     }
-    // Note: No need for card removal detection here since reed switch handles that
+    // Card removal is detected by the pogo switch, not here.
+}
+
+// Reader watchdog: a figure on the pins and NFC_REINIT_AFTER_FAILURES reads without an answer
+// (wedged PN532 after an I2C glitch, or simply a figure without a readable card): run the
+// reader's init sequence again. Harmless when the reader was fine.
+void NfcController::reinitReader()
+{
+    nfc.begin();
+    const uint32_t versiondata = nfc.getFirmwareVersion();
+    if (versiondata)
+    {
+        nfc.SAMConfig();
+    }
+    ESP_LOGW(TAG, "reader re-initialised after %u failed reads (%s)", consecutiveFailures,
+             versiondata ? "chip answered" : "chip not answering");
+    char detail[24];
+    snprintf(detail, sizeof(detail), "failures=%u%s", consecutiveFailures, versiondata ? "" : " noack");
+    Faults::raise(Fault::NFC_RESET, detail, false);
 }
 
 void NfcController::simulateCard(const String &uid)
@@ -246,15 +305,16 @@ void NfcController::simulateCard(const String &uid)
     pogoActive = true;
     cardReadInSession = true;
     lastReadUID = uid;
-    dockedCardData = NFCData();
-    dockedCardData.uidString = uid;
-    dockedCardData.timestamp = millis();
-    dockedCardData.isValid = true;
+    NFCData data;
+    data.uidString = uid;
+    data.timestamp = millis();
+    data.isValid = true;
+    setDockedCard(data);
     cardPresent = true;
-    Serial.printf("NfcController: SIMULATED figure %s mounted\n", uid.c_str());
+    ESP_LOGI(TAG, "SIMULATED figure %s mounted", uid.c_str());
     if (afterNFCReadCallback)
     {
-        afterNFCReadCallback(dockedCardData);
+        afterNFCReadCallback(data);
     }
 }
 
@@ -264,14 +324,14 @@ void NfcController::clearSimulation()
     {
         return;
     }
-    Serial.println("NfcController: SIMULATED figure removed");
+    ESP_LOGI(TAG, "SIMULATED figure removed");
     if (cardReadInSession && afterDetachNFCCallback)
     {
         afterDetachNFCCallback();
     }
     cardPresent = false;
     cardReadInSession = false;
-    dockedCardData.isValid = false;
+    invalidateDockedCard();
     pogoActive = false;
     lastReadUID = "";
     simulated = false;
@@ -312,7 +372,7 @@ bool NfcController::powerDown()
         delay(3);         // PN532 needs ~1ms after the response to actually power down
         nfcReady = false; // any further NFC use requires begin() again
     }
-    Serial.printf("NfcController: PN532 power-down %s\n", acked ? "OK" : "FAILED");
+    ESP_LOGI(TAG, "PN532 power-down %s", acked ? "OK" : "FAILED");
     return acked;
 }
 
@@ -343,36 +403,40 @@ bool NfcController::isCardPresent() const
 
 NFCData NfcController::currentNFCData() const
 {
+    DataLock lock(dataLock);
     return dockedCardData;
+}
+
+String NfcController::currentUidCopy() const
+{
+    DataLock lock(dataLock);
+    return dockedCardData.isValid ? dockedCardData.uidString : String();
 }
 
 void NfcController::diagnostics()
 {
-    Serial.println("\n--- NFC Controller Diagnostics ---");
+    ESP_LOGI(TAG, "--- NFC Controller Diagnostics ---");
     if (!nfcReady)
     {
-        Serial.println("NFC board not found. Check wiring and I2C address.");
+        ESP_LOGW(TAG, "NFC board not found. Check wiring and I2C address.");
         return;
     }
 
     uint32_t versiondata = nfc.getFirmwareVersion();
-    Serial.print("Firmware version: ");
-    Serial.print((versiondata >> 16) & 0xFF, DEC);
-    Serial.print('.');
-    Serial.println((versiondata >> 8) & 0xFF, DEC);
+    ESP_LOGI(TAG, "Firmware version: %u.%u", (unsigned)((versiondata >> 16) & 0xFF), (unsigned)((versiondata >> 8) & 0xFF));
 
-    Serial.println("Place a card on the reader to test communication...");
-    uint8_t uid[MAX_UID_LENGTH] = {0};
-    uint8_t uidLength;
-    uint8_t success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 1000);
+    ESP_LOGI(TAG, "Place a card on the reader to test communication...");
+    uint8_t raw[256] = {0}; // the library may write up to 255 UID bytes
+    uint8_t uidLength = 0;
+    uint8_t success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, raw, &uidLength, 1000);
 
     if (success)
     {
-        Serial.println("Diagnostics PASSED: Successfully read a card.");
+        ESP_LOGI(TAG, "Diagnostics PASSED: Successfully read a card (UID %u bytes).", uidLength);
     }
     else
     {
-        Serial.println("Diagnostics FAILED: Could not read a card within 1 second.");
+        ESP_LOGW(TAG, "Diagnostics FAILED: Could not read a card within 1 second.");
     }
-    Serial.println("--------------------------------\n");
+    ESP_LOGI(TAG, "--------------------------------");
 }

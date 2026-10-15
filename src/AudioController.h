@@ -8,10 +8,12 @@
 #include <Wire.h>
 #include <vector>
 #include <functional>
+#include <atomic>
 #include "AudioGeneratorMP3.h"
 #include "AudioOutputI2S.h"
 #include "ReadAheadFileSource.h"
 #include "FileManager.h"
+#include "Faults.h"
 
 // Forward declaration to avoid circular includes
 class NfcController;
@@ -93,16 +95,17 @@ public:
     void clearPlaylist();
     bool isWaitingForTrack() const { return waitingForTrack; }
     bool consumeWaitStarted();        // true once when the playlist started waiting for a download
+    // A download wait longer than this ends the playlist (PLAYLIST_STUCK) instead of sitting in
+    // "loading" for good.
+    static constexpr unsigned long DOWNLOAD_WAIT_MAX_MS = 45UL * 60UL * 1000UL;
 
     // Playlist information
     bool hasPlaylist() const { return !playlist.empty(); }
     int getCurrentTrackIndex() const { return currentPlaylistIndex; }
     int getPlaylistSize() const { return playlist.size(); }
-    String getPlaylistFigureUid() const { return playlistFigureUid; }
-    bool playlistContains(const String& path) const {
-        for (const auto& p : playlist) { if (p == path) return true; }
-        return false;
-    }
+    // Copies taken under the audio lock: safe from any task.
+    String getPlaylistFigureUid() const;
+    bool playlistContains(const String& path) const;
 
     // Volume control (codec attenuation only; the NVS write is deferred to update())
     bool volumeUp();
@@ -124,16 +127,15 @@ public:
     AudioState getState() const { return currentState; }
     // The story track: while a prompt plays this is the interrupted track (or nothing), never
     // the prompt file itself, so playlist merges and the portal never mistake a prompt for a story.
-    String getCurrentTrack() const {
-        if (transientPlayback) return resumeAfterPrompt ? resumeTrackPath : String();
-        return currentTrackPath;
-    }
+    // A copy taken under the audio lock: safe from any task.
+    String getCurrentTrack() const;
     bool isPlaying() const { return currentState == PLAYING; }
     bool isPaused() const { return currentState == PAUSED; }
     bool isStopped() const { return currentState == STOPPED; }
     uint32_t getReadAheadFill() const { return source ? source->available() : 0; }
     uint32_t getReadAheadCapacity() const { return source ? source->capacity() : 0; }
-    uint32_t getUnderruns() const { return source ? source->underruns() : 0; }
+    uint32_t getUnderruns() const { return source ? source->underruns() : 0; }  // current track (reset per open)
+    uint32_t getTotalUnderruns() const { return totalUnderruns.load(); }        // since boot, for the device report
     void printStatus();
 
     // Track timing
@@ -142,8 +144,9 @@ public:
     // Loop-task housekeeping (deferred NVS writes, headphone polling); decoding runs on its own task
     void update();
 
-    // Beep functions
-    void volumeBeep(); // Beep to indicate volume level
+    // Volume beep (only while nothing plays): played like a prompt, so it never advances or
+    // re-arms the playlist when it ends.
+    void volumeBeep();
     // Spoken prompts / tones (VoicePrompts): interrupts a playing or paused track, which is
     // resumed at the same position when the prompt ends. One prompt at a time.
     bool playPrompt(const String& filePath);
@@ -174,16 +177,18 @@ private:
     int currentVolume;
     int volumeCeiling;  // Maximum allowed volume (0-100), stored in NVS
     bool initialized;
-    bool transientPlayback;   // a beep: must not advance the playlist when it ends
+    // Prompt bookkeeping (all written under the audio lock). transientPlayback: a prompt or the
+    // volume beep is playing; it must not advance the playlist when it ends.
+    bool transientPlayback;
     String resumeTrackPath;          // track interrupted by a prompt
     float resumeSeconds = 0.0f;
     bool resumeAfterPrompt = false;
     bool resumeAsPaused = false;
-    volatile bool promptEnded = false;   // set by the audio task, handled in update()
+    std::atomic<bool> promptEnded{false};   // set by the audio task, handled in update()
     bool startingPrompt = false;         // play() called from playPrompt()
     bool deferredPlayPending = false;    // a story asked to start while a prompt was playing
     String deferredPlayPath;
-    volatile bool playlistEnded = false; // set when the last track finished
+    std::atomic<bool> playlistEnded{false}; // set when the last track finished
     bool outputsActive;       // codec unmuted + amp released
     bool codecMuted;
     AmpMode ampMode;
@@ -209,8 +214,21 @@ private:
     bool playlistFinished; // Track if playlist has finished playing
     bool playlistOpen = false;        // more tracks of this figure are still downloading
     bool waitingForTrack = false;     // the last cached track ended while playlistOpen
-    volatile bool waitStarted = false; // consumed by the loop task (prompt + LED)
+    unsigned long waitingSince = 0;   // millis() when the wait began (DOWNLOAD_WAIT_MAX_MS)
+    std::atomic<bool> waitStarted{false}; // consumed by the loop task (prompt + LED)
     String waitAfterPath;             // the track we finished on; playback resumes after it
+
+    // Faults found on the audio task are raised by the loop task (update()): Faults::raise
+    // writes NVS and is not meant for the decode path. Guarded by the audio lock.
+    struct PendingFault {
+        Fault fault;
+        bool speak;
+        char detail[40];
+    };
+    static constexpr int MAX_PENDING_FAULTS = 4;
+    PendingFault pendingFaults[MAX_PENDING_FAULTS];
+    int pendingFaultCount = 0;
+    std::atomic<uint32_t> totalUnderruns{0};
 
     // ES8388 control
     bool initializeES8388();
@@ -228,10 +246,14 @@ private:
     bool isValidAudioFile(const String& filePath);
     bool startDecoder(const String& filePath);
     void releaseDecoder();
+    bool playFile(const String& filePath);   // one file (story or prompt), lock held
+    void stopPlayback();                      // decoder + outputs down; prompt bookkeeping untouched
+    void endOfCachedTracks();                 // wait for a download, or end the playlist
+    bool playlistFigurePresent();             // false (and the playlist cleared) when the figure is gone
+    void queueFault(Fault f, const String& path, bool speak = true, const char* extra = nullptr);
+    void raisePendingFaults();                // loop task
     void finishTrack();
     void updatePlaybackSlice();
-    bool suspendBackgroundTaskForControl();
-    void resumeBackgroundTaskForControl();
     static void audioTaskEntry(void* parameter);
 
     // File manager reference

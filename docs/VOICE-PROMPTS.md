@@ -14,7 +14,7 @@ voice Yelda) into `sdcard/sounds/`, and played by `VoicePrompts` (src/VoicePromp
 ```
 
 Write a card with `tools/sdcard-prepare.sh /dev/diskN` (erases it, FAT32, copies `sdcard/`).
-A card without the files works: the toy stays silent and logs `VoicePrompts: cannot play`.
+A card without the files works: the toy stays silent and logs `prompts: cannot play`.
 Until the factory writes the cards, a missing pack could also be fetched from the portal
 (`/sounds/<lang>/` manifest) on the first connection; not built yet.
 
@@ -22,7 +22,15 @@ Until the factory writes the cards, a missing pack could also be fetched from th
 
 - One prompt at a time, queued (8 deep), the same prompt never twice within its interval.
 - A prompt marked *interrupt* pauses a playing story, plays, and the story resumes at the
-  same position. Everything else is dropped while a story plays (the story wins).
+  same position (the resumed story stays silent until the seek has landed). Everything else
+  is dropped while a story plays (the story wins). There is deliberately no "wait for
+  silence" policy: no prompt needed it, and a prompt spoken minutes after its cause (a story
+  can run for 20 minutes) only confuses; the dead branch and its 30 s timeout were removed
+  in 1.2.18.
+- `say()` may be called from any task (the provisioning prompts come from the WiFi event
+  task): the "already queued" bit is claimed atomically, the loop drains the queue.
+- The volume beep (`/sounds/beep.mp3`, `VoicePrompts::kBeepPath`) goes through the same path
+  as a prompt: it never advances the playlist or re-announces a download wait when it ends.
 - `sayBlocking` is used only where the device is about to go away (sleep, WiFi reset,
   battery cutoff).
 - Prompts do not change the LED scene (the "playing" scene is for stories).

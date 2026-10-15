@@ -50,7 +50,10 @@ public:
 
     // Download `pack` into /sounds.staging for firmware `forVersion`; files already there are
     // kept. cb(true) once the folder is complete and its pack.json written, cb(false) when a
-    // file could not be downloaded (the queue retries first) or after the watchdog.
+    // file could not be downloaded (the queue retries first) or after the watchdog; the rest
+    // of the pack's queued downloads are then cancelled. Staging a different pack while one is
+    // in progress replaces it (the previous cb gets false); the same pack again keeps going and
+    // both callbacks get the result.
     bool stage(const Pack &pack, const String &forVersion, std::function<void(bool)> cb);
     bool isStaging() const { return _staging; }
     int stagingProgress() const;   // files done, in percent
@@ -65,7 +68,12 @@ public:
 
 private:
     PromptPackManager() = default;
+    // One parser for both sources: the firmware check's "prompts" object and a pack.json on
+    // the card. Paths that are absolute or contain ".." are dropped.
+    static void parseFields(JsonVariantConst v, Pack &out);
     bool readPackJson(const String &dir, Pack &pack, String &forVersion);
+    bool ownsStagingPath(const String &path) const;   // a file of the pack being staged
+    void cancelQueuedStaging();
     bool filesComplete(const String &dir, const Pack &pack, int *missing = nullptr);
     bool writeStagingManifest();
     bool activateStaging();
