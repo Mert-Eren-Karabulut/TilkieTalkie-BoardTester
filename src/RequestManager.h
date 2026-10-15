@@ -29,8 +29,6 @@ private:
     String authToken;
     int timeout;
     
-    // Response handling
-    static constexpr size_t MAX_RESPONSE_SIZE = 16384; // 16KB max response
     static const char* SD_DATA_DIR;
     static const char* SD_MANIFEST_DIR;
     static const char* SD_PENDING_MANIFEST_DIR;
@@ -39,7 +37,7 @@ private:
     void setDefaultHeaders();
     JsonDocument parseResponse(const String& response);
     
-    // HTTP request helper - consolidates common request patterns
+    // Synchronous request on the calling task (token fetch only).
     JsonDocument executeHttpRequest(const String& endpoint, const String& method, const String* payload = nullptr);
     // One HTTP exchange (serialized by httpLock). Returns the HTTP status (>0), an HTTPClient
     // error (<0) or 0 when the request was not attempted; error carries the reason.
@@ -81,15 +79,9 @@ public:
     bool hasPendingRequests();                      // queued, in flight or not yet dispatched
     bool isRequestPending(const String &endpoint);  // the same endpoint is queued or in flight
 
-    // HTTP Methods
-    JsonDocument get(const String& endpoint);
-    JsonDocument post(const String& endpoint, const JsonDocument& data);
-
     // Utility methods
     bool isConnected();
     bool isNetworkReady();   // WiFi up with an IP (no portal check)
-    String getLastError();
-    int getLastStatusCode();
     String getJWTToken();
     bool validateToken(const String& token);
     void initConnection();
@@ -167,9 +159,13 @@ public:
     String getFigureIdFromUid(const String &uid);
 
 private:
-    String lastError;
-    int lastStatusCode;
-    
+    // Faults raised by HTTP exchanges are queued here and raised from update() on the loop task
+    // (Faults is not thread-safe; performHttp also runs on the request worker).
+    struct DeferredFault { uint16_t code; char detail[40]; bool speak; };
+    std::vector<DeferredFault> deferredFaults;   // guarded by jobLock
+    void deferFault(uint16_t code, const char *detail, bool speak);
+    void raiseDeferredFaults();
+
     // NVS storage for UID to Figure ID mappings
     static const char* NVS_NAMESPACE;
     static const char* NVS_UID_MAPPING_KEY;

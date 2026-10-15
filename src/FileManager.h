@@ -19,9 +19,9 @@ struct DownloadTask
 {
     String url;
     String localPath;
-    int retryCount;            // consecutive failed attempts (drives the backoff; reset on success)
-    int hardFailures;          // size/checksum mismatches (terminal after MAX_HARD_FAILURES)
-    unsigned long lastAttempt; // Last attempt timestamp for retry delay
+    int retryCount;            // failed attempts so far (drives the backoff; persisted)
+    int hardFailures;          // checksum mismatches / oversize / temp file not creatable (terminal after MAX_HARD_FAILURES)
+    unsigned long lastAttempt; // millis() of the last attempt this boot (not persisted: 0 after a reboot)
     String checksum;           // Optional for file integrity verification
 };
 
@@ -54,7 +54,8 @@ private:
     static const unsigned long MAX_RETRY_DELAY_MS = 600000;     // 10 minute backoff cap
     static const unsigned long SD_WRITER_STALL_MS = 3000;       // network side waits this long for the SD writer
     static const size_t DOWNLOAD_BUFFER_SIZE = 32768;           // 32KB internal SRAM (DMA-aligned) - 2x32KB = 64KB total
-    static const unsigned long DOWNLOAD_TIMEOUT_MS = 300000;    // 5 minutes per download
+    static const unsigned long QUEUE_SAVE_INTERVAL_MS = 5000;   // retry bookkeeping is flushed at most this often
+    static const unsigned long SD_SLOW_WRITE_MS = 3000;         // a single card write above this raises SD_SLOW
 
     // SD card persistence paths (instead of NVS to avoid bloat)
     static const char* SD_DATA_DIR;
@@ -77,9 +78,14 @@ private:
         String requestPath;      // HTTP request path (built before connect())
         int httpStatus;
         uint64_t freeBytesAtStart;
-        volatile bool finishRequested;   // set by callbacks; finalizeAsyncDownload() runs on the loop task
-        volatile bool finishSuccess;
-        volatile bool permanentFailure;
+        // Completion handshake. Two producers (async_tcp callbacks, SD writer) may ask to finish;
+        // the first one wins a compare-exchange FINISH_NONE -> FINISH_CLAIMED, fills in the
+        // result, then publishes FINISH_READY (release). finalizeAsyncDownload() runs on the loop
+        // task once it sees FINISH_READY (acquire).
+        std::atomic<uint8_t> finishState;
+        bool finishSuccess;
+        bool permanentFailure;
+        uint8_t finishKind;              // FinishKind: what the loop task raises as a fault
         char finishError[96];
         volatile bool writerExited;
         volatile bool producerDone;      // no more network data: writer flushes the partial tail
@@ -92,15 +98,18 @@ private:
         bool headersParsed;
         unsigned long startTime;
         unsigned long connectTime;
-        unsigned long lastDataTime;
         unsigned long totalWriteTime;
+        unsigned long maxWriteMs;        // longest single card write (SD_SLOW)
         int writeCount;
         int lastReportedProgress;
         char headerBuffer[1024];
         size_t headerBufferUsed;
         // Ring indices: monotonically increasing byte counters (single producer / single consumer).
-        volatile size_t ringHead;
-        volatile size_t ringTail;
+        // The producer publishes ringHead with release after copying the bytes in; the consumer
+        // publishes ringTail with release after copying them out; each side loads the other's
+        // index with acquire.
+        std::atomic<size_t> ringHead;
+        std::atomic<size_t> ringTail;
         TaskHandle_t writeTaskHandle;
         SemaphoreHandle_t dataAvailable;
         volatile bool writeTaskRunning;
@@ -112,8 +121,8 @@ private:
             headersParsed = false;
             startTime = 0;
             connectTime = 0;
-            lastDataTime = 0;
             totalWriteTime = 0;
+            maxWriteMs = 0;
             writeCount = 0;
             lastReportedProgress = 0;
             headerBuffer[0] = '\0';
@@ -130,9 +139,10 @@ private:
             requestPath = "";
             httpStatus = 0;
             freeBytesAtStart = 0;
-            finishRequested = false;
+            finishState = FINISH_NONE;
             finishSuccess = false;
             permanentFailure = false;
+            finishKind = FK_NONE;
             finishError[0] = '\0';
             writerExited = false;
             producerDone = false;
@@ -142,17 +152,26 @@ private:
         }
     };
 
+    enum : uint8_t { FINISH_NONE = 0, FINISH_CLAIMED = 1, FINISH_READY = 2 };
+    enum FinishKind : uint8_t { FK_NONE = 0, FK_STALLED, FK_NO_SPACE, FK_SD_WRITE };
+
     // Private members
     bool sdCardInitialized;
     bool downloadInProgress;
     AsyncDownloadState asyncState;
     std::vector<DownloadTask> downloadQueue;
     std::vector<FileEntry> requiredFiles;
+    // Queue persistence is batched: retry bookkeeping only marks the queue dirty; update()
+    // writes it at most every QUEUE_SAVE_INTERVAL_MS, and terminal changes write it at once.
+    bool queueDirty = false;
+    unsigned long lastQueueSave = 0;
     
     // Cached free-space figure: f_getfree can scan the whole FAT (seconds on a 30 GB card)
     // while holding the filesystem lock, so it is refreshed only when idle and at most once a minute.
-    uint64_t cachedFreeBytes = 0;
-    unsigned long cachedFreeAt = 0;
+    // Written by the maintenance task and the loop task, read by the report: atomic (a 64-bit
+    // value tears on this 32-bit core).
+    std::atomic<uint64_t> cachedFreeBytes{0};
+    std::atomic<unsigned long> cachedFreeAt{0};
     volatile bool freeRefreshInFlight = false;
     void requestFreeSpaceRefresh();   // runs the FAT free-cluster count on the maintenance task
     void refreshFreeSpaceCache();
@@ -178,11 +197,7 @@ private:
     // Helper methods
     bool initializeSDCard();
     bool checkConnectivity();
-    bool pingGoogle();
-    bool isChargingRequired();
 
-    
-    
     // SD-based persistence operations
     bool saveDownloadQueue();
     bool loadDownloadQueue();
@@ -190,16 +205,19 @@ private:
     bool loadRequiredFiles();
     bool saveDownloadStats();
     bool loadDownloadStats();
+    void quarantineCorrupt(const char *path); // unparseable json -> *.bad (one kept), SD_FILE_CORRUPT
 
     // Download operations
-    bool downloadFileFromURL(const String &url, const String &localPath, const String &checksum, String &errorMsg);
+    // pathError: the local path cannot be created (directory or temp file); everything else
+    // that fails to start (task, semaphore, client, connect) is transient and retried.
+    bool downloadFileFromURL(const String &url, const String &localPath, const String &checksum, String &errorMsg,
+                             bool &pathError);
     void abortAsyncStart();
-    void requestAsyncFinish(bool success, const char *error, bool permanent = false);
+    void requestAsyncFinish(bool success, const char *error, bool permanent = false, uint8_t kind = FK_NONE);
     void finalizeAsyncDownload();
     bool writeJsonAtomic(const char *path, const JsonDocument &doc);
-    bool openJsonForRead(const char *path, File &file);
-    bool verifyFileIntegrity(const String &filePath, const String &expectedChecksum);
     void processDownloadQueue();
+    void giveUp(std::vector<DownloadTask>::iterator it, const char *reason); // terminal: drop, save, fault, callback
     void addToDownloadQueue(const String &url, const String &localPath, const String &checksum = "");
     
     // Async download callbacks
@@ -224,6 +242,11 @@ private:
     };
     QueueHandle_t deleteQueue = nullptr;
     TaskHandle_t maintenanceTaskHandle = nullptr;
+    // Orphaned "*.tmp" under /assets (a download cut by a reset) are swept by the maintenance
+    // task at boot; no download starts while a sweep is queued or running.
+    std::atomic<bool> tmpSweepPending{false};
+    void sweepOrphanedTempFiles();          // maintenance task
+    void sweepTempDir(const String &dir, int depth, int &removed);
     std::atomic<int> pendingDeletes{0};   // all queued jobs (name kept for the callers)
     std::atomic<int> pendingWork{0};      // deletes + writes only (the free-space count must not hold off sleep)
     std::vector<String> pendingDeletePaths; // guarded by pendingLock
@@ -233,7 +256,9 @@ private:
     bool ensureMaintenanceTask();
     bool enqueueJob(uint8_t kind, const String& path, const char* data, size_t len);
     bool ringPush(const uint8_t* data, size_t len);
-    size_t ringAvailable() const { return asyncState.ringHead - asyncState.ringTail; }
+    size_t ringAvailable() const {
+        return asyncState.ringHead.load(std::memory_order_acquire) - asyncState.ringTail.load(std::memory_order_acquire);
+    }
     size_t ringFree() const { return RING_SIZE - ringAvailable() - 1; }
 
 
@@ -241,7 +266,6 @@ private:
     bool createDirectoryStructure(const String &path);
     bool createDirectoryRecursive(const String &path);
     String getDirectoryFromPath(const String &path);
-    size_t getFileSize(const String &path);
 
 public:
     // Singleton access
@@ -255,7 +279,7 @@ public:
     void update();
 
     // File management methods
-    bool deleteFile(const String &path);
+    bool deleteFile(const String &path);                            // removes the file only (not its required-file entry)
     bool deleteFileDeferred(const String &path);                  // erased later by the SD maintenance task
     bool writeFileDeferred(const String &path, const String &content); // written later (tmp + rename) by the SD maintenance task
     bool isDeletePending(const String &path);                       // queued for deletion, not yet gone
@@ -267,6 +291,11 @@ public:
     bool removeDirectory(const String &path);
     std::vector<String> listFiles(const String &directory = "/");
     bool fileExists(const String &path);
+    // Playable: on the card and not queued for deletion. Use this (not fileExists) wherever a
+    // track could be announced for playback.
+    bool isPresent(const String &path);
+    // Reads path, or path.tmp when a crash hit between remove(path) and rename(tmp).
+    bool openJsonForRead(const char *path, File &file);
     void printFileTree();
     void formatSDCard(); // Format SD card as FAT32
     // SD Card diagnostics
@@ -274,9 +303,10 @@ public:
     void benchmarkSequentialWrite(size_t chunkBytes, int count); // per-write timing, no network involved
 
     // Download management methods
-    bool scheduleDownload(const String &url, const String &localPath, const String &checksum = "");
+    // persist=false: the caller adds a batch and calls flushDownloadQueue() once.
+    bool scheduleDownload(const String &url, const String &localPath, const String &checksum = "", bool persist = true);
+    void flushDownloadQueue();
     void cancelAllDownloads();
-    void retryFailedDownloads();
     int getPendingDownloadsCount();
     bool isDownloadInProgress() const { return downloadInProgress; }
     bool hasActiveDownload() const { return downloadInProgress; } // a transfer is in flight (not merely queued)
@@ -294,7 +324,6 @@ public:
 
     // Bulk deletion methods
     void clearAllRequiredFiles();                   // Clear all required files from NVS and storage
-    bool deleteFigureFiles(const String &figureId); // Delete all files for a specific figure
 
     // Status and info methods
     bool isSDCardAvailable() const { return sdCardInitialized; }
@@ -314,26 +343,16 @@ public:
     void printRequiredFiles();
     String formatBytes(size_t bytes);
 
-    // File integrity
-    String calculateFileChecksum(const String &filePath);
-
     // Maintenance operations
-    void cleanupTempFiles();
+    void cleanupTempFiles();   // queue a sweep of orphaned "*.tmp" under /assets (maintenance task)
 
-    // Event callbacks
-    typedef void (*DownloadProgressCallback)(const String &url, const String &path, int progress, size_t downloaded, size_t total);
+    // Completion of every download that leaves the queue: success, or a terminal failure
+    // (permanent HTTP error, retries exhausted, local path not creatable). Loop task.
     typedef void (*DownloadCompleteCallback)(const String &url, const String &path, bool success, const String &error);
-    typedef void (*FileSystemEventCallback)(const String &operation, const String &path, bool success);
-
-    void setDownloadProgressCallback(DownloadProgressCallback callback);
     void setDownloadCompleteCallback(DownloadCompleteCallback callback);
-    void setFileSystemEventCallback(FileSystemEventCallback callback);
 
 private:
-    // Callbacks
-    DownloadProgressCallback downloadProgressCallback;
     DownloadCompleteCallback downloadCompleteCallback;
-    FileSystemEventCallback fileSystemEventCallback;
 };
 
 #endif // FILEMANAGER_H

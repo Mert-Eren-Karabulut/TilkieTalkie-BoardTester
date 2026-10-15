@@ -15,7 +15,7 @@ except the pieces marked *exists*.
 | Firmware token fetch | GET only (RequestManager::getJWTToken) |
 | Factory reset | `ConfigManager::factoryReset()` erases **all** of NVS (`nvs_flash_erase`) |
 | BLE provisioning | IDF provisioning manager, security 1, PoP = `ConfigManager::getProvisioningPin()` (same value on every device today) |
-| Console self-tests | `battery`, `sdbench`, `nfcdiag`, `ledon`, `play`, `speedtest`, `pdstatus`, `efusemac` … (operator-driven, no pass/fail) |
+| Console self-tests | `battery`, `sdbench`, `nfcdiag`, `ledon`, `play`, `pdstatus`, `efusemac` … (operator-driven, no pass/fail) |
 
 ## 2. Goals
 

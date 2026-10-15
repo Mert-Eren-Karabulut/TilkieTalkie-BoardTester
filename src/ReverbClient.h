@@ -92,6 +92,8 @@ private:
     int _lastReportedRssi = 0;
     uint32_t _lastReportedSdFree = 0;
     bool _reportDue = false;
+    unsigned long _lastReportEvalAt = 0;     // the report state is gathered at most once a second
+    unsigned long _lastOverflowLogAt = 0;
     unsigned long _fastReportMs = 0;
     unsigned long _fastReportUntil = 0;
     static QueueHandle_t _outbox;
