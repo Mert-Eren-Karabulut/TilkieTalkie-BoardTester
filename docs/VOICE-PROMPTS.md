@@ -86,7 +86,9 @@ remotely, paired with firmware releases (portal docs/OTA.md "Voice prompt packs"
   with `\n` plus a trailing `\n`. `tools/sounds/gen_prompts.py` writes it and also produces
   `releases/prompts-<id>.zip`, the file to upload on the portal's Firmware page ("Voice prompt
   packs"). `tools/sdcard-prepare.sh` copies `pack.json` to the card, so a factory card reports
-  the pack it carries. The same zip serves as the flasher page's `sounds.zip`.
+  the pack it carries. The same zip serves as the flasher page's `sounds.zip`. Packs made or
+  edited on the portal (own recordings instead of TTS) are downloaded from the Firmware page
+  and written with `tools/sdcard-prepare.sh /dev/diskN prompts-<id>.zip`.
 - **No ambiguity about the files.** The firmware embeds the exact list it expects
   (`TTPROMPTS1:tr/setup_welcome.mp3,...,beep.mp3`, generated from the prompt list in
   VoicePrompts.h). The portal reads it from the uploaded `.bin` and only lets a pack be assigned
