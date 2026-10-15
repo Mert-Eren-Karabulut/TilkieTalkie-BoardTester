@@ -122,7 +122,12 @@ public:
 
     // Status
     AudioState getState() const { return currentState; }
-    String getCurrentTrack() const { return currentTrackPath; }
+    // The story track: while a prompt plays this is the interrupted track (or nothing), never
+    // the prompt file itself, so playlist merges and the portal never mistake a prompt for a story.
+    String getCurrentTrack() const {
+        if (transientPlayback) return resumeAfterPrompt ? resumeTrackPath : String();
+        return currentTrackPath;
+    }
     bool isPlaying() const { return currentState == PLAYING; }
     bool isPaused() const { return currentState == PAUSED; }
     bool isStopped() const { return currentState == STOPPED; }

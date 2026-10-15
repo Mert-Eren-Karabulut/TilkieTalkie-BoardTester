@@ -43,6 +43,12 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 - Prompt packs (1.2.15, docs/VOICE-PROMPTS.md "Remote update"): the portal pairs a pack with each release,
   the device stages it before an update and activates it on the new firmware's first boot; rollback-safe.
   First use on an existing device: its card has no pack.json → it downloads the pack once (~1 MB) and swaps it in.
+- 1.2.16 (from the colleague's device, evening of 2026-10-15): playlist continued from the first
+  track instead of the next one after a download wait (the wait prompt was taken for the current
+  story track); WiFi that never reconnected for 16 min next to a working router (now: radio reset
+  every 4th failed attempt, idle restart after 15 min offline, radio reset when the link is up but
+  the portal unreachable 10 min); loop watchdog 120 s (a hung loop used to need a battery pull);
+  a token check without an answer no longer rotates the hub token.
 - **Not yet run on hardware**: everything from 1.2.11 on (bench board away). First things to try:
   tap a new figure with 3+ tracks and let track 1 end before track 2 is down; delete a figure
   from the hub page and re-tap; change a track on the portal and watch the toy re-download.

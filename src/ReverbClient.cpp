@@ -147,6 +147,7 @@ void ReverbClient::update()
 
     if (isConnected())
     {
+        _lastConnectedAt = millis();
         sendDeviceReport(false);
     }
 }

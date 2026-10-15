@@ -15,6 +15,10 @@ private:
     ConfigManager& config;
     bool provisioningManagerInitialized;
     unsigned long lastReconnectAttempt;
+    bool connectedOnce = false;
+    int reconnectFailures = 0;        // consecutive background attempts without a link
+    unsigned long offlineSince = 0;   // provisioned but no link since (0 = link up)
+    std::function<bool()> idleCheck;  // the 15-minute restart only while the toy is idle
     
     static WiFiProvisioningManager* instance;
     static void onSysProvEvent(arduino_event_t *sys_event);
@@ -33,6 +37,10 @@ public:
     void printStatus();
     void reset();
     void handleBackgroundReconnection();
+    // Full radio restart (off, on, connect with the stored credentials): the escalation when
+    // plain reconnects fail, or when the link is up but nothing gets through.
+    void resetRadio(const char *why);
+    void setIdleCheck(std::function<bool()> fn) { idleCheck = fn; }
     
     // Query underlying library state
     bool isProvisioned();

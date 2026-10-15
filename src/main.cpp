@@ -3,6 +3,7 @@
 #include <esp_private/brownout.h> // esp_brownout_disable() for the dead-cell recovery hold
 #include <esp_sleep.h>
 #include <esp_wifi.h>
+#include <esp_task_wdt.h>
 #include <sys/time.h> // gettimeofday: system time survives deep sleep (sleeptest elapsed)
 #include <esp_log.h>
 #include <HTTPClient.h>
@@ -667,8 +668,12 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
         // path may have started tracks from an older manifest (figure re-bound, content replaced);
         // once the backend's answer arrives, content that is not in it must not keep playing.
         const String current = audioController.getCurrentTrack();
-        bool keepPlaying = false;
-        if (!current.isEmpty())
+        bool keepPlaying = audioController.isWaitingForTrack(); // between stories: the merge continues it
+        if (keepPlaying)
+        {
+            // nothing to check: the playlist is ours and parked after its last cached track
+        }
+        else if (!current.isEmpty())
         {
             for (const auto &path : playlist)
             {
@@ -1134,6 +1139,25 @@ void setup()
     ledController.setScene(LedController::SCENE_BOOT); // "waking up" from the first second
     OtaManager::getInstance().begin();
 
+    // Loop watchdog. A hung loop task (2026-10-15: LEDs on, prompts playing, no network, no
+    // buttons) stayed hung until someone pulled the battery; now it panics after 120 s and the
+    // crash-loop guard in OtaManager treats a repeating hang like a crash. Only the loop task is
+    // watched; synchronous HTTP on the loop (token, channel auth) resets it in between.
+    {
+        esp_task_wdt_config_t wdt = {};
+        wdt.timeout_ms = 120000;
+        wdt.idle_core_mask = 0;
+        wdt.trigger_panic = true;
+        if (esp_task_wdt_reconfigure(&wdt) == ESP_OK && esp_task_wdt_add(NULL) == ESP_OK)
+        {
+            ESP_LOGI(TAG, "Loop watchdog armed (120 s)");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Loop watchdog could not be armed");
+        }
+    }
+
     ESP_LOGI(TAG, "Initializing Sleep Controller...");
     sleepController.begin();
     // Inactivity timeout (disabled during first-boot bring-up so it stays awake to
@@ -1423,6 +1447,11 @@ void startFullSystem()
         gSetupWelcomeRepeats = 1;
     }
 
+    wifiProv.setIdleCheck([]() {
+        // A restart to recover the network is invisible only while nothing is going on.
+        return !audioController.isPlaying() && !audioController.isPaused() && !nfcController.isCardPresent() &&
+               !OtaManager::getInstance().inProgress() && !fileManager.hasActiveDownload() && !PromptPackManager::getInstance().isStaging();
+    });
     OtaManager::getInstance().setIdleCheck([]() {
         // Flash writes stall every task for tens of ms: never while a story plays or a file is
         // being written, not on a nearly empty cell, and only after "updating myself" was said
@@ -1544,6 +1573,26 @@ static void serviceNetworkStart()
     }
     ESP_LOGI(TAG, "NET: WiFi is up - starting network services");
     startNetworkServices();
+}
+
+// WiFi "connected" but nothing gets through (DHCP lease gone, AP dropped us silently): the
+// Reverb socket then stays down although the radio reports a link. After 10 min of that the
+// radio is reset; the plain "not connected" case is handled in WiFiProvisioningManager.
+static void serviceNetworkHealth()
+{
+    static unsigned long lastReset = 0;
+    if (!gNetworkServicesStarted || !WiFi.isConnected() || wifiProv.isProvisioningManagerActive())
+    {
+        return;
+    }
+    const unsigned long now = millis();
+    const unsigned long last = reverb.lastConnectedAt();
+    const unsigned long ref = last ? last : gFullSystemStartedAt;
+    if (now - ref > 10UL * 60UL * 1000UL && now - lastReset > 10UL * 60UL * 1000UL)
+    {
+        lastReset = now;
+        wifiProv.resetRadio("link up but the portal has been unreachable for 10 min");
+    }
 }
 
 // Voice feedback that depends on state rather than on an event.
@@ -1692,6 +1741,7 @@ static void serviceChargeMonitor()
 
 void loop()
 {
+    esp_task_wdt_reset();
     Diag::periodicReport(10000); // loop section timing + heap every 10 s
 
     // Stack monitoring every 10 seconds
@@ -3552,6 +3602,7 @@ void loop()
     // Charge bar while docked (transient NFC/audio pulses play over it and it resumes).
     TT_TIMED("chargeux", updateChargingUx());
     TT_TIMED("netstart", serviceNetworkStart());
+    TT_TIMED("nethealth", serviceNetworkHealth());
     TT_TIMED("ux", serviceUxPrompts());
     TT_TIMED("battux", updateBatteryUx());
 

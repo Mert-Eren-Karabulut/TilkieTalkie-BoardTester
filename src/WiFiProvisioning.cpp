@@ -277,23 +277,57 @@ void WiFiProvisioningManager::handleBackgroundReconnection() {
         if (eventCb) eventCb(ProvEvent::ENDED);
     }
     // Only attempt reconnection if we're provisioned but not connected
-    if (isConnected() || provisioningManagerInitialized || !isProvisioned()) {
+    if (isConnected()) {
+        connectedOnce = true;
+        offlineSince = 0;
+        reconnectFailures = 0;
         return;
     }
-    
+    if (provisioningManagerInitialized || !isProvisioned()) {
+        return;
+    }
     // Retry without blocking: every 10 s until the first connection of this boot, then every
     // 30 s. The WiFi driver reports the result through the events; nothing is waited for here.
-    static bool connectedOnce = false;
+    // Every 4th failed attempt restarts the radio outright: a toy whose reconnects failed for
+    // 16 minutes next to a working router came back within seconds of a reboot (2026-10-15).
     unsigned long currentTime = millis();
+    if (!offlineSince) {
+        offlineSince = currentTime;
+    }
     const unsigned long interval = connectedOnce ? 30000UL : 10000UL;
     if (currentTime - lastReconnectAttempt >= interval) {
         lastReconnectAttempt = currentTime;
-        Serial.println("Attempting WiFi reconnection with stored credentials (background)...");
-        WiFi.begin(); // Use stored credentials
+        reconnectFailures++;
+        if (reconnectFailures >= 4 && (reconnectFailures % 4) == 0) {
+            resetRadio("reconnects keep failing");
+        } else {
+            Serial.println("Attempting WiFi reconnection with stored credentials (background)...");
+            WiFi.begin(); // Use stored credentials
+        }
     }
-    if (WiFi.isConnected()) {
-        connectedOnce = true;
+    // Still nothing after 15 minutes: a restart while the toy is idle is invisible and ends
+    // whatever state the driver got into.
+    if (currentTime - offlineSince > 15UL * 60UL * 1000UL && idleCheck && idleCheck()) {
+        Serial.println("WiFi: offline for 15 min although provisioned - restarting while idle");
+        delay(200);
+        ESP.restart();
     }
+}
+
+void WiFiProvisioningManager::resetRadio(const char *why) {
+    Serial.printf("WiFi: radio reset (%s)\n", why);
+    WiFi.disconnect(true, false); // radio off, credentials kept
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+    WiFi.mode(WIFI_STA);
+    const String ssid = config.getWiFiSSID();
+    const String pass = config.getWiFiPassword();
+    if (ssid.length() > 0) {
+        WiFi.begin(ssid.c_str(), pass.c_str());
+    } else {
+        WiFi.begin();
+    }
+    lastReconnectAttempt = millis();
 }
 
 void WiFiProvisioningManager::handleProvisioningEvent(arduino_event_t *sys_event) {

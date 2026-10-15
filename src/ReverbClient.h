@@ -31,6 +31,7 @@ public:
     void update();
     void cleanup();
     bool isConnected();
+    unsigned long lastConnectedAt() const { return _lastConnectedAt; } // millis(), 0 = never this boot
     String getConnectionStatus();
     void disconnect();
     void forceReconnect();
@@ -85,6 +86,7 @@ private:
     unsigned long _lastReportAt = 0;
     unsigned long _lastPositionReportAt = 0;
     String _lastReportSignature;
+    unsigned long _lastConnectedAt = 0;
     float _lastReportedPercent = -100.0f;
     float _lastReportedVoltage = 0.0f;
     int _lastReportedRssi = 0;
