@@ -15,7 +15,7 @@
 #include "RequestManager.h"
 
 // Define static members
-char ReverbClient::jsonBuffer[768];
+char ReverbClient::jsonBuffer[1024];
 char ReverbClient::urlBuffer[128];
 char ReverbClient::headerBuffer[256];
 char ReverbClient::channelBuffer[64];
@@ -557,6 +557,7 @@ void ReverbClient::sendDeviceReport(bool force)
                            "\"device_report\":{"
                            "\"device_id\":\"%s\","
                            "\"last_error\":\"%s\","
+                           "\"ota\":{\"state\":\"%s\",\"progress\":%d},"
                            "\"battery\":{"
                            "\"status\":\"%s\","
                            "\"percent\":%.1f,"
@@ -584,6 +585,8 @@ void ReverbClient::sendDeviceReport(bool force)
                            channelBuffer,
                            _deviceId.c_str(),
                            _lastError,
+                           OtaManager::getInstance().stateName(),
+                           OtaManager::getInstance().progress(),
                            isCharging ? "charging" : "discharging",
                            batteryPercent,
                            batteryVoltage,

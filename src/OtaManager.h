@@ -49,6 +49,7 @@ public:
     void markBootHealthy();  // network is up (the image itself is confirmed after 60 s of uptime)
 
     State state() const { return _state; }
+    const char *stateName() const;   // "idle", "waiting", "downloading", ... for reports
     int progress() const { return _progress; }
     bool inProgress() const { return _state == DOWNLOADING || _state == APPLYING || _state == REBOOTING; }
     const Job &job() const { return _job; }

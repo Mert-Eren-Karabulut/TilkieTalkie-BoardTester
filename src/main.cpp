@@ -1213,11 +1213,14 @@ void setup()
 // Brings up the heavy subsystems (SD, WiFi, audio, Reverb, NFC, buttons). Called once the
 // battery can support them — immediately from setup() on a healthy cell, or later from
 // loop() once a depleted cell has charged back above SYSTEM_START_V.
-// The toy is idle enough for an update to be written (used by OtaManager's idle check).
+// The toy is idle enough for an update to be written (used by OtaManager's idle check):
+// docked (USB power present - a full pack on the dock counts), no figure on the pins, nothing
+// paused, no story download. Updates never start on battery; a release marked mandatory still
+// forces itself after an hour of waiting (OtaManager).
 static bool otaIdleConditions()
 {
-    return !audioController.isPaused() && !nfcController.isCardPresent() && !fileManager.hasActiveDownload() &&
-           (battery.getChargingStatus() || battery.getBatteryPercentage() >= 40.0f);
+    return battery.isVbusPresent() && !audioController.isPaused() && !nfcController.isCardPresent() &&
+           !fileManager.hasActiveDownload();
 }
 
 // API client + Reverb. Safe to call once WiFi has an IP; idempotent.

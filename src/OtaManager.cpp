@@ -616,3 +616,8 @@ bool OtaManager::consumeJustFailed()
     _justFailed = false;
     return v;
 }
+
+const char *OtaManager::stateName() const
+{
+    return ::stateName(_state);
+}

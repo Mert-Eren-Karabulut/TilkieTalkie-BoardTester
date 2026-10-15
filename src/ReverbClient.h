@@ -96,7 +96,7 @@ private:
     void drainOutbox();
     
     // Pre-allocated static buffers to reduce heap fragmentation
-    static char jsonBuffer[768];
+    static char jsonBuffer[1024];
     static char urlBuffer[128];
     static char headerBuffer[256];
     static char channelBuffer[64];
