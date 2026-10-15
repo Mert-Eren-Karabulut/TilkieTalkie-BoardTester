@@ -592,7 +592,7 @@ void OtaManager::printStatus()
     Serial.printf("OTA: firmware %s code %u hw %s | partition %s (next %s)%s | state %s %d%%%s%s\n",
                   firmwareVersion(), (unsigned)firmwareVersionCode(), TT_HARDWARE_REV,
                   running ? running->label : "?", next ? next->label : "?",
-                  _pendingVerify ? " pending-verify" : (_bootHealthyMarked ? " confirmed" : ""), stateName(_state), (int)_progress,
+                  _pendingVerify ? " pending-verify" : (_bootHealthyMarked ? " confirmed" : ""), ::stateName(_state), (int)_progress,
                   _error.length() ? " error: " : "", _error.c_str());
     if (_job.releaseId)
     {
