@@ -142,6 +142,13 @@ public:
     enum class FigureEvent { DOWNLOADS_STARTED };  // nothing playable yet, stories being downloaded
     void setFigureEventCallback(std::function<void(const String &uid, FigureEvent)> cb) { figureEventCallback = cb; }
     
+    // Stories on the card for the portal: one "client-device-files" event per figure, built on the
+    // SD maintenance task (manifests + file sizes), sent by ReverbClient from its outbox.
+    void requestInventory();                 // loop task: queue the job
+    void buildInventory();                   // maintenance task
+    bool forgetFigure(const String &uid);    // delete a figure's cached stories + manifest (loop task)
+    bool forgetTrack(const String &path);    // delete one cached track (loop task)
+
     // Helper method to get figure ID from UID (for deletion purposes)
     String getFigureIdFromUid(const String &uid);
 

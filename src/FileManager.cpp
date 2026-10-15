@@ -1,6 +1,7 @@
 #include "FileManager.h"
 #include "BatteryManagement.h"
 #include "PsramJson.h"
+#include "RequestManager.h"
 #include <SD_MMC.h>
 #include <AsyncTCP.h>
 #include <HTTPClient.h>
@@ -354,6 +355,9 @@ bool FileManager::deleteFile(const String& path) {
 }
 
 bool FileManager::ensureMaintenanceTask() {
+    if (!pendingLock) {
+        pendingLock = xSemaphoreCreateMutex();
+    }
     if (!deleteQueue) {
         deleteQueue = xQueueCreate(32, sizeof(MaintJob*));
         if (!deleteQueue) {
@@ -361,7 +365,7 @@ bool FileManager::ensureMaintenanceTask() {
         }
     }
     if (!maintenanceTaskHandle) {
-        if (xTaskCreatePinnedToCore(sdMaintenanceTask, "sd_maint", 6144, this, 2, &maintenanceTaskHandle, 0) != pdPASS) {
+        if (xTaskCreatePinnedToCore(sdMaintenanceTask, "sd_maint", 8192, this, 2, &maintenanceTaskHandle, 0) != pdPASS) {
             maintenanceTaskHandle = nullptr;
             return false;
         }
@@ -391,13 +395,19 @@ bool FileManager::enqueueJob(uint8_t kind, const String& path, const char* data,
         free(job->path); free(job->data); free(job);
         return false;
     }
+    const bool work = (kind == 0 || kind == 1);
     pendingDeletes++;
-    if (kind != 2) pendingWork++;
+    if (work) pendingWork++;
     if (xQueueSend(deleteQueue, &job, 0) != pdTRUE) {
         pendingDeletes--;
-        if (kind != 2) pendingWork--;
+        if (work) pendingWork--;
         free(job->path); free(job->data); free(job);
         return false;
+    }
+    if (kind == 0 && pendingLock) {
+        xSemaphoreTake(pendingLock, portMAX_DELAY);
+        pendingDeletePaths.push_back(path);
+        xSemaphoreGive(pendingLock);
     }
     return true;
 }
@@ -466,6 +476,16 @@ void FileManager::sdMaintenanceTask(void* parameter) {
             if (job->kind == 0) {
                 bool ok = SD_MMC.remove(job->path);
                 Serial.printf("FileManager: %s %s (%lu ms, background)\n", ok ? "deleted" : "failed to delete", job->path, millis() - t0);
+                if (self->pendingLock) {
+                    xSemaphoreTake(self->pendingLock, portMAX_DELAY);
+                    for (auto it = self->pendingDeletePaths.begin(); it != self->pendingDeletePaths.end(); ++it) {
+                        if (*it == job->path) { self->pendingDeletePaths.erase(it); break; }
+                    }
+                    xSemaphoreGive(self->pendingLock);
+                }
+            } else if (job->kind == 3) {
+                RequestManager::getInstance().buildInventory(); // stories on the card -> ReverbClient outbox
+                self->inventoryQueued = false;
             } else if (job->kind == 1) {
                 bool ok = self->writeFileNow(job->path, job->data, job->len);
                 unsigned long dt = millis() - t0;
@@ -477,7 +497,7 @@ void FileManager::sdMaintenanceTask(void* parameter) {
                 self->freeRefreshInFlight = false;
             }
         }
-        const bool work = job->kind != 2;
+        const bool work = (job->kind == 0 || job->kind == 1);
         free(job->path);
         free(job->data);
         free(job);
@@ -1108,6 +1128,28 @@ void FileManager::requestFreeSpaceRefresh() {
     }
     if (enqueueJob(2, "/", nullptr, 0)) {
         freeRefreshInFlight = true;
+    }
+}
+
+bool FileManager::isDeletePending(const String& path) {
+    if (!pendingLock) {
+        return false;
+    }
+    bool pending = false;
+    xSemaphoreTake(pendingLock, portMAX_DELAY);
+    for (const String& p : pendingDeletePaths) {
+        if (p == path) { pending = true; break; }
+    }
+    xSemaphoreGive(pendingLock);
+    return pending;
+}
+
+void FileManager::enqueueInventory() {
+    if (inventoryQueued) {
+        return;
+    }
+    if (enqueueJob(3, "/", nullptr, 0)) {
+        inventoryQueued = true;
     }
 }
 

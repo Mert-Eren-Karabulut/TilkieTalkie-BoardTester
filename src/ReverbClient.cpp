@@ -12,6 +12,7 @@
 #include "ConfigManager.h"
 #include "CaBundle.h"
 #include "OtaManager.h"
+#include "RequestManager.h"
 
 // Define static members
 char ReverbClient::jsonBuffer[768];
@@ -20,6 +21,7 @@ char ReverbClient::headerBuffer[256];
 char ReverbClient::channelBuffer[64];
 char ReverbClient::tempBuffer[256];
 char ReverbClient::_lastError[16] = "";
+QueueHandle_t ReverbClient::_outbox = nullptr;
 
 void ReverbClient::setLastError(const char *code)
 {
@@ -137,6 +139,7 @@ void ReverbClient::update()
     if (_ws)
     {
         _ws->loop();
+        drainOutbox();
     }
 
     serviceSubscription();
@@ -533,9 +536,12 @@ void ReverbClient::sendDeviceReport(bool force)
                    abs(wifiRSSI - _lastReportedRssi) >= 10 ||
                    sdFreeSpace != _lastReportedSdFree;
     // Docked: power is free and the owner is likely looking at the portal -> 15 s; on battery 60 s.
-    const unsigned long heartbeatMs = battery.isVbusPresent() ? 15000UL : 60000UL;
+    // Docked: 10 s; on battery: 30 s; while the portal is watching (set-report-interval): faster.
+    const bool fast = _fastReportUntil != 0 && (long)(_fastReportUntil - now) > 0;
+    const unsigned long heartbeatMs = fast ? _fastReportMs : (battery.isVbusPresent() ? 10000UL : 30000UL);
     bool heartbeat = (now - _lastReportAt) >= heartbeatMs;
-    bool position = (audioState == 1) && (now - _lastPositionReportAt) >= 5000UL;
+    const unsigned long positionMs = (fast && _fastReportMs < 5000UL) ? _fastReportMs : 5000UL;
+    bool position = (audioState == 1) && (now - _lastPositionReportAt) >= positionMs;
     if (!force && !_reportDue && !changed && !heartbeat && !position)
     {
         return;
@@ -1041,6 +1047,39 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
         Serial.printf("ReverbClient: OTA update requested (release %u)\n", (unsigned)releaseId);
         OtaManager::getInstance().checkNow(releaseId, "command");
     }
+    else if (lowerType == "list-files")
+    {
+        Serial.println("ReverbClient: list-files");
+        RequestManager::getInstance().requestInventory();
+    }
+    else if (lowerType == "delete-figure")
+    {
+        if (!hasValue || value.isEmpty())
+        {
+            Serial.println("ReverbClient: delete-figure needs a figure uid");
+        }
+        else
+        {
+            RequestManager::getInstance().forgetFigure(value);
+            RequestManager::getInstance().requestInventory();
+        }
+    }
+    else if (lowerType == "delete-track")
+    {
+        if (!hasValue || !value.startsWith("/assets/"))
+        {
+            Serial.println("ReverbClient: delete-track refused - only files under /assets/");
+        }
+        else
+        {
+            RequestManager::getInstance().forgetTrack(value);
+            RequestManager::getInstance().requestInventory();
+        }
+    }
+    else if (lowerType == "set-report-interval")
+    {
+        setReportInterval(hasValue ? (uint32_t)value.toInt() : 5);
+    }
     else if (lowerType == "reboot" || lowerType == "restart")
     {
         Serial.println("ReverbClient: Executing reboot command");
@@ -1051,5 +1090,62 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
     else
     {
         Serial.printf("ReverbClient: Unknown command type: %s\n", type.c_str());
+    }
+}
+
+void ReverbClient::setReportInterval(uint32_t seconds)
+{
+    if (seconds < 2) seconds = 2;
+    if (seconds > 60) seconds = 60;
+    _fastReportMs = seconds * 1000UL;
+    _fastReportUntil = millis() + 120000UL;
+    if (_fastReportUntil == 0) _fastReportUntil = 1;
+    _reportDue = true;
+    Serial.printf("ReverbClient: reports every %u s for the next 2 minutes\n", (unsigned)seconds);
+}
+
+void ReverbClient::queueDeviceFiles(const String &innerJson)
+{
+    if (!_outbox)
+    {
+        _outbox = xQueueCreate(12, sizeof(char *));
+        if (!_outbox) return;
+    }
+    const size_t len = innerJson.length() + 1;
+    char *copy = static_cast<char *>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!copy) copy = static_cast<char *>(malloc(len));
+    if (!copy) return;
+    memcpy(copy, innerJson.c_str(), len);
+    if (xQueueSend(_outbox, &copy, pdMS_TO_TICKS(50)) != pdTRUE)
+    {
+        free(copy);
+        Serial.println("ReverbClient: outbox full, inventory part dropped");
+    }
+}
+
+void ReverbClient::drainOutbox()
+{
+    if (!_outbox || !isConnected())
+    {
+        return;
+    }
+    char *item = nullptr;
+    if (xQueueReceive(_outbox, &item, 0) != pdTRUE || !item)
+    {
+        return;
+    }
+    String frame;
+    frame.reserve(strlen(item) + 160);
+    frame += "{\"event\":\"client-device-files\",\"channel\":\"private-device.";
+    frame += _deviceId;
+    frame += "\",\"data\":{\"device_files\":{\"device_id\":\"";
+    frame += _deviceId;
+    frame += "\",";
+    frame += item;
+    frame += "}}}";
+    free(item);
+    if (!_ws->sendTXT((uint8_t *)frame.c_str(), frame.length()))
+    {
+        Serial.println("ReverbClient: failed to send device files event");
     }
 }

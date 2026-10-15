@@ -2,6 +2,7 @@
 #include "ReverbClient.h"
 #include "CaBundle.h"
 #include "PsramJson.h"
+#include "AudioController.h"
 
 // Initialize static members
 const char* RequestManager::NVS_NAMESPACE = "requestmgr";
@@ -1358,4 +1359,139 @@ void RequestManager::removeStaleAssets(const String &uid, const JsonDocument &cu
     if (requiredChanged) {
         fileManager.flushRequiredFiles();
     }
+}
+
+// ---- Stories inventory for the portal ------------------------------------------------------
+
+void RequestManager::requestInventory()
+{
+    FileManager::getInstance().enqueueInventory();
+}
+
+// Runs on the SD maintenance task: reads every cached manifest, sizes the tracks, and queues one
+// event per figure ({"seq","total","sd","figure"} without the outer braces; ReverbClient wraps it).
+void RequestManager::buildInventory()
+{
+    FileManager &fm = FileManager::getInstance();
+    std::vector<String> uids;
+    for (const String &name : fm.listFiles(SD_MANIFEST_DIR)) {
+        if (name.endsWith(".json")) {
+            uids.push_back(name.substring(0, name.length() - 5));
+        }
+    }
+    const uint32_t freeMb = fm.getSDCardFreeMB();
+    const uint32_t totalMb = (uint32_t)(SD_MMC.totalBytes() >> 20);
+    char sd[64];
+    snprintf(sd, sizeof(sd), "\"sd\":{\"free_mb\":%u,\"total_mb\":%u}", (unsigned)freeMb, (unsigned)totalMb);
+    if (uids.empty()) {
+        ReverbClient::queueDeviceFiles(String("\"seq\":0,\"total\":0,") + sd + ",\"figure\":null");
+        return;
+    }
+    size_t seq = 0;
+    for (const String &uid : uids) {
+        JsonDocument manifest(&psramJsonAllocator);
+        const bool loaded = loadUnitManifest(uid, manifest);
+        JsonDocument out(&psramJsonAllocator);
+        out["seq"] = (int)++seq;
+        out["total"] = (int)uids.size();
+        JsonObject fig = out["figure"].to<JsonObject>();
+        fig["uid"] = uid;
+        fig["id"] = loaded ? jsonValueToString(manifest["figure"]["id"]) : String();
+        fig["name"] = loaded ? manifest["figure"]["name"].as<String>() : String("?");
+        JsonArray tracks = fig["tracks"].to<JsonArray>();
+        uint64_t bytes = 0;
+        int count = 0;
+        auto addTrack = [&](JsonObjectConst t) {
+            if (count >= 60) return;
+            String path = normalizeStoragePath(t["storage_path"].as<String>());
+            if (path.isEmpty()) return;
+            JsonObject o = tracks.add<JsonObject>();
+            o["id"] = jsonValueToString(t["id"]);
+            o["name"] = t["name"].as<String>();
+            o["path"] = path;
+            size_t size = 0;
+            bool cached = false;
+            if (!fm.isDeletePending(path)) {
+                File f = SD_MMC.open(path);
+                if (f) {
+                    size = f.size();
+                    cached = !f.isDirectory();
+                    f.close();
+                }
+            }
+            o["size"] = (uint32_t)size;
+            o["cached"] = cached;
+            bytes += size;
+            count++;
+        };
+        if (loaded) {
+            for (JsonVariantConst c : manifest["contents"].as<JsonArrayConst>())
+                for (JsonVariantConst e : c["episodes"].as<JsonArrayConst>())
+                    for (JsonVariantConst t : e["tracks"].as<JsonArrayConst>())
+                        addTrack(t.as<JsonObjectConst>());
+            for (JsonVariantConst t : manifest["custom_tracks"].as<JsonArrayConst>())
+                addTrack(t.as<JsonObjectConst>());
+        }
+        fig["bytes"] = (uint32_t)bytes;
+        String json;
+        serializeJson(out, json);
+        // "{...}" -> "..." so the sender can prepend device_id; sd is inserted here as text
+        String inner = json.substring(1, json.length() - 1);
+        ReverbClient::queueDeviceFiles(inner + "," + sd);
+    }
+}
+
+bool RequestManager::forgetFigure(const String &uid)
+{
+    FileManager &fileManager = FileManager::getInstance();
+    AudioController &audio = AudioController::getInstance();
+    if (audio.hasPlaylist() && audio.getPlaylistFigureUid() == uid) {
+        audio.stop();
+        audio.clearPlaylist();
+    }
+    JsonDocument manifest(&psramJsonAllocator);
+    std::vector<String> paths;
+    if (loadUnitManifest(uid, manifest)) {
+        paths = extractAssetPaths(manifest);
+    }
+    const std::vector<String> keep = assetsReferencedByOtherUnits(uid);
+    int deleted = 0;
+    for (const String &path : paths) {
+        bool shared = false;
+        for (const String &k : keep) {
+            if (k == path) { shared = true; break; }
+        }
+        if (shared) continue;
+        fileManager.removeRequiredFile(path, false);
+        fileManager.deleteFileDeferred(path);
+        deleted++;
+    }
+    fileManager.flushRequiredFiles();
+    fileManager.deleteFileDeferred(getUnitManifestPath(uid));
+    deletePendingUnitManifest(uid);
+    for (auto it = activeDownloads.begin(); it != activeDownloads.end();) {
+        if (it->uid == uid) it = activeDownloads.erase(it); else ++it;
+    }
+    if (uidToFigureIdMap.erase(uid) > 0) {
+        saveUidMappings();
+    }
+    Serial.printf("RequestManager: forgot figure %s (%d file(s) queued for deletion, %u shared kept)\n",
+                  uid.c_str(), deleted, (unsigned)keep.size());
+    return true;
+}
+
+bool RequestManager::forgetTrack(const String &path)
+{
+    if (!path.startsWith("/assets/")) {
+        return false;
+    }
+    FileManager &fileManager = FileManager::getInstance();
+    AudioController &audio = AudioController::getInstance();
+    if (audio.getCurrentTrack() == path) {
+        audio.stop();
+    }
+    fileManager.removeRequiredFile(path, true);
+    fileManager.deleteFileDeferred(path);
+    Serial.printf("RequestManager: forgot track %s\n", path.c_str());
+    return true;
 }

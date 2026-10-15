@@ -12,6 +12,7 @@
 #include <ArduinoJson.h>
 #include <mbedtls/sha256.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <atomic>
 
 struct DownloadTask
@@ -225,6 +226,9 @@ private:
     TaskHandle_t maintenanceTaskHandle = nullptr;
     std::atomic<int> pendingDeletes{0};   // all queued jobs (name kept for the callers)
     std::atomic<int> pendingWork{0};      // deletes + writes only (the free-space count must not hold off sleep)
+    std::vector<String> pendingDeletePaths; // guarded by pendingLock
+    SemaphoreHandle_t pendingLock = nullptr;
+    volatile bool inventoryQueued = false;
     static void sdMaintenanceTask(void* parameter);
     bool ensureMaintenanceTask();
     bool enqueueJob(uint8_t kind, const String& path, const char* data, size_t len);
@@ -255,6 +259,8 @@ public:
     bool deleteFile(const String &path);
     bool deleteFileDeferred(const String &path);                  // erased later by the SD maintenance task
     bool writeFileDeferred(const String &path, const String &content); // written later (tmp + rename) by the SD maintenance task
+    bool isDeletePending(const String &path);                       // queued for deletion, not yet gone
+    void enqueueInventory();                                         // build the stories inventory on the maintenance task
     bool hasPendingMaintenance() const { return pendingWork.load() > 0; }
     bool flushRequiredFiles() { return saveRequiredFiles(); }
     bool deleteFileAndRemoveFromRequired(const String &path); // Smart delete that removes from required list

@@ -4,6 +4,8 @@
 #include <functional>
 #include <WiFiClientSecure.h>
 #include <WebSocketsClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 class ReverbClient
 {
@@ -33,6 +35,12 @@ public:
     void disconnect();
     void forceReconnect();
     bool sendMessage(const String &message);
+    // Stories inventory: the SD maintenance task queues one JSON fragment per figure
+    // ("seq":..,"total":..,"figure":{..},"sd":{..}); update() sends them as "client-device-files".
+    static void queueDeviceFiles(const String &innerJson);
+    // Reports every `seconds` (2..60) for the next two minutes (the portal asks while a page is open).
+    void setReportInterval(uint32_t seconds);
+
     // Child-facing error code of the last problem (fruit names, see docs/VOICE-PROMPTS.md), sent in reports.
     static void setLastError(const char *code);
     static const char *lastError() { return _lastError; }
@@ -82,6 +90,10 @@ private:
     int _lastReportedRssi = 0;
     uint32_t _lastReportedSdFree = 0;
     bool _reportDue = false;
+    unsigned long _fastReportMs = 0;
+    unsigned long _fastReportUntil = 0;
+    static QueueHandle_t _outbox;
+    void drainOutbox();
     
     // Pre-allocated static buffers to reduce heap fragmentation
     static char jsonBuffer[768];
