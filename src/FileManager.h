@@ -262,6 +262,9 @@ private:
     std::atomic<bool> tmpSweepPending{false};
     std::vector<String> tmpKeep;            // "*.tmp" of queued downloads: kept for Range resume
     void sweepOrphanedTempFiles();          // maintenance task
+    void sweepTrash();                      // maintenance task: erase /.trash
+    void checkDeviceMarker();               // begin(): /.device holds the uuid of the toy the cache belongs to
+    bool cardWasForeign = false;
     void sweepTempDir(const String &dir, int depth, int &removed);
     std::atomic<int> pendingDeletes{0};   // all queued jobs (name kept for the callers)
     std::atomic<int> pendingWork{0};      // deletes + writes only (the free-space count must not hold off sleep)
@@ -340,6 +343,13 @@ public:
 
     // Bulk deletion methods
     void clearAllRequiredFiles();                   // Clear all required files from NVS and storage
+    // Card cache wipe (customer reset, a card from another toy): stories (/assets), manifests
+    // (/.requestmanager), the download queue and the required-files list. The prompt pack
+    // (/sounds*) and the /.device marker stay. The directories are renamed into /.trash at
+    // once and erased by the maintenance task (a slow card takes seconds per file).
+    bool wipeCardCache(const char *why);
+    // True once after begin() found a /.device marker naming another toy (cache wiped).
+    bool takeCardWasForeign() { const bool f = cardWasForeign; cardWasForeign = false; return f; }
 
     // Status and info methods
     bool isSDCardAvailable() const { return sdCardInitialized; }

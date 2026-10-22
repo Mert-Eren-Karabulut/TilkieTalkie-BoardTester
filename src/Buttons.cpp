@@ -62,6 +62,16 @@ void ButtonController::update() {
         }
     }
     
+    // Second threshold of the 1+4 combo (customer reset)
+    if (comboActive && comboProcessed && !comboLongProcessed && comboLongHoldTime > 0) {
+        if (currentTime - comboStartTime >= comboLongHoldTime) {
+            comboLongProcessed = true;
+            if (comboHoldLongCallback) {
+                comboHoldLongCallback();
+            }
+        }
+    }
+
     // Check combo2 hold completion (Button 2 + 3)
     if (combo2Active && !combo2Processed) {
         if (currentTime - combo2StartTime >= comboHoldTime) {
@@ -188,6 +198,7 @@ void ButtonController::updateCombo() {
             comboActive = true;
             comboStartTime = max(btn1PressTime, btn4PressTime);
             comboProcessed = false;
+            comboLongProcessed = false;
             
             // Cancel individual button events
             buttons[BUTTON_1].singleClickPending = false;
@@ -253,8 +264,15 @@ void ButtonController::resetButton(ButtonId button) {
 void ButtonController::resetCombo() {
     if (comboActive) {
         ESP_LOGI(TAG, "Combo hold ended");
+        // Released between the two thresholds: the first one's action (it was only armed).
+        const bool releasedAfterHold = comboProcessed && !comboLongProcessed;
+        const unsigned long held = millis() - comboStartTime;
         comboActive = false;
         comboProcessed = false;
+        comboLongProcessed = false;
+        if (releasedAfterHold && comboReleasedAfterHoldCallback) {
+            comboReleasedAfterHoldCallback(held);
+        }
         
         // Reset combo buttons
         resetButton(BUTTON_1);
@@ -304,6 +322,18 @@ void ButtonController::onComboHold(ComboCallback callback) {
 
 void ButtonController::onComboHold2(ComboCallback callback) {
     comboHold2Callback = callback;
+}
+
+void ButtonController::onComboHoldLong(ComboCallback callback) {
+    comboHoldLongCallback = callback;
+}
+
+void ButtonController::onComboReleasedAfterHold(std::function<void(unsigned long)> callback) {
+    comboReleasedAfterHoldCallback = callback;
+}
+
+void ButtonController::setComboLongHoldTime(unsigned long comboMs) {
+    comboLongHoldTime = comboMs;
 }
 
 // Configuration methods

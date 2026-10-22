@@ -83,6 +83,8 @@ const VoicePrompts::Policy &VoicePrompts::policy(Prompt p)
         {false, 60000},     // UPDATE_START
         {false, 60000},     // UPDATE_DONE
         {false, 60000},     // UPDATE_FAILED
+        {false, 60000},     // NOT_LINKED (UxScenes: once per boot after the hello, then daily, idle only)
+        {false, 5000},      // SETUP_CAPTIVE
         {true, 1500},       // TONE_CHARGE_ON
         {true, 1500},       // TONE_CHARGE_OFF
         {true, 0},          // TONE_SLEEP (blocking)

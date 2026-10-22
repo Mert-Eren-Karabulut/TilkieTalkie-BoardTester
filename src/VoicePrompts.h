@@ -35,7 +35,9 @@
     X(CHARGE_FULL, "charge_full")           /* charger terminated */                               \
     X(UPDATE_START, "update_start")         /* OTA download started */                             \
     X(UPDATE_DONE, "update_done")           /* first boot on a new firmware */                     \
-    X(UPDATE_FAILED, "update_failed")       /* OTA failed (Karpuz) */
+    X(UPDATE_FAILED, "update_failed")       /* OTA failed (Karpuz) */                              \
+    X(NOT_LINKED, "not_linked")             /* online, but no account owns the toy (Kivi) */       \
+    X(SETUP_CAPTIVE, "setup_captive")       /* provisioning: the network wants a login page (Nar) */
 #define TT_TONE_PROMPTS(X)                                                                         \
     X(TONE_CHARGE_ON, "tone_charge_on")     /* charger plugged */                                  \
     X(TONE_CHARGE_OFF, "tone_charge_off")   /* charger unplugged */                                \

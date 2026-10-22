@@ -36,6 +36,9 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 107 | TOKEN_REJECTED | error | | 401 even after a token refresh |
 | 108 | WS_AUTH_FAILED | error | | channel authorisation refused |
 | 109 | WS_DISCONNECTED | info | | socket dropped (counted) |
+| 110 | NOT_LINKED | info | kivi | online, but `GET /api/hubs/{uuid}` says `bound: false` (or the legacy token endpoint answered 404); raised at boot and then daily, cleared (`Faults::clear`) once bound; the `not_linked` prompt is spoken once per boot after the hello, idle only, at most daily |
+| 112 | NOT_ENROLLED | info | | no factory pop at boot (detail `no pop`), or the token POST answered 404 (detail `404`) / 401 (detail `secret`); retried every 15 min |
+| 113 | CAPTIVE_PORTAL | warning | nar | the portal probe (`/storage/ping.json`) got an answer that is not ours (redirect, HTML, other body): during pairing the network is rejected and `setup_captive` is spoken; a provisioned toy stays offline silently and re-probes every 2 min. No answer at all is 106 (silent, once per link), and pairing accepts such a network |
 | 201 | FIGURE_UNKNOWN | error | elma | portal has no unit for this card |
 | 202 | FIGURE_NO_CONTENT | error | elma | figure exists, nothing to play |
 | 203 | FIGURE_OFFLINE | error | armut | portal unreachable and nothing cached for the card |
@@ -49,6 +52,7 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 303 | SD_FULL | error | muz | no space for a download |
 | 304 | SD_FILE_CORRUPT | warning | | manifest / queue / pack json unreadable (recreated) |
 | 305 | SD_SLOW | info | | write stall above 3 s |
+| 306 | CARD_FOREIGN | info | | `/.device` on the card names another toy: its story cache was wiped (detail `prev=<uuid>`) |
 | 401 | AUDIO_INIT_FAILED | critical | | codec / I2S init failed |
 | 402 | DECODER_FAILED | error | | a file could not start decoding |
 | 403 | AUDIO_UNDERRUN | info | | read-ahead ran dry (counted) |
@@ -77,10 +81,31 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 803 | HEAP_LOW | warning | | internal heap below threshold |
 | 804 | LOOP_STALL | warning | | a loop section took longer than 2 s |
 | 805 | STACK_LOW | warning | | loop task stack under 1 KB |
-| 806 | CONFIG_CORRUPT | error | | NVS record unreadable, defaults restored |
+| 806 | CONFIG_CORRUPT | error | | NVS record unreadable, defaults restored; also: the NVS partition was full and reformatted at boot (detail `nvs full, reformatted [-<namespace>...]` names what could not be restored), or the requestmgr namespace was full and erased alone |
 
 The fruit list stays short on purpose (a child can repeat one word): elma, armut, kiraz,
-üzüm, portakal, karpuz, muz.
+üzüm, portakal, karpuz, muz, kivi, nar.
+
+### NVS without losing the factory identity
+
+`ESP_ERR_NVS_NO_FREE_PAGES` at boot used to erase the whole partition (two code paths, plus the
+Arduino core's own fallback in `initArduino()`), which would also destroy the factory secret
+and pop. Now `ConfigManager` (it runs first, at static construction) mounts the partition
+read-only, copies every entry to PSRAM, reformats, and writes the entries back, the `factory`
+namespace first, then `config`, `nvs.net80211` (WiFi), `settings`, `faults`, `requestmgr`, the
+rest. A namespace that no longer fits is erased as a whole and named in the 806 detail. A
+format from a newer IDF (`NEW_VERSION_FOUND`) cannot be read and is erased (806
+`nvs newer format, erased`). At run time a namespace that cannot be written (the uid
+mappings) is erased alone, never the partition.
+
+### WiFi: a stored password that stopped working
+
+A docked toy whose router password changed used to restart every ~15 min and say hello +
+"I cannot connect" each time, all night. After 3 consecutive auth-type disconnects (auth
+fail, 4-way/handshake timeout, MIC failure) on a provisioned toy: no radio resets, no idle
+restarts, one silent reconnect attempt every 30 min, `wifi_lost` (103 with the hint) at most
+every 6 hours, and the amber offline LED only for 30 s around each attempt. A successful
+connection or a "network not found" ends the streak.
 
 ## Firmware
 

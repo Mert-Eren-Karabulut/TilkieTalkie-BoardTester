@@ -90,6 +90,27 @@ Endpoints loadEndpoints()
     }
     return ep;
 }
+// Host and port of the captive-portal probe (docs/PROTOCOL-V2.md §6): the API base's host,
+// over plain HTTP. https bases use port 80 (nginx serves /storage there, like the assets); an
+// http base (bench portal, `endpoint set http://<ip>:8000/api ...`) keeps its own port.
+static void probeTargetFrom(const String &apiBase, String &host, uint16_t &port)
+{
+    String rest = apiBase;
+    const bool tls = rest.startsWith("https://");
+    if (rest.indexOf("://") >= 0) rest = rest.substring(rest.indexOf("://") + 3);
+    int slash = rest.indexOf('/');
+    String hostPort = slash >= 0 ? rest.substring(0, slash) : rest;
+    int colon = hostPort.lastIndexOf(':');
+    port = 80;
+    host = hostPort;
+    if (colon > 0)
+    {
+        host = hostPort.substring(0, colon);
+        if (!tls) port = (uint16_t)hostPort.substring(colon + 1).toInt();
+        if (port == 0) port = 80;
+    }
+}
+
 // The Arduino core marks a freshly booted OTA image valid inside initArduino() unless this
 // weak hook says otherwise; OtaManager confirms the image itself once the portal is reached
 // (or after 10 min of uptime), so that an image that dies or cannot reach the portal before
@@ -100,16 +121,12 @@ extern "C" bool verifyRollbackLater()
 }
 
 // ReverbClient calls this when /broadcasting/auth rejects the stored hub token (revoked
-// server-side); the fresh token is persisted and shared with the API client.
+// server-side). A token renewed in the last 10 min is handed over as is (the socket held an
+// older one); otherwise RequestManager refreshes it (rate-limited, persisted, shared). Fetching
+// a new one on every refusal used to make the API client and the socket revoke each other.
 static String refreshHubTokenForReverb()
 {
-    String fresh = requestManager.getJWTToken();
-    if (fresh.length() > 0)
-    {
-        config.setJWTToken(fresh);
-        requestManager.setAuthToken(fresh);
-    }
-    return fresh;
+    return requestManager.currentOrFreshToken();
 }
 
 
@@ -133,15 +150,17 @@ String getDeviceEfuseMacDecimal()
 
 String getDeviceEfuseMacHex()
 {
+    // getEfuseMac() packs the six MAC bytes little-endian (first byte of the MAC in the low
+    // byte), so the printed order starts at the low byte; the old code printed it reversed.
     uint64_t mac = ESP.getEfuseMac();
     char macHex[18];
     snprintf(macHex, sizeof(macHex), "%02X:%02X:%02X:%02X:%02X:%02X",
-             (uint8_t)(mac >> 40),
-             (uint8_t)(mac >> 32),
-             (uint8_t)(mac >> 24),
-             (uint8_t)(mac >> 16),
+             (uint8_t)mac,
              (uint8_t)(mac >> 8),
-             (uint8_t)mac);
+             (uint8_t)(mac >> 16),
+             (uint8_t)(mac >> 24),
+             (uint8_t)(mac >> 32),
+             (uint8_t)(mac >> 40));
     return String(macHex);
 }
 
@@ -378,6 +397,13 @@ void setup()
     {
         Faults::raise(Fault::CONFIG_CORRUPT); // NVS could not be opened at static init
     }
+    {
+        const String note = ConfigManager::getInstance().takeNvsRepairNote();
+        if (note.length() > 0)
+        {
+            Faults::raise(Fault::CONFIG_CORRUPT, note.substring(0, 39).c_str()); // partition was full and reformatted
+        }
+    }
     Faults::setSpeaker([](Fault f) {
         switch (f)
         {
@@ -392,6 +418,8 @@ void setup()
         case Fault::OTA_SHA_MISMATCH: prompts.say(Prompt::UPDATE_FAILED); break;
         case Fault::NFC_READ_TROUBLE: prompts.say(Prompt::NFC_READ_TROUBLE); break;
         case Fault::BATTERY_LOW: prompts.say(Prompt::BATTERY_LOW); break;
+        case Fault::NOT_LINKED: scheduleNotLinkedPrompt(); break; // spoken when idle, after the hello, at most daily
+        case Fault::CAPTIVE_PORTAL: prompts.say(Prompt::SETUP_CAPTIVE); break;
         default: break; // silent faults (muz: the toy cannot speak without the card anyway)
         }
     });
@@ -496,6 +524,42 @@ static OtaManager::Conditions otaConditions()
     return c;
 }
 
+static const char *gResetRequestedBy = nullptr;
+
+void requestCustomerReset(const char *why)
+{
+    gResetRequestedBy = why ? why : "request";
+}
+
+void runCustomerReset(bool all, const char *why, bool speak)
+{
+    ESP_LOGW(TAG, "=== %s reset (%s) ===", all ? "Service (--all)" : "Customer", why ? why : "?");
+    ledController.flash(LedController::FX_RESET);
+    audioController.stop();
+    audioController.clearPlaylist();
+    // Unbind first, while the token still exists (skipped offline; the portal's unbind stays
+    // possible from the app or the admin).
+    const bool unbound = requestManager.unbindBestEffort();
+    ESP_LOGI(TAG, "reset: portal unbind %s", unbound ? "done" : "skipped/failed");
+    config.clearJWTToken();
+    requestManager.forgetToken();
+    fileManager.wipeCardCache("reset");
+    requestManager.forgetAllUidMappings();
+    Faults::clearAll();
+    config.deleteSetting("audio_volume");
+    config.deleteSetting("volume_ceiling");
+    config.deleteSetting("max_brightness");
+    if (all)
+    {
+        config.clearFactory();
+    }
+    if (speak)
+    {
+        prompts.sayBlocking(Prompt::WIFI_RESET_DONE, 6000);
+    }
+    wifiProv.reset(); // forgets the network and restarts into provisioning
+}
+
 // API client + Reverb. Safe to call once WiFi has an IP; idempotent.
 static void startNetworkServices()
 {
@@ -539,6 +603,10 @@ void startFullSystem()
         // before the first word is spoken (docs/VOICE-PROMPTS.md "Remote update").
         PromptPackManager::getInstance().setPendingVerify(OtaManager::getInstance().bootedFromUpdate());
         PromptPackManager::getInstance().begin();
+        if (fileManager.takeCardWasForeign())
+        {
+            requestManager.forgetAllUidMappings(); // the wiped cache's figures (CARD_FOREIGN was raised)
+        }
         // Downloads interrupted by the reboot continue from the persisted queue; give their
         // figures a tracker so the manifest is completed when they land.
         requestManager.recoverPendingManifests();
@@ -595,7 +663,8 @@ void startFullSystem()
     // Initialize Button Controller
     ESP_LOGI(TAG, "Initializing Button Controller...");
     buttonController.begin();
-    buttonController.setComboHoldTime(5000); // both combos: 5 s
+    buttonController.setComboHoldTime(5000);      // both combos: 5 s
+    buttonController.setComboLongHoldTime(10000); // 1+4 only: 10 s = customer reset
 
     // Set up button callbacks
     buttonController.onSingleClick([](ButtonController::ButtonId button)
@@ -648,14 +717,27 @@ void startFullSystem()
                                    ESP_LOGI(TAG, "Hold ended on button %d (total duration: %lu ms)", button + 1, duration);
                                });
 
+    // Volume buttons held together (docs/CONSOLE.md "Button holds"): at 5 s a tone (two rising
+    // notes) arms "forget WiFi", done when the buttons are let go before 10 s; still held at
+    // 10 s a second tone (three falling notes) and the customer reset.
     buttonController.onComboHold([]()
     {
-        // Volume buttons held together for 5 s: forget the WiFi network (stories stay on the
-        // card), tell the user, then restart into BLE provisioning.
-        ESP_LOGW(TAG, "COMBO HOLD (1+4) - forgetting the WiFi network, restarting into provisioning");
+        ESP_LOGW(TAG, "COMBO HOLD (1+4) 5 s - release to forget WiFi, keep holding for a full reset");
         ledController.flash(LedController::FX_RESET);
+        prompts.say(Prompt::TONE_CHARGE_ON);
+    });
+    buttonController.onComboReleasedAfterHold([](unsigned long heldMs)
+    {
+        // Forget the WiFi network (stories stay on the card), then restart into BLE provisioning.
+        ESP_LOGW(TAG, "COMBO (1+4) released after %lu ms - forgetting the WiFi network", heldMs);
         prompts.sayBlocking(Prompt::WIFI_RESET_DONE, 6000);
         wifiProv.reset(); // clears credentials and restarts
+    });
+    buttonController.onComboHoldLong([]()
+    {
+        ESP_LOGW(TAG, "COMBO HOLD (1+4) 10 s - customer reset");
+        prompts.sayBlocking(Prompt::TONE_SLEEP, 2000);
+        runCustomerReset(false, "buttons", true);
     });
 
     buttonController.onComboHold2([]()
@@ -677,17 +759,33 @@ void startFullSystem()
         {
         case WiFiProvisioningManager::ProvEvent::CRED_RECV: prompts.say(Prompt::SETUP_CONNECTING); break;
         case WiFiProvisioningManager::ProvEvent::CRED_FAIL: Faults::raise(Fault::WIFI_AUTH_FAILED); break;
+        // The network wants a login page: rejected like a wrong password (speaks setup_captive).
+        // Raised from the WiFi event task like WIFI_AUTH_FAILED above.
+        case WiFiProvisioningManager::ProvEvent::CAPTIVE: Faults::raise(Fault::CAPTIVE_PORTAL, "provisioning"); break;
         case WiFiProvisioningManager::ProvEvent::ENDED:
             if (WiFi.isConnected()) prompts.say(Prompt::SETUP_SUCCESS);
             break;
         default: break;
         }
     });
+    if (config.factoryPop().isEmpty())
+    {
+        // No factory identity (docs/PROTOCOL-V2.md §1): BLE provisioning uses the legacy PIN
+        // (TT_LEGACY_POP builds) or is impossible; the token comes from the legacy endpoint.
+        Faults::raise(Fault::NOT_ENROLLED, "no pop");
+    }
+    {
+        String host;
+        uint16_t port = 80;
+        probeTargetFrom(loadEndpoints().apiBase, host, port);
+        wifiProv.setProbeTarget(host, port);
+        ESP_LOGI(TAG, "portal probe: http://%s:%u/storage/ping.json", host.c_str(), (unsigned)port);
+    }
     wifiProv.begin();
 
     // Voice feedback: Turkish prompts from the SD card (docs/VOICE-PROMPTS.md)
     prompts.begin();
-    if (!wifiProv.isProvisioned())
+    if (!wifiProv.isProvisioned() && !wifiProv.provisioningImpossible())
     {
         startSetupWelcome(); // repeated by serviceUxPrompts() while nobody pairs
     }
@@ -709,7 +807,10 @@ static void serviceNetworkStart()
     {
         return;
     }
-    if (!WiFi.isConnected())
+    // Behind a captive portal (or without internet) the toy behaves as offline: the API client
+    // and the WebSocket see no network, and nothing starts until the portal probe passes.
+    RequestManager::setPortalReachable(wifiProv.isInternetReady());
+    if (!wifiProv.isInternetReady())
     {
         gWifiUpSince = 0;
         return;
@@ -753,9 +854,9 @@ static void serviceNetworkStart()
 static void serviceNetworkHealth()
 {
     static unsigned long lastReset = 0;
-    if (!gNetworkServicesStarted || !WiFi.isConnected() || wifiProv.isProvisioningManagerActive())
+    if (!gNetworkServicesStarted || !wifiProv.isInternetReady() || wifiProv.isProvisioningManagerActive())
     {
-        return;
+        return; // a captive network is "offline": no radio reset for it
     }
     const unsigned long now = millis();
     const unsigned long last = reverb.lastConnectedAt();
@@ -886,8 +987,8 @@ void loop()
     // Handle WiFi background reconnection (only when credentials exist but not connected)
     TT_TIMED("wifi", wifiProv.handleBackgroundReconnection());
 
-    // Update Reverb client only if WiFi is connected
-    if (WiFi.isConnected())
+    // Update Reverb client only if WiFi is connected and the portal is reachable (not captive)
+    if (wifiProv.isInternetReady())
     {
         TT_TIMED("reverb", reverb.update());
     }
@@ -956,6 +1057,10 @@ void loop()
 
     // Charge bar while docked (transient NFC/audio pulses play over it and it resumes).
     TT_TIMED("chargeux", updateChargingUx());
+    if (gResetRequestedBy)
+    {
+        runCustomerReset(false, gResetRequestedBy, true); // does not return
+    }
     TT_TIMED("netstart", serviceNetworkStart());
     TT_TIMED("nethealth", serviceNetworkHealth());
     TT_TIMED("ux", serviceUxPrompts());

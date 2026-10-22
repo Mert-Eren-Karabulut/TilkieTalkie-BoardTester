@@ -95,21 +95,41 @@ public:
     // millis() of the last 2xx/304 from the portal (0 = none this boot): "the portal was reached"
     // for the OTA image confirmation.
     unsigned long lastPortalSuccessAt() const { return portalSuccessAt.load(); }
-    // A hub endpoint answered 403 (unbound / token revoked): get a fresh device token. Called at
-    // most once per 10 min from performHttp, which then retries the request once.
-    // [F2 stub: validates / re-acquires with today's flow; the F1 branch replaces it with the
-    //  POST /token + secret flow, same signature.]
-    bool forceTokenRefresh(const char *reason);
     bool hasPendingRequests();                      // queued, in flight or not yet dispatched
     bool isRequestPending(const String &endpoint);  // the same endpoint is queued or in flight
 
     // Utility methods
     bool isConnected();
-    bool isNetworkReady();   // WiFi up with an IP (no portal check)
+    bool isNetworkReady();   // WiFi up with an IP and the portal probe passed (not a captive portal)
+    // Set by the loop from WiFiProvisioningManager::isInternetReady(): false behind a captive
+    // portal, so every request, download and upload treats the network as absent.
+    static void setPortalReachable(bool reachable) { portalReachableFlag = reachable; }
+    static bool portalReachable() { return portalReachableFlag; }
+    // Fetches a new device token (PROTOCOL-V2 §2) and returns it ("" on failure); does not
+    // store it. Enrolled unit (factory secret present): POST /hubs/{uuid}/token with the
+    // X-Hub-Secret header (404/401 raise NOT_ENROLLED, 404/401/429 back off for 15 min). Not
+    // enrolled: the legacy GET /hubs/{uuid}/token, unchanged.
     String getJWTToken();
     bool validateToken(const String& token);
     void initConnection();
     void update();
+
+    // Re-acquire the device token now, at most once per 10 minutes (callers: 403 from a hub
+    // endpoint, the 80-day age, the token validation). Returns whether a fetch was attempted.
+    // Any task (takes the HTTP lock, recursive).
+    bool forceTokenRefresh(const char *why);
+    // Reverb's channel auth was refused: the token if it was renewed in the last 10 min (the
+    // socket simply held an older one), otherwise a forced refresh. Never two refreshes that
+    // revoke each other in a loop.
+    String currentOrFreshToken();
+
+    // Account link (PROTOCOL-V2 §3): GET /hubs/{uuid} with the device token answers
+    // {"bound": bool}; checked once the token is valid at boot and every 24 h.
+    enum class LinkState : uint8_t { UNKNOWN, LINKED, NOT_LINKED };
+    LinkState linkState() const { return linkStateValue; }
+    // Customer reset: POST /hubs/{uuid}/unbind with the device token, 3 s, skipped offline.
+    bool unbindBestEffort();
+    void forgetToken();                      // RAM copy (the caller clears NVS)
 
     void getCheckFigureTracks(const String &uid); // Method to fetch figure tracks
 
@@ -181,8 +201,11 @@ public:
 
     // Helper method to get figure ID from UID (for deletion purposes)
     String getFigureIdFromUid(const String &uid);
+    // Customer reset / a card from another toy: drop every uid -> figure mapping (NVS too).
+    void forgetAllUidMappings();
 
 private:
+    static volatile bool portalReachableFlag;
     // Faults raised by HTTP exchanges are queued here and raised from update() on the loop task
     // (Faults is not thread-safe; performHttp also runs on the request worker).
     struct DeferredFault { uint16_t code; char detail[40]; bool speak; };
@@ -190,9 +213,28 @@ private:
     void deferFault(uint16_t code, const char *detail, bool speak);
     void raiseDeferredFaults();
 
+    // Device token bookkeeping (see getJWTToken / forceTokenRefresh)
+    String fetchDeviceTokenWithSecret();
+    String fetchLegacyToken();
+    int checkStoredToken(const String &token);    // HTTP status of the validation (<=0: no answer)
+    void serviceToken();                           // loop: retries without a token, the daily age tick
+    void serviceLinkCheck();                       // loop: the 24 h bound check
+    void applyBound(JsonVariantConst doc);         // loop task
+    String hubPath() const;                        // "/hubs/<uuid>"
+    bool begun = false;
+    unsigned long tokenBlockedUntil = 0;           // 404/401/429 from the token POST: wait 15 min
+    unsigned long lastForcedRefreshAt = 0;
+    unsigned long lastTokenIssuedAt = 0;
+    unsigned long nextTokenRetryAt = 0;
+    unsigned long nextTokenDayAt = 0;
+    unsigned long nextLinkCheckAt = 0;
+    volatile int8_t pendingBound = -1;             // set by a validation on any task, applied on the loop (-1 none)
+    volatile LinkState linkStateValue = LinkState::UNKNOWN;
+
     // NVS storage for UID to Figure ID mappings
     static const char* NVS_NAMESPACE;
-    static const char* NVS_UID_MAPPING_KEY;
+    static const char* NVS_UID_MAPPING_KEY;      // legacy unbounded object, migrated once
+    static const char* NVS_UID_LRU_KEY;
     nvs_handle_t nvsHandle;
     
     // Figure download tracking
@@ -227,8 +269,13 @@ private:
     std::function<void(const String &, FigureEvent)> figureEventCallback;
     std::vector<PendingFigureCompletion> pendingCompletions;
     
-    // UID to Figure ID mapping for deletion purposes
-    std::map<String, String> uidToFigureIdMap;
+    // Unit uid -> figure id, most recently used last, at most UID_MAP_MAX entries (NVS key
+    // "uid_lru", a JSON array of [uid, id] pairs). The cached manifest on the card carries the
+    // same id (figure.id), so this is only a fallback for a unit whose manifest is gone; the
+    // bound keeps the string far from the 20 KB partition's limits (the old unbounded
+    // "uid_mappings" object is migrated once).
+    static const size_t UID_MAP_MAX = 48;
+    std::vector<std::pair<String, String>> uidLru;
     
     // Helper methods for tracking
     void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData, bool hasPendingManifest = false, const String &pendingManifestJson = String(), const String &previousManifestJson = String(), bool alreadyEmitted = false);

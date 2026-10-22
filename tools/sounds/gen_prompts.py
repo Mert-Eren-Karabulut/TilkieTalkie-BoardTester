@@ -60,6 +60,8 @@ PROMPTS = {
     "update_start":      "Kendimi güncelliyorum, birkaç dakika sürebilir. Bu sırada beni kapatma.",
     "update_done":       "Güncelleme tamamlandı!",
     "update_failed":     "Güncelleme başarısız oldu, daha sonra yeniden deneyeceğim. Hata kodu: Karpuz.",
+    "not_linked":        "Henüz bir hesaba bağlı değilim. Beni uygulamadan ekle.",
+    "setup_captive":     "Bu ağ bir giriş sayfası istiyor, lütfen başka bir ağ seç. Hata kodu: Nar.",
 }
 
 # name -> list of (frequency Hz, seconds, gain); 0 Hz = silence

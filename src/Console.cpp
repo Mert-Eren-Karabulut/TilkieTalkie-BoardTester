@@ -232,6 +232,125 @@ void Console::serviceChargeMonitor()
 }
 #endif // TT_BENCH
 
+// ---- `ft` factory protocol (docs/PROTOCOL-V2.md §9): one JSON line per answer -------------
+
+static const char *POP_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+// "TK-ABCD-EFGH", "tk-abcd-efgh" or "ABCDEFGH" -> "ABCDEFGH"; "" when it is not a valid pop.
+static String normalisePop(String pop)
+{
+    pop.toUpperCase();
+    if (pop.startsWith("TK-")) pop = pop.substring(3);
+    pop.replace("-", "");
+    if (pop.length() != 8) return String();
+    for (size_t i = 0; i < pop.length(); ++i)
+    {
+        if (!strchr(POP_ALPHABET, pop[i])) return String();
+    }
+    return pop;
+}
+
+// The label payload: TT1:<uuid>:TK-XXXX-XXXX ("" when no pop is enrolled).
+static String labelPayload()
+{
+    const String pop = config.factoryPop();
+    if (pop.length() != 8) return String();
+    return "TT1:" + getDeviceEfuseMacDecimal() + ":TK-" + pop.substring(0, 4) + "-" + pop.substring(4);
+}
+
+static bool safeToken(const String &v, size_t minLen, size_t maxLen)
+{
+    if (v.length() < minLen || v.length() > maxLen) return false;
+    for (size_t i = 0; i < v.length(); ++i)
+    {
+        const char c = v[i];
+        if (!(isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.')) return false;
+    }
+    return true;
+}
+
+static void ftReply(bool ok, const String &fieldsOrError)
+{
+    // fieldsOrError: for ok, JSON members without braces ("" for none); for !ok, the error text.
+    if (ok)
+    {
+        Serial.printf("{\"ok\":true%s%s}\n", fieldsOrError.length() ? "," : "", fieldsOrError.c_str());
+    }
+    else
+    {
+        Serial.printf("{\"ok\":false,\"error\":\"%s\"}\n", fieldsOrError.c_str());
+    }
+    Serial.flush();
+}
+
+static void ftShow()
+{
+    const String serial = config.factorySerial();
+    const String label = labelPayload();
+    String f = "\"uuid\":\"" + getDeviceEfuseMacDecimal() + "\",\"mac\":\"" + getDeviceEfuseMacHex() + "\",\"serial\":";
+    f += serial.length() ? "\"" + serial + "\"" : String("null");
+    f += String(",\"enrolled\":") + (config.isEnrolled() ? "true" : "false");
+    f += ",\"label\":";
+    f += label.length() ? "\"" + label + "\"" : String("null");
+    ftReply(true, f); // never the secret
+}
+
+static void ftCommand(const String &rest)
+{
+    String parts[4];
+    const int n = splitArgs(rest, parts, 4);
+    const String sub = n > 0 ? parts[0] : String();
+    if (sub == "show")
+    {
+        ftShow();
+    }
+    else if (sub == "enroll")
+    {
+        if (n < 3)
+        {
+            ftReply(false, "usage: ft enroll <secret> <pop> [serial]");
+            return;
+        }
+        const String pop = normalisePop(parts[2]);
+        if (!safeToken(parts[1], 16, 128))
+        {
+            ftReply(false, "bad secret");
+        }
+        else if (pop.isEmpty())
+        {
+            ftReply(false, "bad pop");
+        }
+        else if (n > 3 && !safeToken(parts[3], 1, 32))
+        {
+            ftReply(false, "bad serial");
+        }
+        else if (!config.setFactory(parts[1], pop, n > 3 ? parts[3] : String()))
+        {
+            ftReply(false, "nvs write failed");
+        }
+        else
+        {
+            ftShow(); // what is stored now (the BLE pop applies from the next provisioning start)
+        }
+    }
+    else if (sub == "reset")
+    {
+        const bool all = n > 1 && parts[1] == "--all";
+        if (n > 1 && !all)
+        {
+            ftReply(false, "usage: ft reset [--all]");
+            return;
+        }
+        ftReply(true, String("\"reset\":\"") + (all ? "all" : "customer") + "\"");
+        delay(100);
+        runCustomerReset(all, all ? "ft reset --all" : "ft reset", false); // restarts
+    }
+    else
+    {
+        ftReply(false, "unknown ft command (enroll, show, reset)");
+    }
+}
+
 static void printHelp()
 {
     ESP_LOGI(TAG, "--- Console commands (docs/CONSOLE.md) ---");
@@ -241,18 +360,17 @@ static void printHelp()
     ESP_LOGI(TAG, "  faults            - active faults and recent fault events (docs/FAULTS.md)");
     ESP_LOGI(TAG, "  restart           - restart the device");
     ESP_LOGI(TAG, "  config / debug    - stored configuration / debug information");
-    ESP_LOGI(TAG, "  efusemac | hubid  - device efuse MAC (hub UUID) in decimal and hex");
+    ESP_LOGI(TAG, "  efusemac | hubid  - hub UUID (decimal), MAC, label payload TT1:<uuid>:<pop>");
+    ESP_LOGI(TAG, "  ft enroll <secret> <pop> [serial] / ft show / ft reset [--all] - factory protocol (JSON lines)");
     ESP_LOGI(TAG, "  heap / stack      - heap and loop-stack usage");
     ESP_LOGI(TAG, "  timing / tasks    - loop section timing / FreeRTOS task stats");
     ESP_LOGI(TAG, "  diag [on|off]     - periodic diagnostics verbosity");
     ESP_LOGI(TAG, "  coredump / coredumperase - stored crash core dump summary / erase it");
     ESP_LOGI(TAG, "  endpoint [clear]  - backend endpoints; clear removes a bench override");
-    ESP_LOGI(TAG, "  ota [check [id] | url <url> <sha256> <size> [version]] - firmware update status / check / install");
+    ESP_LOGI(TAG, "  ota [check [id]]  - firmware update status / check");
     ESP_LOGI(TAG, "WiFi / Reverb:");
     ESP_LOGI(TAG, "  qr / reset / stats - provisioning QR / forget WiFi / connection status");
     ESP_LOGI(TAG, "  reverbstatus / reverbclean / reverbstart - WebSocket status / free it / start it");
-    ESP_LOGI(TAG, "  send <message>    - send a message to the Reverb API for broadcast");
-    ESP_LOGI(TAG, "  testauth          - test the stored hub token against the portal");
     ESP_LOGI(TAG, "Battery / power:");
     ESP_LOGI(TAG, "  battery / battscan - battery status / scan the battery I2C bus");
     ESP_LOGI(TAG, "  batterycfg        - reapply 4V5 rail and charger defaults");
@@ -265,11 +383,10 @@ static void printHelp()
     ESP_LOGI(TAG, "  sleep / sleep now - deep sleep if allowed / unconditionally");
     ESP_LOGI(TAG, "  sleepafter <ms> / cancelsleep / sleepstatus - schedule / cancel / sleep controller status");
     ESP_LOGI(TAG, "Files:");
-    ESP_LOGI(TAG, "  sdtree / sdinfo / sdformat - card tree / size and free space / format FAT32");
+    ESP_LOGI(TAG, "  sdtree / sdinfo   - card tree / size and free space");
     ESP_LOGI(TAG, "  sdbench / sdwritebench [chunkKB] [count] - card benchmarks");
     ESP_LOGI(TAG, "  dlstats / dlqueue / dlclear - download statistics / queue / drop the queue");
     ESP_LOGI(TAG, "  required / checkfiles / cleanup - required files / schedule missing ones / remove temp files");
-    ESP_LOGI(TAG, "  download <url> <path> / addfile <path> <url> / deletefile <path> - manual file management");
     ESP_LOGI(TAG, "Audio:");
     ESP_LOGI(TAG, "  play [<path>] / pause / resume / stop - playback");
     ESP_LOGI(TAG, "  next / prev / playlist / track - playlist navigation and status");
@@ -284,6 +401,10 @@ static void printHelp()
     ESP_LOGI(TAG, "Bench (TT_BENCH):");
     ESP_LOGI(TAG, "  endpoint set <api_base> <reverb_host> <port> <tls 0|1> [key] - point the unit at a bench server (NVS)");
     ESP_LOGI(TAG, "  factory / delete / deletefig <uid> - erase all data / required files / one figure (asks yes)");
+    ESP_LOGI(TAG, "  sdformat          - delete everything on the card");
+    ESP_LOGI(TAG, "  download <url> <path> / addfile <path> <url> / deletefile <path> - manual file management");
+    ESP_LOGI(TAG, "  ota url <url> <sha256> <size> [version] - install an arbitrary image");
+    ESP_LOGI(TAG, "  send <message> / testauth - Reverb broadcast (the portal refuses device chat) / token test without TLS checks");
     ESP_LOGI(TAG, "  poweroff          - disable the peripheral rail (asks yes)");
     ESP_LOGI(TAG, "  cat <path>        - print the first 4 KB of a file on the card");
     ESP_LOGI(TAG, "  tap <uid> / untap - simulate mounting / removing a figure");
@@ -308,6 +429,12 @@ static void dispatch(String command)
     {
         printHelp();
     }
+    else if (command == "ft" || command.startsWith("ft "))
+    {
+        ftCommand(command.length() > 3 ? command.substring(3) : String());
+    }
+#ifdef TT_BENCH
+    // The portal does not accept chat from a device (401/403): bench only.
     else if (command.startsWith("send "))
     {
         String message = command.substring(5); // Get the text after "send "
@@ -329,6 +456,7 @@ static void dispatch(String command)
             ESP_LOGI(TAG, "Usage: send <your message>");
         }
     }
+#endif // TT_BENCH
 
     // WiFi related commands
     else if (command == "qr" || command == "reset" || command == "stats")
@@ -365,12 +493,14 @@ static void dispatch(String command)
         const String deviceId = getDeviceEfuseMacDecimal();
         const String deviceMacHex = getDeviceEfuseMacHex();
 
+        const String label = labelPayload();
         ESP_LOGI(TAG, "--- Device Identity ---");
         ESP_LOGI(TAG, "Hub UUID / efuse MAC (decimal): %s", deviceId.c_str());
         ESP_LOGI(TAG, "Base MAC (hex): %s", deviceMacHex.c_str());
-        ESP_LOGI(TAG, "Backend token endpoint: /api/hubs/%s/token", deviceId.c_str());
-        ESP_LOGI(TAG, "Create or bind a Hub with uuid='%s' to your user.", deviceId.c_str());
+        ESP_LOGI(TAG, "Factory identity: %s", config.isEnrolled() ? "enrolled" : "not enrolled (ft enroll)");
+        ESP_LOGI(TAG, "Label payload: %s", label.length() ? label.c_str() : "(no pop enrolled)");
     }
+#ifdef TT_BENCH
     else if (command == "testauth")
     {
         ESP_LOGI(TAG, "--- Testing Authorization ---");
@@ -434,7 +564,6 @@ static void dispatch(String command)
             ESP_LOGE(TAG, "Failed to connect to server");
         }
     }
-#ifdef TT_BENCH
     else if (command == "factory")
     {
         ESP_LOGW(TAG, "WARNING: Factory reset will erase ALL stored data!");
@@ -489,6 +618,8 @@ static void dispatch(String command)
         }
         fileManager.benchmarkSequentialWrite((size_t)chunkKb * 1024, count);
     }
+#ifdef TT_BENCH
+    // No confirmation and arbitrary URLs/paths: bench only (docs/SYSTEM-AUDIT-2026-10-22.md).
     else if (command == "sdformat")
     {
         fileManager.formatSDCard();
@@ -582,7 +713,6 @@ static void dispatch(String command)
             ESP_LOGI(TAG, "Note: This will also remove the file from required list to prevent re-download");
         }
     }
-#ifdef TT_BENCH
     // Delete all required files command
     else if (command == "delete")
     {
@@ -908,6 +1038,8 @@ static void dispatch(String command)
             id.trim();
             ota.checkNow(id.isEmpty() ? 0 : (uint32_t)id.toInt(), "console");
         }
+#ifdef TT_BENCH
+        // Any image with a hash the operator supplies: bench only.
         else if (arg.startsWith("url "))
         {
             String parts[4];
@@ -927,6 +1059,7 @@ static void dispatch(String command)
                 ota.startJob(job);
             }
         }
+#endif // TT_BENCH
     }
     else if (command.startsWith("amp"))
     {

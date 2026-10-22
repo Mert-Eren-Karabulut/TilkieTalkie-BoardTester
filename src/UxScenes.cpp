@@ -16,6 +16,14 @@ static bool gIdleHelloDone = false;
 static bool gWifiLostAnnounced = false;
 static unsigned long gWifiLostAnnouncedAt = 0;
 
+static bool gNotLinkedPending = false;
+static unsigned long gNotLinkedSaidAt = 0;   // 0 = not said this boot
+
+void scheduleNotLinkedPrompt()
+{
+    gNotLinkedPending = true;
+}
+
 void startSetupWelcome()
 {
     prompts.say(Prompt::SETUP_WELCOME);
@@ -41,6 +49,10 @@ bool chargeBarAllowed()
     if (gOtaProgress >= 0 || gSystemError)
     {
         return false;
+    }
+    if (!WiFi.isConnected() && wifiProv.provisioningImpossible())
+    {
+        return false; // the red "cannot be provisioned" scene wins over the charge bar
     }
     if (audioController.isPlaying() || audioController.isPaused() || audioController.isWaitingForTrack())
     {
@@ -127,8 +139,10 @@ void deriveLedScene()
         ledController.setScene(LedController::SCENE_OTA, gOtaProgress);
         return;
     }
-    if (gSystemError || Faults::hasActive(Severity::CRITICAL))
+    if (gSystemError || Faults::hasActive(Severity::CRITICAL) ||
+        (!WiFi.isConnected() && wifiProv.provisioningImpossible()))
     {
+        // provisioningImpossible: not provisioned and no pop to provision with (112 NOT_ENROLLED)
         ledController.setScene(LedController::SCENE_ERROR);
         return;
     }
@@ -156,12 +170,14 @@ void deriveLedScene()
     {
         ledController.setScene(LedController::SCENE_DOWNLOADING);
     }
-    else if (!WiFi.isConnected())
+    else if (!WiFi.isConnected() || wifiProv.isOfflineOnLink())
     {
         if (wifiProv.isProvisioningManagerActive())
             ledController.setScene(LedController::SCENE_PROVISIONING);
         else if (millis() - gFullSystemStartedAt < Policy::WIFI_CONNECTING_WINDOW_MS)
             ledController.setScene(LedController::SCENE_WIFI_CONNECTING);
+        else if (wifiProv.quietOffline())
+            ledController.setScene(lowBattery ? LedController::SCENE_LOW_BATTERY : LedController::SCENE_OFF); // password rejected: the amber LED only around each retry
         else
             ledController.setScene(LedController::SCENE_OFFLINE);
     }
@@ -238,12 +254,37 @@ void serviceUxPrompts()
             prompts.say(Prompt::IDLE_HELLO);
         }
     }
+    // Not linked to an account: after the hello (it needs a few seconds), only while idle, and
+    // at most once a day. A pending request outside the daily window is dropped (the next
+    // daily link check raises it again).
+    if (gNotLinkedPending && gIdleHelloDone && now - gFullSystemStartedAt > 10000)
+    {
+        const bool idle = !nfcController.isPogoSwitchActive() && !nfcController.isCardPresent() &&
+                          !audioController.isPlaying() && !audioController.isPaused() && !prompts.isBusy();
+        if (requestManager.linkState() != RequestManager::LinkState::NOT_LINKED)
+        {
+            gNotLinkedPending = false; // linked in the meantime
+        }
+        else if (gNotLinkedSaidAt && now - gNotLinkedSaidAt < 24UL * 60UL * 60UL * 1000UL)
+        {
+            gNotLinkedPending = false;
+        }
+        else if (idle)
+        {
+            gNotLinkedPending = false;
+            gNotLinkedSaidAt = now ? now : 1;
+            prompts.say(Prompt::NOT_LINKED);
+        }
+    }
     // Provisioned, the home network is in range, but no link for a minute. Away from home
     // (network not in range) the toy plays from the card and says nothing about it.
+    // When the router keeps rejecting the stored password (WiFiProvisioningManager::
+    // credentialsRejected) the toy stops restarting and says it at most every 6 hours.
     if (provisioned && !WiFi.isConnected() && !wifiProv.isProvisioningManagerActive() && wifiProv.isHomeNetworkVisible() &&
         now - gFullSystemStartedAt > Policy::WIFI_CONNECTING_WINDOW_MS)
     {
-        if (!gWifiLostAnnounced || now - gWifiLostAnnouncedAt > 600000UL)
+        const unsigned long every = wifiProv.credentialsRejected() ? 6UL * 60UL * 60UL * 1000UL : 600000UL;
+        if (!gWifiLostAnnounced || now - gWifiLostAnnouncedAt > every)
         {
             gWifiLostAnnounced = true;
             gWifiLostAnnouncedAt = now;

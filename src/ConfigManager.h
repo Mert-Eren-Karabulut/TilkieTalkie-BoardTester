@@ -30,6 +30,11 @@ private:
     static const char *DEVICE_NAME_KEY;
     static const char *PROVISIONING_PIN_KEY;
     static const char *JWT_TOKEN_KEY;
+    static const char *TOKEN_DAYS_KEY;
+    static const char *FACTORY_NAMESPACE;  // per-unit identity written at the factory (docs/PROTOCOL-V2.md §1)
+
+    // Factory namespace access (own Preferences handle, opened per call; caller holds the lock).
+    String factoryString(const char *key);
 
 public:
     ConfigManager();
@@ -52,9 +57,25 @@ public:
     String getProvisioningPin();
     void setProvisioningPin(const String &pin);
 
-    // JWT Token management
+    // Device token (PROTOCOL-V2 §2). token_days counts the days the token has been in use (a
+    // daily tick on the loop, one NVS write per day); RequestManager refreshes it at 80.
     String getJWTToken();
-    void setJWTToken(const String &token);
+    void setJWTToken(const String &token);   // also resets token_days when the token changes
+    void clearJWTToken();                    // token + token_days (customer reset)
+    uint16_t getTokenDays();
+    void setTokenDays(uint16_t days);
+
+    // Factory identity (NVS namespace "factory", PROTOCOL-V2 §1): keys secret, pop, serial
+    // (strings), enrolled (u8), reserved tested (JSON blob) and bringup. Written over USB by
+    // `ft enroll`; survives the customer reset and `ft reset`; only `ft reset --all` wipes it.
+    // The secret is never logged or printed.
+    bool hasFactorySecret();
+    String factorySecret();
+    String factoryPop();
+    String factorySerial();
+    bool isEnrolled();
+    bool setFactory(const String &secret, const String &pop, const String &serial);
+    void clearFactory();
 
     // General methods
     void resetAll();
@@ -65,6 +86,10 @@ public:
     // True once if the NVS namespace could not be opened at construction (before Faults is up):
     // the caller raises CONFIG_CORRUPT.
     bool takeOpenFailure();
+    // Non-empty once if the NVS partition had to be reformatted at boot (no free pages): the
+    // entries were read back first and rewritten; the note names what could not be restored.
+    // The caller raises CONFIG_CORRUPT with it once Faults is up.
+    String takeNvsRepairNote();
     size_t getFreeSpace();  // Get available NVS space
     void factoryReset();  // Complete factory reset including NVS erase
     

@@ -19,29 +19,61 @@ learning-discharge floor in the loop).
 Persisted bench state stays removable from a production image: `endpoint clear` drops an
 `endpoint set` override and `gaugebus attach` ends a `gaugebus release`.
 
-Confirmations (`factory`, `delete`, `deletefig`, `poweroff`) wait at most 10 s for `yes`,
+Confirmations (`factory`, `delete`, `deletefig`, `poweroff`; bench) wait at most 10 s for `yes`,
 feeding the loop watchdog meanwhile; any other answer or silence cancels.
 
 ## Production commands
 
 | group | commands |
 |---|---|
-| system | `help`, `version`, `faults`, `restart`, `config`, `debug`, `efusemac` / `hubid`, `heap`, `stack`, `timing`, `tasks`, `diag [on\|off]`, `coredump`, `coredumperase`, `endpoint`, `endpoint clear`, `ota`, `ota check [release_id]`, `ota url <url> <sha256> <size> [version]` |
-| WiFi / Reverb | `qr`, `reset`, `stats`, `reverbstatus`, `reverbclean`, `reverbstart`, `send <message>`, `testauth` |
+| system | `help`, `version`, `faults`, `restart`, `config` (no PIN), `debug`, `efusemac` / `hubid`, `heap`, `stack`, `timing`, `tasks`, `diag [on\|off]`, `coredump`, `coredumperase`, `endpoint`, `endpoint clear`, `ota`, `ota check [release_id]` |
+| factory (`ft`) | `ft enroll <secret> <pop> [serial]`, `ft show`, `ft reset [--all]` (below) |
+| WiFi / Reverb | `qr`, `reset`, `stats`, `reverbstatus`, `reverbclean`, `reverbstart` |
 | battery / power | `battery`, `battscan`, `batterycfg`, `batteryclearflags`, `chargekick`, `gaugefets`, `gaugeprot`, `gaugecuvfix`, `gaugebus`, `gaugebus attach`, `pdstatus`, `power`, `poweron` |
 | sleep | `sleep`, `sleep now`, `sleepafter <ms>`, `cancelsleep`, `sleepstatus` |
-| files | `sdtree`, `sdinfo`, `sdformat`, `sdbench`, `sdwritebench [chunkKB] [count]`, `dlstats`, `dlqueue`, `dlclear`, `required`, `checkfiles`, `cleanup`, `download <url> <path>`, `addfile <path> <url>`, `deletefile <path>` |
+| files | `sdtree`, `sdinfo`, `sdbench`, `sdwritebench [chunkKB] [count]`, `dlstats`, `dlqueue`, `dlclear`, `required`, `checkfiles`, `cleanup` |
 | audio | `play <path>`, `play`, `pause`, `resume`, `stop`, `next`, `prev`, `playlist`, `track`, `volup`, `voldown`, `volume`, `volume <n>`, `audio`, `amp on\|off\|auto` |
 | LED | `ledon <hex> <0-255>`, `ledoff`, `pulse <hex>`, `rapid <hex> <count>` |
 | NFC | `nfcstatus`, `nfcdata`, `nfcreed` / `nfcpogo`, `nfcdiag`, `nfcsleep` |
 
 `faults` prints the active faults and the recent fault events (docs/FAULTS.md).
 
+`hubid` prints the hub uuid (the efuse MAC in decimal), the MAC in the usual byte order
+(1.2.19 and older printed it reversed), whether the unit is enrolled, and the label payload
+`TT1:<uuid>:TK-XXXX-XXXX` once a pop is enrolled.
+
+### Factory protocol `ft` (docs/PROTOCOL-V2.md §9, first commands)
+
+One command per line, one JSON line back on the console: `{"ok":true,...}` or
+`{"ok":false,"error":"..."}`.
+
+| command | answer |
+|---|---|
+| `ft enroll <secret> <pop> [serial]` | stores the factory identity (NVS namespace `factory`) and answers like `ft show`. secret: 16-128 characters of `A-Za-z0-9-_.` (the portal's base64url secret); pop: `TK-XXXX-XXXX` or `XXXXXXXX` from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, stored as the bare 8 upper-case characters (the BLE proof of possession); serial: optional, up to 32 of the same characters |
+| `ft show` | `{"ok":true,"uuid":"...","mac":"AA:BB:CC:DD:EE:FF","serial":"..."\|null,"enrolled":true\|false,"label":"TT1:<uuid>:TK-XXXX-XXXX"\|null}`; never the secret |
+| `ft reset` | `{"ok":true,"reset":"customer"}`, then the customer reset below (the factory namespace survives) and a restart |
+| `ft reset --all` | `{"ok":true,"reset":"all"}`, the same plus the factory namespace (secret, pop, serial, test and bring-up records) |
+
+## Button holds (volume buttons 1 + 4)
+
+| hold | what |
+|---|---|
+| 5 s | a tone (two rising notes): "forget WiFi" is armed; letting go before 10 s forgets the network (stories stay), says `wifi_reset_done` and restarts into BLE provisioning |
+| 10 s | a second tone (three falling notes): **customer reset**: best-effort `POST /api/hubs/{uuid}/unbind` with the device token (3 s, skipped offline), device token and its age deleted, card cache wiped (stories, manifests, download queue, uid mappings; not the prompt pack, not `/.device`), fault ring cleared, volume / volume ceiling / brightness settings deleted, WiFi forgotten, restart into provisioning. The factory namespace stays. The app/admin command `factory-reset` and `ft reset` run the same reset |
+
+Buttons 2 + 3 held 5 s restart the toy (unchanged).
+
 ## Bench commands (`-DTT_BENCH` only)
 
 | command | what |
 |---|---|
-| `endpoint set <api_base> <reverb_host> <port> <tls 0\|1> [key]` | point the unit at a bench portal (NVS; `restart` to apply) |
+| `endpoint set <api_base> <reverb_host> <port> <tls 0\|1> [key]` | point the unit at a bench portal (NVS; `restart` to apply); the portal probe follows it (`http://<host>:<port>/storage/ping.json` for an http base): until it answers `{"ping":"tilkie"}` the toy is offline; an answer that is not ours = captive portal (rejected while pairing), no answer = no internet (accepted while pairing, re-probed every 2 min) |
+| `sdformat` | delete everything on the card (no confirmation) |
+| `download <url> <path>`, `addfile <path> <url>`, `deletefile <path>` | manual file management (any URL, any path) |
+| `ota url <url> <sha256> <size> [version]` | install an arbitrary image |
+| `testauth` | sends the token to `/user` without certificate checks |
+| `send <message>` | chat broadcast (the portal refuses chat from a device: 401/403) |
+| `config` | also prints the legacy provisioning PIN |
 | `factory` | erase all stored data (asks `yes`) |
 | `delete` | delete all required files from NVS and the card (asks `yes`) |
 | `deletefig <uid>` | delete one figure's cached stories + manifest (asks `yes`) |
