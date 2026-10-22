@@ -378,6 +378,13 @@ void setup()
     {
         Faults::raise(Fault::CONFIG_CORRUPT); // NVS could not be opened at static init
     }
+    {
+        const String note = ConfigManager::getInstance().takeNvsRepairNote();
+        if (note.length() > 0)
+        {
+            Faults::raise(Fault::CONFIG_CORRUPT, note.substring(0, 39).c_str()); // partition was full and reformatted
+        }
+    }
     Faults::setSpeaker([](Fault f) {
         switch (f)
         {

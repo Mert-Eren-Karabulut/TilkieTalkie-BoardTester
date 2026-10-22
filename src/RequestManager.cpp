@@ -15,6 +15,7 @@ static const char *TAG = "api";
 // Initialize static members
 const char* RequestManager::NVS_NAMESPACE = "requestmgr";
 const char* RequestManager::NVS_UID_MAPPING_KEY = "uid_mappings";
+const char* RequestManager::NVS_UID_LRU_KEY = "uid_lru";
 const char* RequestManager::SD_DATA_DIR = "/.requestmanager";
 const char* RequestManager::SD_MANIFEST_DIR = "/.requestmanager/manifests";
 const char* RequestManager::SD_PENDING_MANIFEST_DIR = "/.requestmanager/pending_manifests";
@@ -93,7 +94,7 @@ RequestManager::~RequestManager()
     }
     
     activeDownloads.clear();
-    uidToFigureIdMap.clear();
+    uidLru.clear();
 }
 
 // Initialization
@@ -1005,31 +1006,56 @@ void RequestManager::staticFileDownloadCallback(const String& url, const String&
 
 void RequestManager::storeUidToFigureIdMapping(const String &uid, const String &figureId)
 {
-    auto it = uidToFigureIdMap.find(uid);
-    if (it != uidToFigureIdMap.end() && it->second == figureId) {
-        return; // unchanged: no NVS write on every tap
+    for (auto it = uidLru.begin(); it != uidLru.end(); ++it) {
+        if (it->first != uid) continue;
+        const bool same = it->second == figureId;
+        uidLru.erase(it);
+        uidLru.emplace_back(uid, figureId); // most recent last
+        if (same) {
+            return; // only the order changed: no NVS write on every tap (persisted with the next change)
+        }
+        saveUidMappings();
+        return;
     }
-    uidToFigureIdMap[uid] = figureId;
+    uidLru.emplace_back(uid, figureId);
+    while (uidLru.size() > UID_MAP_MAX) {
+        uidLru.erase(uidLru.begin()); // least recently used
+    }
     saveUidMappings();
 }
 
 String RequestManager::getFigureIdFromUid(const String &uid)
 {
-    auto it = uidToFigureIdMap.find(uid);
-    return (it != uidToFigureIdMap.end()) ? it->second : String();
+    for (const auto &e : uidLru) {
+        if (e.first == uid) return e.second;
+    }
+    // Not mapped (evicted, or never fetched this way): the cached manifest knows it too.
+    JsonDocument manifest(&psramJsonAllocator);
+    if (loadUnitManifest(uid, manifest)) {
+        return jsonValueToString(manifest["figure"]["id"]);
+    }
+    return String();
+}
+
+void RequestManager::forgetAllUidMappings()
+{
+    uidLru.clear();
+    if (!initializeNVS()) return;
+    nvs_erase_key(nvsHandle, NVS_UID_LRU_KEY);
+    nvs_erase_key(nvsHandle, NVS_UID_MAPPING_KEY);
+    nvs_commit(nvsHandle);
+    ESP_LOGI(TAG, "uid mappings cleared");
 }
 
 // NVS operations
 bool RequestManager::initializeNVS()
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
+    if (nvsHandle != 0) {
+        return true;
     }
-    ESP_ERROR_CHECK(err);
-    
-    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvsHandle);
+    // The partition is initialised (and, if it was full, repaired without losing the factory
+    // identity) by ConfigManager during static construction; erasing it here would wipe it all.
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvsHandle);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
         return false;
@@ -1043,52 +1069,92 @@ bool RequestManager::saveUidMappings()
     if (nvsHandle == 0) return false;
     
     JsonDocument doc(&psramJsonAllocator);
-    JsonObject mappings = doc.to<JsonObject>();
-    
-    for (const auto& pair : uidToFigureIdMap) {
-        mappings[pair.first] = pair.second;
+    JsonArray list = doc.to<JsonArray>();
+    for (const auto &e : uidLru) {
+        JsonArray pair = list.add<JsonArray>();
+        pair.add(e.first);
+        pair.add(e.second);
     }
-    
     String jsonString;
     serializeJson(doc, jsonString);
     
-    esp_err_t err = nvs_set_str(nvsHandle, NVS_UID_MAPPING_KEY, jsonString.c_str());
+    esp_err_t err = nvs_set_str(nvsHandle, NVS_UID_LRU_KEY, jsonString.c_str());
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE || err == ESP_ERR_NVS_NO_FREE_PAGES) {
+        // This namespace cannot be written any more: erase it alone (never the partition, which
+        // also holds the factory identity and the WiFi credentials) and write the list again.
+        ESP_LOGW(TAG, "NVS full writing the uid mappings - erasing namespace %s", NVS_NAMESPACE);
+        nvs_erase_all(nvsHandle);
+        nvs_commit(nvsHandle);
+        deferFault((uint16_t)Fault::CONFIG_CORRUPT, "requestmgr full, erased", false);
+        err = nvs_set_str(nvsHandle, NVS_UID_LRU_KEY, jsonString.c_str());
+    }
     if (err != ESP_OK) return false;
     
     return nvs_commit(nvsHandle) == ESP_OK;
 }
 
+// Reads a string key into a PSRAM buffer (caller frees with heap_caps_free); null when absent.
+// Parsed straight from PSRAM: an oversized legacy value must not need a copy in internal RAM.
+static char *readNvsString(nvs_handle_t h, const char *key)
+{
+    size_t size = 0;
+    if (nvs_get_str(h, key, nullptr, &size) != ESP_OK || size == 0) return nullptr;
+    char *buf = (char *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+    if (!buf) return nullptr;
+    if (nvs_get_str(h, key, buf, &size) != ESP_OK) {
+        heap_caps_free(buf);
+        return nullptr;
+    }
+    return buf;
+}
+
 bool RequestManager::loadUidMappings()
 {
     if (nvsHandle == 0) return false;
-    
-    size_t required_size = 0;
-    esp_err_t err = nvs_get_str(nvsHandle, NVS_UID_MAPPING_KEY, NULL, &required_size);
-    
-    if (err == ESP_ERR_NVS_NOT_FOUND) return true;
-    if (err != ESP_OK) return false;
-    
-    char* jsonString = (char*)heap_caps_malloc(required_size, MALLOC_CAP_SPIRAM);
-    if (!jsonString) return false;
-    
-    err = nvs_get_str(nvsHandle, NVS_UID_MAPPING_KEY, jsonString, &required_size);
-    if (err != ESP_OK) {
-        heap_caps_free(jsonString);
-        return false;
+    uidLru.clear();
+
+    char *json = readNvsString(nvsHandle, NVS_UID_LRU_KEY);
+    if (json) {
+        JsonDocument doc(&psramJsonAllocator);
+        const bool ok = deserializeJson(doc, json) == DeserializationError::Ok;
+        heap_caps_free(json);
+        if (ok) {
+            for (JsonArrayConst pair : doc.as<JsonArrayConst>()) {
+                if (pair.size() == 2) uidLru.emplace_back(pair[0].as<String>(), jsonValueToString(pair[1]));
+            }
+        }
+        while (uidLru.size() > UID_MAP_MAX) uidLru.erase(uidLru.begin());
+        ESP_LOGI(TAG, "Loaded %u UID mappings", (unsigned)uidLru.size());
+        return true;
     }
-    
-    JsonDocument doc(&psramJsonAllocator);
-    DeserializationError error = deserializeJson(doc, jsonString);
-    heap_caps_free(jsonString);
-    
-    if (error) return false;
-    
-    uidToFigureIdMap.clear();
-    for (JsonPair pair : doc.as<JsonObject>()) {
-        uidToFigureIdMap[String(pair.key().c_str())] = pair.value().as<String>();
+
+    // One-time migration of the old unbounded {"uid":"id",...} object (any size). Units whose
+    // manifest is still on the card count as the most recent; the rest is dropped first.
+    json = readNvsString(nvsHandle, NVS_UID_MAPPING_KEY);
+    if (!json) return true;
+    size_t total = 0;
+    {
+        JsonDocument doc(&psramJsonAllocator);
+        const bool ok = deserializeJson(doc, json) == DeserializationError::Ok;
+        heap_caps_free(json);
+        if (ok) {
+            std::vector<std::pair<String, String>> cached;
+            FileManager &fm = FileManager::getInstance();
+            for (JsonPairConst pair : doc.as<JsonObjectConst>()) {
+                total++;
+                String uid = pair.key().c_str();
+                String id = jsonValueToString(pair.value());
+                if (fm.fileExists(getUnitManifestPath(uid))) cached.emplace_back(uid, id); else uidLru.emplace_back(uid, id);
+            }
+            uidLru.insert(uidLru.end(), cached.begin(), cached.end());
+            while (uidLru.size() > UID_MAP_MAX) uidLru.erase(uidLru.begin());
+        }
     }
-    
-    ESP_LOGI(TAG, "Loaded %d UID mappings", uidToFigureIdMap.size());
+    if (saveUidMappings()) {
+        nvs_erase_key(nvsHandle, NVS_UID_MAPPING_KEY);
+        nvs_commit(nvsHandle);
+    }
+    ESP_LOGI(TAG, "uid mappings migrated: %u of %u kept", (unsigned)uidLru.size(), (unsigned)total);
     return true;
 }
 
@@ -1587,8 +1653,12 @@ bool RequestManager::forgetFigure(const String &uid)
     for (auto it = activeDownloads.begin(); it != activeDownloads.end();) {
         if (it->uid == uid) it = activeDownloads.erase(it); else ++it;
     }
-    if (uidToFigureIdMap.erase(uid) > 0) {
-        saveUidMappings();
+    for (auto it = uidLru.begin(); it != uidLru.end(); ++it) {
+        if (it->first == uid) {
+            uidLru.erase(it);
+            saveUidMappings();
+            break;
+        }
     }
     ESP_LOGI(TAG, "forgot figure %s (%d file(s) queued for deletion, %u shared kept)",
                   uid.c_str(), deleted, (unsigned)keep.size());

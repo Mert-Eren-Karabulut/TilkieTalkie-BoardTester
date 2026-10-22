@@ -157,6 +157,8 @@ public:
 
     // Helper method to get figure ID from UID (for deletion purposes)
     String getFigureIdFromUid(const String &uid);
+    // Customer reset / a card from another toy: drop every uid -> figure mapping (NVS too).
+    void forgetAllUidMappings();
 
 private:
     // Faults raised by HTTP exchanges are queued here and raised from update() on the loop task
@@ -168,7 +170,8 @@ private:
 
     // NVS storage for UID to Figure ID mappings
     static const char* NVS_NAMESPACE;
-    static const char* NVS_UID_MAPPING_KEY;
+    static const char* NVS_UID_MAPPING_KEY;      // legacy unbounded object, migrated once
+    static const char* NVS_UID_LRU_KEY;
     nvs_handle_t nvsHandle;
     
     // Figure download tracking
@@ -203,8 +206,13 @@ private:
     std::function<void(const String &, FigureEvent)> figureEventCallback;
     std::vector<PendingFigureCompletion> pendingCompletions;
     
-    // UID to Figure ID mapping for deletion purposes
-    std::map<String, String> uidToFigureIdMap;
+    // Unit uid -> figure id, most recently used last, at most UID_MAP_MAX entries (NVS key
+    // "uid_lru", a JSON array of [uid, id] pairs). The cached manifest on the card carries the
+    // same id (figure.id), so this is only a fallback for a unit whose manifest is gone; the
+    // bound keeps the string far from the 20 KB partition's limits (the old unbounded
+    // "uid_mappings" object is migrated once).
+    static const size_t UID_MAP_MAX = 48;
+    std::vector<std::pair<String, String>> uidLru;
     
     // Helper methods for tracking
     void startTrackingFigure(const String &uid, const String &figureName, const String &figureId, const std::vector<String> &trackPaths, const Figure &figureData, bool hasPendingManifest = false, const String &pendingManifestJson = String(), const String &previousManifestJson = String(), bool alreadyEmitted = false);
