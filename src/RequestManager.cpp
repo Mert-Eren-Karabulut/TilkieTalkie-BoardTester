@@ -20,6 +20,14 @@ const char* RequestManager::SD_MANIFEST_DIR = "/.requestmanager/manifests";
 const char* RequestManager::SD_PENDING_MANIFEST_DIR = "/.requestmanager/pending_manifests";
 static const unsigned long RECHECK_FIRST_MS = 3UL * 60UL * 1000UL;        // after boot (plus up to 60 s jitter)
 static const unsigned long RECHECK_INTERVAL_MS = 12UL * 60UL * 60UL * 1000UL; // the portal also pushes sync-figure
+// Status handling (requestAsync): re-send delays for 5xx, the 429 default and the 403 refresh rate.
+static const unsigned long SERVER_RETRY_MS[] = {30UL * 1000UL, 2UL * 60UL * 1000UL, 10UL * 60UL * 1000UL};
+static const int SERVER_RETRIES = 3;
+static const int THROTTLE_RETRIES = 2;
+static const int RETRY_AFTER_DEFAULT_S = 60;
+static const int PORTAL_UNREACHABLE_AFTER_5XX = 4;       // the first 5xx plus three retries
+static const unsigned long TOKEN_REFRESH_403_MIN_MS = 10UL * 60UL * 1000UL;
+static const char *RESPONSE_HEADERS[] = {"Retry-After"};
 
 namespace {
 struct LockGuard {
@@ -214,7 +222,7 @@ JsonDocument RequestManager::parseResponse(const String& response)
 // One HTTP exchange. Serialized by httpLock: the synchronous API runs it on the caller (boot,
 // token refresh), the asynchronous API on the request worker task - never two at once.
 int RequestManager::performHttp(const String& endpoint, const String& method, const String* payload, String& body, String& error,
-                                const String& ifNoneMatch)
+                                const String& ifNoneMatch, int* retryAfterS)
 {
     body = String();
     error = String();
@@ -243,6 +251,7 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
 
     http.setTimeout(timeout);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.collectHeaders(RESPONSE_HEADERS, 1);
     setDefaultHeaders();
     if (ifNoneMatch.length() > 0) {
         http.addHeader("If-None-Match", "\"" + ifNoneMatch + "\"");
@@ -266,6 +275,7 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
         }
         http.setTimeout(timeout);
         http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.collectHeaders(RESPONSE_HEADERS, 1);
         setDefaultHeaders();
         if (ifNoneMatch.length() > 0) {
             http.addHeader("If-None-Match", "\"" + ifNoneMatch + "\"");
@@ -284,7 +294,7 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
             authToken = "";
             ConfigManager::getInstance().setJWTToken(String());
             initConnection();
-            int retried = authToken.length() > 0 ? performHttp(endpoint, method, payload, body, error) : 0;
+            int retried = authToken.length() > 0 ? performHttp(endpoint, method, payload, body, error, ifNoneMatch, retryAfterS) : 0;
             retrying = false;
             if (authToken.length() > 0) {
                 return retried;
@@ -295,7 +305,40 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
         return code;
     }
 
+    if (code == 403 && !tokenEndpoint) {
+        // A hub endpoint refusing the token (hub unbound, token revoked on the portal): before
+        // 2026-10 only 401 refreshed it, so fault uploads and OTA checks failed until a reboot.
+        // Refresh once per 10 min and retry this request once; otherwise the 403 stands.
+        static bool retrying403 = false;
+        static unsigned long lastRefresh403 = 0;
+        http.end();
+        if (!retrying403 && (lastRefresh403 == 0 || millis() - lastRefresh403 >= TOKEN_REFRESH_403_MIN_MS)) {
+            lastRefresh403 = millis() ? millis() : 1;
+            retrying403 = true;
+            ESP_LOGI(TAG, "403 on %s - refreshing the device token and retrying once", endpoint.c_str());
+            const bool refreshed = forceTokenRefresh("403");
+            int retried = refreshed ? performHttp(endpoint, method, payload, body, error, ifNoneMatch, retryAfterS) : code;
+            retrying403 = false;
+            if (refreshed) {
+                return retried;
+            }
+        }
+        error = "Forbidden";
+        return code;
+    }
+
     if (code > 0) {
+        if (code == 429 && retryAfterS) {
+            // Seconds only (the portal's limiter sends seconds); an HTTP date or nothing -> 60 s.
+            const String ra = http.header("Retry-After");
+            long v = ra.length() > 0 ? ra.toInt() : 0;
+            if (v <= 0) v = RETRY_AFTER_DEFAULT_S;
+            if (v > 3600) v = 3600;
+            *retryAfterS = (int)v;
+        }
+        if ((code >= 200 && code < 300) || code == 304) {
+            portalSuccessAt = millis() ? millis() : 1; // the portal was reached (OTA image confirmation)
+        }
         // 204/304 and Content-Length: 0 carry no body. Asking HTTPClient for one anyway makes it
         // wait for the server to close the keep-alive connection: 65 s behind nginx.
         if (code != 204 && code != 304 && http.getSize() != 0) {
@@ -385,7 +428,7 @@ void RequestManager::raiseDeferredFaults()
 // the WebSocket alive meanwhile. Callbacks run on the loop task from update().
 
 bool RequestManager::requestAsync(const String &endpoint, const String &method, const String &payload, AsyncCallback cb,
-                                  const String &ifNoneMatch)
+                                  const String &ifNoneMatch, Retry retry)
 {
     if (!isNetworkReady()) {
         return false;
@@ -396,6 +439,7 @@ bool RequestManager::requestAsync(const String &endpoint, const String &method, 
     job->payload = payload;
     job->ifNoneMatch = ifNoneMatch;
     job->cb = cb;
+    job->retry = retry;
     bool startWorker = false;
     {
         LockGuard guard(jobLock);
@@ -412,11 +456,11 @@ bool RequestManager::requestAsync(const String &endpoint, const String &method, 
     return true;
 }
 
-bool RequestManager::postAsync(const String &endpoint, const JsonDocument &data, AsyncCallback cb)
+bool RequestManager::postAsync(const String &endpoint, const JsonDocument &data, AsyncCallback cb, Retry retry)
 {
     String jsonString;
     serializeJson(data, jsonString);
-    return requestAsync(endpoint, "POST", jsonString, cb);
+    return requestAsync(endpoint, "POST", jsonString, cb, String(), retry);
 }
 
 bool RequestManager::hasPendingRequests()
@@ -445,10 +489,56 @@ void RequestManager::workerEntry(void *arg)
     vTaskDelete(nullptr);
 }
 
+// Worker side of the status handling (see Retry in RequestManager.h). Returns true when the
+// job was put back into the queue with a later notBefore instead of being answered.
+bool RequestManager::requeueIfRetrying(AsyncJob *job)
+{
+    const unsigned long now = millis();
+    const int code = job->status;
+    if (code == 429) {
+        const int ra = job->retryAfterS > 0 ? job->retryAfterS : RETRY_AFTER_DEFAULT_S;
+        throttledUntil = (now + (unsigned long)ra * 1000UL) | 1UL;
+        ESP_LOGW(TAG, "%s throttled (429), portal requests paused for %d s", job->endpoint.c_str(), ra);
+        if (job->retry != Retry::NONE && job->throttleRetries < THROTTLE_RETRIES) {
+            job->throttleRetries++;
+            job->notBefore = throttledUntil.load();
+        } else {
+            return false;
+        }
+    } else if (code >= 500 && code < 600) {
+        const int run = ++consecutive5xx;
+        if (run == PORTAL_UNREACHABLE_AFTER_5XX) {
+            char d[40];
+            snprintf(d, sizeof(d), "http=%d %.26s", code, job->endpoint.c_str());
+            deferFault((uint16_t)Fault::PORTAL_UNREACHABLE, d, false);
+        }
+        if (job->retry == Retry::BACKGROUND && job->serverRetries < SERVER_RETRIES) {
+            const unsigned long wait = SERVER_RETRY_MS[job->serverRetries];
+            job->serverRetries++;
+            job->notBefore = (now + wait) | 1UL;
+            ESP_LOGW(TAG, "%s -> %d, retry %d/%d in %lu s", job->endpoint.c_str(), code, job->serverRetries, SERVER_RETRIES,
+                     wait / 1000);
+        } else {
+            return false;
+        }
+    } else {
+        if (code > 0) {
+            consecutive5xx = 0; // the portal answers properly again
+        }
+        return false;
+    }
+    job->body = String();
+    job->error = String();
+    LockGuard guard(jobLock);
+    jobQueue.push_back(job);
+    return true;
+}
+
 void RequestManager::workerLoop()
 {
     for (;;) {
         AsyncJob *job = nullptr;
+        bool throttledAnswer = false;
         {
             LockGuard guard(jobLock);
             if (jobQueue.empty()) {
@@ -456,13 +546,50 @@ void RequestManager::workerLoop()
                 activeEndpoint = String();
                 break;
             }
-            job = jobQueue.front();
-            jobQueue.pop_front();
-            activeEndpoint = job->endpoint;
-            jobStartedAt = millis();
+            // First job that may run now: its own retry delay is over and the portal is not
+            // throttling us (a NONE-policy job is answered 429 at once instead of waiting).
+            const unsigned long now = millis();
+            const unsigned long throttle = throttledUntil.load();
+            const bool throttled = throttle != 0 && (long)(now - throttle) < 0;
+            for (auto it = jobQueue.begin(); it != jobQueue.end(); ++it) {
+                AsyncJob *candidate = *it;
+                if (candidate->notBefore != 0 && (long)(now - candidate->notBefore) < 0) {
+                    continue;
+                }
+                if (throttled && candidate->retry != Retry::NONE) {
+                    continue;
+                }
+                job = candidate;
+                throttledAnswer = throttled; // only a NONE job gets here while throttled
+                jobQueue.erase(it);
+                break;
+            }
+            if (job) {
+                activeEndpoint = job->endpoint;
+                jobStartedAt = millis();
+            }
         }
-        job->status = performHttp(job->endpoint, job->method, job->method == "POST" ? &job->payload : nullptr, job->body, job->error,
-                                  job->ifNoneMatch);
+        if (!job) {
+            vTaskDelay(pdMS_TO_TICKS(250)); // only delayed jobs left: they keep the worker alive
+            continue;
+        }
+        if (throttledAnswer) {
+            job->status = 429;
+            job->body = String();
+            job->error = String();
+            const long left = (long)(throttledUntil.load() - millis()) / 1000;
+            job->retryAfterS = left > 0 ? (int)left : 1;
+        } else {
+            job->retryAfterS = 0;
+            job->status = performHttp(job->endpoint, job->method, job->method == "POST" ? &job->payload : nullptr, job->body,
+                                      job->error, job->ifNoneMatch, &job->retryAfterS);
+            if (requeueIfRetrying(job)) {
+                LockGuard guard(jobLock);
+                activeEndpoint = String();
+                jobStartedAt = 0;
+                continue;
+            }
+        }
         {
             LockGuard guard(jobLock);
             jobDone.push_back(job);
@@ -485,6 +612,9 @@ void RequestManager::dispatchCompletedJobs()
             jobDone.pop_front();
         }
         JsonDocument doc = responseToDocument(job->status, job->body, job->error);
+        if (job->status == 429) {
+            doc["_retry_after"] = job->retryAfterS > 0 ? job->retryAfterS : RETRY_AFTER_DEFAULT_S;
+        }
         if (job->cb) {
             job->cb(doc, job->status); // may queue further requests
         }
@@ -595,6 +725,17 @@ void RequestManager::initConnection()
     }
 }
 
+// F2 stub (the F1 branch replaces it with the POST /api/hubs/{uuid}/token + X-Hub-Secret flow):
+// today's validation, which keeps a token the portal still accepts and fetches a new one
+// otherwise. Runs under httpLock like every token exchange.
+bool RequestManager::forceTokenRefresh(const char *reason)
+{
+    LockGuard guard(httpLock);
+    ESP_LOGI(TAG, "device token refresh (%s)", reason ? reason : "?");
+    initConnection();
+    return authToken.length() > 0;
+}
+
 void RequestManager::getCheckFigureTracks(const String &uid)
 {
     ESP_LOGI(TAG, "Processing figure tracks request");
@@ -620,19 +761,49 @@ void RequestManager::processOnlineFigureRequest(const String &uid, bool alreadyE
         ESP_LOGI(TAG, "manifest request already pending for this figure");
         return;
     }
-    bool started = getAsync(endpoint, [this, uid, alreadyEmitted](JsonDocument &doc, int) {
-        handleUnitManifest(uid, alreadyEmitted, doc);
-    });
+    // INTERACTIVE: a tap waits for this answer; a 5xx is answered at once (the cache already
+    // plays), a 429 waits for Retry-After and is re-sent.
+    bool started = getAsync(endpoint, [this, uid, alreadyEmitted](JsonDocument &doc, int status) {
+        handleUnitManifest(uid, alreadyEmitted, doc, status);
+    }, Retry::INTERACTIVE);
     if (!started) {
         JsonDocument doc(&psramJsonAllocator);
         doc["error"] = true;
         doc["message"] = "Network not ready";
-        handleUnitManifest(uid, alreadyEmitted, doc);
+        handleUnitManifest(uid, alreadyEmitted, doc, 0);
     }
 }
 
-void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, JsonDocument &doc)
+void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, JsonDocument &doc, int status)
 {
+    // Status first (docs/PROTOCOL-V2.md §4): 410 = the card was deleted on the portal, purge it;
+    // 404 = no such unit (the cache, if any, is kept); anything else that is not 200 (offline,
+    // 401/403 after the token refresh, 429 after its re-sends, 5xx) = the portal could not answer,
+    // which is not a statement about the card: the cache is kept.
+    if (status == 410) {
+        purgeRevokedUnit(uid);
+        if (!alreadyEmitted && figureDownloadCompleteCallback) {
+            Figure emptyFigure;
+            queueFigureDownloadCompletion(uid, "revoked", false, "No figure: card revoked on the portal", emptyFigure);
+        }
+        return;
+    }
+    if (status == 404) {
+        if (!alreadyEmitted && figureDownloadCompleteCallback) {
+            Figure emptyFigure;
+            queueFigureDownloadCompletion(uid, "null", false, "No figure data found", emptyFigure);
+        }
+        return;
+    }
+    if (status != 200 && !doc["error"].as<bool>()) {
+        ESP_LOGW(TAG, "manifest fetch for %s answered %d", uid.c_str(), status);
+        if (!alreadyEmitted && figureDownloadCompleteCallback) {
+            Figure emptyFigure;
+            queueFigureDownloadCompletion(uid, "Unknown", false,
+                                          String("Backend unreachable (http=") + status + ") and nothing cached", emptyFigure);
+        }
+        return;
+    }
     if (doc["error"].as<bool>()) {
         ESP_LOGW(TAG, "manifest fetch failed (%s)", doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "?");
         if (!alreadyEmitted && figureDownloadCompleteCallback) {
@@ -1595,6 +1766,20 @@ bool RequestManager::forgetFigure(const String &uid)
     return true;
 }
 
+// The portal answered 410 {"revoked": true}: the card no longer exists there. Its manifest,
+// pending manifest, the assets no other cached card uses and their queued downloads go (the same
+// clean-up as the hub page's delete-figure). Never on 404 or a network error.
+void RequestManager::purgeRevokedUnit(const String &uid)
+{
+    FileManager &fm = FileManager::getInstance();
+    const bool cached = fm.fileExists(getUnitManifestPath(uid)) || fm.fileExists(getPendingUnitManifestPath(uid));
+    ESP_LOGW(TAG, "card %s was revoked on the portal - %s", uid.c_str(), cached ? "purging its cache" : "nothing cached");
+    if (cached) {
+        forgetFigure(uid);
+        requestInventory();
+    }
+}
+
 bool RequestManager::forgetTrack(const String &path)
 {
     if (!path.startsWith("/assets/")) {
@@ -1739,6 +1924,10 @@ void RequestManager::recheckUnit(const String &uid)
             ESP_LOGI(TAG, "%s unchanged", uid.c_str());
             return;
         }
+        if (status == 410) {
+            purgeRevokedUnit(uid);
+            return;
+        }
         if (status != 200) {
             ESP_LOGW(TAG, "re-check of %s failed (%d)", uid.c_str(), status);
             char d[40];
@@ -1747,6 +1936,6 @@ void RequestManager::recheckUnit(const String &uid)
             return;
         }
         ESP_LOGI(TAG, "%s changed on the portal - updating the cache", uid.c_str());
-        handleUnitManifest(uid, true, doc);
-    }, checksum);
+        handleUnitManifest(uid, true, doc, status);
+    }, checksum, Retry::BACKGROUND);
 }
