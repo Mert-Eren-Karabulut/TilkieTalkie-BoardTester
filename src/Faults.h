@@ -19,6 +19,9 @@
     X(107, TOKEN_REJECTED, ERROR, "", ON_NETWORK, "Portal rejected the hub token after a refresh", "Check the hub's owner binding; re-bind the hub in the app") \
     X(108, WS_AUTH_FAILED, ERROR, "", ON_NETWORK, "WebSocket channel authorisation refused", "Check Reverb and the hub's token") \
     X(109, WS_DISCONNECTED, INFO, "", EVENT, "WebSocket dropped", "Normal on flaky links; watch the count") \
+    X(110, NOT_LINKED, INFO, "kivi", EVENT, "Toy is online but not linked to an account", "Add the toy in the app with the pairing code on its label") \
+    X(112, NOT_ENROLLED, INFO, "", EVENT, "No factory identity, or the portal does not know it", "Enroll the unit at the factory (ft enroll) and on the portal") \
+    X(113, CAPTIVE_PORTAL, WARNING, "nar", EVENT, "Network wants a login page (captive portal)", "Use a home network without a login page") \
     X(201, FIGURE_UNKNOWN, ERROR, "elma", ON_PLAY, "Portal has no unit for this card", "Register the card (Catalog > Cards > Import)") \
     X(202, FIGURE_NO_CONTENT, ERROR, "elma", ON_PLAY, "Figure exists but has nothing to play", "Add content to the figure, or bind content to the wildcard card") \
     X(203, FIGURE_OFFLINE, ERROR, "armut", ON_PLAY, "Portal unreachable and nothing cached for the card", "Get the toy online once; the stories are then cached") \
@@ -32,6 +35,7 @@
     X(303, SD_FULL, ERROR, "muz", EVENT, "No space left for a download", "Delete stories from the hub page or use a bigger card") \
     X(304, SD_FILE_CORRUPT, WARNING, "", EVENT, "A json file on the card was unreadable and recreated", "Watch the count; a card that corrupts files should be replaced") \
     X(305, SD_SLOW, INFO, "", EVENT, "Card write stall above 3 s", "Slow card; affects download speed only") \
+    X(306, CARD_FOREIGN, INFO, "", EVENT, "Card came from another toy, its story cache was wiped", "Normal after moving a card between toys") \
     X(401, AUDIO_INIT_FAILED, CRITICAL, "", ON_BOOT, "Codec or I2S initialisation failed", "Hardware fault: return the unit") \
     X(402, DECODER_FAILED, ERROR, "", ON_PLAY, "A file could not start decoding", "Check the file (MP3) on the portal") \
     X(403, AUDIO_UNDERRUN, INFO, "", EVENT, "Read-ahead ran dry during playback", "Slow card; watch the count") \
