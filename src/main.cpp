@@ -91,6 +91,27 @@ Endpoints loadEndpoints()
     }
     return ep;
 }
+// Host and port of the captive-portal probe (docs/PROTOCOL-V2.md §6): the API base's host,
+// over plain HTTP. https bases use port 80 (nginx serves /storage there, like the assets); an
+// http base (bench portal, `endpoint set http://<ip>:8000/api ...`) keeps its own port.
+static void probeTargetFrom(const String &apiBase, String &host, uint16_t &port)
+{
+    String rest = apiBase;
+    const bool tls = rest.startsWith("https://");
+    if (rest.indexOf("://") >= 0) rest = rest.substring(rest.indexOf("://") + 3);
+    int slash = rest.indexOf('/');
+    String hostPort = slash >= 0 ? rest.substring(0, slash) : rest;
+    int colon = hostPort.lastIndexOf(':');
+    port = 80;
+    host = hostPort;
+    if (colon > 0)
+    {
+        host = hostPort.substring(0, colon);
+        if (!tls) port = (uint16_t)hostPort.substring(colon + 1).toInt();
+        if (port == 0) port = 80;
+    }
+}
+
 // The Arduino core marks a freshly booted OTA image valid inside initArduino() unless this
 // weak hook says otherwise; OtaManager confirms the image itself after 60 s of uptime so that a
 // crash before then still lets the bootloader fall back to the previous firmware.
@@ -675,6 +696,9 @@ void startFullSystem()
         {
         case WiFiProvisioningManager::ProvEvent::CRED_RECV: prompts.say(Prompt::SETUP_CONNECTING); break;
         case WiFiProvisioningManager::ProvEvent::CRED_FAIL: Faults::raise(Fault::WIFI_AUTH_FAILED); break;
+        // The network wants a login page: rejected like a wrong password (speaks setup_captive).
+        // Raised from the WiFi event task like WIFI_AUTH_FAILED above.
+        case WiFiProvisioningManager::ProvEvent::CAPTIVE: Faults::raise(Fault::CAPTIVE_PORTAL, "provisioning"); break;
         case WiFiProvisioningManager::ProvEvent::ENDED:
             if (WiFi.isConnected()) prompts.say(Prompt::SETUP_SUCCESS);
             break;
@@ -686,6 +710,13 @@ void startFullSystem()
         // No factory identity (docs/PROTOCOL-V2.md §1): BLE provisioning uses the legacy PIN
         // (TT_LEGACY_POP builds) or is impossible; the token comes from the legacy endpoint.
         Faults::raise(Fault::NOT_ENROLLED, "no pop");
+    }
+    {
+        String host;
+        uint16_t port = 80;
+        probeTargetFrom(loadEndpoints().apiBase, host, port);
+        wifiProv.setProbeTarget(host, port);
+        ESP_LOGI(TAG, "portal probe: http://%s:%u/storage/ping.json", host.c_str(), (unsigned)port);
     }
     wifiProv.begin();
 
@@ -718,7 +749,10 @@ static void serviceNetworkStart()
     {
         return;
     }
-    if (!WiFi.isConnected())
+    // Behind a captive portal (or without internet) the toy behaves as offline: the API client
+    // and the WebSocket see no network, and nothing starts until the portal probe passes.
+    RequestManager::setPortalReachable(wifiProv.isInternetReady());
+    if (!wifiProv.isInternetReady())
     {
         gWifiUpSince = 0;
         return;
@@ -761,9 +795,9 @@ static void serviceNetworkStart()
 static void serviceNetworkHealth()
 {
     static unsigned long lastReset = 0;
-    if (!gNetworkServicesStarted || !WiFi.isConnected() || wifiProv.isProvisioningManagerActive())
+    if (!gNetworkServicesStarted || !wifiProv.isInternetReady() || wifiProv.isProvisioningManagerActive())
     {
-        return;
+        return; // a captive network is "offline": no radio reset for it
     }
     const unsigned long now = millis();
     const unsigned long last = reverb.lastConnectedAt();
@@ -894,8 +928,8 @@ void loop()
     // Handle WiFi background reconnection (only when credentials exist but not connected)
     TT_TIMED("wifi", wifiProv.handleBackgroundReconnection());
 
-    // Update Reverb client only if WiFi is connected
-    if (WiFi.isConnected())
+    // Update Reverb client only if WiFi is connected and the portal is reachable (not captive)
+    if (wifiProv.isInternetReady())
     {
         TT_TIMED("reverb", reverb.update());
     }

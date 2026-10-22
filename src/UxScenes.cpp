@@ -170,12 +170,14 @@ void deriveLedScene()
     {
         ledController.setScene(LedController::SCENE_DOWNLOADING);
     }
-    else if (!WiFi.isConnected())
+    else if (!WiFi.isConnected() || wifiProv.isCaptive())
     {
         if (wifiProv.isProvisioningManagerActive())
             ledController.setScene(LedController::SCENE_PROVISIONING);
         else if (millis() - gFullSystemStartedAt < Policy::WIFI_CONNECTING_WINDOW_MS)
             ledController.setScene(LedController::SCENE_WIFI_CONNECTING);
+        else if (wifiProv.quietOffline())
+            ledController.setScene(lowBattery ? LedController::SCENE_LOW_BATTERY : LedController::SCENE_OFF); // password rejected: the amber LED only around each retry
         else
             ledController.setScene(LedController::SCENE_OFFLINE);
     }
@@ -276,10 +278,13 @@ void serviceUxPrompts()
     }
     // Provisioned, the home network is in range, but no link for a minute. Away from home
     // (network not in range) the toy plays from the card and says nothing about it.
+    // When the router keeps rejecting the stored password (WiFiProvisioningManager::
+    // credentialsRejected) the toy stops restarting and says it at most every 6 hours.
     if (provisioned && !WiFi.isConnected() && !wifiProv.isProvisioningManagerActive() && wifiProv.isHomeNetworkVisible() &&
         now - gFullSystemStartedAt > Policy::WIFI_CONNECTING_WINDOW_MS)
     {
-        if (!gWifiLostAnnounced || now - gWifiLostAnnouncedAt > 600000UL)
+        const unsigned long every = wifiProv.credentialsRejected() ? 6UL * 60UL * 60UL * 1000UL : 600000UL;
+        if (!gWifiLostAnnounced || now - gWifiLostAnnouncedAt > every)
         {
             gWifiLostAnnounced = true;
             gWifiLostAnnouncedAt = now;

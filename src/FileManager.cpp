@@ -290,7 +290,8 @@ bool FileManager::initializeSDCard() {
 bool FileManager::checkConnectivity() {
     // The TCP connect to the asset host is the real connectivity test; a probe to a third
     // party used to block the loop for up to ~15 s per queued file whenever WAN was down.
-    return WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0);
+    // Behind a captive portal a download would fetch a login page: offline until the probe passes.
+    return WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0) && RequestManager::portalReachable();
 }
 
 void FileManager::update() {

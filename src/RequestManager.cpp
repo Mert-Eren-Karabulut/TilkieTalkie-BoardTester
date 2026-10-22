@@ -16,6 +16,7 @@ static const char *TAG = "api";
 const char* RequestManager::NVS_NAMESPACE = "requestmgr";
 const char* RequestManager::NVS_UID_MAPPING_KEY = "uid_mappings";
 const char* RequestManager::NVS_UID_LRU_KEY = "uid_lru";
+volatile bool RequestManager::portalReachableFlag = false;
 const char* RequestManager::SD_DATA_DIR = "/.requestmanager";
 const char* RequestManager::SD_MANIFEST_DIR = "/.requestmanager/manifests";
 const char* RequestManager::SD_PENDING_MANIFEST_DIR = "/.requestmanager/pending_manifests";
@@ -186,7 +187,7 @@ void RequestManager::update()
 // Consolidated network check
 bool RequestManager::isNetworkReady()
 {
-    if (WiFi.status() != WL_CONNECTED) {
+    if (WiFi.status() != WL_CONNECTED || !portalReachableFlag) {
         return false;
     }
     return WiFi.localIP()[0] != 0;

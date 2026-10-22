@@ -81,7 +81,11 @@ public:
 
     // Utility methods
     bool isConnected();
-    bool isNetworkReady();   // WiFi up with an IP (no portal check)
+    bool isNetworkReady();   // WiFi up with an IP and the portal probe passed (not a captive portal)
+    // Set by the loop from WiFiProvisioningManager::isInternetReady(): false behind a captive
+    // portal, so every request, download and upload treats the network as absent.
+    static void setPortalReachable(bool reachable) { portalReachableFlag = reachable; }
+    static bool portalReachable() { return portalReachableFlag; }
     // Fetches a new device token (PROTOCOL-V2 §2) and returns it ("" on failure); does not
     // store it. Enrolled unit (factory secret present): POST /hubs/{uuid}/token with the
     // X-Hub-Secret header (404/401 raise NOT_ENROLLED, 404/401/429 back off for 15 min). Not
@@ -182,6 +186,7 @@ public:
     void forgetAllUidMappings();
 
 private:
+    static volatile bool portalReachableFlag;
     // Faults raised by HTTP exchanges are queued here and raised from update() on the loop task
     // (Faults is not thread-safe; performHttp also runs on the request worker).
     struct DeferredFault { uint16_t code; char detail[40]; bool speak; };

@@ -28,7 +28,8 @@ implement. FW = firmware, P = portal. Everything here replaces earlier docs wher
   pop: no BLE provisioning at all, 112 at boot, red LED scene while it is unprovisioned, no
   setup_welcome prompt. Enrolled units always use their pop. `ft enroll` stores the pop as its
   8 characters (it accepts `TK-XXXX-XXXX` or `XXXXXXXX`, upper-cases and drops `TK-` and the
-  dashes); the app sends those 8 characters as the BLE PoP and as `pairing_code`.
+  dashes); the app sends those 8 characters as the BLE PoP. The label QR carries
+  `TT1:<uuid>:TK-XXXX-XXXX` (`ft show` and `hubid` print it).
 - Label QR payload: `TT1:<uuid>:<pop>` (the app parses it; the human-readable pop sits under
   the QR).
 
@@ -106,8 +107,14 @@ States: IDLE, CHECKING, WAITING, PROMPTS, DOWNLOADING, APPLYING, REBOOTING, FAIL
 ## 6. WiFi: open networks and captive portals
 
 - Open networks are accepted (empty password stored and mirrored). After every connection the
-  device probes `GET http://portal.tilkietalkie.com/api/ping` (plain HTTP, expects
-  `{"ping":"tilkie"}`); any redirect, HTML or wrong body means a captive portal.
+  device probes `GET http://<host of the configured API base>/storage/ping.json` (plain HTTP,
+  port 80 for an https base, the base's own port for an http bench base; no redirects
+  followed, 5 s) and needs the body to be exactly `{"ping":"tilkie"}` after trimming
+  whitespace; any redirect, HTML, other body or no answer means a captive portal. Network
+  services (token, Reverb, checks, downloads) start only after the probe passed.
+- During provisioning the probe runs before the provisioning manager reports success; a
+  failed probe is reported to the app as a failed connection (the same status as a wrong
+  password: FAIL / auth error).
 - During provisioning a captive network is **rejected**: the credentials are forgotten, fault
   113 CAPTIVE_PORTAL (warning, fruit **nar**) is raised, the prompt `setup_captive` is spoken
   ("Bu ağ bir giriş sayfası istiyor, lütfen başka bir ağ seç. Hata kodu: Nar.") and
