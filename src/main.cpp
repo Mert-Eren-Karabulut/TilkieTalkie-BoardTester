@@ -679,11 +679,17 @@ void startFullSystem()
         default: break;
         }
     });
+    if (config.factoryPop().isEmpty())
+    {
+        // No factory identity (docs/PROTOCOL-V2.md §1): BLE provisioning uses the legacy PIN
+        // (TT_LEGACY_POP builds) or is impossible; the token comes from the legacy endpoint.
+        Faults::raise(Fault::NOT_ENROLLED, "no pop");
+    }
     wifiProv.begin();
 
     // Voice feedback: Turkish prompts from the SD card (docs/VOICE-PROMPTS.md)
     prompts.begin();
-    if (!wifiProv.isProvisioned())
+    if (!wifiProv.isProvisioned() && !wifiProv.provisioningImpossible())
     {
         startSetupWelcome(); // repeated by serviceUxPrompts() while nobody pairs
     }

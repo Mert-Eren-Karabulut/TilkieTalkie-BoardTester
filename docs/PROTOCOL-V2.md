@@ -22,6 +22,13 @@ implement. FW = firmware, P = portal. Everything here replaces earlier docs wher
   order), serial, enrolled yes/no (never the secret). The BLE PoP is the stored `pop`; the
   hard-coded `abcd1234` disappears (a device without a pop cannot be provisioned over BLE and
   says so with the 112 NOT_ENROLLED fault / red LED).
+- Transition flag `TT_LEGACY_POP` (build flag, set in both PlatformIO envs today, "remove once
+  the fleet is enrolled"): a unit without a stored pop still provisions with the old shared
+  PIN and raises 112 NOT_ENROLLED (info) at boot. A build without the flag and a unit without a
+  pop: no BLE provisioning at all, 112 at boot, red LED scene while it is unprovisioned, no
+  setup_welcome prompt. Enrolled units always use their pop. `ft enroll` stores the pop as its
+  8 characters (it accepts `TK-XXXX-XXXX` or `XXXXXXXX`, upper-cases and drops `TK-` and the
+  dashes); the app sends those 8 characters as the BLE PoP and as `pairing_code`.
 - Label QR payload: `TT1:<uuid>:<pop>` (the app parses it; the human-readable pop sits under
   the QR).
 

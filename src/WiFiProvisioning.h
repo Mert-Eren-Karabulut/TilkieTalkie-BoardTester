@@ -15,6 +15,7 @@ private:
     bool provisioningManagerInitialized;
     unsigned long lastReconnectAttempt;
     bool connectedOnce = false;
+    bool noProofOfPossession = false;
     int reconnectFailures = 0;        // consecutive background attempts without a link
     unsigned long offlineSince = 0;   // provisioned but no link since (0 = link up)
     std::function<bool()> idleCheck;  // the 15-minute restart only while the toy is idle
@@ -56,6 +57,12 @@ public:
     // the card): no reconnect churn, no escalation, no "I cannot connect" prompt.
     bool isHomeNetworkVisible() const { return homeNetworkVisible; }
     
+    // No proof of possession for BLE provisioning (no factory pop enrolled, and the build has
+    // no TT_LEGACY_POP fallback): the toy cannot be provisioned and says so (112, red LED).
+    bool provisioningImpossible() const { return noProofOfPossession; }
+    // The PoP BLE provisioning uses: the factory pop, or the legacy PIN (TT_LEGACY_POP), or "".
+    String proofOfPossession();
+
     // Query underlying library state
     bool isProvisioned();
     bool isProvisioningManagerActive();

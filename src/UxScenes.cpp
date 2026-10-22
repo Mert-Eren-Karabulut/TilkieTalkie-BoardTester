@@ -42,6 +42,10 @@ bool chargeBarAllowed()
     {
         return false;
     }
+    if (!WiFi.isConnected() && wifiProv.provisioningImpossible())
+    {
+        return false; // the red "cannot be provisioned" scene wins over the charge bar
+    }
     if (audioController.isPlaying() || audioController.isPaused() || audioController.isWaitingForTrack())
     {
         return false;
@@ -127,8 +131,10 @@ void deriveLedScene()
         ledController.setScene(LedController::SCENE_OTA, gOtaProgress);
         return;
     }
-    if (gSystemError || Faults::hasActive(Severity::CRITICAL))
+    if (gSystemError || Faults::hasActive(Severity::CRITICAL) ||
+        (!WiFi.isConnected() && wifiProv.provisioningImpossible()))
     {
+        // provisioningImpossible: not provisioned and no pop to provision with (112 NOT_ENROLLED)
         ledController.setScene(LedController::SCENE_ERROR);
         return;
     }

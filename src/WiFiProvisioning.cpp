@@ -136,12 +136,21 @@ void WiFiProvisioningManager::startProvisioning() {
     ESP_LOGI(TAG, "Free heap before provisioning: %u bytes", (unsigned)ESP.getFreeHeap());
 
     String deviceName = config.getDeviceName();
-    String pin = config.getProvisioningPin();
+    const String pop = proofOfPossession();
+    if (pop.isEmpty()) {
+        // Without a per-unit pop anyone in BLE range could provision the toy with the PIN that
+        // every unit shared: no provisioning at all (NOT_ENROLLED was raised at boot).
+        ESP_LOGE(TAG, "no factory pop enrolled - BLE provisioning disabled (ft enroll)");
+        noProofOfPossession = true;
+        wifi_prov_mgr_deinit();
+        provisioningManagerInitialized = false;
+        return;
+    }
 
     // Start provisioning with the library
     esp_err_t ret = wifi_prov_mgr_start_provisioning(
         WIFI_PROV_SECURITY_1,    // Use security
-        pin.c_str(),             // Proof of possession
+        pop.c_str(),             // Proof of possession (never logged)
         deviceName.c_str(),      // Device name (BLE advertisement name)
         nullptr                  // Service key (not used for BLE)
     );
@@ -154,6 +163,20 @@ void WiFiProvisioningManager::startProvisioning() {
     ESP_LOGI(TAG, "BLE provisioning started successfully!");
     ESP_LOGI(TAG, "Device is now discoverable as: %s", deviceName.c_str());
     printQRCode();
+}
+
+String WiFiProvisioningManager::proofOfPossession() {
+    String pop = config.factoryPop();
+    if (pop.length() > 0) {
+        return pop;
+    }
+#ifdef TT_LEGACY_POP
+    // Un-enrolled fleet (docs/PROTOCOL-V2.md §1): the old shared PIN until every unit has a pop.
+    ESP_LOGW(TAG, "no factory pop enrolled - using the legacy provisioning PIN (TT_LEGACY_POP)");
+    return config.getProvisioningPin();
+#else
+    return String();
+#endif
 }
 
 void WiFiProvisioningManager::printQRCode() {
