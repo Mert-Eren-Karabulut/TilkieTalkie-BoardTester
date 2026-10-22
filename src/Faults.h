@@ -96,6 +96,7 @@ namespace Faults
     // elsewhere (a track failing while the figure-level DOWNLOAD_FAILED is what the child hears).
     void raise(Fault f, const char *detail = nullptr, bool speak = true);
     void clear(Fault f);
+    void clearAll();                             // customer reset: empty the ring and the active set (NVS too)
     void clearOn(FaultClear trigger);            // ON_NETWORK / ON_PLAY: the owner of the condition calls this
     void update();                               // loop task: debounced upload of unsent events
     const FaultInfo *info(Fault f);

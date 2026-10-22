@@ -516,6 +516,42 @@ static bool otaIdleConditions()
            !fileManager.hasActiveDownload();
 }
 
+static const char *gResetRequestedBy = nullptr;
+
+void requestCustomerReset(const char *why)
+{
+    gResetRequestedBy = why ? why : "request";
+}
+
+void runCustomerReset(bool all, const char *why, bool speak)
+{
+    ESP_LOGW(TAG, "=== %s reset (%s) ===", all ? "Service (--all)" : "Customer", why ? why : "?");
+    ledController.flash(LedController::FX_RESET);
+    audioController.stop();
+    audioController.clearPlaylist();
+    // Unbind first, while the token still exists (skipped offline; the portal's unbind stays
+    // possible from the app or the admin).
+    const bool unbound = requestManager.unbindBestEffort();
+    ESP_LOGI(TAG, "reset: portal unbind %s", unbound ? "done" : "skipped/failed");
+    config.clearJWTToken();
+    requestManager.forgetToken();
+    fileManager.wipeCardCache("reset");
+    requestManager.forgetAllUidMappings();
+    Faults::clearAll();
+    config.deleteSetting("audio_volume");
+    config.deleteSetting("volume_ceiling");
+    config.deleteSetting("max_brightness");
+    if (all)
+    {
+        config.clearFactory();
+    }
+    if (speak)
+    {
+        prompts.sayBlocking(Prompt::WIFI_RESET_DONE, 6000);
+    }
+    wifiProv.reset(); // forgets the network and restarts into provisioning
+}
+
 // API client + Reverb. Safe to call once WiFi has an IP; idempotent.
 static void startNetworkServices()
 {
@@ -558,6 +594,10 @@ void startFullSystem()
         // before the first word is spoken (docs/VOICE-PROMPTS.md "Remote update").
         PromptPackManager::getInstance().setPendingVerify(OtaManager::getInstance().bootedFromUpdate());
         PromptPackManager::getInstance().begin();
+        if (fileManager.takeCardWasForeign())
+        {
+            requestManager.forgetAllUidMappings(); // the wiped cache's figures (CARD_FOREIGN was raised)
+        }
         // Downloads interrupted by the reboot continue from the persisted queue; give their
         // figures a tracker so the manifest is completed when they land.
         requestManager.recoverPendingManifests();
@@ -614,7 +654,8 @@ void startFullSystem()
     // Initialize Button Controller
     ESP_LOGI(TAG, "Initializing Button Controller...");
     buttonController.begin();
-    buttonController.setComboHoldTime(5000); // both combos: 5 s
+    buttonController.setComboHoldTime(5000);      // both combos: 5 s
+    buttonController.setComboLongHoldTime(10000); // 1+4 only: 10 s = customer reset
 
     // Set up button callbacks
     buttonController.onSingleClick([](ButtonController::ButtonId button)
@@ -667,14 +708,27 @@ void startFullSystem()
                                    ESP_LOGI(TAG, "Hold ended on button %d (total duration: %lu ms)", button + 1, duration);
                                });
 
+    // Volume buttons held together (docs/CONSOLE.md "Button holds"): at 5 s a tone (two rising
+    // notes) arms "forget WiFi", done when the buttons are let go before 10 s; still held at
+    // 10 s a second tone (three falling notes) and the customer reset.
     buttonController.onComboHold([]()
     {
-        // Volume buttons held together for 5 s: forget the WiFi network (stories stay on the
-        // card), tell the user, then restart into BLE provisioning.
-        ESP_LOGW(TAG, "COMBO HOLD (1+4) - forgetting the WiFi network, restarting into provisioning");
+        ESP_LOGW(TAG, "COMBO HOLD (1+4) 5 s - release to forget WiFi, keep holding for a full reset");
         ledController.flash(LedController::FX_RESET);
+        prompts.say(Prompt::TONE_CHARGE_ON);
+    });
+    buttonController.onComboReleasedAfterHold([](unsigned long heldMs)
+    {
+        // Forget the WiFi network (stories stay on the card), then restart into BLE provisioning.
+        ESP_LOGW(TAG, "COMBO (1+4) released after %lu ms - forgetting the WiFi network", heldMs);
         prompts.sayBlocking(Prompt::WIFI_RESET_DONE, 6000);
         wifiProv.reset(); // clears credentials and restarts
+    });
+    buttonController.onComboHoldLong([]()
+    {
+        ESP_LOGW(TAG, "COMBO HOLD (1+4) 10 s - customer reset");
+        prompts.sayBlocking(Prompt::TONE_SLEEP, 2000);
+        runCustomerReset(false, "buttons", true);
     });
 
     buttonController.onComboHold2([]()
@@ -1011,6 +1065,10 @@ void loop()
 
     // Charge bar while docked (transient NFC/audio pulses play over it and it resumes).
     TT_TIMED("chargeux", updateChargingUx());
+    if (gResetRequestedBy)
+    {
+        runCustomerReset(false, gResetRequestedBy, true); // does not return
+    }
     TT_TIMED("netstart", serviceNetworkStart());
     TT_TIMED("nethealth", serviceNetworkHealth());
     TT_TIMED("ux", serviceUxPrompts());

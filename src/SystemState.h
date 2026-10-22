@@ -74,3 +74,13 @@ void startFullSystem();
 void startReverb();
 String getDeviceEfuseMacDecimal();
 String getDeviceEfuseMacHex();
+
+// --- Resets (docs/PROTOCOL-V2.md §7) ---
+// Customer reset: forget WiFi, delete the device token, wipe the card cache (stories,
+// manifests, queue, uid mappings; not the prompt pack, not /.device), clear the fault ring and
+// the volume/brightness settings, ask the portal to unbind (best effort, 3 s), restart into
+// provisioning. all=true (`ft reset --all`) also erases the factory namespace. Loop task only;
+// does not return.
+void runCustomerReset(bool all, const char *why, bool speak);
+// From a callback that must not block (the Reverb `factory-reset` command): runs from the loop.
+void requestCustomerReset(const char *why);

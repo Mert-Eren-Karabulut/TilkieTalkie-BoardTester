@@ -17,6 +17,8 @@
 #include "RequestManager.h"
 #include <esp_log.h>
 
+void requestCustomerReset(const char *why); // main.cpp (SystemState.h): the customer reset, run from the loop
+
 static const char *TAG = "reverb";
 
 // JSON string escaping for values put into hand-built frames: quotes, backslashes and control
@@ -1170,6 +1172,12 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
     else if (lowerType == "set-report-interval")
     {
         setReportInterval(hasValue ? (uint32_t)value.toInt() : 5);
+    }
+    else if (lowerType == "factory-reset")
+    {
+        // App / admin: the customer reset (docs/PROTOCOL-V2.md §7), run from the loop task.
+        ESP_LOGW(TAG, "factory-reset command");
+        requestCustomerReset("command");
     }
     else if (lowerType == "reboot" || lowerType == "restart")
     {

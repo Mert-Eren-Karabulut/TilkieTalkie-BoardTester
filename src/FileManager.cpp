@@ -6,6 +6,9 @@
 #include <AsyncTCP.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_task_wdt.h>
+#include <esp_random.h>
+#include <functional>
 #include <mbedtls/sha256.h>
 #include <algorithm>
 
@@ -74,6 +77,12 @@ bool FileManager::begin() {
     
     // Create data directory for persistence files
     createDirectory(SD_DATA_DIR);
+
+    // A card moved from another toy must not resume that toy's queue or play its cache.
+    checkDeviceMarker();
+    if (SD_MMC.exists("/.trash")) {
+        enqueueJob(5, "/.trash", nullptr, 0); // a wipe interrupted by a reboot (or just done)
+    }
     
     // Load persistent data from SD card
     loadDownloadStats();
@@ -474,6 +483,8 @@ void FileManager::sdMaintenanceTask(void* parameter) {
                 self->inventoryQueued = false;
             } else if (job->kind == 4) {
                 self->sweepOrphanedTempFiles();
+            } else if (job->kind == 5) {
+                self->sweepTrash();
             } else if (job->kind == 1) {
                 bool ok = self->writeFileNow(job->path, job->data, job->len);
                 unsigned long dt = millis() - t0;
@@ -1534,6 +1545,125 @@ void FileManager::sweepTempDir(const String &dir, int depth, int &removed) {
     for (const String &sub : subdirs) {
         sweepTempDir(sub, depth + 1, removed);
     }
+}
+
+// ---- Card identity and cache wipe -----------------------------------------------------------
+
+static const char *DEVICE_MARKER = "/.device";
+static const char *TRASH_DIR = "/.trash";
+
+void FileManager::checkDeviceMarker() {
+    char uuid[24];
+    snprintf(uuid, sizeof(uuid), "%llu", ESP.getEfuseMac());
+    String previous;
+    File f = SD_MMC.open(DEVICE_MARKER, FILE_READ);
+    if (f) {
+        previous = f.readString().substring(0, 32);
+        f.close();
+        previous.trim();
+    }
+    if (previous == uuid) {
+        return;
+    }
+    if (previous.length() > 0) {
+        // Its manifests would play cache-first and its queue would resume here; the portal
+        // decides afresh what this toy gets when a figure is tapped.
+        ESP_LOGW(TAG, "card belongs to toy %s - wiping its story cache", previous.c_str());
+        wipeCardCache("card from another toy");
+        cardWasForeign = true;
+        char d[40];
+        snprintf(d, sizeof(d), "prev=%.30s", previous.c_str());
+        Faults::raise(Fault::CARD_FOREIGN, d);
+    } else {
+        // New card, or a card prepared before the marker existed: it is ours from now on.
+        ESP_LOGI(TAG, "card marker written (%s)", uuid);
+    }
+    if (!writeFileNow(DEVICE_MARKER, uuid, strlen(uuid))) {
+        ESP_LOGW(TAG, "cannot write %s", DEVICE_MARKER);
+    }
+}
+
+bool FileManager::wipeCardCache(const char *why) {
+    if (!sdCardInitialized) {
+        return false;
+    }
+    ESP_LOGW(TAG, "wiping the card cache (%s)", why ? why : "?");
+    // Queued manifest writes must land first, or they would recreate a manifest after the wipe.
+    for (int i = 0; i < 100 && pendingWork.load() > 0; ++i) {
+        if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+        delay(50);
+    }
+    downloadQueue.clear();
+    requiredFiles.clear();
+    queueDirty = false;
+    const char *lists[] = {SD_DOWNLOAD_QUEUE_FILE, SD_REQUIRED_FILES_FILE};
+    for (const char *path : lists) {
+        if (SD_MMC.exists(path)) SD_MMC.remove(path);
+        const String tmp = String(path) + ".tmp";
+        if (SD_MMC.exists(tmp)) SD_MMC.remove(tmp);
+    }
+    createDirectory(TRASH_DIR);
+    const char *dirs[] = {"/assets", "/.requestmanager"};
+    int moved = 0;
+    for (const char *dir : dirs) {
+        if (!SD_MMC.exists(dir)) continue;
+        char target[48];
+        snprintf(target, sizeof(target), "%s/%08lx%s", TRASH_DIR, (unsigned long)esp_random(), dir + 1);
+        if (SD_MMC.rename(dir, target)) {
+            moved++;
+        } else {
+            ESP_LOGW(TAG, "cannot move %s to the trash", dir);
+        }
+    }
+    createDirectory("/assets");
+    createDirectory("/.requestmanager");
+    createDirectory("/.requestmanager/manifests");
+    createDirectory("/.requestmanager/pending_manifests");
+    if (!enqueueJob(5, TRASH_DIR, nullptr, 0)) {
+        ESP_LOGW(TAG, "trash sweep not queued (next boot does it)");
+    }
+    ESP_LOGW(TAG, "card cache wiped: %d folder(s) moved to %s", moved, TRASH_DIR);
+    return true;
+}
+
+// Maintenance task. Deletes /.trash bottom-up, a few entries at a time (a directory listing is
+// never held in memory as a whole: a story folder may hold thousands of files).
+void FileManager::sweepTrash() {
+    const unsigned long t0 = millis();
+    int removed = 0;
+    std::function<void(const String &, int)> removeTree = [&](const String &dir, int depth) {
+        if (depth > 8) return;
+        for (;;) {
+            File d = SD_MMC.open(dir);
+            if (!d || !d.isDirectory()) {
+                if (d) d.close();
+                return;
+            }
+            std::vector<String> files, subdirs;
+            for (File e = d.openNextFile(); e && files.size() + subdirs.size() < 32; e = d.openNextFile()) {
+                String full = dir + "/" + e.name();
+                if (e.isDirectory()) subdirs.push_back(full); else files.push_back(full);
+                e.close();
+            }
+            d.close();
+            if (files.empty() && subdirs.empty()) break;
+            const int before = removed;
+            bool subGone = false;
+            for (const String &f : files) {
+                if (SD_MMC.remove(f)) removed++;
+            }
+            for (const String &sub : subdirs) {
+                removeTree(sub, depth + 1);
+                subGone = subGone || !SD_MMC.exists(sub);
+            }
+            if (removed == before && !subGone) {
+                break; // nothing could be removed this round: give up instead of spinning
+            }
+        }
+        SD_MMC.rmdir(dir);
+    };
+    removeTree(TRASH_DIR, 0);
+    ESP_LOGI(TAG, "trash erased: %d file(s) in %lu s", removed, (millis() - t0) / 1000);
 }
 
 void FileManager::resetDownloadStats() {

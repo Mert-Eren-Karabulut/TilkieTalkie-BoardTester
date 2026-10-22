@@ -330,6 +330,16 @@ void Faults::clear(Fault f)
     if (idx >= 0) deactivate(idx);
 }
 
+void Faults::clearAll()
+{
+    memset(&g_ring, 0, sizeof(g_ring));
+    g_ring.magic = RING_MAGIC;
+    g_activeCount = 0;
+    memset(g_everRaised, 0, sizeof(g_everRaised));
+    g_uploadAt = 0;
+    save(); // the boot sequence number is kept (the portal orders events by it)
+}
+
 void Faults::clearOn(FaultClear trigger)
 {
     for (int i = g_activeCount - 1; i >= 0; --i) {

@@ -55,12 +55,18 @@ public:
     void onHoldEnd(HoldCallback callback);
     void onComboHold(ComboCallback callback);
     void onComboHold2(ComboCallback callback); // Button 2 + 3 combo
+    // Button 1 + 4, second threshold: still held after setComboLongHoldTime() (the first
+    // threshold, setComboHoldTime(), has fired onComboHold before).
+    void onComboHoldLong(ComboCallback callback);
+    // Button 1 + 4 released after the first threshold but before the second one.
+    void onComboReleasedAfterHold(std::function<void(unsigned long heldMs)> callback);
 
     // Configuration
     void setDebounceTime(unsigned long debounceMs);
     void setHoldThreshold(unsigned long holdMs);
     void setHoldInterval(unsigned long intervalMs);
     void setComboHoldTime(unsigned long comboMs);
+    void setComboLongHoldTime(unsigned long comboMs);  // 0 = no second threshold
 
     // Utility functions
     bool isPressed(ButtonId button);
@@ -76,6 +82,7 @@ private:
     unsigned long holdThreshold = 500;      // 500ms to trigger hold
     unsigned long holdInterval = 100;       // 100ms between hold callbacks
     unsigned long comboHoldTime = 10000;    // 10 seconds for combo
+    unsigned long comboLongHoldTime = 0;    // second 1+4 threshold (0 = none)
 
     // Button state structure
     struct ButtonState {
@@ -96,6 +103,7 @@ private:
     bool comboActive = false;
     unsigned long comboStartTime = 0;
     bool comboProcessed = false;
+    bool comboLongProcessed = false;
 
     // Combo2 state (Button 2 + 3)
     bool combo2Active = false;
@@ -109,6 +117,8 @@ private:
     HoldCallback holdEndCallback = nullptr;
     ComboCallback comboHoldCallback = nullptr;
     ComboCallback comboHold2Callback = nullptr;
+    ComboCallback comboHoldLongCallback = nullptr;
+    std::function<void(unsigned long)> comboReleasedAfterHoldCallback = nullptr;
 
     // Singleton constructor
     ButtonController() = default;
