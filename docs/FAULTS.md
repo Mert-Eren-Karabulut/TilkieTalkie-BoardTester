@@ -91,20 +91,40 @@ The fruit list stays short on purpose (a child can repeat one word): elma, armut
   for persistent faults, speaks the mapped prompt through `VoicePrompts` (its policy still
   decides when), sets the error LED scene for `critical`, and queues the event for the
   portal. The same code is reported at most once per 10 minutes; repeats are counted.
-- `Faults::clear(Fault code)` – ends an active fault (the clearing is reported too). Each
-  code declares how it clears: `manual` (next raise/clear call), `on_network` (WiFi back),
-  `on_play` (a figure plays), `on_boot`.
-- `Faults::active()` – the active set for the device report; `Faults::fruit()` – the fruit
-  of the most severe active (or latest) fault, kept in `last_error` for older portal code.
-- Persistence: a 32-entry ring in NVS (`faults` blob) plus RTC-noinit copies of the last
-  code and uptime. At boot the reset reason is classified (`801`, `802`, `505`, or none) and
-  reported with the previous uptime, then the unsent entries are uploaded.
+- `Faults::clear(Fault code)` – ends an active fault. A clear is **not** sent as an event: the
+  portal learns it from the next `active` list (device report or events upload), which no
+  longer contains the code. Each code declares how it clears: `event` (a point event, never
+  active), `on_network` (WiFi back), `on_play` (a figure plays), `on_boot`.
+- Active set: at most **8** codes, the same cap in the device report and in the events upload
+  (it used to be 4 in the report). `Faults::fruit()` – the fruit of the most severe active
+  fault, kept in `last_error` for older portal code.
+- Persistence: a 32-entry ring in NVS (`faults` blob, layout `FAU4`; a `FAU3` ring from
+  1.2.18/1.2.19 is migrated) plus an RTC-noinit copy of the uptime, refreshed every 10 s. At
+  boot the previous boot's final uptime is captured from it **before** it restarts for the new
+  boot, the reset reason is classified (`801`, `802`, `505`, or none) and reported with that
+  uptime, then the unsent entries are uploaded.
 - Upload: `POST /api/hubs/{uuid}/events` with up to 20 events
-  `{code, slug, severity, detail, count, uptime_s, boot, firmware, age_s}`; `age_s` lets the
-  portal compute the real time without a clock on the toy. Sent 5 s after a raise (debounced)
-  and at boot once the token is there; entries stay in NVS until the portal answers 200.
-- Device report: `"faults":{"active":[{"c":103,"since_s":120}],"last":{"c":204,"age_s":30,"d":"…"}}`
-  next to the existing `last_error`.
+  `{code, slug, severity, detail, count, uptime_s, boot, firmware, age_s, approx?, at?}` and the
+  active list (≤ 8). Sent 5 s after a raise (debounced) and at boot once the token is there.
+  - `age_s`: seconds since the event. Exact for this boot, and for the previous boot when only
+    a reset (software, panic, watchdog, brownout) lay in between. For older boots, or after a
+    power-off or deep sleep (the time the toy was off is unknown), it is a lower bound and the
+    event carries `"approx": true` (absent = exact).
+  - `at`: unix seconds (UTC) of the event when the toy's clock was set by SNTP, either at the
+    time of the raise or derived from an exact age at upload. The portal prefers `at` over
+    `age_s` when present.
+  - `detail` is any string ≤ 40 bytes; the upload is serialized by ArduinoJson (escaped).
+  - Answers: `200`/`201` = delivered (marked sent). Any other **4xx** (validation, unknown or
+    foreign hub, token refused after RequestManager's refresh) = the batch is **dropped** (not
+    retried, so one bad batch cannot block every later event), except `408`/`429`. `429`
+    honours `Retry-After`; `5xx` is retried by RequestManager (30 s, 2 min, 10 min), then the
+    batch waits 5 min. Transport errors: 5 min.
+- Device report: `"faults":{"active":[{"c":103,"since_s":120}],"last":{"c":204,"age_s":30,"n":1,"d":"…"}}`
+  next to the existing `last_error`; `active` ≤ 8; `last` is this boot's newest event, its `d`
+  properly JSON-escaped (quote, backslash, control characters).
+- Catalogue fields (fruit, description, remedy) never contain `;` or `|`, the marker's record
+  and field separators: `src/Faults.cpp` refuses them at compile time (one `static_assert` per
+  row) and `tools/faults.py` refuses them when exporting.
 
 Where today's code sets `ReverbClient::setLastError("elma")` it calls
 `Faults::raise(Fault::FIGURE_NO_CONTENT, uid)`; where it says a prompt for a failure, the
