@@ -28,6 +28,7 @@
 #include "DeadCellRecovery.h"
 #include "UxScenes.h"
 #include "Console.h"
+#include "TimeSync.h"
 
 // The espidf CMake build compiles every file in src/ regardless of build_src_filter,
 // so the sleep-probe build (env:sleepprobe, -DSLEEP_PROBE_BUILD) excludes this whole
@@ -716,6 +717,7 @@ static void serviceNetworkStart()
     {
         gWifiUpSince = millis() ? millis() : 1;
     }
+    TimeSync::begin(); // SNTP from the first connection on (idempotent); the clock then survives sleep and resets
     if (gNetworkServicesStarted)
     {
         static bool healthyMarked = false;
@@ -901,6 +903,7 @@ void loop()
     TT_TIMED("ota", OtaManager::getInstance().update());
     TT_TIMED("prompts", PromptPackManager::getInstance().update());
     TT_TIMED("faults", Faults::update());
+    TimeSync::update();
     {
         static unsigned long lastHeapCheck = 0;
         if (millis() - lastHeapCheck > 30000)
