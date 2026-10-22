@@ -39,13 +39,13 @@ Until the factory writes the cards, a missing pack could also be fetched from th
 
 | name | spoken (tr) | when | policy |
 |---|---|---|---|
-| setup_welcome | Merhaba! Ben Tilki. Beni internete bağlamak için telefonundaki Tilki Toki uygulamasını aç ve yeni cihaz ekle'ye dokun. | boot without WiFi credentials; repeated every 90 s, 5 times | drop while playing |
+| setup_welcome | Merhaba! Ben Tilki. Beni internete bağlamak için telefonundaki Tilki Toki uygulamasını aç ve yeni cihaz ekle'ye dokun. | boot without WiFi credentials; repeated every 90 s, 5 times. Not said by a unit that cannot be provisioned (no factory pop in a build without TT_LEGACY_POP: red LED instead) | drop while playing |
 | setup_connecting | Teşekkürler! İnternete bağlanıyorum, birazcık bekle. | credentials received over BLE | |
 | setup_success | Harika, internete bağlandım! Şimdi ilk figürünü üzerime yerleştir. | provisioning ended with the network up | |
 | setup_failed | Bağlanamadım. Kablosuz ağ adını ve şifresini kontrol edip uygulamadan tekrar dene. Hata kodu: Üzüm. | credentials rejected | |
-| wifi_lost | İnternete bağlanamıyorum. Modemin açık olduğundan emin ol. Hata kodu: Portakal. | provisioned, the home network is in range (scan) but no link 60 s after boot; again every 10 min. Out of range (toy used away from home, playing from the card): silent | |
+| wifi_lost | İnternete bağlanamıyorum. Modemin açık olduğundan emin ol. Hata kodu: Portakal. | provisioned, the home network is in range (scan) but no link 60 s after boot; again every 10 min, every 6 h once the router has rejected the stored password 3 times in a row (docs/FAULTS.md). Out of range (toy used away from home, playing from the card) or behind a captive portal: silent | |
 | wifi_reset_hint | Kablosuz ağın değiştiyse iki ses tuşuna birlikte beş saniye basılı tut, sonra beni uygulamadan yeniden bağla. | right after wifi_lost | |
-| wifi_reset_done | Ağ ayarlarını sildim. Şimdi beni uygulamadan yeniden bağlayabilirsin. | volume buttons held 5 s (stories stay on the card) | blocking, then restart |
+| wifi_reset_done | Ağ ayarlarını sildim. Şimdi beni uygulamadan yeniden bağlayabilirsin. | volume buttons released after 5 s (forget WiFi, stories stay on the card), or after the 10 s customer reset / the `factory-reset` command | blocking, then restart |
 | idle_hello | Merhaba! Bir hikâye dinlemek için figürünü üzerime koy. | provisioned boot, no figure on the pins (3 s in) | |
 | nfc_read_trouble | Figürü okuyamadım. Lütfen kaldırıp yeniden yerleştir. | figure on the pins, no card read for 3 s | |
 | figure_no_content | Bu figürde henüz hikâye yok. Hata kodu: Elma. | portal: figure without stories | |
@@ -61,9 +61,11 @@ Until the factory writes the cards, a missing pack could also be fetched from th
 | update_start | Kendimi güncelliyorum, birkaç dakika sürebilir. Bu sırada beni kapatma. | OTA download started (toy is idle by policy) | |
 | update_done | Güncelleme tamamlandı! | first boot on a new firmware, once confirmed | |
 | update_failed | Güncelleme başarısız oldu, daha sonra yeniden deneyeceğim. Hata kodu: Karpuz. | OTA failed | |
-| tone_charge_on | two rising notes | charger plugged | interrupt |
+| not_linked | Henüz bir hesaba bağlı değilim. Beni uygulamadan ekle. | online but no account owns the toy (110 NOT_LINKED, Kivi): once per boot after idle_hello, only while idle (no figure, nothing playing), at most once a day | |
+| setup_captive | Bu ağ bir giriş sayfası istiyor, lütfen başka bir ağ seç. Hata kodu: Nar. | pairing: the network the app sent wants a login page (113 CAPTIVE_PORTAL); the app is told the connection failed and pairing goes on | |
+| tone_charge_on | two rising notes | charger plugged; volume buttons held 5 s (release = forget WiFi) | interrupt |
 | tone_charge_off | two falling notes | charger unplugged | interrupt |
-| tone_sleep | three soft falling notes | going to deep sleep | blocking |
+| tone_sleep | three soft falling notes | going to deep sleep; volume buttons held 10 s (customer reset) | blocking |
 
 Dropped from the old list: "put me on the charger to download" (downloads happen whenever the
 toy is online, battery or not).
@@ -82,6 +84,8 @@ column + show on the hub page).
 | üzüm | WiFi password rejected during pairing | setup_failed |
 | portakal | provisioned, but no network | wifi_lost |
 | karpuz | firmware update failed | update_failed |
+| kivi | online, but not linked to an account (add the toy in the app) | not_linked |
+| nar | the network wants a login page (captive portal), pick another one | setup_captive |
 | muz | SD card problem (reserved; the toy cannot speak without the card) | LED red |
 
 ## Remote update: prompt packs

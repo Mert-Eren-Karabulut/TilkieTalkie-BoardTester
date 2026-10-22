@@ -14,7 +14,11 @@ portal `docs/DEVICE-COMMANDS.md` (commands and events).
   (`assets/contents/{content}/{episode}/{track}.mp3`, `assets/custom_tracks/{id}.mp3`).
   One copy per track whatever the number of units or figures that reference it; a track
   is deleted only when no cached manifest references it any more.
-- NVS: unit uid → figure id (for the portal's inventory).
+- NVS: unit uid → figure id, the 48 most recently used units (`requestmgr/uid_lru`; the card's
+  manifest carries the same id and is what the inventory reads). The old unbounded
+  `uid_mappings` object is migrated once.
+- `/.device`: the uuid of the toy this cache belongs to. A card that names another toy is
+  wiped on mount (stories, manifests, queue; the prompt pack stays), 306 CARD_FOREIGN.
 
 Why per unit and not per figure: the portal's manifest endpoint is `/units/{uid}` because
 wildcard figures carry per-unit content (`content_unit`, `custom_track_unit`). For a normal
