@@ -86,3 +86,29 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 
 ## Factory mode — next phase
 Plan with open decisions: docs/FACTORY-MODE.md.
+
+## 1.3.0 (protocol v2, 2026-10-23) — not yet run on hardware
+Built and merged from two reviewed branches (docs/PROTOCOL-V2.md, docs/OTA-STATE-MACHINE.md); nothing
+in this release has been on a device yet. Bench plan, in order, against the LAN bench portal first
+(`scripts/bench/bench.sh up` in the portal repo; `endpoint set` on the device), then production:
+1. USB-flash `releases/tilkietalkie-1.3.0-usb.bin` on a card that has the old pack; boot, WiFi, probe
+   (`/storage/ping.json`), token (legacy GET: the bench hub has no secret), Reverb, hub page live.
+2. Prompt pack c1f1888c0884: upload on the portal, pair with the release; live sync must bring the
+   two new prompts (`not_linked`, `setup_captive`) to the card.
+3. Enrollment: `POST /api/factory/hubs` for the bench uuid on the portal, `ft enroll <secret> <pop>`,
+   restart: token now comes from `POST /token` + X-Hub-Secret; hub page shows "enrolled".
+4. `GET /api/hubs/{uuid}` link check: unbind the hub on the portal → fault 110 + `not_linked` prompt
+   after the hello; bind with the pairing code → fault clears.
+5. Customer reset: volume buttons 10 s (tone at 5 s, second tone at 10 s) → WiFi + token + cache gone,
+   portal shows the hub unbound; re-provision over BLE with the per-unit pop (needs the app).
+6. Captive portal: a phone hotspot with a captive page, or a LAN rule that answers HTTP with HTML →
+   during pairing the toy says `setup_captive` and forgets the network; already provisioned → offline
+   only. A network without internet must pair normally and stay offline.
+7. OTA 1.3.0 → 1.3.1 (any trivial bump) dock-only: offer while undocked waits; dock → prompts → download;
+   undock mid-download continues; 10-min-old offer re-checks; rollback test with `TT_OTA_CRASH_TEST` →
+   next offer declined (`declined` event on the portal); explicit pin overrides.
+8. Range resume: pull the WiFi mid-download, reconnect → the `.tmp` continues (206 in the portal log).
+9. Revoked card: delete the card on the portal → tap → 410 → cache purged, "figure unknown".
+10. Foreign card: card from another uuid → cache wiped once (fault 306), prompt pack kept.
+11. Faults page: events carry `at` (SNTP) and `approx`; the report carries `fw` and `prompts`.
+12. Inventory with a 60+-track figure: parts merged on the hub page, `truncated` shown.
