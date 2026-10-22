@@ -6,6 +6,7 @@
 #include <WebSocketsClient.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <ArduinoJson.h>
 
 class ReverbClient
 {
@@ -59,7 +60,7 @@ private:
     int subscribeToPrivate();      // 0 = subscribe frame sent, otherwise the HTTP status (or -1)
     void serviceSubscription();    // runs the channel auth from update(), never inside the WS callback
     void bumpReconnectBackoff();
-    void handleDeviceCommand(const char *payloadStr);
+    void handleDeviceCommand(JsonVariantConst data);   // the parsed "data" of device.command.sent
     void executeCommand(const String &type, const String &value, bool hasValue);
     static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
     void handleEvent(WStype_t type, uint8_t *payload, size_t length);
@@ -82,7 +83,8 @@ private:
     uint8_t _subscribeFailures = 0;
     unsigned long _reconnectDelayMs = 2000;
     std::function<String()> _tokenRefreshCb;
-    // Report cadence: on change, every 5 s while playing (position), at least every 60 s.
+    // Report cadence: on change, every 5 s while playing (position), heartbeat every 10 s docked /
+    // 30 s on battery, faster while the portal page asks (set-report-interval).
     unsigned long _lastReportAt = 0;
     unsigned long _lastPositionReportAt = 0;
     String _lastReportSignature;
@@ -99,8 +101,11 @@ private:
     static QueueHandle_t _outbox;
     void drainOutbox();
     
-    // Pre-allocated static buffers to reduce heap fragmentation
-    static char jsonBuffer[1536];
+    // Pre-allocated buffers to reduce heap fragmentation. The report frame lives in PSRAM
+    // (allocated once in begin()): with fw, 8 active faults and an escaped detail it no longer
+    // fits the old 1.5 KB internal buffer.
+    static constexpr size_t JSON_BUFFER_LEN = 2560;
+    static char *jsonBuffer;
     static char urlBuffer[128];
     static char headerBuffer[256];
     static char channelBuffer[64];

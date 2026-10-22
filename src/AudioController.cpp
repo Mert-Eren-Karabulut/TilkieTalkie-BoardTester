@@ -952,11 +952,14 @@ bool AudioController::playTrack(const String& trackId) {
         return false;
     }
 
-    // Playlist paths end in /{trackId}.mp3
+    // The portal sends the track's path from list-files ("/assets/..."): matched exactly, since
+    // a content track and a custom track can share an id. A bare id (older portals) still
+    // matches the path suffix /{trackId}.mp3.
+    const bool byPath = trackId.startsWith("/");
     String suffix = "/" + trackId + ".mp3";
 
     for (int i = 0; i < (int)playlist.size(); i++) {
-        if (playlist[i].endsWith(suffix)) {
+        if (byPath ? playlist[i] == trackId : playlist[i].endsWith(suffix)) {
             ESP_LOGI(TAG, "Found track ID %s at playlist index %d", trackId.c_str(), i);
             currentPlaylistIndex = i;
             playlistFinished = false;

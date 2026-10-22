@@ -36,6 +36,20 @@ struct LockGuard {
     ~LockGuard() { if (m) xSemaphoreGiveRecursive(m); }
 };
 
+// Cut to at most maxBytes on a UTF-8 character boundary (a cut inside "ş" would make the whole
+// frame invalid JSON for the portal).
+String utf8Truncate(const String &in, size_t maxBytes)
+{
+    if (in.length() <= maxBytes) {
+        return in;
+    }
+    size_t cut = maxBytes;
+    while (cut > 0 && (((uint8_t)in[cut]) & 0xC0) == 0x80) {
+        cut--;
+    }
+    return in.substring(0, cut);
+}
+
 String jsonValueToString(JsonVariantConst value)
 {
     if (value.isNull()) {
@@ -1655,33 +1669,41 @@ void RequestManager::buildInventory()
     }
 }
 
-// One "client-device-files" fragment. pending: describe the manifest being downloaded (the
-// final one, if any, is what the figure played before the update).
+// One figure of the "client-device-files" inventory, as one or more fragments (ReverbClient wraps
+// each into a frame). pending: describe the manifest being downloaded (the final one, if any, is
+// what the figure played before the update).
+//
+// Wire format (agreed with the portal, docs/CONTENT-SYNC.md "Inventory"): every fragment of a
+// figure carries the same seq/total; a figure whose tracks do not fit one frame is split into
+// parts with top-level "part" (1-based) and "parts" (<= 32), each repeating the figure's
+// uid/id/name/bytes/state/truncated with only its slice of "tracks". Single-part figures carry
+// no part/parts (as before). "truncated": true marks a figure with more than 60 tracks (only
+// the first 60 are listed). Every frame stays under 9,000 bytes (Reverb drops > 10,000).
 void RequestManager::appendInventoryFigure(const String &uid, bool pending, size_t seq, size_t total, const char *sd)
 {
+    static const int INV_MAX_TRACKS = 60;
+    static const size_t INV_TRACKS_BUDGET = 7800;   // bytes of track objects per frame (frame overhead + figure fields < 1,100)
+    static const int INV_MAX_PARTS = 32;
+    static const size_t INV_NAME_MAX = 120;          // a long title must not need a frame of its own
     FileManager &fm = FileManager::getInstance();
     JsonDocument manifest(&psramJsonAllocator);
     bool loaded = pending ? loadPendingUnitManifest(uid, manifest) : loadUnitManifest(uid, manifest);
     if (!loaded && pending) {
         loaded = loadUnitManifest(uid, manifest);
     }
-    JsonDocument out(&psramJsonAllocator);
-    out["seq"] = (int)seq;
-    out["total"] = (int)total;
-    JsonObject fig = out["figure"].to<JsonObject>();
-    fig["uid"] = uid;
-    fig["id"] = loaded ? jsonValueToString(manifest["figure"]["id"]) : String();
-    fig["name"] = loaded ? manifest["figure"]["name"].as<String>() : String("?");
-    JsonArray tracks = fig["tracks"].to<JsonArray>();
+    JsonDocument all(&psramJsonAllocator);       // every listed track, split below
+    JsonArray tracks = all.to<JsonArray>();
     uint64_t bytes = 0;
     int count = 0, cachedCount = 0;
+    bool truncated = false;
     auto addTrack = [&](JsonObjectConst t) {
-        if (count >= 60) return;
         String path = normalizeStoragePath(t["storage_path"].as<String>());
         if (path.isEmpty()) return;
+        if (count >= INV_MAX_TRACKS) { truncated = true; return; }
         JsonObject o = tracks.add<JsonObject>();
         o["id"] = jsonValueToString(t["id"]);
-        o["name"] = t["name"].as<String>();
+        String name = t["name"].as<String>();
+        o["name"] = utf8Truncate(name, INV_NAME_MAX);
         o["path"] = path;
         size_t size = 0;
         bool cached = false;
@@ -1707,15 +1729,56 @@ void RequestManager::appendInventoryFigure(const String &uid, bool pending, size
         for (JsonVariantConst t : manifest["custom_tracks"].as<JsonArrayConst>())
             addTrack(t.as<JsonObjectConst>());
     }
-    fig["bytes"] = (uint32_t)bytes;
+
+    // Slice the tracks so each fragment's track list stays within the budget.
+    std::vector<std::pair<size_t, size_t>> slices; // [first, end)
+    size_t first = 0, used = 0;
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        const size_t len = measureJson(tracks[i]) + 1;
+        if (i > first && used + len > INV_TRACKS_BUDGET) {
+            slices.push_back({first, i});
+            first = i;
+            used = 0;
+        }
+        used += len;
+    }
+    slices.push_back({first, tracks.size()}); // also the empty figure: one fragment, no tracks
+    if ((int)slices.size() > INV_MAX_PARTS) {
+        slices.resize(INV_MAX_PARTS);
+        truncated = true;
+    }
+
     // downloading: the manifest is not final yet (tracks still arriving); partial: final but
     // some tracks are missing (deleted from the portal page or a failed download); ready: all there.
-    fig["state"] = pending ? "downloading" : (count > 0 && cachedCount == count ? "ready" : "partial");
-    String json;
-    serializeJson(out, json);
-    // "{...}" -> "..." so the sender can prepend device_id; sd is inserted here as text
-    String inner = json.substring(1, json.length() - 1);
-    ReverbClient::queueDeviceFiles(inner + "," + String(sd));
+    const char *state = pending ? "downloading" : (count > 0 && cachedCount == count ? "ready" : "partial");
+    const size_t parts = slices.size();
+    String figureName = loaded ? manifest["figure"]["name"].as<String>() : String("?");
+    figureName = utf8Truncate(figureName, INV_NAME_MAX);
+    for (size_t p = 0; p < parts; ++p) {
+        JsonDocument out(&psramJsonAllocator);
+        out["seq"] = (int)seq;
+        out["total"] = (int)total;
+        if (parts > 1) {
+            out["part"] = (int)(p + 1);
+            out["parts"] = (int)parts;
+        }
+        JsonObject fig = out["figure"].to<JsonObject>();
+        fig["uid"] = uid;
+        fig["id"] = loaded ? jsonValueToString(manifest["figure"]["id"]) : String();
+        fig["name"] = figureName;
+        fig["bytes"] = (uint32_t)bytes;
+        fig["state"] = state;
+        fig["truncated"] = truncated;
+        JsonArray slice = fig["tracks"].to<JsonArray>();
+        for (size_t i = slices[p].first; i < slices[p].second; ++i) {
+            slice.add(tracks[i]);
+        }
+        String json;
+        serializeJson(out, json);
+        // "{...}" -> "..." so the sender can prepend device_id; sd is inserted here as text
+        String inner = json.substring(1, json.length() - 1);
+        ReverbClient::queueDeviceFiles(inner + "," + String(sd));
+    }
 }
 
 bool RequestManager::forgetFigure(const String &uid)

@@ -15,6 +15,10 @@
 #include "PromptPackManager.h"
 #include "Faults.h"
 #include "RequestManager.h"
+#include "PsramJson.h"
+#include "TimeSync.h"
+#include "Version.h"
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 
 static const char *TAG = "reverb";
@@ -47,7 +51,7 @@ static String jsonEscape(const String &in)
 }
 
 // Define static members
-char ReverbClient::jsonBuffer[1536];
+char *ReverbClient::jsonBuffer = nullptr;
 char ReverbClient::urlBuffer[128];
 char ReverbClient::headerBuffer[256];
 char ReverbClient::channelBuffer[64];
@@ -85,6 +89,14 @@ void ReverbClient::begin(const char *host, uint16_t port, const char *appKey, co
     _useTls = useTls;
     _apiOrigin = (apiOrigin && apiOrigin[0]) ? String(apiOrigin) : String(_useTls ? "https://" : "http://") + _host;
     _initialized = true;
+    if (!jsonBuffer)
+    {
+        jsonBuffer = static_cast<char *>(heap_caps_malloc(JSON_BUFFER_LEN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!jsonBuffer)
+        {
+            jsonBuffer = static_cast<char *>(malloc(JSON_BUFFER_LEN));
+        }
+    }
 
     // HTTP client for /broadcasting/auth and chat: TLS or plain depending on the API origin.
     if (!_httpClient)
@@ -386,130 +398,97 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
 
     case WStype_TEXT:
     {
-        // Parse JSON minimally using string search
-        char *payloadStr = (char *)payload;
-        payloadStr[length] = '\0';
-
-        if (strstr(payloadStr, "pusher:connection_established"))
+        // Pusher frames: {"event":"...","channel":"...","data":"<JSON as a string>"} (or data as an
+        // object). Parsed with ArduinoJson into PSRAM: escaped quotes and \uXXXX (Turkish letters)
+        // survive, and routing is on the event name, not on substrings of the whole frame.
+        JsonDocument frame(&psramJsonAllocator);
+        const DeserializationError err = deserializeJson(frame, (const char *)payload, length);
+        if (err)
         {
-            // Look for socket_id in the data field - handle both escaped and unescaped JSON
-            char *socketStart = strstr(payloadStr, "socket_id");
-            if (socketStart)
+            ESP_LOGW(TAG, "unparsable frame (%s, %u bytes)", err.c_str(), (unsigned)length);
+            break;
+        }
+        const char *event = frame["event"] | "";
+        JsonDocument data(&psramJsonAllocator);
+        JsonVariantConst rawData = frame["data"];
+        if (rawData.is<const char *>())
+        {
+            if (deserializeJson(data, rawData.as<const char *>()))
             {
-                // Find the actual ID value after the colon and quotes
-                socketStart = strchr(socketStart, ':');
-                if (socketStart)
-                {
-                    socketStart++; // Skip the colon
-                    // Skip whitespace and quotes
-                    while (*socketStart && (*socketStart == ' ' || *socketStart == '"' || *socketStart == '\\'))
-                    {
-                        socketStart++;
-                    }
-
-                    // Find the end of the socket ID
-                    char *socketEnd = socketStart;
-                    while (*socketEnd && *socketEnd != '"' && *socketEnd != '\\' && *socketEnd != ',' && *socketEnd != '}')
-                    {
-                        socketEnd++;
-                    }
-
-                    if (socketEnd > socketStart)
-                    {
-                        char tempChar = *socketEnd;
-                        *socketEnd = '\0';
-                        _socketId = String(socketStart);
-                        *socketEnd = tempChar; // Restore the character
-
-                        ESP_LOGI(TAG, "Connected with socket ID: %s", _socketId.c_str());
-                        // The channel auth is an HTTP round trip: done from update(), not here.
-                        _isPrivateSubscribed = false;
-                        _pendingSubscribe = true;
-                        _subscribeRetryAt = 0;
-                        _subscribeFailures = 0;
-                        _reconnectDelayMs = 2000;
-                        _ws->setReconnectInterval(_reconnectDelayMs);
-                    }
-                }
+                data.clear(); // a plain string (or empty): no fields
             }
         }
-        else if (strstr(payloadStr, "pusher_internal:subscription_succeeded"))
+        else
+        {
+            data.set(rawData);
+        }
+
+        if (strcmp(event, "pusher:connection_established") == 0)
+        {
+            const char *socketId = data["socket_id"] | "";
+            if (socketId[0])
+            {
+                _socketId = socketId;
+                ESP_LOGI(TAG, "Connected with socket ID: %s", _socketId.c_str());
+                // The channel auth is an HTTP round trip: done from update(), not here.
+                _isPrivateSubscribed = false;
+                _pendingSubscribe = true;
+                _subscribeRetryAt = 0;
+                _subscribeFailures = 0;
+                _reconnectDelayMs = 2000;
+                _ws->setReconnectInterval(_reconnectDelayMs);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "connection_established without a socket_id");
+            }
+        }
+        else if (strcmp(event, "pusher_internal:subscription_succeeded") == 0)
         {
             ESP_LOGI(TAG, "Successfully subscribed to private channel");
             _isPrivateSubscribed = true;
             _reportDue = true;
         }
-        else if (strstr(payloadStr, "pusher:error"))
+        else if (strcmp(event, "pusher:error") == 0)
         {
             ESP_LOGI(TAG, "server error: %.*s", (int)length, payload);
         }
-        else if (strstr(payloadStr, "pusher:ping"))
+        else if (strcmp(event, "pusher:ping") == 0)
         {
             const char *pong = "{\"event\":\"pusher:pong\",\"data\":{}}";
             _ws->sendTXT(pong, strlen(pong));
         }
-        else if (strstr(payloadStr, "device.status.updated") || strstr(payloadStr, "client-device-report"))
+        else if (strcmp(event, "pusher:pong") == 0 || strcmp(event, "device.status.updated") == 0 ||
+                 strcmp(event, "client-device-report") == 0 || strcmp(event, "device.files.updated") == 0 ||
+                 strcmp(event, "client-device-files") == 0 || strcmp(event, "hub.firmware.updated") == 0 ||
+                 strcmp(event, "hub.events.updated") == 0)
         {
-            // Our own report, relayed back (raw client event) or re-broadcast by the server.
+            // Our own events relayed back, or broadcasts meant for the portal pages.
         }
-        else if (strstr(payloadStr, "device.command.sent"))
+        else if (strcmp(event, "device.command.sent") == 0)
         {
-            handleDeviceCommand(payloadStr);
+            handleDeviceCommand(data.as<JsonVariantConst>());
         }
-        else if (strstr(payloadStr, "chat-message"))
+        else if (strcmp(event, "chat-message") == 0)
         {
-            ESP_LOGI(TAG, "Chat message event detected!");
-
-            if (!_chatCb)
+            const char *text = data["text"] | (const char *)nullptr;
+            if (!text)
+            {
+                ESP_LOGW(TAG, "chat message without text");
+            }
+            else if (!_chatCb)
             {
                 ESP_LOGE(TAG, "ERROR - No callback registered for chat messages!");
-                break;
-            }
-
-            // The data field contains escaped JSON, so we need to find the text field within it
-            // Look for "text":"<message>" pattern in the escaped JSON
-            char *textStart = strstr(payloadStr, "\\\"text\\\":\\\"");
-            if (textStart)
-            {
-                textStart += 12; // Skip past "\"text\":\""
-                char *textEnd = strstr(textStart, "\\\"");
-                if (textEnd)
-                {
-                    *textEnd = '\0';
-                    String messageText = String(textStart);
-                    *textEnd = '\\'; // Restore the backslash
-
-                    ESP_LOGI(TAG, "Received chat message: %s", messageText.c_str());
-                    _chatCb(messageText);
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "Could not find end quote for text field");
-                }
             }
             else
             {
-                // Fallback: try unescaped version in case format changes
-                textStart = strstr(payloadStr, "\"text\":\"");
-                if (textStart)
-                {
-                    textStart += 8; // Skip past "text":"
-                    char *textEnd = strchr(textStart, '"');
-                    if (textEnd)
-                    {
-                        *textEnd = '\0';
-                        String messageText = String(textStart);
-                        *textEnd = '"'; // Restore the quote
-
-                        ESP_LOGI(TAG, "Received chat message (fallback): %s", messageText.c_str());
-                        _chatCb(messageText);
-                    }
-                }
-                else
-                {
-                    ESP_LOGW(TAG, "Could not parse chat message. Full payload: %.*s", length, payload);
-                }
+                ESP_LOGI(TAG, "Received chat message: %s", text);
+                _chatCb(String(text));
             }
+        }
+        else
+        {
+            ESP_LOGD(TAG, "event '%s' ignored", event);
         }
         break;
     }
@@ -520,7 +499,7 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
 
 void ReverbClient::sendDeviceReport(bool force)
 {
-    if (!isConnected())
+    if (!isConnected() || !jsonBuffer)
         return;
 
     // Gathering the state and building the signature costs a few String allocations and
@@ -576,10 +555,13 @@ void ReverbClient::sendDeviceReport(bool force)
 
     // A report goes out when something meaningful changed (with hysteresis on the analog values,
     // so a cell voltage hovering on a boundary does not cause a report every poll), every 5 s
-    // while playing (position), and at least every 60 s (heartbeat).
+    // while playing (position), and as a heartbeat (10 s docked, 30 s on battery).
     PromptPackManager &ppm = PromptPackManager::getInstance();
     const String promptPack = ppm.installedChecksum().substring(0, 12);
     const String faultsJson = Faults::reportJson();
+    // The running firmware ("fw") and the prompt pack ("prompts") let the portal clear a stale
+    // ota_status after a USB flash (it used to learn the version from the OTA check only).
+    const String fwVersion = jsonEscape(String(firmwareVersion()));
     strlcpy(_lastError, Faults::fruit(), sizeof(_lastError)); // older portal code reads the fruit
     char signature[220];
     snprintf(signature, sizeof(signature), "%d|%d|%d|%d|%s|%s|%d|%d|%d|%s|%s|%s",
@@ -595,8 +577,8 @@ void ReverbClient::sendDeviceReport(bool force)
                    fabsf(batteryVoltage - _lastReportedVoltage) >= 0.10f ||
                    abs(wifiRSSI - _lastReportedRssi) >= 10 ||
                    sdFreeSpace != _lastReportedSdFree;
-    // Docked: power is free and the owner is likely looking at the portal -> 15 s; on battery 60 s.
-    // Docked: 10 s; on battery: 30 s; while the portal is watching (set-report-interval): faster.
+    // Heartbeat: docked 10 s (power is free, the owner is likely looking at the portal), on
+    // battery 30 s; while the portal page is watching (set-report-interval): its rate.
     const bool fast = _fastReportUntil != 0 && (long)(_fastReportUntil - now) > 0;
     const unsigned long heartbeatMs = fast ? _fastReportMs : (battery.isVbusPresent() ? 10000UL : 30000UL);
     bool heartbeat = (now - _lastReportAt) >= heartbeatMs;
@@ -609,7 +591,7 @@ void ReverbClient::sendDeviceReport(bool force)
 
     snprintf(channelBuffer, sizeof(channelBuffer), "private-device.%s", _deviceId.c_str());
 
-    int written = snprintf(jsonBuffer, sizeof(jsonBuffer),
+    int written = snprintf(jsonBuffer, JSON_BUFFER_LEN,
                            "{"
                            "\"event\":\"client-device-report\","
                            "\"channel\":\"%s\","
@@ -617,6 +599,7 @@ void ReverbClient::sendDeviceReport(bool force)
                            "\"device_report\":{"
                            "\"device_id\":\"%s\","
                            "\"last_error\":\"%s\","
+                           "\"fw\":{\"v\":\"%s\",\"code\":%u},"
                            "\"ota\":{\"state\":\"%s\",\"progress\":%d},"
                            "\"prompts\":{\"pack\":\"%s\",\"state\":\"%s\"},"
                            "\"faults\":{%s},"
@@ -650,6 +633,8 @@ void ReverbClient::sendDeviceReport(bool force)
                            channelBuffer,
                            _deviceId.c_str(),
                            _lastError,
+                           fwVersion.c_str(),
+                           (unsigned)firmwareVersionCode(),
                            OtaManager::getInstance().stateName(),
                            OtaManager::getInstance().progress(),
                            promptPack.c_str(),
@@ -676,7 +661,7 @@ void ReverbClient::sendDeviceReport(bool force)
                            nfcCardId.c_str(),
                            nfcCardId.length() > 0 ? "\"" : "");
 
-    const bool overflow = written <= 0 || written >= (int)sizeof(jsonBuffer) - 1;
+    const bool overflow = written <= 0 || written >= (int)JSON_BUFFER_LEN - 1;
     if (overflow)
     {
         if (_lastOverflowLogAt == 0 || now - _lastOverflowLogAt >= 60000UL)
@@ -740,7 +725,11 @@ int ReverbClient::subscribeToPrivate()
         }
         String authValue = authResponse.substring(authStart, authEnd);
 
-        snprintf(jsonBuffer, sizeof(jsonBuffer),
+        if (!jsonBuffer)
+        {
+            return -1;
+        }
+        snprintf(jsonBuffer, JSON_BUFFER_LEN,
                  "{\"event\":\"pusher:subscribe\",\"data\":{\"auth\":\"%s\",\"channel\":\"%s\"}}",
                  authValue.c_str(), channelBuffer);
 
@@ -750,169 +739,63 @@ int ReverbClient::subscribeToPrivate()
     return -1;
 }
 
-void ReverbClient::handleDeviceCommand(const char *payloadStr)
+void ReverbClient::handleDeviceCommand(JsonVariantConst data)
 {
-    // Parse the command data from the escaped JSON
-    // Look for the data field which contains escaped JSON with device_id, timestamp, type, and value
-    char *dataStart = strstr(payloadStr, "\\\"data\\\":\\\"");
-    if (!dataStart)
+    // {"device_id","timestamp","issued_at","type","value"} from the portal's DeviceCommandSent.
+    if (!data.is<JsonObjectConst>())
     {
-        // Fallback: try unescaped version
-        dataStart = strstr(payloadStr, "\"data\":\"");
-        if (!dataStart)
-        {
-            ESP_LOGW(TAG, "Could not find data field in command");
-            return;
-        }
-        dataStart += 8; // Skip past "data":"
-    }
-    else
-    {
-        dataStart += 12; // Skip past "\"data\":\""
-    }
-
-    // Find the end of the data field - look for the closing quote before the comma or closing brace
-    // We need to find the last \" before \",\"channel\" or \"}
-    char *dataEnd = nullptr;
-    char *searchPos = dataStart;
-
-    // Look for the pattern that indicates end of data field
-    char *channelStart = strstr(dataStart, "\\\",\\\"channel\\\"");
-    if (!channelStart)
-    {
-        channelStart = strstr(dataStart, "\",\"channel\"");
-    }
-
-    if (channelStart)
-    {
-        dataEnd = channelStart;
-    }
-    else
-    {
-        // Fallback: look for closing quote near end
-        char *endBrace = strstr(dataStart, "\"}");
-        if (endBrace)
-        {
-            dataEnd = endBrace;
-        }
-    }
-
-    if (!dataEnd)
-    {
-        ESP_LOGW(TAG, "Could not find end of data field");
+        ESP_LOGW(TAG, "command without a data object, ignored");
         return;
     }
-
-    // Create a temporary buffer for the data content
-    size_t dataLen = dataEnd - dataStart;
-    if (dataLen >= sizeof(tempBuffer) - 1)
+    const char *deviceId = data["device_id"] | (const char *)nullptr;
+    if (deviceId && _deviceId != deviceId)
     {
-        ESP_LOGW(TAG, "Command data too large to parse");
+        ESP_LOGI(TAG, "command addressed to another device, ignored");
         return;
     }
-
-    // Copy and null-terminate the data
-    memcpy(tempBuffer, dataStart, dataLen);
-    tempBuffer[dataLen] = '\0';
-
-    // Unescape the JSON data
-    String unescapedData = String(tempBuffer);
-    unescapedData.replace("\\\"", "\"");
-    unescapedData.replace("\\\\", "\\");
-
-    ESP_LOGI(TAG, "Parsing command data: %s", unescapedData.c_str());
-
-    int idStart = unescapedData.indexOf("\"device_id\":\"");
-    if (idStart >= 0)
+    const char *type = data["type"] | "";
+    if (!type[0])
     {
-        idStart += 13;
-        int idEnd = unescapedData.indexOf("\"", idStart);
-        if (idEnd > idStart && unescapedData.substring(idStart, idEnd) != _deviceId)
+        ESP_LOGW(TAG, "command without a type, ignored");
+        return;
+    }
+    // A command that sat in a stopped queue worker must not fire minutes later (a "play" at
+    // night, a stale ota-update): dropped when older than 5 min, once the clock is set.
+    JsonVariantConst issuedAt = data["issued_at"];
+    if (!issuedAt.isNull() && TimeSync::valid())
+    {
+        const double issued = issuedAt.is<const char *>() ? atof(issuedAt.as<const char *>()) : issuedAt.as<double>();
+        const double age = (double)TimeSync::now() - issued;
+        if (issued > 0 && age > 300.0)
         {
-            ESP_LOGI(TAG, "command addressed to another device, ignored");
+            ESP_LOGW(TAG, "command '%s' issued %.0f s ago - dropped (older than 5 min)", type, age);
             return;
         }
     }
 
-    // Extract command type
-    String commandType = "";
-    int typeStart = unescapedData.indexOf("\"type\":\"");
-    if (typeStart >= 0)
-    {
-        typeStart += 8; // Skip past "type":"
-        int typeEnd = unescapedData.indexOf("\"", typeStart);
-        if (typeEnd > typeStart)
-        {
-            commandType = unescapedData.substring(typeStart, typeEnd);
-        }
-    }
-
-    // Extract command value (can be null, string, or number)
-    String commandValue = "";
+    // value: null, a string or a number (kept as its JSON text, e.g. 42 or 0.5).
+    String commandValue;
     bool hasValue = false;
-    int valueStart = unescapedData.indexOf("\"value\":");
-    if (valueStart >= 0)
+    JsonVariantConst value = data["value"];
+    if (value.is<const char *>())
     {
-        valueStart += 8; // Skip past "value":
-
-        // Skip whitespace
-        while (valueStart < unescapedData.length() &&
-               (unescapedData.charAt(valueStart) == ' ' || unescapedData.charAt(valueStart) == '\t'))
-        {
-            valueStart++;
-        }
-
-        if (valueStart < unescapedData.length())
-        {
-            char valueChar = unescapedData.charAt(valueStart);
-            if (valueChar == 'n')
-            {
-                // Check for null
-                if (unescapedData.substring(valueStart, valueStart + 4) == "null")
-                {
-                    hasValue = false;
-                }
-            }
-            else if (valueChar == '"')
-            {
-                // String value
-                valueStart++; // Skip opening quote
-                int valueEnd = unescapedData.indexOf("\"", valueStart);
-                if (valueEnd > valueStart)
-                {
-                    commandValue = unescapedData.substring(valueStart, valueEnd);
-                    hasValue = true;
-                }
-            }
-            else if (isdigit(valueChar) || valueChar == '-')
-            {
-                // Numeric value
-                int valueEnd = valueStart;
-                while (valueEnd < unescapedData.length() &&
-                       (isdigit(unescapedData.charAt(valueEnd)) ||
-                        unescapedData.charAt(valueEnd) == '.' ||
-                        unescapedData.charAt(valueEnd) == '-'))
-                {
-                    valueEnd++;
-                }
-                commandValue = unescapedData.substring(valueStart, valueEnd);
-                hasValue = true;
-            }
-        }
+        commandValue = value.as<const char *>();
+        hasValue = true;
+    }
+    else if (value.is<bool>())
+    {
+        commandValue = value.as<bool>() ? "true" : "false";
+        hasValue = true;
+    }
+    else if (!value.isNull())
+    {
+        serializeJson(value, commandValue);
+        hasValue = true;
     }
 
-    if (commandType.length() == 0)
-    {
-        ESP_LOGW(TAG, "Could not extract command type");
-        return;
-    }
-
-    ESP_LOGI(TAG, "Executing command - Type: %s, Value: %s, HasValue: %s",
-                  commandType.c_str(),
-                  commandValue.c_str(),
+    ESP_LOGI(TAG, "Executing command - Type: %s, Value: %s, HasValue: %s", type, commandValue.c_str(),
                   hasValue ? "true" : "false");
-
-    executeCommand(commandType, commandValue, hasValue);
+    executeCommand(String(type), commandValue, hasValue);
 }
 
 void ReverbClient::executeCommand(const String &type, const String &value, bool hasValue)
@@ -1199,7 +1082,7 @@ void ReverbClient::queueDeviceFiles(const String &innerJson)
 {
     if (!_outbox)
     {
-        _outbox = xQueueCreate(12, sizeof(char *));
+        _outbox = xQueueCreate(24, sizeof(char *)); // a large figure is several parts
         if (!_outbox) return;
     }
     const size_t len = innerJson.length() + 1;
@@ -1207,7 +1090,10 @@ void ReverbClient::queueDeviceFiles(const String &innerJson)
     if (!copy) copy = static_cast<char *>(malloc(len));
     if (!copy) return;
     memcpy(copy, innerJson.c_str(), len);
-    if (xQueueSend(_outbox, &copy, pdMS_TO_TICKS(50)) != pdTRUE)
+    // The maintenance task may wait for the loop to send (one frame per loop pass) while the
+    // channel is up; with the channel down nothing drains, so it does not wait at all.
+    const bool live = instance && instance->_isPrivateSubscribed;
+    if (xQueueSend(_outbox, &copy, live ? pdMS_TO_TICKS(1000) : 0) != pdTRUE)
     {
         free(copy);
         ESP_LOGW(TAG, "outbox full, inventory part dropped");
