@@ -395,6 +395,8 @@ void setup()
         case Fault::OTA_SHA_MISMATCH: prompts.say(Prompt::UPDATE_FAILED); break;
         case Fault::NFC_READ_TROUBLE: prompts.say(Prompt::NFC_READ_TROUBLE); break;
         case Fault::BATTERY_LOW: prompts.say(Prompt::BATTERY_LOW); break;
+        case Fault::NOT_LINKED: scheduleNotLinkedPrompt(); break; // spoken when idle, after the hello, at most daily
+        case Fault::CAPTIVE_PORTAL: prompts.say(Prompt::SETUP_CAPTIVE); break;
         default: break; // silent faults (muz: the toy cannot speak without the card anyway)
         }
     });

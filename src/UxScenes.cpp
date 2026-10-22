@@ -16,6 +16,14 @@ static bool gIdleHelloDone = false;
 static bool gWifiLostAnnounced = false;
 static unsigned long gWifiLostAnnouncedAt = 0;
 
+static bool gNotLinkedPending = false;
+static unsigned long gNotLinkedSaidAt = 0;   // 0 = not said this boot
+
+void scheduleNotLinkedPrompt()
+{
+    gNotLinkedPending = true;
+}
+
 void startSetupWelcome()
 {
     prompts.say(Prompt::SETUP_WELCOME);
@@ -242,6 +250,28 @@ void serviceUxPrompts()
         if (provisioned && !nfcController.isPogoSwitchActive())
         {
             prompts.say(Prompt::IDLE_HELLO);
+        }
+    }
+    // Not linked to an account: after the hello (it needs a few seconds), only while idle, and
+    // at most once a day. A pending request outside the daily window is dropped (the next
+    // daily link check raises it again).
+    if (gNotLinkedPending && gIdleHelloDone && now - gFullSystemStartedAt > 10000)
+    {
+        const bool idle = !nfcController.isPogoSwitchActive() && !nfcController.isCardPresent() &&
+                          !audioController.isPlaying() && !audioController.isPaused() && !prompts.isBusy();
+        if (requestManager.linkState() != RequestManager::LinkState::NOT_LINKED)
+        {
+            gNotLinkedPending = false; // linked in the meantime
+        }
+        else if (gNotLinkedSaidAt && now - gNotLinkedSaidAt < 24UL * 60UL * 60UL * 1000UL)
+        {
+            gNotLinkedPending = false;
+        }
+        else if (idle)
+        {
+            gNotLinkedPending = false;
+            gNotLinkedSaidAt = now ? now : 1;
+            prompts.say(Prompt::NOT_LINKED);
         }
     }
     // Provisioned, the home network is in range, but no link for a minute. Away from home

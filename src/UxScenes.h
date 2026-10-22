@@ -17,3 +17,7 @@ void updateBatteryUx();
 // startFullSystem() on an unprovisioned boot: say the setup invitation now and repeat it
 // (every 90 s, up to 5 times) while nobody pairs.
 void startSetupWelcome();
+// The portal says no account owns the toy (110 NOT_LINKED, raised at boot and then daily):
+// the not_linked prompt is spoken once per boot after the idle hello, only while idle (no
+// figure, nothing playing), and at most once a day.
+void scheduleNotLinkedPrompt();
