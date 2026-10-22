@@ -100,16 +100,12 @@ extern "C" bool verifyRollbackLater()
 }
 
 // ReverbClient calls this when /broadcasting/auth rejects the stored hub token (revoked
-// server-side); the fresh token is persisted and shared with the API client.
+// server-side). A token renewed in the last 10 min is handed over as is (the socket held an
+// older one); otherwise RequestManager refreshes it (rate-limited, persisted, shared). Fetching
+// a new one on every refusal used to make the API client and the socket revoke each other.
 static String refreshHubTokenForReverb()
 {
-    String fresh = requestManager.getJWTToken();
-    if (fresh.length() > 0)
-    {
-        config.setJWTToken(fresh);
-        requestManager.setAuthToken(fresh);
-    }
-    return fresh;
+    return requestManager.currentOrFreshToken();
 }
 
 

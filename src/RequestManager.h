@@ -82,10 +82,31 @@ public:
     // Utility methods
     bool isConnected();
     bool isNetworkReady();   // WiFi up with an IP (no portal check)
+    // Fetches a new device token (PROTOCOL-V2 §2) and returns it ("" on failure); does not
+    // store it. Enrolled unit (factory secret present): POST /hubs/{uuid}/token with the
+    // X-Hub-Secret header (404/401 raise NOT_ENROLLED, 404/401/429 back off for 15 min). Not
+    // enrolled: the legacy GET /hubs/{uuid}/token, unchanged.
     String getJWTToken();
     bool validateToken(const String& token);
     void initConnection();
     void update();
+
+    // Re-acquire the device token now, at most once per 10 minutes (callers: 403 from a hub
+    // endpoint, the 80-day age, the token validation). Returns whether a fetch was attempted.
+    // Any task (takes the HTTP lock, recursive).
+    bool forceTokenRefresh(const char *why);
+    // Reverb's channel auth was refused: the token if it was renewed in the last 10 min (the
+    // socket simply held an older one), otherwise a forced refresh. Never two refreshes that
+    // revoke each other in a loop.
+    String currentOrFreshToken();
+
+    // Account link (PROTOCOL-V2 §3): GET /hubs/{uuid} with the device token answers
+    // {"bound": bool}; checked once the token is valid at boot and every 24 h.
+    enum class LinkState : uint8_t { UNKNOWN, LINKED, NOT_LINKED };
+    LinkState linkState() const { return linkStateValue; }
+    // Customer reset: POST /hubs/{uuid}/unbind with the device token, 3 s, skipped offline.
+    bool unbindBestEffort();
+    void forgetToken();                      // RAM copy (the caller clears NVS)
 
     void getCheckFigureTracks(const String &uid); // Method to fetch figure tracks
 
@@ -167,6 +188,24 @@ private:
     std::vector<DeferredFault> deferredFaults;   // guarded by jobLock
     void deferFault(uint16_t code, const char *detail, bool speak);
     void raiseDeferredFaults();
+
+    // Device token bookkeeping (see getJWTToken / forceTokenRefresh)
+    String fetchDeviceTokenWithSecret();
+    String fetchLegacyToken();
+    int checkStoredToken(const String &token);    // HTTP status of the validation (<=0: no answer)
+    void serviceToken();                           // loop: retries without a token, the daily age tick
+    void serviceLinkCheck();                       // loop: the 24 h bound check
+    void applyBound(JsonVariantConst doc);         // loop task
+    String hubPath() const;                        // "/hubs/<uuid>"
+    bool begun = false;
+    unsigned long tokenBlockedUntil = 0;           // 404/401/429 from the token POST: wait 15 min
+    unsigned long lastForcedRefreshAt = 0;
+    unsigned long lastTokenIssuedAt = 0;
+    unsigned long nextTokenRetryAt = 0;
+    unsigned long nextTokenDayAt = 0;
+    unsigned long nextLinkCheckAt = 0;
+    volatile int8_t pendingBound = -1;             // set by a validation on any task, applied on the loop (-1 none)
+    volatile LinkState linkStateValue = LinkState::UNKNOWN;
 
     // NVS storage for UID to Figure ID mappings
     static const char* NVS_NAMESPACE;

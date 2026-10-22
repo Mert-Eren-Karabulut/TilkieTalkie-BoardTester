@@ -21,6 +21,11 @@ const char* RequestManager::SD_MANIFEST_DIR = "/.requestmanager/manifests";
 const char* RequestManager::SD_PENDING_MANIFEST_DIR = "/.requestmanager/pending_manifests";
 static const unsigned long RECHECK_FIRST_MS = 3UL * 60UL * 1000UL;        // after boot (plus up to 60 s jitter)
 static const unsigned long RECHECK_INTERVAL_MS = 12UL * 60UL * 60UL * 1000UL; // the portal also pushes sync-figure
+static const unsigned long TOKEN_BACKOFF_MS = 15UL * 60UL * 1000UL;     // 404 / 401 / 429 from the token POST
+static const unsigned long TOKEN_RETRY_SHORT_MS = 60UL * 1000UL;        // transport error or 5xx
+static const unsigned long FORCED_REFRESH_MIN_MS = 10UL * 60UL * 1000UL;
+static const unsigned long DAY_MS = 24UL * 60UL * 60UL * 1000UL;
+static const uint16_t TOKEN_REFRESH_DAYS = 80;                          // the portal's tokens live 90 days
 
 namespace {
 struct LockGuard {
@@ -121,6 +126,8 @@ bool RequestManager::begin()
     fileManager.setDownloadCompleteCallback(staticFileDownloadCallback);
 
     initConnection();
+    begun = true;
+    nextTokenRetryAt = millis() + TOKEN_BACKOFF_MS; // without a token: the next attempt in 15 min (Reverb may ask sooner)
 
     ESP_LOGI(TAG, "%s", authToken.length() > 0 ? "Initialized with token" : "No token available");
     return authToken.length() > 0;
@@ -156,6 +163,8 @@ void RequestManager::update()
 {
     raiseDeferredFaults();
     dispatchCompletedJobs();
+    serviceToken();
+    serviceLinkCheck();
     serviceManifestRecheck();
 
     if (!figureDownloadCompleteCallback || pendingCompletions.empty()) {
@@ -283,7 +292,7 @@ int RequestManager::performHttp(const String& endpoint, const String& method, co
             retrying = true;
             ESP_LOGI(TAG, "401 - refreshing hub token and retrying once");
             authToken = "";
-            ConfigManager::getInstance().setJWTToken(String());
+            ConfigManager::getInstance().clearJWTToken();
             initConnection();
             int retried = authToken.length() > 0 ? performHttp(endpoint, method, payload, body, error) : 0;
             retrying = false;
@@ -516,52 +525,164 @@ bool RequestManager::isConnected()
     return WiFi.status() == WL_CONNECTED;
 }
 
+String RequestManager::hubPath() const
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "/hubs/%llu", ESP.getEfuseMac());
+    return String(buf);
+}
+
+// ---- Device token (docs/PROTOCOL-V2.md §2) -------------------------------------------------
+
+
 String RequestManager::getJWTToken()
 {
     LockGuard guard(httpLock);
-    uint64_t macAddress = ESP.getEfuseMac();
-    
-    String endpoint = "/hubs/" + String(macAddress, 10) + "/token";
-    //print endpoint being accessed
+    if (ConfigManager::getInstance().hasFactorySecret()) {
+        return fetchDeviceTokenWithSecret();
+    }
+    return fetchLegacyToken();
+}
+
+// Legacy path for units without a factory secret (the fleet before enrollment): unchanged
+// GET /hubs/{uuid}/token, answered with the owner's hub token while the portal allows it.
+String RequestManager::fetchLegacyToken()
+{
+    String endpoint = hubPath() + "/token";
     ESP_LOGI(TAG, "Requesting JWT token from endpoint: %s", endpoint.c_str());
     
-    // Temporarily clear auth token so executeHttpRequest doesn't try to init connection
+    // Temporarily clear auth token so the request goes out without the old one
     String savedToken = authToken;
     authToken = "";
-    
-    JsonDocument doc = executeHttpRequest(endpoint, "GET");
-    
+    String body, error;
+    const int code = performHttp(endpoint, "GET", nullptr, body, error);
     authToken = savedToken;
+    JsonDocument doc = responseToDocument(code, body, error);
     
     if (doc["status"] == "success") {
         ESP_LOGI(TAG, "JWT token obtained");
+        lastTokenIssuedAt = millis() ? millis() : 1;
         return doc["token"].as<String>();
     }
+    if (code == 404) {
+        // The portal hands out the legacy token only for a hub bound to exactly one user: this
+        // is the "online but not linked" case (it used to look like "offline" to the child).
+        linkStateValue = LinkState::NOT_LINKED;
+        pendingBound = 0;
+    }
     
-    ESP_LOGW(TAG, "JWT token request failed: %s", doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "?");
+    ESP_LOGW(TAG, "JWT token request failed (%d): %s", code, doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "?");
     return String();
 }
 
-bool RequestManager::validateToken(const String& token)
+// POST /hubs/{uuid}/token, X-Hub-Secret, no body -> {"token": "...", "expires_in": s}.
+String RequestManager::fetchDeviceTokenWithSecret()
+{
+    const unsigned long now = millis();
+    if (tokenBlockedUntil && (long)(now - tokenBlockedUntil) < 0) {
+        return String(); // backing off after 404/401/429 (or a transient failure)
+    }
+    if (!isNetworkReady()) {
+        return String();
+    }
+    const String secret = ConfigManager::getInstance().factorySecret();
+    const String endpoint = hubPath() + "/token";
+    const String url = baseUrl + endpoint;
+    http.end();
+    if (!http.begin(*client, url)) {
+        tokenBlockedUntil = now + TOKEN_RETRY_SHORT_MS;
+        return String();
+    }
+    http.setTimeout(timeout);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS); // the secret goes to this URL only
+    http.addHeader("Accept", "application/json");
+    http.addHeader("User-Agent", "TilkieTalkie/1.0");
+    http.addHeader("X-Hub-Secret", secret); // never logged
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+    int code = http.POST((uint8_t *)nullptr, 0);
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+    String body;
+    if (code > 0 && code != 204 && http.getSize() != 0) {
+        body = http.getString();
+    }
+    http.end();
+    ESP_LOGI(TAG, "POST %s -> %d", endpoint.c_str(), code); // never the body (it carries the token)
+
+    if (code == 200 || code == 201) {
+        JsonDocument doc(&psramJsonAllocator);
+        if (deserializeJson(doc, body) == DeserializationError::Ok) {
+            const String token = doc["token"].as<String>();
+            if (token.length() > 0 && token != "null") {
+                const long expires = doc["expires_in"] | 0L;
+                ESP_LOGI(TAG, "device token obtained (expires in %ld d)", expires / 86400L);
+                tokenBlockedUntil = 0;
+                lastTokenIssuedAt = millis() ? millis() : 1;
+                return token;
+            }
+        }
+        ESP_LOGW(TAG, "token answer without a token");
+        tokenBlockedUntil = millis() + TOKEN_RETRY_SHORT_MS;
+        return String();
+    }
+    if (code == 404 || code == 401) {
+        // 404: the portal does not know this unit's secret (not enrolled there); 401: wrong secret.
+        ESP_LOGW(TAG, "device token refused (%d): %s - retry in 15 min", code, code == 404 ? "not enrolled" : "secret rejected");
+        deferFault((uint16_t)Fault::NOT_ENROLLED, code == 404 ? "404" : "secret", false);
+        tokenBlockedUntil = millis() + TOKEN_BACKOFF_MS;
+    } else if (code == 429) {
+        ESP_LOGW(TAG, "device token request throttled (429) - waiting 15 min");
+        tokenBlockedUntil = millis() + TOKEN_BACKOFF_MS;
+    } else {
+        if (code <= 0) {
+            char d[40];
+            snprintf(d, sizeof(d), "%d %.30s", code, endpoint.c_str());
+            deferFault((uint16_t)Fault::PORTAL_UNREACHABLE, d, false);
+        }
+        tokenBlockedUntil = millis() + TOKEN_RETRY_SHORT_MS;
+    }
+    return String();
+}
+
+// Validation of a stored token. Enrolled units ask GET /hubs/{uuid} (a device principal may
+// call it, and the answer carries the account link too); the legacy path keeps validate-token.
+int RequestManager::checkStoredToken(const String &token)
 {
     LockGuard guard(httpLock);
-    uint64_t macAddress = ESP.getEfuseMac();
-    String endpoint = "/hubs/" + String(macAddress, 10) + "/validate-token";
+    const bool device = ConfigManager::getInstance().hasFactorySecret();
+    const String endpoint = device ? hubPath() : hubPath() + "/validate-token";
     
     http.end();
     String url = baseUrl + endpoint;
     
     if (!http.begin(*client, url)) {
-        return false;
+        return 0;
     }
     
     http.setTimeout(timeout);
-    setDefaultHeaders();
+    http.addHeader("Accept", "application/json");
+    http.addHeader("User-Agent", "TilkieTalkie/1.0");
     http.addHeader("Authorization", "Bearer " + token);
     if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset(); // only the loop task is subscribed
     int httpResponseCode = http.GET();
     if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset(); // only the loop task is subscribed
+    String body;
+    if (device && httpResponseCode == 200 && http.getSize() != 0) {
+        body = http.getString();
+    }
     http.end();
+    if (device && httpResponseCode == 200) {
+        JsonDocument doc(&psramJsonAllocator);
+        if (deserializeJson(doc, body) == DeserializationError::Ok) {
+            JsonVariantConst b = doc["bound"];
+            pendingBound = b.is<bool>() ? (b.as<bool>() ? 1 : 0) : 1;
+        }
+    }
+    return httpResponseCode;
+}
+
+bool RequestManager::validateToken(const String& token)
+{
+    const int httpResponseCode = checkStoredToken(token);
     if (httpResponseCode <= 0) {
         // No answer (DNS not ready right after connecting, portal down): that says nothing about
         // the token. Keep it; a token the portal really rejects fails with 401 later and is
@@ -578,22 +699,183 @@ void RequestManager::initConnection()
     ConfigManager &config = ConfigManager::getInstance();
     String storedToken = config.getJWTToken();
 
-    if (storedToken.length() > 0 && validateToken(storedToken)) {
-        ESP_LOGI(TAG, "Using stored JWT token");
-        setAuthToken(storedToken);
-        return;
+    if (storedToken.length() > 0) {
+        const int code = checkStoredToken(storedToken);
+        if (code == 403) {
+            // A hub endpoint refused a token it knows (unbound, revoked ability): refresh once
+            // per 10 min, otherwise keep using it.
+            setAuthToken(storedToken);
+            forceTokenRefresh("validation 403");
+            return;
+        }
+        if (code != 401) {
+            // 200, or no answer (that says nothing about the token: a flaky boot must not revoke it).
+            if (code <= 0) {
+                ESP_LOGI(TAG, "token check got no answer (%d) - keeping the stored token", code);
+            }
+            ESP_LOGI(TAG, "Using stored JWT token");
+            setAuthToken(storedToken);
+            if (config.hasFactorySecret() && config.getTokenDays() >= TOKEN_REFRESH_DAYS) {
+                forceTokenRefresh("80 days");
+            }
+            if (!nextLinkCheckAt) nextLinkCheckAt = millis() + 2000; // the bound check right after boot
+            return;
+        }
     }
     
-    config.setJWTToken(String()); // Clear invalid token
+    config.clearJWTToken(); // invalid (401) or none
     
     String newToken = getJWTToken();
     if (newToken.length() > 0) {
         ESP_LOGI(TAG, "New JWT token obtained");
         config.setJWTToken(newToken);
         setAuthToken(newToken);
+        nextLinkCheckAt = millis() + 2000;
     } else {
         setAuthToken(String());
     }
+}
+
+bool RequestManager::forceTokenRefresh(const char *why)
+{
+    LockGuard guard(httpLock);
+    const unsigned long now = millis();
+    if (lastForcedRefreshAt && now - lastForcedRefreshAt < FORCED_REFRESH_MIN_MS) {
+        return false;
+    }
+    lastForcedRefreshAt = now ? now : 1;
+    ESP_LOGI(TAG, "refreshing the device token (%s)", why ? why : "?");
+    const String fresh = getJWTToken();
+    if (fresh.length() > 0) {
+        ConfigManager::getInstance().setJWTToken(fresh); // resets token_days
+        setAuthToken(fresh);
+    }
+    return true;
+}
+
+String RequestManager::currentOrFreshToken()
+{
+    LockGuard guard(httpLock);
+    if (lastTokenIssuedAt && millis() - lastTokenIssuedAt < FORCED_REFRESH_MIN_MS && authToken.length() > 0) {
+        return authToken;
+    }
+    forceTokenRefresh("channel auth refused");
+    return authToken.length() > 0 ? authToken : ConfigManager::getInstance().getJWTToken();
+}
+
+void RequestManager::forgetToken()
+{
+    setAuthToken(String());
+    linkStateValue = LinkState::UNKNOWN;
+}
+
+bool RequestManager::unbindBestEffort()
+{
+    LockGuard guard(httpLock);
+    String token = authToken.length() > 0 ? authToken : ConfigManager::getInstance().getJWTToken();
+    if (token.isEmpty() || !isNetworkReady()) {
+        return false;
+    }
+    const String url = baseUrl + hubPath() + "/unbind";
+    http.end();
+    if (!http.begin(*client, url)) {
+        return false;
+    }
+    http.setTimeout(3000);
+    http.setConnectTimeout(3000);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Accept", "application/json");
+    http.addHeader("User-Agent", "TilkieTalkie/1.0");
+    http.addHeader("Authorization", "Bearer " + token);
+    if (esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+    const int code = http.POST(String("{}"));
+    http.end();
+    ESP_LOGI(TAG, "unbind -> %d", code);
+    return code >= 200 && code < 300;
+}
+
+// Loop task. A unit without a token (not enrolled on the portal, throttled, offline at boot)
+// tries again every 15 min; a unit with one ages it by a day every 24 h of uptime and renews
+// it at 80 days (the 401 path covers the time spent asleep, which this counter does not see).
+void RequestManager::serviceToken()
+{
+    if (!begun) {
+        return;
+    }
+    const unsigned long now = millis();
+    if (pendingBound >= 0) {
+        JsonDocument doc;
+        doc["bound"] = pendingBound == 1;
+        pendingBound = -1;
+        applyBound(doc.as<JsonVariantConst>());
+    }
+    if (authToken.isEmpty()) {
+        if (isNetworkReady() && (long)(now - nextTokenRetryAt) >= 0) {
+            nextTokenRetryAt = now + TOKEN_BACKOFF_MS;
+            initConnection();
+        }
+        return;
+    }
+    if (nextTokenDayAt == 0) {
+        nextTokenDayAt = now + DAY_MS;
+    } else if ((long)(now - nextTokenDayAt) >= 0) {
+        nextTokenDayAt = now + DAY_MS;
+        ConfigManager &config = ConfigManager::getInstance();
+        const uint16_t days = config.getTokenDays() + 1;
+        config.setTokenDays(days); // the one NVS write of the day
+        if (config.hasFactorySecret() && days >= TOKEN_REFRESH_DAYS) {
+            forceTokenRefresh("80 days");
+        }
+    }
+}
+
+void RequestManager::applyBound(JsonVariantConst doc)
+{
+    // Device principal: {"bound": bool, ...}. A legacy owner token gets the full hub resource
+    // (possibly under "data"): read "bound" if it is there, otherwise the owner's token proves it.
+    JsonVariantConst b = doc["bound"];
+    if (!b.is<bool>()) b = doc["data"]["bound"];
+    const bool bound = b.is<bool>() ? b.as<bool>() : true;
+    if (!bound) {
+        // One event when it is first seen and then once a day (the legacy path re-learns it on
+        // every token retry, every 15 min). The speaker hands it to UxScenes, which says the
+        // not_linked prompt once per boot after the hello, when idle, and at most once a day.
+        static unsigned long lastRaisedAt = 0;
+        const bool first = linkStateValue != LinkState::NOT_LINKED;
+        linkStateValue = LinkState::NOT_LINKED;
+        if (first || !lastRaisedAt || millis() - lastRaisedAt >= DAY_MS) {
+            lastRaisedAt = millis() ? millis() : 1;
+            ESP_LOGI(TAG, "hub is not linked to an account");
+            Faults::raise(Fault::NOT_LINKED, "bound=false");
+        }
+    } else {
+        if (linkStateValue == LinkState::NOT_LINKED) {
+            ESP_LOGI(TAG, "hub is linked to an account now");
+        }
+        linkStateValue = LinkState::LINKED;
+        Faults::clear(Fault::NOT_LINKED);
+    }
+}
+
+void RequestManager::serviceLinkCheck()
+{
+    const unsigned long now = millis();
+    if (!begun || !nextLinkCheckAt || (long)(now - nextLinkCheckAt) < 0 || authToken.isEmpty() || !isNetworkReady()) {
+        return;
+    }
+    const String endpoint = hubPath();
+    if (isRequestPending(endpoint)) {
+        return;
+    }
+    nextLinkCheckAt = now + DAY_MS;
+    getAsync(endpoint, [this](JsonDocument &doc, int status) {
+        if (status == 200) {
+            applyBound(doc.as<JsonVariantConst>());
+        } else {
+            ESP_LOGI(TAG, "link check failed (%d) - again in 30 min", status);
+            nextLinkCheckAt = millis() + 30UL * 60UL * 1000UL;
+        }
+    });
 }
 
 void RequestManager::getCheckFigureTracks(const String &uid)
