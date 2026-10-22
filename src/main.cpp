@@ -150,15 +150,17 @@ String getDeviceEfuseMacDecimal()
 
 String getDeviceEfuseMacHex()
 {
+    // getEfuseMac() packs the six MAC bytes little-endian (first byte of the MAC in the low
+    // byte), so the printed order starts at the low byte; the old code printed it reversed.
     uint64_t mac = ESP.getEfuseMac();
     char macHex[18];
     snprintf(macHex, sizeof(macHex), "%02X:%02X:%02X:%02X:%02X:%02X",
-             (uint8_t)(mac >> 40),
-             (uint8_t)(mac >> 32),
-             (uint8_t)(mac >> 24),
-             (uint8_t)(mac >> 16),
+             (uint8_t)mac,
              (uint8_t)(mac >> 8),
-             (uint8_t)mac);
+             (uint8_t)(mac >> 16),
+             (uint8_t)(mac >> 24),
+             (uint8_t)(mac >> 32),
+             (uint8_t)(mac >> 40));
     return String(macHex);
 }
 
