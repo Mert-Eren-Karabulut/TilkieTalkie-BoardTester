@@ -349,6 +349,23 @@ void PromptPackManager::cancelQueuedStaging()
     }
 }
 
+void PromptPackManager::cancelStaging()
+{
+    if (!_staging)
+    {
+        return;
+    }
+    ESP_LOGW(TAG, "pack %.12s staging cancelled", _pack.checksum.c_str());
+    cancelQueuedStaging();
+    _staging = false;
+    if (_cb)
+    {
+        auto cb = _cb;
+        _cb = nullptr;
+        cb(false);
+    }
+}
+
 void PromptPackManager::finishStaging(bool ok)
 {
     _staging = false;

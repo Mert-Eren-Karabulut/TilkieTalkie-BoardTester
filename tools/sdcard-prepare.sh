@@ -10,8 +10,10 @@
 #      toy reports which pack it carries and only downloads a pack when the portal pairs a
 #      different one with its firmware.
 #
-# Everything on the card is erased. The firmware creates its own folders (audio, temp, logs,
-# images, .requestmanager) on first boot; stories are downloaded per figure.
+# Everything on the card is erased. The firmware creates its own folders on first boot:
+# /assets (stories, downloaded per figure), /.filemanager (download queue, required files),
+# /.requestmanager/manifests and /.requestmanager/pending_manifests (cached unit manifests),
+# and /sounds.staging / /sounds.old only while a prompt pack is being updated.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DISK="${1:?usage: tools/sdcard-prepare.sh /dev/diskN [prompts.zip]   (see: diskutil list external)}"

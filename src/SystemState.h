@@ -44,6 +44,8 @@ extern unsigned long gFullSystemStartedAt; // millis() when startFullSystem() ra
 extern unsigned long gFigureLoadingSince;  // tap time until something plays / fails
 extern bool gSystemError;                  // NFC reader failed to come up (steady red scene)
 extern int gOtaProgress;                   // 0-100 while an update is being written, else -1
+// time_valid: TimeSync::valid() (TimeSync.h). SNTP starts once WiFi has an IP; until the clock
+// is set, fault events carry only their age and command issued_at is not checked.
 
 // Gauge learning-cycle discharge (bench `learndis`): the charger is in HIZ on purpose, so the
 // charger supervisor, the charge bar and the low-battery cutoff stand down. Always false in a

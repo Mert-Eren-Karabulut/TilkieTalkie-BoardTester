@@ -49,8 +49,8 @@ namespace Policy
     // --- Sleep ---
     // Inactivity before deep sleep on battery (set at boot).
     constexpr unsigned long INACTIVITY_TIMEOUT_MS = 5UL * 60UL * 1000UL;
-    // Value applied after first-boot bring-up completes and when the bench learning cycle
-    // ends (historical "restore normal 30 s"; differs from the boot value above, kept as is).
+    // Restored when the bench learning cycle ends (Console.cpp). Bring-up completion restores
+    // INACTIVITY_TIMEOUT_MS since 1.2.20 (it used to leave a new toy at 30 s until a reboot).
     constexpr unsigned long INACTIVITY_TIMEOUT_SHORT_MS = 30000;
     // Effectively never (bring-up, learning discharge).
     constexpr unsigned long INACTIVITY_TIMEOUT_NEVER = 0xFFFFFFFF;

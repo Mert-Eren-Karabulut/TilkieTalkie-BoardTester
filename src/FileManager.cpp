@@ -79,6 +79,9 @@ bool FileManager::begin() {
     loadDownloadStats();
     loadDownloadQueue();
     loadRequiredFiles();
+    // Orphaned partial downloads are swept before the first download starts (the sweep's flag
+    // holds downloads off); the queue is loaded first so its partial files stay for Range resume.
+    cleanupTempFiles();
     
     ESP_LOGI(TAG, "Initialization complete");
     return true;
@@ -279,9 +282,6 @@ bool FileManager::initializeSDCard() {
     
     sdCardInitialized = true;
     createDirectory("/assets"); // story assets; sub-directories are created per download
-    // Orphaned partial downloads are swept before the first download starts (this sets the
-    // flag that holds downloads off, so it must precede the maintenance task's first job).
-    cleanupTempFiles();
     ensureMaintenanceTask(); // background deletes/writes + the first free-space count
     
     return true;
@@ -740,15 +740,32 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
         return false;
     }
 
-    if (SD_MMC.exists(asyncState.tempPath)) {
-        SD_MMC.remove(asyncState.tempPath);
+    // An interrupted download left its .tmp: continue it with a Range request instead of
+    // starting over (a 3 MB track on a 0.3 MB/s card is 10 s of writes). Only with a checksum:
+    // the whole file is verified at the end, prefix included (the SD writer hashes it first).
+    size_t existing = 0;
+    if (!checksum.isEmpty() && SD_MMC.exists(asyncState.tempPath)) {
+        File partial = SD_MMC.open(asyncState.tempPath, FILE_READ);
+        if (partial) {
+            existing = partial.isDirectory() ? 0 : partial.size();
+            partial.close();
+        }
     }
-    asyncState.file = SD_MMC.open(asyncState.tempPath, FILE_WRITE);
-    if (!asyncState.file) {
-        errorMsg = "Failed to create temporary file";
-        pathError = true;
-        downloadInProgress = false;
-        return false;
+    if (existing > 0) {
+        asyncState.resumeFrom = existing;
+        ESP_LOGI(TAG, "resuming %s at %u bytes", localPath.c_str(), (unsigned)existing);
+        // the SD writer opens the file (append, or truncate on a 200) once the answer is known
+    } else {
+        if (SD_MMC.exists(asyncState.tempPath)) {
+            SD_MMC.remove(asyncState.tempPath);
+        }
+        asyncState.file = SD_MMC.open(asyncState.tempPath, FILE_WRITE);
+        if (!asyncState.file) {
+            errorMsg = "Failed to create temporary file";
+            pathError = true;
+            downloadInProgress = false;
+            return false;
+        }
     }
 
     asyncState.ringHead = 0;
@@ -838,8 +855,8 @@ void FileManager::abortAsyncStart() {
     if (asyncState.file) {
         asyncState.file.close();
     }
-    if (SD_MMC.exists(asyncState.tempPath)) {
-        SD_MMC.remove(asyncState.tempPath);
+    if (asyncState.resumeFrom == 0 && SD_MMC.exists(asyncState.tempPath)) {
+        SD_MMC.remove(asyncState.tempPath); // a resumable partial file stays for the next attempt
     }
     downloadInProgress = false;
     asyncState.reset();
@@ -884,6 +901,14 @@ void FileManager::processDownloadQueue() {
             return;
         }
 
+        if (task.checksum.isEmpty() && task.localPath.startsWith("/assets/")) {
+            // A story asset without a checksum (queued by an older firmware) is never fetched
+            // unverified over plain HTTP; the next manifest with a checksum queues it again.
+            ESP_LOGW(TAG, "dropping %s: no checksum", task.localPath.c_str());
+            giveUp(it, "nosha");
+            return;
+        }
+
         if (task.retryCount >= MAX_RETRY_COUNT) {
             // Gave up: the next tap of the figure re-queues whatever its manifest still needs.
             ESP_LOGW(TAG, "giving up on %s after %d attempts", task.url.c_str(), task.retryCount);
@@ -924,6 +949,9 @@ void FileManager::giveUp(std::vector<DownloadTask>::iterator it, const char *rea
     const String error = reason ? reason : "";
     downloadQueue.erase(it);
     saveDownloadQueue();
+    if (SD_MMC.exists(path + ".tmp")) {
+        deleteFileDeferred(path + ".tmp"); // nothing will resume it
+    }
     Faults::raise(Fault::DOWNLOAD_FAILED, faultDetail(path).c_str(), false);
     if (downloadCompleteCallback) {
         downloadCompleteCallback(url, path, false, error); // last: it may change the queue
@@ -1469,6 +1497,9 @@ bool FileManager::cancelQueuedDownload(const String &path) {
         if (it->localPath == path && !(downloadInProgress && asyncState.localPath == path)) {
             it = downloadQueue.erase(it);
             removed = true;
+            if (SD_MMC.exists(path + ".tmp")) {
+                deleteFileDeferred(path + ".tmp"); // a partial file nothing will resume
+            }
         } else {
             ++it;
         }
@@ -1484,6 +1515,14 @@ void FileManager::cleanupTempFiles() {
         return;
     }
     tmpSweepPending = true; // holds new downloads off until the sweep is done
+    // Partial files of queued downloads (with a checksum) are resumed, not swept. Read by the
+    // maintenance task only after it dequeues the job.
+    tmpKeep.clear();
+    for (const DownloadTask &t : downloadQueue) {
+        if (!t.checksum.isEmpty()) {
+            tmpKeep.push_back(t.localPath + ".tmp");
+        }
+    }
     if (!enqueueJob(4, "/assets", nullptr, 0)) {
         tmpSweepPending = false;
         ESP_LOGW(TAG, "temp-file sweep could not be queued");
@@ -1491,7 +1530,8 @@ void FileManager::cleanupTempFiles() {
 }
 
 // Maintenance task. A "*.tmp" under /assets is a download cut by a reset or power loss (a
-// finished download is renamed); none is being written while tmpSweepPending is set.
+// finished download is renamed); none is being written while tmpSweepPending is set. Those of
+// queued downloads are kept (tmpKeep): the next attempt resumes them with a Range request.
 void FileManager::sweepOrphanedTempFiles() {
     int removed = 0;
     unsigned long t0 = millis();
@@ -1518,7 +1558,7 @@ void FileManager::sweepTempDir(const String &dir, int depth, int &removed) {
         full += e.name();
         if (e.isDirectory()) {
             subdirs.push_back(full);
-        } else if (full.endsWith(".tmp")) {
+        } else if (full.endsWith(".tmp") && std::find(tmpKeep.begin(), tmpKeep.end(), full) == tmpKeep.end()) {
             temps.push_back(full);
         }
         e.close();
@@ -1768,6 +1808,9 @@ void FileManager::onAsyncConnect(void* arg, AsyncClient* client) {
     request += "Host: " + hostname + "\r\n";
     request += "Connection: close\r\n";
     request += "Accept-Encoding: identity\r\n";
+    if (self->asyncState.resumeFrom > 0) {
+        request += "Range: bytes=" + String((unsigned long)self->asyncState.resumeFrom) + "-\r\n";
+    }
     request += "User-Agent: TilkieTalkie/1.0 (ESP32-S3)\r\n";
     request += "\r\n";
     client->write(request.c_str(), request.length());
@@ -1817,7 +1860,26 @@ void FileManager::onAsyncData(void* arg, AsyncClient* client, void* data, size_t
             return;
         }
         self->asyncState.httpStatus = status;
-        if (status != 200) {
+        const bool resuming = self->asyncState.resumeFrom > 0;
+        if (resuming && status == 416) {
+            // The partial file is not a prefix of what the server has (file replaced): start over.
+            self->requestAsyncFinish(false, "HTTP 416 on resume", false, FK_RESTART);
+            return;
+        }
+        if (resuming && status == 200) {
+            // Range ignored: the whole file comes; the writer truncates the partial one first.
+            self->asyncState.restartFromZero = true; // published to the writer by the ring index (release)
+            ESP_LOGI(TAG, "server sent the whole file (200) - restarting from zero");
+        } else if (resuming && status == 206) {
+            const char* cr = strcasestr(self->asyncState.headerBuffer, "content-range:");
+            unsigned long long first = 0, last = 0, total = 0;
+            if (!cr || sscanf(cr + 14, " bytes %llu-%llu/%llu", &first, &last, &total) != 3 ||
+                first != self->asyncState.resumeFrom || last + 1 != total) {
+                self->requestAsyncFinish(false, "unexpected Content-Range on resume", false, FK_RESTART);
+                return;
+            }
+            self->asyncState.rangeTotal = (int64_t)total;
+        } else if (status != 200) {
             char msg[48];
             snprintf(msg, sizeof(msg), "HTTP %d", status);
             self->requestAsyncFinish(false, msg, status >= 400 && status < 500);
@@ -1932,12 +1994,63 @@ bool FileManager::ringPush(const uint8_t* data, size_t len) {
 // SD writer task (core 0): drains the PSRAM ring in DOWNLOAD_BUFFER_SIZE chunks through the
 // internal bounce buffer, hashing as it goes. Exits only when told to AND signals it, so the
 // owner can delete the semaphore safely.
+// Resume: the hash must cover the bytes already on the card. Read through the bounce buffer
+// before any new byte is written (the ring absorbs the network meanwhile).
+static bool hashPrefix(File &f, size_t len, uint8_t *buf, size_t bufLen, mbedtls_sha256_context *sha, volatile bool *stop)
+{
+    while (len > 0) {
+        if (*stop) return false;
+        const size_t want = len < bufLen ? len : bufLen;
+        const int n = f.read(buf, want);
+        if (n <= 0) return false;
+        mbedtls_sha256_update(sha, buf, (size_t)n);
+        len -= (size_t)n;
+    }
+    return true;
+}
+
+// SD writer: the temp file of a resumed download is opened here, once the server's answer is
+// known: append after the prefix (206) or truncate (200, restartFromZero).
+bool FileManager::writerOpenFile() {
+    if (asyncState.file) {
+        return true;
+    }
+    if (asyncState.restartFromZero) {
+        mbedtls_sha256_free(&asyncState.sha); // the prefix hash is void
+        mbedtls_sha256_init(&asyncState.sha);
+        mbedtls_sha256_starts(&asyncState.sha, 0);
+        asyncState.file = SD_MMC.open(asyncState.tempPath, FILE_WRITE);
+    } else {
+        asyncState.file = SD_MMC.open(asyncState.tempPath, FILE_APPEND);
+    }
+    if (!asyncState.file) {
+        asyncState.fileOpenFailed = true;
+        return false;
+    }
+    return true;
+}
+
 void FileManager::sdWriteTask(void* parameter) {
     FileManager* self = static_cast<FileManager*>(parameter);
+    if (self->asyncState.resumeFrom > 0) {
+        File prefix = SD_MMC.open(self->asyncState.tempPath, FILE_READ);
+        const bool ok = prefix && hashPrefix(prefix, self->asyncState.resumeFrom, self->persistentBufferA, DOWNLOAD_BUFFER_SIZE,
+                                             &self->asyncState.sha, &self->asyncState.discardRing);
+        if (prefix) prefix.close();
+        if (!ok && !self->asyncState.discardRing) {
+            self->requestAsyncFinish(false, "partial file unreadable", false, FK_RESTART);
+            self->asyncState.discardRing = true;
+        }
+    }
     for (;;) {
         size_t avail = self->ringAvailable();
         const bool flushTail = self->asyncState.producerDone && avail > 0;
         if (self->asyncState.discardRing) {
+            break;
+        }
+        if ((avail >= DOWNLOAD_BUFFER_SIZE || flushTail) && !self->writerOpenFile()) {
+            self->requestAsyncFinish(false, "temp file could not be opened", false, FK_SD_WRITE);
+            self->asyncState.discardRing = true;
             break;
         }
         if (avail >= DOWNLOAD_BUFFER_SIZE || flushTail) {
@@ -2056,9 +2169,13 @@ void FileManager::finalizeAsyncDownload() {
     size_t bytesWritten = 0;
     if (asyncState.file) {
         asyncState.file.flush();
-        bytesWritten = asyncState.file.position();
+        bytesWritten = asyncState.file.size(); // the whole file: a resumed prefix included
         asyncState.file.close();
     }
+    // What the complete file must measure: Content-Range's total on a resume (206), else
+    // Content-Length (a 200, also the restart of a resume).
+    const bool resumed = asyncState.resumeFrom > 0 && !asyncState.restartFromZero;
+    const int64_t expectedSize = resumed ? asyncState.rangeTotal : (int64_t)asyncState.contentLength;
     String actualSha;
     if (asyncState.shaActive) {
         uint8_t digest[32];
@@ -2076,14 +2193,15 @@ void FileManager::finalizeAsyncDownload() {
         if (bytesWritten == 0) {
             success = false;
             errorMsg = "No data received";
-        } else if (asyncState.contentLength > 0 && bytesWritten < static_cast<size_t>(asyncState.contentLength)) {
-            // The server closed early (proxy timeout, link drop): transient, retried with backoff.
+        } else if (expectedSize > 0 && (int64_t)bytesWritten < expectedSize) {
+            // The server closed early (proxy timeout, link drop): transient, retried with backoff
+            // (and resumed from here).
             success = false;
-            errorMsg = "Incomplete: wrote " + String(bytesWritten) + " expected " + String(asyncState.contentLength);
-        } else if (asyncState.contentLength > 0 && bytesWritten > static_cast<size_t>(asyncState.contentLength)) {
+            errorMsg = "Incomplete: wrote " + String(bytesWritten) + " expected " + String((long)expectedSize);
+        } else if (expectedSize > 0 && (int64_t)bytesWritten > expectedSize) {
             success = false;
             hardFailure = true; // more bytes than announced: the server is broken, not the link
-            errorMsg = "Size mismatch: wrote " + String(bytesWritten) + " expected " + String(asyncState.contentLength);
+            errorMsg = "Size mismatch: wrote " + String(bytesWritten) + " expected " + String((long)expectedSize);
         } else if (!asyncState.checksum.isEmpty() && !actualSha.equalsIgnoreCase(asyncState.checksum)) {
             success = false;
             hardFailure = true;
@@ -2115,7 +2233,14 @@ void FileManager::finalizeAsyncDownload() {
         default: break;
         }
     }
-    if (!success && SD_MMC.exists(asyncState.tempPath)) {
+    // A transient failure keeps the partial file for a Range resume (it is a valid prefix: the
+    // writer only appends whole chunks); broken data, a refused resume, a full card or a
+    // write error delete it. Terminal give-ups delete it below.
+    const bool restartPending = asyncState.finishKind == FK_RESTART;
+    const bool keepPartial = !success && !hardFailure && !asyncState.permanentFailure && !restartPending &&
+                             !asyncState.checksum.isEmpty() && !asyncState.fileOpenFailed &&
+                             asyncState.finishKind != FK_SD_WRITE && asyncState.finishKind != FK_NO_SPACE;
+    if (!success && !keepPartial && SD_MMC.exists(asyncState.tempPath)) {
         SD_MMC.remove(asyncState.tempPath);
     }
 
@@ -2160,6 +2285,12 @@ void FileManager::finalizeAsyncDownload() {
                 terminal = true;
             }
         }
+        if (restartPending && !terminal) {
+            // The partial file was the problem, not the link: the retry from zero is immediate
+            // and does not count as an attempt.
+            if (it->retryCount > 0) it->retryCount--;
+            it->lastAttempt = 0;
+        }
         if (terminal) {
             downloadQueue.erase(it);
             saveDownloadQueue();
@@ -2168,6 +2299,9 @@ void FileManager::finalizeAsyncDownload() {
         }
     } else {
         terminal = true; // ad-hoc download (not queued): nothing will retry it
+    }
+    if (terminal && keepPartial && SD_MMC.exists(asyncState.tempPath)) {
+        SD_MMC.remove(asyncState.tempPath); // nothing will resume it
     }
     ESP_LOGW(TAG, "Download failed: %s (%s)%s", asyncState.localPath.c_str(), errorMsg.c_str(),
                   terminal ? " - giving up" : " - will retry");

@@ -16,6 +16,11 @@ SRC = os.path.join(ROOT, "src", "Faults.h")
 ROW = re.compile(r'X\((\d+),\s*([A-Z0-9_]+),\s*(INFO|WARNING|ERROR|CRITICAL),\s*"([^"]*)",\s*(EVENT|ON_NETWORK|ON_PLAY|ON_BOOT),\s*"([^"]*)",\s*"([^"]*)"\)')
 
 
+# The TTFAULTS1 marker separates records with ';' and fields with '|' (src/Faults.cpp also
+# refuses them at compile time); the portal cuts a field at the first one it meets.
+SEPARATORS = (";", "|")
+
+
 def catalogue():
     text = open(SRC, encoding="utf-8").read()
     start = text.index("#define TT_FAULT_LIST(X)")
@@ -23,6 +28,11 @@ def catalogue():
     rows = []
     for m in ROW.finditer(text[start:end]):
         code, slug, sev, fruit, clears, desc, remedy = m.groups()
+        for name, value in (("fruit", fruit), ("description", desc), ("remedy", remedy)):
+            bad = [c for c in SEPARATORS if c in value]
+            if bad:
+                sys.exit(f"src/Faults.h: fault {code} {slug}: {name} contains {' and '.join(repr(c) for c in bad)}, "
+                         f"which breaks the TTFAULTS1 marker: {value!r}")
         rows.append({"code": int(code), "slug": slug, "severity": sev.lower(), "fruit": fruit,
                      "clears": clears.lower(), "description": desc, "remedy": remedy})
     return rows

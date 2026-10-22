@@ -11,7 +11,12 @@ PIO="$HOME/.platformio/penv/bin/pio"
 ENV=esp32-s3-devkitc-1
 CFG="$ROOT/sdkconfig.$ENV"
 VERSION="${1:-}"
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+# Strict major.minor.patch, each 0-99 without leading zeros, no prefix or suffix: the same rule
+# as the firmware (src/Version.h, which also refuses the build) and the portal, which derives
+# version_code = major*10000 + minor*100 + patch from the image.
+PART='(0|[1-9][0-9]?)'
+if ! [[ "$VERSION" =~ ^$PART\.$PART\.$PART$ ]]; then
+  echo "refusing version '$VERSION': must be major.minor.patch, each 0-99 (e.g. 1.2.20; not v1.2.20, 1.2, 1.2.100)" >&2
   echo "usage: tools/release.sh <major.minor.patch> [--upload]" >&2
   exit 1
 fi

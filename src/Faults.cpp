@@ -2,10 +2,12 @@
 #include "RequestManager.h"
 #include "Version.h"
 #include "PsramJson.h"
+#include "TimeSync.h"
 #include <Preferences.h>
 #include <esp_system.h>
 #include <esp_attr.h>
 #include <string.h>
+#include <esp_heap_caps.h>
 
 namespace
 {
@@ -23,6 +25,18 @@ constexpr size_t kCatalogSize = sizeof(kCatalog) / sizeof(kCatalog[0]);
 const char kFaultSchema[] __attribute__((used)) = "TTFAULTS1:" TT_FAULT_LIST(TT_FAULT_MARKER);
 #undef TT_FAULT_MARKER
 
+// The marker's separators must not appear inside a field: the portal splits records at ';' and
+// fields at '|' (a remedy with a ';' used to be cut there). Refused at compile time, per row.
+constexpr bool noSeparator(const char *s)
+{
+    return *s == '\0' ? true : (*s != ';' && *s != '|' && noSeparator(s + 1));
+}
+#define TT_FAULT_CHECK(code, name, sev, fruit, clear, desc, remedy)                                                   \
+    static_assert(noSeparator(fruit) && noSeparator(desc) && noSeparator(remedy),                                     \
+                  "fault " #code " " #name ": ';' or '|' in a catalogue field breaks the TTFAULTS1 marker");
+TT_FAULT_LIST(TT_FAULT_CHECK)
+#undef TT_FAULT_CHECK
+
 // Persistent ring of events (NVS blob) - small, fixed-size records.
 constexpr int RING = 32;
 constexpr int DETAIL_LEN = 40;
@@ -30,6 +44,9 @@ constexpr unsigned long DEDUPE_MS = 10UL * 60UL * 1000UL;   // same code: one ev
 constexpr unsigned long UPLOAD_DEBOUNCE_MS = 5000;
 constexpr unsigned long UPLOAD_RETRY_MS = 5UL * 60UL * 1000UL;
 constexpr int UPLOAD_BATCH = 20;
+// Active faults, the same cap in the device report and in the events upload (the two used to
+// disagree: 4 and 8). The portal accepts up to 32.
+constexpr int MAX_ACTIVE = 8;
 
 struct __attribute__((packed)) Entry {
     uint16_t code;
@@ -39,6 +56,18 @@ struct __attribute__((packed)) Entry {
     uint32_t uptimeS;    // uptime of the boot it happened in
     uint32_t boot;       // boot sequence number
     char detail[DETAIL_LEN];
+    uint32_t at;         // unix seconds when it happened (SNTP), 0 = clock not set then
+};
+// Previous layout (firmware 1.2.18 - 1.2.19, magic FAU3): no "at". Migrated at load so an
+// update does not lose the events waiting for upload.
+struct __attribute__((packed)) EntryV3 {
+    uint16_t code;
+    uint8_t severity;
+    uint8_t sent;
+    uint16_t count;
+    uint32_t uptimeS;
+    uint32_t boot;
+    char detail[DETAIL_LEN];
 };
 struct __attribute__((packed)) Ring {
     uint32_t magic;
@@ -46,7 +75,14 @@ struct __attribute__((packed)) Ring {
     uint16_t used;
     Entry e[RING];
 };
-constexpr uint32_t RING_MAGIC = 0x46415533; // "FAU3"
+struct __attribute__((packed)) RingV3 {
+    uint32_t magic;
+    uint16_t head;
+    uint16_t used;
+    EntryV3 e[RING];
+};
+constexpr uint32_t RING_MAGIC = 0x46415534;    // "FAU4"
+constexpr uint32_t RING_MAGIC_V3 = 0x46415533; // "FAU3"
 
 Ring g_ring;
 bool g_dirty = false;
@@ -55,7 +91,7 @@ unsigned long g_lastRaise[kCatalogSize] = {};
 bool g_everRaised[kCatalogSize] = {};
 // Active faults: index into the catalogue + uptime at raise
 struct Active { int idx; uint32_t sinceS; };
-Active g_active[8];
+Active g_active[MAX_ACTIVE];
 int g_activeCount = 0;
 std::function<void(Fault)> g_speaker;
 unsigned long g_uploadAt = 0;      // 0 = nothing pending
@@ -67,6 +103,11 @@ bool g_begun = false;
 RTC_NOINIT_ATTR uint32_t g_rtcMagic;
 RTC_NOINIT_ATTR uint32_t g_rtcUptimeS;
 constexpr uint32_t RTC_MAGIC = 0x55505431; // "UPT1"
+// The previous boot's final uptime (to within the 10 s refresh), captured at boot BEFORE the
+// RTC copy is restarted for this boot. Events of the previous boot get an exact age from it
+// when the gap between the two boots was only a reset (no power-off, no deep sleep).
+uint32_t g_prevUptimeS = 0;
+bool g_prevAgeExact = false;
 
 int indexOf(uint16_t code)
 {
@@ -89,6 +130,30 @@ const char *severityName(Severity s)
 
 uint32_t uptimeS() { return (uint32_t)(millis() / 1000UL); }
 
+// JSON string escaping (quote, backslash, control characters as \u00XX); UTF-8 passes through.
+// out must hold 6x the input in the worst case; a value that would not fit is cut cleanly.
+void jsonEscapeInto(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (const char *p = in; *p; ++p) {
+        const unsigned char c = (unsigned char)*p;
+        char buf[8];
+        const char *add = buf;
+        if (c == '"') add = "\\\"";
+        else if (c == '\\') add = "\\\\";
+        else if (c == '\n') add = "\\n";
+        else if (c == '\r') add = "\\r";
+        else if (c == '\t') add = "\\t";
+        else if (c < 0x20) snprintf(buf, sizeof(buf), "\\u%04x", c);
+        else { buf[0] = (char)c; buf[1] = 0; }
+        const size_t len = strlen(add);
+        if (o + len + 1 > cap) break;
+        memcpy(out + o, add, len);
+        o += len;
+    }
+    out[o] = 0;
+}
+
 void load()
 {
     Preferences p;
@@ -101,6 +166,22 @@ void load()
     if (n == sizeof(Ring) && p.getBytes("ring", &g_ring, sizeof(Ring)) == sizeof(Ring) && g_ring.magic == RING_MAGIC &&
         g_ring.head < RING && g_ring.used <= RING) {
         // ok
+    } else if (n == sizeof(RingV3)) {
+        // Ring written by 1.2.18/1.2.19: same records without the clock time.
+        RingV3 *old = static_cast<RingV3 *>(heap_caps_malloc(sizeof(RingV3), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        memset(&g_ring, 0, sizeof(g_ring));
+        g_ring.magic = RING_MAGIC;
+        if (old && p.getBytes("ring", old, sizeof(RingV3)) == sizeof(RingV3) && old->magic == RING_MAGIC_V3 &&
+            old->head < RING && old->used <= RING) {
+            g_ring.head = old->head;
+            g_ring.used = old->used;
+            for (int k = 0; k < RING; ++k) {
+                memcpy(&g_ring.e[k], &old->e[k], sizeof(EntryV3));
+                g_ring.e[k].at = 0;
+            }
+            g_dirty = true;
+        }
+        if (old) heap_caps_free(old);
     } else {
         memset(&g_ring, 0, sizeof(g_ring));
         g_ring.magic = RING_MAGIC;
@@ -137,7 +218,22 @@ void record(const FaultInfo &info, const char *detail)
     e.count = 1;
     e.uptimeS = uptimeS();
     e.boot = g_boot;
-    if (detail) strlcpy(e.detail, detail, sizeof(e.detail));
+    if (detail) {
+        strlcpy(e.detail, detail, sizeof(e.detail));
+        // A cut inside a multi-byte UTF-8 character would make the upload invalid JSON for the
+        // portal (the whole batch refused): drop the incomplete tail.
+        size_t n = strlen(e.detail);
+        if (n == sizeof(e.detail) - 1) {
+            size_t lead = n;
+            while (lead > 0 && (((uint8_t)e.detail[lead - 1]) & 0xC0) == 0x80) lead--;
+            if (lead > 0 && ((uint8_t)e.detail[lead - 1]) >= 0xC0) {
+                const uint8_t c = (uint8_t)e.detail[lead - 1];
+                const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+                if (n - (lead - 1) < need) e.detail[lead - 1] = 0;
+            }
+        }
+    }
+    e.at = TimeSync::now(); // 0 until SNTP has set the clock (the upload derives it later if it can)
     g_ring.head = (g_ring.head + 1) % RING;
     if (g_ring.used < RING) g_ring.used++;
     g_dirty = true;
@@ -168,8 +264,27 @@ void classifyReset()
 {
     const esp_reset_reason_t r = esp_reset_reason();
     const bool haveUptime = (g_rtcMagic == RTC_MAGIC);
+    // Captured before g_rtcUptimeS is restarted below (it used to be zeroed first and every
+    // event of the previous boot got this boot's uptime as its age).
+    g_prevUptimeS = haveUptime ? g_rtcUptimeS : 0;
+    // Exact only when the toy went from the previous boot straight into this one: a software,
+    // panic, watchdog or brownout reset. After a power-off or a deep sleep the time in between
+    // is unknown, so those ages are lower bounds ("approx").
+    switch (r) {
+    case ESP_RST_SW:
+    case ESP_RST_PANIC:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+    case ESP_RST_BROWNOUT:
+        g_prevAgeExact = haveUptime;
+        break;
+    default:
+        g_prevAgeExact = false;
+        break;
+    }
     char detail[DETAIL_LEN];
-    snprintf(detail, sizeof(detail), "reason=%d prev_uptime=%lus", (int)r, haveUptime ? (unsigned long)g_rtcUptimeS : 0UL);
+    snprintf(detail, sizeof(detail), "reason=%d prev_uptime=%lus", (int)r, (unsigned long)g_prevUptimeS);
     const FaultInfo *fi = nullptr;
     switch (r) {
     case ESP_RST_TASK_WDT:
@@ -212,14 +327,35 @@ void buildBatch(JsonDocument &doc, int &count)
         o["uptime_s"] = e.uptimeS;
         o["boot"] = e.boot;
         o["firmware"] = firmwareVersion();
-        // Age: exact within this boot; for an earlier boot the time the toy was off is unknown,
-        // so the previous boot's final uptime (RTC) bounds it from below.
-        uint32_t age = (e.boot == g_boot) ? (now - e.uptimeS) : (now + (g_rtcUptimeS > e.uptimeS ? g_rtcUptimeS - e.uptimeS : 0));
+        // Age: exact within this boot, and for the previous boot when only a reset lay in
+        // between (its final uptime was captured at boot). Older boots, or a gap with a
+        // power-off / deep sleep: the toy's off time is unknown, the age is a lower bound and
+        // the event says so ("approx": true).
+        bool exact = true;
+        uint32_t age;
+        if (e.boot == g_boot) {
+            age = now >= e.uptimeS ? now - e.uptimeS : 0;
+        } else if (e.boot + 1 == g_boot && g_prevUptimeS > 0) {
+            age = now + (g_prevUptimeS > e.uptimeS ? g_prevUptimeS - e.uptimeS : 0);
+            exact = g_prevAgeExact;
+        } else {
+            age = now;
+            exact = false;
+        }
         o["age_s"] = age;
+        if (!exact) o["approx"] = true;
+        // Wall-clock time when known (the portal prefers it over age_s): stored at raise once
+        // SNTP had set the clock, else derived now from an exact age.
+        const uint32_t unixNow = TimeSync::now();
+        if (e.at) {
+            o["at"] = e.at;
+        } else if (exact && unixNow > age) {
+            o["at"] = unixNow - age;
+        }
         count++;
     }
     JsonArray active = doc["active"].to<JsonArray>();
-    for (int i = 0; i < g_activeCount; ++i) {
+    for (int i = 0; i < g_activeCount && i < MAX_ACTIVE; ++i) {
         JsonObject a = active.add<JsonObject>();
         a["c"] = kCatalog[g_active[i].idx].code;
         a["since_s"] = now - g_active[i].sinceS;
@@ -267,9 +403,10 @@ void upload()
             for (int k = 0; k < g_ring.used; ++k) {
                 if (!g_ring.e[k].sent) { g_uploadAt = millis() + 1000; break; }
             }
-        } else if (code == 422 || code == 400) {
-            // The portal refused the batch itself (not a transport problem): keeping it would block
-            // every later event behind it. Drop it and move on.
+        } else if (code >= 400 && code < 500 && code != 408 && code != 429) {
+            // The portal refused the batch (validation, unknown or foreign hub, token refused
+            // even after the refresh RequestManager already tried): keeping it would block every
+            // later event behind it. Dropped, not retried (docs/FAULTS.md).
             markSent(sent);
             save();
             g_uploadAt = 0;
@@ -384,7 +521,7 @@ String Faults::reportJson()
 {
     const uint32_t now = uptimeS();
     String s = "\"active\":[";
-    for (int i = 0; i < g_activeCount && i < 4; ++i) {
+    for (int i = 0; i < g_activeCount && i < MAX_ACTIVE; ++i) {
         if (i) s += ",";
         s += "{\"c\":" + String(kCatalog[g_active[i].idx].code) + ",\"since_s\":" + String(now - g_active[i].sinceS) + "}";
     }
@@ -398,8 +535,10 @@ String Faults::reportJson()
     if (!last) {
         s += "null";
     } else {
-        String d = last->detail;
-        d.replace("\"", "'");
+        // The detail goes into a hand-built frame: a backslash, quote or control character in
+        // it used to break the whole report (only '"' was handled).
+        char d[DETAIL_LEN * 6 + 1];
+        jsonEscapeInto(last->detail, d, sizeof(d));
         s += "{\"c\":" + String(last->code) + ",\"age_s\":" + String(now - last->uptimeS) + ",\"n\":" + String(last->count) + ",\"d\":\"" + d + "\"}";
     }
     return s;

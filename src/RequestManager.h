@@ -17,6 +17,7 @@
 #include <functional>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <atomic>
 
 class RequestManager
 {
@@ -41,8 +42,9 @@ private:
     JsonDocument executeHttpRequest(const String& endpoint, const String& method, const String* payload = nullptr);
     // One HTTP exchange (serialized by httpLock). Returns the HTTP status (>0), an HTTPClient
     // error (<0) or 0 when the request was not attempted; error carries the reason.
+    // retryAfterS: filled with the Retry-After seconds of a 429 (default 60).
     int performHttp(const String& endpoint, const String& method, const String* payload, String& body, String& error,
-                    const String& ifNoneMatch = String());
+                    const String& ifNoneMatch = String(), int* retryAfterS = nullptr);
     JsonDocument responseToDocument(int code, const String& body, const String& error);
 
     // Private constructor for singleton
@@ -71,11 +73,33 @@ public:
     // worker task; the callback runs from update() on the loop task with the parsed body or
     // {"error":true,"message":...}. Returns false when there is no network (no callback).
     using AsyncCallback = std::function<void(JsonDocument &doc, int status)>;
+    // What the worker does with a non-final answer before the callback sees it:
+    //  - 429: the portal throttles every request of this hub until Retry-After (default 60 s);
+    //    BACKGROUND and INTERACTIVE requests wait and are re-sent (twice at most); none of it
+    //    counts as "offline".
+    //  - 5xx: BACKGROUND requests are re-sent after 30 s, 2 min and 10 min; INTERACTIVE ones (a
+    //    tap: the child waits) are answered at once. PORTAL_UNREACHABLE is raised only once four
+    //    5xx answers came in a row (the first one plus three retries).
+    //  - NONE: answered at once whatever the status (OtaManager runs its own schedule); during a
+    //    429 throttle such a request is not sent at all and answers 429.
+    // A 429 answer carries "_retry_after" (seconds) in the document.
+    enum class Retry : uint8_t { BACKGROUND, INTERACTIVE, NONE };
     // ifNoneMatch: a manifest checksum sent as If-None-Match; the portal answers 304 (no body) when unchanged.
     bool requestAsync(const String &endpoint, const String &method, const String &payload, AsyncCallback cb,
-                      const String &ifNoneMatch = String());
-    bool getAsync(const String &endpoint, AsyncCallback cb) { return requestAsync(endpoint, "GET", String(), cb); }
-    bool postAsync(const String &endpoint, const JsonDocument &data, AsyncCallback cb);
+                      const String &ifNoneMatch = String(), Retry retry = Retry::BACKGROUND);
+    bool getAsync(const String &endpoint, AsyncCallback cb, Retry retry = Retry::BACKGROUND)
+    {
+        return requestAsync(endpoint, "GET", String(), cb, String(), retry);
+    }
+    bool postAsync(const String &endpoint, const JsonDocument &data, AsyncCallback cb, Retry retry = Retry::BACKGROUND);
+    // millis() of the last 2xx/304 from the portal (0 = none this boot): "the portal was reached"
+    // for the OTA image confirmation.
+    unsigned long lastPortalSuccessAt() const { return portalSuccessAt.load(); }
+    // A hub endpoint answered 403 (unbound / token revoked): get a fresh device token. Called at
+    // most once per 10 min from performHttp, which then retries the request once.
+    // [F2 stub: validates / re-acquires with today's flow; the F1 branch replaces it with the
+    //  POST /token + secret flow, same signature.]
+    bool forceTokenRefresh(const char *reason);
     bool hasPendingRequests();                      // queued, in flight or not yet dispatched
     bool isRequestPending(const String &endpoint);  // the same endpoint is queued or in flight
 
@@ -239,7 +263,8 @@ private:
     void removeStaleAssets(const String &uid, const JsonDocument &currentManifest, const JsonDocument *previousManifest);
     void processOnlineFigureRequest(const String &uid, bool alreadyEmitted);
     void processOfflineFigureRequest(const String &uid);
-    void handleUnitManifest(const String &uid, bool alreadyEmitted, JsonDocument &doc); // loop task
+    void handleUnitManifest(const String &uid, bool alreadyEmitted, JsonDocument &doc, int status); // loop task
+    void purgeRevokedUnit(const String &uid);   // 410 {"revoked": true}: the card was deleted on the portal
 
     // Request worker
     struct AsyncJob {
@@ -251,6 +276,11 @@ private:
         String body;
         String error;
         int status = 0;
+        Retry retry = Retry::BACKGROUND;
+        uint8_t throttleRetries = 0;   // 429 re-sends
+        uint8_t serverRetries = 0;     // 5xx re-sends (BACKGROUND)
+        int retryAfterS = 0;           // of the last 429
+        unsigned long notBefore = 0;   // millis(); 0 = ready
     };
     std::deque<AsyncJob*> jobQueue;     // waiting for the worker
     std::deque<AsyncJob*> jobDone;      // finished, callback not yet run
@@ -259,6 +289,12 @@ private:
     bool workerRunning = false;
     SemaphoreHandle_t jobLock = nullptr;   // guards the deques + worker state
     SemaphoreHandle_t httpLock = nullptr;  // recursive: one HTTP exchange at a time
+    // Portal-wide state shared by every request (worker task + loop): a 429 throttle and the
+    // run of consecutive 5xx answers.
+    std::atomic<unsigned long> throttledUntil{0};
+    std::atomic<int> consecutive5xx{0};
+    std::atomic<unsigned long> portalSuccessAt{0};
+    bool requeueIfRetrying(AsyncJob *job);   // worker: true when the job goes back to the queue
     static void workerEntry(void *arg);
     void workerLoop();
     void dispatchCompletedJobs();

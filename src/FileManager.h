@@ -76,6 +76,14 @@ private:
         String tempPath;
         String checksum;         // expected sha256 (hex) from the manifest, may be empty
         String requestPath;      // HTTP request path (built before connect())
+        // Range resume of an interrupted .tmp (docs/CONTENT-SYNC.md "Interrupted downloads"):
+        // resumeFrom bytes are on the card; the request asks for the rest. The SD writer hashes
+        // the existing prefix first and opens the file for append - or truncates it when the
+        // server answers 200 (restartFromZero, set by the network side before any body byte).
+        size_t resumeFrom;
+        int64_t rangeTotal;              // total size from Content-Range (206), -1 unknown
+        volatile bool restartFromZero;
+        volatile bool fileOpenFailed;    // writer could not (re)open the temp file
         int httpStatus;
         uint64_t freeBytesAtStart;
         // Completion handshake. Two producers (async_tcp callbacks, SD writer) may ask to finish;
@@ -149,11 +157,17 @@ private:
             discardRing = false;
             drainStartedMs = 0;
             shaActive = false;
+            resumeFrom = 0;
+            rangeTotal = -1;
+            restartFromZero = false;
+            fileOpenFailed = false;
         }
     };
 
     enum : uint8_t { FINISH_NONE = 0, FINISH_CLAIMED = 1, FINISH_READY = 2 };
-    enum FinishKind : uint8_t { FK_NONE = 0, FK_STALLED, FK_NO_SPACE, FK_SD_WRITE };
+    // FK_RESTART: the partial file cannot be continued (416, wrong Content-Range, prefix
+    // unreadable): it is deleted and the next attempt starts from zero, without a retry penalty.
+    enum FinishKind : uint8_t { FK_NONE = 0, FK_STALLED, FK_NO_SPACE, FK_SD_WRITE, FK_RESTART };
 
     // Private members
     bool sdCardInitialized;
@@ -229,6 +243,7 @@ private:
     
     // Async download helpers
     static void sdWriteTask(void* parameter);
+    bool writerOpenFile();                  // SD writer: hash the resumed prefix, open for append / truncate
 
     // Deferred deletes: SD_MMC.remove() takes 0.3-2 s per file on a slow card, so stale assets are
     // erased by a low-priority task on core 0 instead of stalling the loop task.
@@ -245,6 +260,7 @@ private:
     // Orphaned "*.tmp" under /assets (a download cut by a reset) are swept by the maintenance
     // task at boot; no download starts while a sweep is queued or running.
     std::atomic<bool> tmpSweepPending{false};
+    std::vector<String> tmpKeep;            // "*.tmp" of queued downloads: kept for Range resume
     void sweepOrphanedTempFiles();          // maintenance task
     void sweepTempDir(const String &dir, int depth, int &removed);
     std::atomic<int> pendingDeletes{0};   // all queued jobs (name kept for the callers)

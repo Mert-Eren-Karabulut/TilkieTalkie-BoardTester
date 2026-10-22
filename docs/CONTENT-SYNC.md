@@ -43,7 +43,35 @@ small JSON files and no duplicate audio.
 Downloads of changed content happen whenever the toy is online (battery or dock), one
 file at a time, with the story playlist waiting for the next track at its end if needed.
 
+## Manifest answers (firmware 1.2.20+)
+
+| status | meaning on the toy |
+|---|---|
+| 200 | manifest, applied as above |
+| 304 | (re-check only) unchanged |
+| 404 | no such unit: tap → `201 FIGURE_UNKNOWN` (elma); a cached copy is **kept** |
+| 410 `{"revoked": true}` | the card was deleted on the portal: its manifest, pending manifest, the assets no other cached card references and their queued downloads are **purged**, the inventory is re-sent; a tap says elma |
+| 429 | throttled: every portal request pauses for `Retry-After` (default 60 s) and is re-sent (twice at most); not "offline" |
+| 5xx | a tap is answered at once (the cache plays; nothing cached → armut); background re-checks are re-sent after 30 s, 2 min, 10 min |
+| 403 | the device token is refreshed (at most once per 10 min) and the request retried once |
+
+An asset without a `checksum` is **not downloaded** (`204 DOWNLOAD_FAILED`, detail `nosha`); a
+copy already on the card stays playable. Queued entries without a checksum left by older
+firmware are dropped. The portal always sends checksums (PROTOCOL-V2 §8).
+
 ## Interrupted downloads
+
+**Range resume.** A transfer cut by a link drop, a stall or a reboot keeps its `<path>.tmp`
+(the boot sweep of orphaned `.tmp` files keeps those of queued downloads). The next attempt
+sends `Range: bytes=<tmp size>-`:
+- `206` with `Content-Range: bytes <tmp size>-<last>/<total>` (`last + 1 == total`): the rest is
+  appended; the SD writer hashes the prefix first, so the sha256 covers the whole file, and the
+  final size must equal `total`;
+- `200`: the server ignored the Range: the `.tmp` is truncated and the whole file written;
+- `416`, or any other `Content-Range`: the `.tmp` is deleted and the download restarts from
+  zero at once (not counted as a failed attempt).
+A checksum mismatch, an oversize file, a full card or a write error deletes the `.tmp`; so does
+giving up on the file or cancelling it.
 
 A reboot (update, button) in the middle of a figure download used to leave the pending
 manifest orphaned: the queued downloads resumed, but nothing promoted the manifest, so the
@@ -61,6 +89,35 @@ tracker back and the missing files are (re)queued.
   (pending manifest), `partial` (final manifest, some tracks missing) or `ready`.
 - `last_error` is cleared when a figure plays, when WiFi is back (portakal), and by the
   reboot that ends an update (karpuz).
+
+## Storage over port 80: the nginx contract
+
+Story tracks (`/storage/...`, whatever the manifest's `url` names) and prompt pack files (`/storage/prompts/...`) are fetched by AsyncTCP
+over **plain HTTP on port 80** (no TLS client on that path; integrity comes from the sha256 in
+the TLS manifest). The portal's nginx must, for `http://portal.tilkietalkie.com/storage/`:
+1. answer on port 80 **without** redirecting to HTTPS: a `301`/`302` is refused by the toy (the
+   file stays queued, the figure never completes; the old code saved the redirect page);
+2. send a `Content-Length` and **no** `Transfer-Encoding: chunked` (refused) - i.e. serve the
+   file statically (`sendfile`), not through PHP;
+3. honour `Accept-Encoding: identity` (no gzip of mp3/json);
+4. support single byte ranges: `Range: bytes=N-` → `206` with `Content-Range`, `416` when N is
+   past the end (nginx's static module does this by default);
+5. close the connection after the response (`Connection: close` from the toy);
+6. keep `/storage/prompts/` on the same rules as the tracks (a redirect there shows up as the
+   pack's files staying "queued").
+The `https://` URLs in manifests are rewritten to `http://` by the firmware for this path; the
+API, the firmware image download and Reverb stay on TLS.
+
+## Inventory (`client-device-files`)
+
+One message per cached figure, `seq` 1..`total` (`total: 0, figure: null` for an empty card),
+plus `sd`. A figure lists at most 60 tracks; with more, `figure.truncated: true` (always a
+boolean). A figure whose track list does not fit one frame (every frame < 9,000 bytes; Reverb
+drops > 10,000) is sent as several messages with the same `seq`/`total` and top-level
+`part` (1-based) and `parts` (≤ 32); each part repeats `figure.uid`, `id`, `name`, `bytes`,
+`state`, `truncated` and carries only its slice of `tracks`. The portal concatenates the parts of
+the same `seq`/`uid` in part order. A figure that fits one frame carries no `part`/`parts`.
+Track and figure names are cut at 120 bytes on a UTF-8 boundary.
 
 ## Not done yet
 

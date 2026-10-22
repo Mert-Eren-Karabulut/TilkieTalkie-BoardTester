@@ -56,6 +56,10 @@ public:
     // both callbacks get the result.
     bool stage(const Pack &pack, const String &forVersion, std::function<void(bool)> cb);
     bool isStaging() const { return _staging; }
+    // Stops a staging in progress (OTA: battery under 15 % on battery): queued pack downloads
+    // are cancelled, the files already in /sounds.staging stay for the next attempt, the
+    // waiting callback gets false.
+    void cancelStaging();
     int stagingProgress() const;   // files done, in percent
 
     void onFileDone(const String &path, bool success);   // loop task, from the download callback
