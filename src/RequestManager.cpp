@@ -873,6 +873,15 @@ void RequestManager::handleUnitManifest(const String &uid, bool alreadyEmitted, 
         if (storagePath.isEmpty()) {
             continue;
         }
+        if (checksum.isEmpty()) {
+            // Unverifiable content over plain HTTP is never downloaded (PROTOCOL-V2 §8: the
+            // portal always sends a checksum). A copy already on the card stays playable.
+            ESP_LOGW(TAG, "asset %s has no checksum - not downloaded", storagePath.c_str());
+            Faults::raise(Fault::DOWNLOAD_FAILED, "nosha", false);
+            if (!fileManager.isPresent(storagePath)) {
+                continue;
+            }
+        }
         trackPaths.push_back(storagePath);
         // A file replaced on the portal keeps its path but gets a new checksum: the copy on the
         // card is stale. Unless it is the track playing right now, drop it and download again.
@@ -1920,6 +1929,11 @@ void RequestManager::recoverPendingManifests()
             trackPaths.push_back(path);
             const String url = asset["url"].as<String>();
             const String checksum = asset["checksum"].as<String>();
+            if (checksum.isEmpty() && !fm.isPresent(path)) {
+                Faults::raise(Fault::DOWNLOAD_FAILED, "nosha", false); // never fetched unverified
+                trackPaths.pop_back();
+                continue;
+            }
             fm.addRequiredFile(path, url, checksum, false);
             if (!fm.isPresent(path) && url.length() > 0) {
                 fm.scheduleDownload(url, path, checksum, false);
