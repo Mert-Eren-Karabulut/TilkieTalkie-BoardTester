@@ -218,7 +218,21 @@ void record(const FaultInfo &info, const char *detail)
     e.count = 1;
     e.uptimeS = uptimeS();
     e.boot = g_boot;
-    if (detail) strlcpy(e.detail, detail, sizeof(e.detail));
+    if (detail) {
+        strlcpy(e.detail, detail, sizeof(e.detail));
+        // A cut inside a multi-byte UTF-8 character would make the upload invalid JSON for the
+        // portal (the whole batch refused): drop the incomplete tail.
+        size_t n = strlen(e.detail);
+        if (n == sizeof(e.detail) - 1) {
+            size_t lead = n;
+            while (lead > 0 && (((uint8_t)e.detail[lead - 1]) & 0xC0) == 0x80) lead--;
+            if (lead > 0 && ((uint8_t)e.detail[lead - 1]) >= 0xC0) {
+                const uint8_t c = (uint8_t)e.detail[lead - 1];
+                const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+                if (n - (lead - 1) < need) e.detail[lead - 1] = 0;
+            }
+        }
+    }
     e.at = TimeSync::now(); // 0 until SNTP has set the clock (the upload derives it later if it can)
     g_ring.head = (g_ring.head + 1) % RING;
     if (g_ring.used < RING) g_ring.used++;

@@ -112,9 +112,13 @@ def tone(parts):
 
 
 def encode(pcm):
+    # Exactly what the portal's normaliser produces for prompt packs (PROTOCOL-V2 §8: MP3, mono,
+    # 44.1 kHz, 64 kbps CBR), so it can skip re-encoding: MPEG-1 Layer III, 64 kbps, 44100 Hz,
+    # mono. The output rate is pinned: LAME may otherwise resample low bitrates to 32 kHz.
     enc = lameenc.Encoder()
     enc.set_bit_rate(64)
     enc.set_in_sample_rate(RATE)
+    enc.set_out_sample_rate(RATE)
     enc.set_channels(1)
     enc.set_quality(2)
     return bytes(enc.encode(pcm.tobytes())) + bytes(enc.flush())

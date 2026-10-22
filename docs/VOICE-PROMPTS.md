@@ -113,7 +113,7 @@ remotely, paired with firmware releases (portal docs/OTA.md "Voice prompt packs"
   failed or interrupted image download leaves old prompts with old firmware; the staging folder
   is reused on the next attempt and dropped when no update is on the way any more.
 - **Rollback.** The new firmware keeps the previous pack as `/sounds.old` until the image is
-  confirmed (60 s). If the bootloader rolls back, the previous firmware finds a pack marked for
+  confirmed (portal reached, or 10 min of uptime; docs/OTA-STATE-MACHINE.md). If the bootloader rolls back, the previous firmware finds a pack marked for
   another version next to `/sounds.old` and restores its own.
 - **Pack changed for the current release / card without a pack.** The device downloads it the
   same way and swaps it in as soon as no prompt is playing.

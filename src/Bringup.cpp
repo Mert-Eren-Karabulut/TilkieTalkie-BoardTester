@@ -150,7 +150,9 @@ void updateBringup()
     case BRINGUP_COMPLETE:
         config.storeInt(BRINGUP_NVS_KEY, 1);
         battery.setChargeCurrent(Policy::CHARGE_CURRENT_FAST_MA); // calibrated now -> safe to raise
-        sleepController.setInactivityTimeout(Policy::INACTIVITY_TIMEOUT_SHORT_MS); // see Policy.h
+        // The normal inactivity timeout (5 min), not the 30 s value it used to restore: a freshly
+        // brought-up toy slept after 30 s of inactivity until its next reboot.
+        sleepController.setInactivityTimeout(Policy::INACTIVITY_TIMEOUT_MS);
         sleepController.resetActivity();
         ledController.setMaxBrightness(255);
         ledController.simpleLed(BRINGUP_LED_SUCCESS, 255); // solid green

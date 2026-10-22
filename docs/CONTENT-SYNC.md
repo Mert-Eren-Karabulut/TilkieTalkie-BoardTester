@@ -92,8 +92,7 @@ tracker back and the missing files are (re)queued.
 
 ## Storage over port 80: the nginx contract
 
-Story tracks (`/storage/tracks/...`, `/storage/contents/...`, `/storage/custom_tracks/...`, as the
-manifest's `url` says) and prompt pack files (`/storage/prompts/...`) are fetched by AsyncTCP
+Story tracks (`/storage/...`, whatever the manifest's `url` names) and prompt pack files (`/storage/prompts/...`) are fetched by AsyncTCP
 over **plain HTTP on port 80** (no TLS client on that path; integrity comes from the sha256 in
 the TLS manifest). The portal's nginx must, for `http://portal.tilkietalkie.com/storage/`:
 1. answer on port 80 **without** redirecting to HTTPS: a `301`/`302` is refused by the toy (the
