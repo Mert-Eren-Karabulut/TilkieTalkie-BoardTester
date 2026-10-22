@@ -67,7 +67,7 @@ Buttons 2 + 3 held 5 s restart the toy (unchanged).
 
 | command | what |
 |---|---|
-| `endpoint set <api_base> <reverb_host> <port> <tls 0\|1> [key]` | point the unit at a bench portal (NVS; `restart` to apply); the captive-portal probe follows it (`http://<host>:<port>/storage/ping.json` for an http base) |
+| `endpoint set <api_base> <reverb_host> <port> <tls 0\|1> [key]` | point the unit at a bench portal (NVS; `restart` to apply); the portal probe follows it (`http://<host>:<port>/storage/ping.json` for an http base): until it answers `{"ping":"tilkie"}` the toy is offline; an answer that is not ours = captive portal (rejected while pairing), no answer = no internet (accepted while pairing, re-probed every 2 min) |
 | `sdformat` | delete everything on the card (no confirmation) |
 | `download <url> <path>`, `addfile <path> <url>`, `deletefile <path>` | manual file management (any URL, any path) |
 | `ota url <url> <sha256> <size> [version]` | install an arbitrary image |

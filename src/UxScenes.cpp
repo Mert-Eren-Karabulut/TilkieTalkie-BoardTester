@@ -170,7 +170,7 @@ void deriveLedScene()
     {
         ledController.setScene(LedController::SCENE_DOWNLOADING);
     }
-    else if (!WiFi.isConnected() || wifiProv.isCaptive())
+    else if (!WiFi.isConnected() || wifiProv.isOfflineOnLink())
     {
         if (wifiProv.isProvisioningManagerActive())
             ledController.setScene(LedController::SCENE_PROVISIONING);

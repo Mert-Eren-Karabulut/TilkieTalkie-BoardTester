@@ -109,12 +109,19 @@ States: IDLE, CHECKING, WAITING, PROMPTS, DOWNLOADING, APPLYING, REBOOTING, FAIL
 - Open networks are accepted (empty password stored and mirrored). After every connection the
   device probes `GET http://<host of the configured API base>/storage/ping.json` (plain HTTP,
   port 80 for an https base, the base's own port for an http bench base; no redirects
-  followed, 5 s) and needs the body to be exactly `{"ping":"tilkie"}` after trimming
-  whitespace; any redirect, HTML, other body or no answer means a captive portal. Network
-  services (token, Reverb, checks, downloads) start only after the probe passed.
-- During provisioning the probe runs before the provisioning manager reports success; a
-  failed probe is reported to the app as a failed connection (the same status as a wrong
-  password: FAIL / auth error).
+  followed, 5 s). Three outcomes:
+  - **online**: the body is exactly `{"ping":"tilkie"}` after trimming whitespace;
+  - **captive portal**: an answer arrives but is not ours (any 3xx, HTML, another body, not
+    HTTP; a DNS hijack shows up as one of these);
+  - **no internet**: no answer at all (DNS failure, connect timeout, reset, silence for 5 s).
+  Network services (token, Reverb, checks, downloads) start only once the probe says online;
+  captive and no internet are both "offline" with a re-probe every 2 minutes.
+- During provisioning the probe runs before the provisioning manager reports success. Only a
+  captive portal is rejected: the app sees a failed connection (the same status as a wrong
+  password: FAIL / auth error), the credentials are forgotten, 113 and `setup_captive`. A
+  network without internet (or a portal outage) is accepted as before: the app sees success,
+  the credentials stay, the toy waits offline and comes online when the probe passes (106
+  PORTAL_UNREACHABLE, silent, once per link).
 - During provisioning a captive network is **rejected**: the credentials are forgotten, fault
   113 CAPTIVE_PORTAL (warning, fruit **nar**) is raised, the prompt `setup_captive` is spoken
   ("Bu ağ bir giriş sayfası istiyor, lütfen başka bir ağ seç. Hata kodu: Nar.") and

@@ -23,7 +23,7 @@ const char *PROBE_BODY = "{\"ping\":\"tilkie\"}";
 // provisioning the event-loop handler below waits on the semaphore without needing stack.
 struct ProbeState {
     std::atomic<bool> busy{false};
-    std::atomic<int8_t> result{-1};   // -1 running/none, 0 failed, 1 passed
+    std::atomic<int8_t> result{-1};   // -1 running/none, else a ProbeResult
     char host[64] = {};
     uint16_t port = 80;
     char why[40] = {};
@@ -31,12 +31,17 @@ struct ProbeState {
 };
 ProbeState g_probe;
 
-bool runProbe(const char *host, uint16_t port, char *why, size_t whyLen)
+// Three outcomes: our body (online); an answer that is not ours (a 3xx, HTML, any other body:
+// someone on this network intercepts HTTP = captive portal); no answer at all (DNS failure,
+// connect timeout, reset, silence for 5 s = the link has no internet right now).
+enum ProbeResult : int8_t { PROBE_CAPTIVE = 0, PROBE_OK = 1, PROBE_NO_INTERNET = 2 };
+
+ProbeResult runProbe(const char *host, uint16_t port, char *why, size_t whyLen)
 {
     WiFiClient c;
     if (!c.connect(host, port, 5000)) {
-        snprintf(why, whyLen, "connect");
-        return false;
+        snprintf(why, whyLen, "connect failed");
+        return PROBE_NO_INTERNET;
     }
     char req[200];
     if (port == 80) {
@@ -62,19 +67,24 @@ bool runProbe(const char *host, uint16_t port, char *why, size_t whyLen)
     }
     c.stop();
     buf[n] = '\0';
-    // Status line: anything but 200 (a 30x to a login page included; redirects are never followed).
+    if (n == 0) {
+        snprintf(why, whyLen, "no answer");
+        return PROBE_NO_INTERNET;
+    }
+    // Something answered. Status line: anything but 200 (a 30x to a login page included;
+    // redirects are never followed) is not ours.
     int status = 0;
     if (n > 12 && strncmp(buf, "HTTP/1.", 7) == 0) {
         status = atoi(buf + 9);
     }
     if (status != 200) {
-        snprintf(why, whyLen, n ? "http=%d" : "no answer", status);
-        return false;
+        snprintf(why, whyLen, status ? "http=%d" : "not http", status);
+        return PROBE_CAPTIVE;
     }
     char *body = strstr(buf, "\r\n\r\n");
     if (!body) {
         snprintf(why, whyLen, "no body");
-        return false;
+        return PROBE_CAPTIVE;
     }
     body += 4;
     while (*body && isspace((unsigned char)*body)) body++;
@@ -82,18 +92,18 @@ bool runProbe(const char *host, uint16_t port, char *why, size_t whyLen)
     while (end > body && isspace((unsigned char)end[-1])) *--end = '\0';
     if (strcmp(body, PROBE_BODY) != 0) {
         snprintf(why, whyLen, "body mismatch (%u bytes)", (unsigned)strlen(body));
-        return false;
+        return PROBE_CAPTIVE;
     }
     snprintf(why, whyLen, "ok");
-    return true;
+    return PROBE_OK;
 }
 
 void probeTask(void *)
 {
     char why[40];
-    const bool ok = runProbe(g_probe.host, g_probe.port, why, sizeof(why));
+    const ProbeResult r = runProbe(g_probe.host, g_probe.port, why, sizeof(why));
     strlcpy(g_probe.why, why, sizeof(g_probe.why));
-    g_probe.result = ok ? 1 : 0;
+    g_probe.result = r;
     g_probe.busy = false;
     xSemaphoreGive(g_probe.done);
     vTaskDelete(nullptr);
@@ -456,6 +466,7 @@ void WiFiProvisioningManager::handleBackgroundReconnection() {
     }
     portalOk = false;
     captiveNow = false;
+    noInternetNow = false;
     if (provisioningManagerInitialized || !isProvisioned()) {
         return;
     }
@@ -674,7 +685,7 @@ void WiFiProvisioningManager::provEventHandler(void *arg, esp_event_base_t base,
 // Only while provisioning, for the connection the app's credentials just produced: the
 // manager must not report success for a network that is a captive portal. The probe runs on
 // its own task; this handler only waits (up to 12 s, the event loop is otherwise idle while a
-// phone provisions). On failure a synthetic "auth failed" disconnect is posted: the manager
+// phone provisions). Only on a captive answer (case b; not on "no answer") a synthetic "auth failed" disconnect is posted: the manager
 // turns it into the same FAIL/AUTH_ERROR status the app shows for a wrong password.
 void WiFiProvisioningManager::gotIpPreHandler(void *arg, esp_event_base_t, int32_t, void *)
 {
@@ -690,12 +701,17 @@ void WiFiProvisioningManager::gotIpPreHandler(void *arg, esp_event_base_t, int32
     for (int i = 0; i < 60 && !(started = startProbe(self->probeHost, self->probePort)); ++i) {
         vTaskDelay(pdMS_TO_TICKS(100)); // a probe of the loop's is still running
     }
-    bool ok = false;
+    // Only a positive "not ours" (case b) rejects the network. No answer (case c, or a probe
+    // that could not run in time) is "no internet yet": the manager reports success as before,
+    // the credentials stay, and the loop re-probes every 2 min.
+    int8_t result = PROBE_NO_INTERNET;
     if (started && xSemaphoreTake(g_probe.done, pdMS_TO_TICKS(12000)) == pdTRUE) {
-        ok = g_probe.result.load() == 1;
+        result = g_probe.result.load();
     }
-    ESP_LOGI(TAG, "provisioning: portal probe %s (%s)", ok ? "passed" : "FAILED", started ? g_probe.why : "not started");
-    if (ok) {
+    ESP_LOGI(TAG, "provisioning: portal probe %s (%s)",
+             result == PROBE_OK ? "passed" : result == PROBE_CAPTIVE ? "CAPTIVE" : "no internet yet - accepted",
+             started ? g_probe.why : "not started");
+    if (result != PROBE_CAPTIVE) {
         return;
     }
     self->captiveRejectPending = true;
@@ -728,18 +744,21 @@ void WiFiProvisioningManager::serviceProbe()
             return;
         }
         loopProbeRunning = false;
-        const bool ok = g_probe.result.load() == 1;
-        portalOk = ok;
-        captiveNow = !ok;
-        if (ok) {
+        const int8_t r = g_probe.result.load();
+        portalOk = r == PROBE_OK;
+        captiveNow = r == PROBE_CAPTIVE;
+        noInternetNow = r == PROBE_NO_INTERNET;
+        if (portalOk) {
             ESP_LOGI(TAG, "portal probe passed - online");
             captiveRaisedThisLink = false;
         } else {
             nextProbeAt = now + CAPTIVE_REPROBE_MS;
-            ESP_LOGW(TAG, "portal probe failed (%s) - captive portal or no internet, staying offline, again in 2 min", g_probe.why);
+            ESP_LOGW(TAG, "portal probe: %s (%s) - staying offline, again in 2 min",
+                     captiveNow ? "captive portal" : "no internet", g_probe.why);
             if (!captiveRaisedThisLink) {
                 captiveRaisedThisLink = true;
-                Faults::raise(Fault::CAPTIVE_PORTAL, g_probe.why, false); // provisioned toy: silent
+                // Provisioned toy: silent either way. No answer is the existing 106.
+                Faults::raise(captiveNow ? Fault::CAPTIVE_PORTAL : Fault::PORTAL_UNREACHABLE, g_probe.why, false);
             }
         }
         return;
@@ -749,9 +768,10 @@ void WiFiProvisioningManager::serviceProbe()
     if (newLink) {
         portalOk = false;
         captiveNow = false;
+        noInternetNow = false;
         captiveRaisedThisLink = false;
     }
-    if (newLink || (captiveNow && (long)(now - nextProbeAt) >= 0)) {
+    if (newLink || ((captiveNow || noInternetNow) && (long)(now - nextProbeAt) >= 0)) {
         if (startProbe(probeHost, probePort)) {
             probedGen = gen;
             loopProbeRunning = true;

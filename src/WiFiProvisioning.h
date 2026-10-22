@@ -62,9 +62,13 @@ public:
     void setProbeTarget(const String &host, uint16_t port) { probeHost = host; probePort = port; }
     // Connected and the probe passed for this connection: network services may run.
     bool isInternetReady() const { return WiFi.status() == WL_CONNECTED && portalOk; }
-    // Connected, but the probe failed (login page, DNS hijack, no internet): treated as offline,
-    // re-probed every 2 minutes, no prompt, no radio reset.
+    // Connected, but something else answered the probe (login page, redirect, DNS hijack):
+    // treated as offline, re-probed every 2 minutes, no prompt, no radio reset.
     bool isCaptive() const { return WiFi.status() == WL_CONNECTED && captiveNow; }
+    // Connected but the probe got no answer (no internet on this link, portal down): offline
+    // the same way, re-probed every 2 minutes; during pairing such a network is accepted.
+    bool hasNoInternet() const { return WiFi.status() == WL_CONNECTED && noInternetNow; }
+    bool isOfflineOnLink() const { return isCaptive() || hasNoInternet(); }
 
     // The stored network rejected the password 3 times in a row (router password changed):
     // no restarts and no radio resets any more, a silent retry every 30 min. UxScenes speaks
@@ -112,6 +116,7 @@ private:
     bool loopProbeRunning = false;
     volatile bool portalOk = false;
     volatile bool captiveNow = false;
+    volatile bool noInternetNow = false;
     unsigned long nextProbeAt = 0;
     bool captiveRaisedThisLink = false;
     volatile bool credRecvSeen = false;        // the app sent credentials; the next GOT_IP is probed in line

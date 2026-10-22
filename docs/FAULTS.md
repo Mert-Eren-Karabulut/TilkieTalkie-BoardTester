@@ -38,7 +38,7 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 109 | WS_DISCONNECTED | info | | socket dropped (counted) |
 | 110 | NOT_LINKED | info | kivi | online, but `GET /api/hubs/{uuid}` says `bound: false` (or the legacy token endpoint answered 404); raised at boot and then daily, cleared (`Faults::clear`) once bound; the `not_linked` prompt is spoken once per boot after the hello, idle only, at most daily |
 | 112 | NOT_ENROLLED | info | | no factory pop at boot (detail `no pop`), or the token POST answered 404 (detail `404`) / 401 (detail `secret`); retried every 15 min |
-| 113 | CAPTIVE_PORTAL | warning | nar | the portal probe (`/storage/ping.json`) failed: during pairing the network is rejected and `setup_captive` is spoken; a provisioned toy stays offline silently and re-probes every 2 min |
+| 113 | CAPTIVE_PORTAL | warning | nar | the portal probe (`/storage/ping.json`) got an answer that is not ours (redirect, HTML, other body): during pairing the network is rejected and `setup_captive` is spoken; a provisioned toy stays offline silently and re-probes every 2 min. No answer at all is 106 (silent, once per link), and pairing accepts such a network |
 | 201 | FIGURE_UNKNOWN | error | elma | portal has no unit for this card |
 | 202 | FIGURE_NO_CONTENT | error | elma | figure exists, nothing to play |
 | 203 | FIGURE_OFFLINE | error | armut | portal unreachable and nothing cached for the card |
