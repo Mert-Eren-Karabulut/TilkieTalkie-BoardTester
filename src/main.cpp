@@ -62,8 +62,6 @@ int gOtaProgress = -1;
 bool gLearnDischarge = false;
 bool gGaugeBusReleased = false;
 
-static int gLastOtaProgress = -1;
-static bool gUpdateAnnounced = false; // "updating myself" spoken before the download starts
 // Network services (API client + Reverb) start when WiFi is up: in startFullSystem() on a
 // provisioned boot, or later from the loop once a fresh provisioning / a late reconnect lands.
 static bool gNetworkServicesStarted = false;
@@ -93,8 +91,9 @@ Endpoints loadEndpoints()
     return ep;
 }
 // The Arduino core marks a freshly booted OTA image valid inside initArduino() unless this
-// weak hook says otherwise; OtaManager confirms the image itself after 60 s of uptime so that a
-// crash before then still lets the bootloader fall back to the previous firmware.
+// weak hook says otherwise; OtaManager confirms the image itself once the portal is reached
+// (or after 10 min of uptime), so that an image that dies or cannot reach the portal before
+// that still lets the bootloader fall back to the previous firmware.
 extern "C" bool verifyRollbackLater()
 {
     return true;
@@ -481,14 +480,20 @@ void setup()
     }
 }
 
-// The toy is idle enough for an update to be written (used by OtaManager's idle check):
-// docked (USB power present - a full pack on the dock counts), no figure on the pins, nothing
-// paused, no story download. Updates never start on battery; a release marked mandatory still
-// forces itself after an hour of waiting (OtaManager).
-static bool otaIdleConditions()
+// What OtaManager's dock-only state machine looks at every loop pass (docs/OTA-STATE-MACHINE.md):
+// the dock (VBUS; a full pack on the dock counts), audio, a figure on the pins (pogo switch or a
+// read card), a story download in flight, the battery for the 15 % abort.
+static OtaManager::Conditions otaConditions()
 {
-    return battery.isVbusPresent() && !audioController.isPaused() && !nfcController.isCardPresent() &&
-           !fileManager.hasActiveDownload();
+    OtaManager::Conditions c;
+    c.docked = battery.isVbusPresent();
+    c.playing = audioController.isPlaying(); // prompts included: "updating myself" must finish first
+    c.paused = audioController.isPaused();
+    c.figure = nfcController.isPogoSwitchActive() || nfcController.isCardPresent();
+    c.storyDownload = fileManager.hasActiveDownload();
+    c.batteryKnown = battery.hasTelemetry();
+    c.batteryPercent = battery.getBatteryPercentage();
+    return c;
 }
 
 // API client + Reverb. Safe to call once WiFi has an IP; idempotent.
@@ -511,6 +516,7 @@ static void startNetworkServices()
         ESP_LOGI(TAG, "Request Manager initialized successfully");
     }
     startReverb();
+    OtaManager::getInstance().onNetworkServicesStarted(); // checks use the configured API base
 }
 
 // Brings up the heavy subsystems (SD, WiFi, audio, Reverb, NFC, buttons). Called once the
@@ -691,12 +697,7 @@ void startFullSystem()
         return !audioController.isPlaying() && !audioController.isPaused() && !nfcController.isCardPresent() &&
                !OtaManager::getInstance().inProgress() && !fileManager.hasActiveDownload() && !PromptPackManager::getInstance().isStaging();
     });
-    OtaManager::getInstance().setIdleCheck([]() {
-        // Flash writes stall every task for tens of ms: never while a story plays or a file is
-        // being written, not on a nearly empty cell, and only after "updating myself" was said
-        // (and finished - a prompt counts as playing).
-        return otaIdleConditions() && gUpdateAnnounced && !audioController.isPlaying();
-    });
+    OtaManager::getInstance().setConditions(otaConditions);
     ESP_LOGI(TAG, "Full system started.");
 }
 
@@ -724,7 +725,7 @@ static void serviceNetworkStart()
         if (!healthyMarked && reverb.isConnected())
         {
             healthyMarked = true;
-            OtaManager::getInstance().markBootHealthy();
+            OtaManager::getInstance().notePortalReached("Reverb subscribed"); // confirms a new image
         }
         return;
     }
@@ -919,27 +920,12 @@ void loop()
         }
     }
     gOtaProgress = OtaManager::getInstance().inProgress() ? OtaManager::getInstance().progress() : -1;
+    // "Kendimi güncelliyorum..." when OtaManager is about to leave WAITING; it starts once the
+    // sentence is over ("update done" is spoken at boot, bootedFromUpdate).
+    if (OtaManager::getInstance().consumeAnnounceRequest())
     {
-        OtaManager &ota = OtaManager::getInstance();
-        // Say "updating myself" first, while nothing else plays; the download starts when the
-        // sentence is over (idle check). A forced (mandatory) start still gets the prompt.
-        if (ota.state() == OtaManager::WAITING && !gUpdateAnnounced && otaIdleConditions() && !audioController.isPlaying())
-        {
-            gUpdateAnnounced = true;
-            prompts.say(Prompt::UPDATE_START);
-        }
-        else if (gOtaProgress >= 0 && gLastOtaProgress < 0 && !gUpdateAnnounced)
-        {
-            gUpdateAnnounced = true;
-            prompts.say(Prompt::UPDATE_START);
-        }
-        if (ota.state() == OtaManager::IDLE || ota.state() == OtaManager::FAILED)
-        {
-            gUpdateAnnounced = false;
-        }
-        (void)ota.consumeJustUpdated(); // "update done" is spoken at boot (bootedFromUpdate)
+        prompts.say(Prompt::UPDATE_START);
     }
-    gLastOtaProgress = gOtaProgress;
     if (OtaManager::getInstance().consumeJustFailed())
     {
         const String err = OtaManager::getInstance().lastError();
@@ -949,6 +935,7 @@ void loop()
         case OtaManager::Failure::SHA: f = Fault::OTA_SHA_MISMATCH; break;
         case OtaManager::Failure::FLASH: f = Fault::OTA_FLASH_FAILED; break;
         case OtaManager::Failure::PROMPTS: f = Fault::PROMPT_PACK_FAILED; break;
+        // BATTERY stays OTA_DOWNLOAD_FAILED (karpuz: "will try again later"), detail says why
         default: break;
         }
         Faults::raise(f, err.substring(0, 39).c_str());

@@ -137,8 +137,10 @@ bool SleepController::canEnterSleep() {
     
     // A firmware update in flight must finish: a toy on battery used to deep-sleep in the middle
     // of the download (the OTA task is not a FileManager download) and start over on the next wake.
-    if (OtaManager::getInstance().inProgress()) {
-        blockedReason = "firmware update in progress";
+    // A new image not yet confirmed must not sleep either: the wake goes through the bootloader,
+    // which rolls a pending image back. (WAITING may sleep: the boot check re-offers.)
+    if (OtaManager::getInstance().blocksSleep()) {
+        blockedReason = "firmware update in progress or new image not confirmed";
         lastCheckResult = false;
         return false;
     }
