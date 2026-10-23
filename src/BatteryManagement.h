@@ -217,12 +217,9 @@ private:
     static const uint16_t DEFAULT_GAUGE_DSG_CURRENT_THRESHOLD_MA = 100;
     static const uint16_t DEFAULT_GAUGE_CHG_CURRENT_THRESHOLD_MA = 75;
     static const uint16_t DEFAULT_GAUGE_QUIT_CURRENT_MA = 40;
-    // Generic LiFePO4 chemistry. TI E2E confirms the BQ28z610 supports LFP (config
-    // same as any Li-ion, just complete a learning cycle). 0x0418 is the generic LFP
-    // Chem ID. We write it to the Chem ID data-flash field; verify on the bench that
-    // it reads back and that gauging behaves (a vendor-matched GPCCHEM ID could refine
-    // accuracy later, but generic LFP + a learning cycle is the standard approach).
-    static const uint16_t DEFAULT_GAUGE_CHEM_ID = 0x0418;
+    // Chemistry: the firmware does not program one (it is not a data-flash word; see
+    // docs/GAUGE-CHEMISTRY.md). The gauge keeps whatever chemistry it shipped with until the
+    // golden data-flash image from a bqStudio session is replayed; MAC 0x0006 reports it.
     // DA Configuration: bit0 CC0=0 (1S pack), bit4 SLEEP=1, bit3 IN_SYSTEM_SLEEP=1.
     // IN_SYSTEM_SLEEP is required on this board: without it the gauge's SLEEP entry
     // needs the I2C bus held LOW, but our bus idles HIGH on pullups, so the gauge
@@ -342,6 +339,7 @@ private:
     uint8_t pollCycle = 0;
     static constexpr uint8_t FULL_POLL_EVERY = 10; // slow diagnostic reads every N telemetry polls
     bool chargerVoltageVerified = false;
+    int chargerIbatMilliAmps = 0; // last IBAT ADC reading of the charger (signed, mA)
     
     // Constructor (private for singleton)
     BatteryManager();
@@ -468,6 +466,11 @@ public:
     // immediately; wake is USB plug-in only (QON is not wired on this board). Writing it
     // with VBUS present is safely ignored by the charger.
     bool enterShipMode();
+    // Factory `ft ship`: the same ship mode with SDRV_DLY=0, i.e. the charger waits 10 s before
+    // opening the BATFET, which gives the operator time to unplug USB after the answer.
+    // cancelShipMode() writes SDRV_CTRL back to 00b (idle) when the unit is still powered.
+    bool armDelayedShipMode();
+    bool cancelShipMode();
     // Reads the CH224Q PD-sink status: which fast-charge handshake succeeded (register
     // 0x09: BC1.2/QC2/QC3/PD/EPR bits) and the PD-granted current budget. Only works
     // while VBUS is present (the chip is VBUS-powered). Returns false if it never ACKs.
@@ -525,6 +528,14 @@ public:
     bool getChargingStatus() const { return isCharging; }
     bool hasTelemetry() const { return telemetryValid; }
     bool isGaugePresent() const { return gaugePresent; }
+    // Factory test (`ft test battery`, bring-up record): cached values of the last poll.
+    uint16_t getDesignCapacityMilliAmpHours() const { return gaugeDesignCapacityMilliAmpHours; }
+    uint16_t getGaugeChemId() const { return gaugeChemId; }       // MAC 0x0006, informational
+    uint8_t getChargerFaultStatus0() const { return chargerFaultStatus0; } // REG20 (live)
+    uint8_t getChargerFaultStatus1() const { return chargerFaultStatus1; } // REG21 (live)
+    const char *getChargeStateName() const { return chargerStateToString((chargerStatus1 >> 5) & 0x07); }
+    int getChargerIbatMilliAmps() const { return chargerIbatMilliAmps; }    // charger IBAT ADC, + charging
+    static String describeChargerFaults(uint8_t fault0, uint8_t fault1);    // "None" or "VBUS OVP, ..."
     
     // True when the cell can actually SOURCE current into the system (and thus
     // buffer RF transients) — i.e. the charger sees VBAT present, or the gauge's

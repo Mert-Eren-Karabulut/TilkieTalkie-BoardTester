@@ -76,6 +76,10 @@ public:
     bool isEnrolled();
     bool setFactory(const String &secret, const String &pop, const String &serial);
     void clearFactory();
+    // Factory records (JSON text): "tested" (`ft commit`) and "bringup" (the bring-up result).
+    // Only these two keys; "" when absent.
+    String factoryRecord(const char *key);
+    bool setFactoryRecord(const char *key, const String &json);
 
     // General methods
     void resetAll();
