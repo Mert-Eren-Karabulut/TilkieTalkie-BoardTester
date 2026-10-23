@@ -76,7 +76,8 @@ Both repos implement this file; PROTOCOL-V2.md §9 points here.
   `{"ft":"ship","ok":true,"unplug_within_s":10}`; the operator unplugs USB within 10 s and the unit
   powers down to ship mode (wake = plugging USB in). If VBUS is still present after 15 s the
   device cancels and sends `{"ft":"ship","ok":false,"error":"still powered"}`. Refused while a
-  test runs or when the cell is under 3.4 V (`"error":"charge first"`).
+  test runs or when the cell is under 30 % state of charge or 3.2 V (`"error":"charge first"`;
+  LiFePO4 rests near 3.3 V from half charge up, so the gauge's state of charge is the gate).
 
 ## Label
 

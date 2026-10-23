@@ -125,3 +125,12 @@ Not run: 5 customer reset and 6 captive portal (need the app / a captive network
 resume, 9 revoked card, 10 foreign card, 12 60-track inventory (need a figure on the pins / a
 second card). The production build has no `endpoint set`: LAN tests use env:bench.
 
+## 1.3.6: factory test protocol (`ft`, docs/FT-PROTOCOL.md) — bench 2026-10-23
+Driven over the console as the station does it: `ft begin` (identity, bring-up state, card, pack,
+battery, tested record), battery / pd / sd automatic tests with data, leds and speaker with the
+operator question and `ft ok`, ble refused cleanly on a provisioned unit, wifi failure path (20 s,
+stored home network restored afterwards), buttons + `ft abort`, `ft result`, `ft commit`,
+`ft end` (log level back), `ft show` (label). Not run: buttons/pogo/nfc/jack (need hands), wifi
+success path (needs the factory network), bring-up re-run, `ft ship` (unplug within 10 s, wake by
+USB), the station page itself in Chrome (WebSerial + ESP Web Tools flash).
+

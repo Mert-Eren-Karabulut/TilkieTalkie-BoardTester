@@ -83,7 +83,11 @@ constexpr unsigned long BLE_ADVERTISE_MS = 10000;
 constexpr unsigned long BRINGUP_BUDGET_MS = 3UL * 60UL * 1000UL;
 constexpr unsigned long SHIP_CANCEL_MS = 15000;       // VBUS still there: cancel
 constexpr unsigned long SHIP_NOT_ENGAGED_MS = 25000;  // unplugged but still alive: cancel
-constexpr float SHIP_MIN_V = 3.40f;
+// LiFePO4 rests near 3.3 V from half charge up, so a voltage gate alone would refuse most units
+// unless they ship while charging. The gauge's state of charge is the primary gate (the owner
+// wants units shipped around 40 %); the voltage only catches an empty cell.
+constexpr float SHIP_MIN_SOC = 30.0f;
+constexpr float SHIP_MIN_V = 3.20f;
 constexpr size_t TESTED_MAX_BYTES = 1500;
 constexpr size_t ERROR_MAX_CHARS = 80;
 
@@ -1432,7 +1436,7 @@ void cmdShip()
         replyError("ship", "no battery telemetry");
         return;
     }
-    if (battery.getBatteryVoltage() < SHIP_MIN_V)
+    if (battery.getBatteryVoltage() < SHIP_MIN_V || battery.getBatteryPercentage() < SHIP_MIN_SOC)
     {
         replyError("ship", "charge first");
         return;
