@@ -73,6 +73,9 @@ Endpoints loadEndpoints();
 
 // --- Hooks main.cpp provides to the console ---
 void startFullSystem();
+// Factory session (FactoryTest.cpp): startFullSystem() leaves WiFi/BLE alone while a session is
+// open; `ft end` starts what it skipped (no-op otherwise).
+void startDeferredWifi();
 void startReverb();
 String getDeviceEfuseMacDecimal();
 String getDeviceEfuseMacHex();

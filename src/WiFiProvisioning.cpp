@@ -229,6 +229,7 @@ void WiFiProvisioningManager::begin() {
         {
             int before = (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
             esp_err_t rel = esp_bt_mem_release(ESP_BT_MODE_BTDM);
+            btReleased = true;
             ESP_LOGI(TAG, "BT controller memory released: %s (%+d bytes internal)", esp_err_to_name(rel),
                      (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL) - before);
         }
@@ -429,6 +430,9 @@ void WiFiProvisioningManager::reset() {
 }
 
 void WiFiProvisioningManager::handleBackgroundReconnection() {
+    if (factoryHoldOn) {
+        return; // a factory test owns the radio (setFactoryHold)
+    }
     if (captiveCleanupPending) {
         // The app has been told "failed" (synthetic auth failure, see gotIpPreHandler). Make the
         // manager accept new credentials, drop the link and forget the captive network.
@@ -588,6 +592,9 @@ void WiFiProvisioningManager::handleProvisioningEvent(arduino_event_t *sys_event
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
         {
             ESP_LOGI(TAG, "WiFi Connected! IP address: %s", IPAddress(sys_event->event_info.got_ip.ip_info.ip.addr).toString().c_str());
+            if (factoryHoldOn) {
+                break; // a factory test network: never mirrored, never probed by the loop
+            }
             connectionGen++;      // the loop probes the portal for this connection
             authFailStreak = 0;
 
@@ -610,7 +617,7 @@ void WiFiProvisioningManager::handleProvisioningEvent(arduino_event_t *sys_event
             const uint8_t reason = sys_event->event_info.wifi_sta_disconnected.reason;
             ESP_LOGW(TAG, "WiFi disconnected (reason %u). Will attempt to reconnect...", (unsigned)reason);
             portalOk = false;
-            if (!provisioningManagerInitialized) { // during pairing the app reports a wrong password
+            if (!provisioningManagerInitialized && !factoryHoldOn) { // during pairing the app reports a wrong password
                 if (isAuthReason(reason)) {
                     const int n = ++authFailStreak;
                     if (n == AUTH_FAIL_LIMIT) {
@@ -633,6 +640,9 @@ void WiFiProvisioningManager::provEventHandler(void *arg, esp_event_base_t base,
     WiFiProvisioningManager *self = static_cast<WiFiProvisioningManager *>(arg);
     if (!self || base != WIFI_PROV_EVENT) {
         return;
+    }
+    if (self->factoryBle) {
+        return; // the factory `ble` test's own manager: none of the pairing bookkeeping applies
     }
     switch (id) {
         case WIFI_PROV_START:
@@ -675,6 +685,8 @@ void WiFiProvisioningManager::provEventHandler(void *arg, esp_event_base_t base,
             break;
         case WIFI_PROV_DEINIT:
             self->provisioningManagerInitialized = false;
+            // The manager was set up with ..._FREE_BTDM: the BT controller memory is gone now.
+            self->btReleased = true;
             break;
         default:
             break;
@@ -734,6 +746,9 @@ void WiFiProvisioningManager::gotIpPreHandler(void *arg, esp_event_base_t, int32
 // every 2 minutes. Network services wait for isInternetReady().
 void WiFiProvisioningManager::serviceProbe()
 {
+    if (factoryHoldOn) {
+        return;
+    }
     if (provisioningManagerInitialized || probeHost.isEmpty()) {
         if (probeHost.isEmpty()) portalOk = true; // nothing to check against
         return;                                   // provisioning probes in gotIpPreHandler
@@ -777,4 +792,122 @@ void WiFiProvisioningManager::serviceProbe()
             loopProbeRunning = true;
         }
     }
+}
+
+// ---- Factory tests ---------------------------------------------------------------------------
+
+void WiFiProvisioningManager::setFactoryHold(bool on)
+{
+    if (on == factoryHoldOn) {
+        return;
+    }
+    if (on) {
+        // A scan of the reconnection logic would abort the test's connect: stop it, forget it.
+        if (scanInFlight) {
+            esp_wifi_scan_stop();
+            WiFi.scanDelete();
+            scanInFlight = false;
+        }
+        loopProbeRunning = false; // a loop probe still in flight is ignored
+        factoryHoldOn = true;
+        return;
+    }
+    factoryHoldOn = false;
+    // Whatever link comes next (the restored home network, or the same one) is probed afresh.
+    portalOk = false;
+    captiveNow = false;
+    noInternetNow = false;
+    probedGen = connectionGen.load() - 1;
+    lastReconnectAttempt = 0;
+    lastBeginAt = millis();
+}
+
+bool WiFiProvisioningManager::startFactoryProbe()
+{
+    if (probeHost.isEmpty()) {
+        return false;
+    }
+    return startProbe(probeHost, probePort);
+}
+
+int WiFiProvisioningManager::factoryProbeResult() const
+{
+    if (g_probe.busy.load()) {
+        return -1;
+    }
+    return g_probe.result.load();
+}
+
+String WiFiProvisioningManager::factoryProbeWhy() const
+{
+    return String(g_probe.why);
+}
+
+int WiFiProvisioningManager::factoryBleStart(String &name, String &err)
+{
+    name = config.getDeviceName();
+    if (provisioningManagerInitialized) {
+        return 2; // the normal provisioning is advertising already: proof enough, left as it is
+    }
+    if (btReleased) {
+        // A provisioned boot (or an ended provisioning) gave the controller memory back to the
+        // heap; it cannot be taken back without a restart.
+        err = "BLE released on this boot (provisioned unit: ft clean first)";
+        return 0;
+    }
+    const String pop = proofOfPossession();
+    if (pop.isEmpty()) {
+        err = "no pop (ft enroll first)";
+        return 0;
+    }
+    esp_err_t r = esp_event_loop_create_default();
+    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+        err = String("event loop: ") + esp_err_to_name(r);
+        return 0;
+    }
+    factoryBleWifiStarted = WiFi.getMode() == WIFI_OFF;
+    if (factoryBleWifiStarted) {
+        WiFi.mode(WIFI_STA); // the provisioning manager needs the WiFi driver
+    }
+    // No ..._FREE_BTDM handler: the controller memory must stay for the customer's pairing
+    // later this boot (`ft end` starts it when the unit is not provisioned).
+    wifi_prov_mgr_config_t cfg = {};
+    cfg.scheme = wifi_prov_scheme_ble;
+    cfg.scheme_event_handler = WIFI_PROV_EVENT_HANDLER_NONE;
+    factoryBle = true;
+    r = wifi_prov_mgr_init(cfg);
+    if (r != ESP_OK) {
+        factoryBle = false;
+        err = String("provisioning init: ") + esp_err_to_name(r);
+        if (factoryBleWifiStarted) WiFi.mode(WIFI_OFF);
+        factoryBleWifiStarted = false;
+        return 0;
+    }
+    wifi_prov_mgr_disable_auto_stop(1000);
+    r = wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_1, pop.c_str(), name.c_str(), nullptr);
+    if (r != ESP_OK) {
+        wifi_prov_mgr_deinit();
+        factoryBle = false;
+        err = String("advertising: ") + esp_err_to_name(r);
+        if (factoryBleWifiStarted) WiFi.mode(WIFI_OFF);
+        factoryBleWifiStarted = false;
+        return 0;
+    }
+    ESP_LOGW(TAG, "factory BLE test: advertising as %s", name.c_str());
+    return 1;
+}
+
+void WiFiProvisioningManager::factoryBleStop()
+{
+    if (!factoryBle) {
+        return;
+    }
+    wifi_prov_mgr_stop_provisioning();
+    wifi_prov_mgr_deinit(); // waits for the BLE stack to stop
+    factoryBle = false;
+    if (factoryBleWifiStarted) {
+        WiFi.mode(WIFI_OFF);
+        factoryBleWifiStarted = false;
+    }
+    ESP_LOGW(TAG, "factory BLE test: advertising stopped");
 }

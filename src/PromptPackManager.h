@@ -45,6 +45,10 @@ public:
 
     static bool parsePack(JsonVariantConst v, Pack &out);   // the "prompts" object of the firmware check
     const String &installedChecksum() const { return _installed; }
+    // Reads /sounds/pack.json now and checks its files on the card (factory `ft begin` / `ft test
+    // sd`). False when there is no readable pack.json; files = entries listed, missing = absent
+    // or of the wrong size.
+    bool installedStatus(String &checksum, int &files, int &missing);
     void noteRequired(const String &checksum) { _required = checksum; } // what the portal pairs with this firmware
     const char *stateName() const;   // ok | outdated | syncing | missing | unknown (device report)
 

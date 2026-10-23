@@ -166,6 +166,12 @@ void superviseChargerOnUsb()
     {
         wanted = 800;  // datasheet 0.2C recommended rate near the temperature edges
     }
+    if (bringupChargeCapped() && wanted > Policy::CHARGE_CURRENT_SAFE_MA)
+    {
+        // Bring-up gave up with an uncalibrated gauge: it over-reads ~4.5x and would trip OCC
+        // at the normal current (fault 508 is active; the next bring-up lifts the cap).
+        wanted = Policy::CHARGE_CURRENT_SAFE_MA;
+    }
     if (wanted != requestedChargeCurrentMa && battery.setChargeCurrent(wanted))
     {
         ESP_LOGI(TAG, "CHARGER: charge current -> %umA (%.3fV, %.1fC)", wanted, v, t);

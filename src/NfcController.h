@@ -66,6 +66,8 @@ public:
 
     // Getters for status
     bool isNFCReady() const;
+    // Factory test: asks the PN532 for its firmware version now (0 = no answer). Loop task.
+    uint32_t firmwareVersion();
     bool isPogoSwitchActive() const;
     bool isCardPresent() const;
     NFCData currentNFCData() const;   // copy taken under the data lock (any task)

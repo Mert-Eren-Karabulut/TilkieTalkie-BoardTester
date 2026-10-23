@@ -29,6 +29,7 @@
 #include "UxScenes.h"
 #include "Console.h"
 #include "TimeSync.h"
+#include "FactoryTest.h"
 
 // The espidf CMake build compiles every file in src/ regardless of build_src_filter,
 // so the sleep-probe build (env:sleepprobe, -DSLEEP_PROBE_BUILD) excludes this whole
@@ -69,6 +70,8 @@ static unsigned long gWifiUpSince = 0;
 static VoicePrompts &prompts = VoicePrompts::getInstance();
 static String gDownloadAnnouncedUid;
 static unsigned long lastStackCheck = 0;
+// startFullSystem() ran during a factory session: WiFi/BLE wait for `ft end` (startDeferredWifi).
+static bool gWifiDeferred = false;
 
 void handleChatMessage(const String &message);
 
@@ -298,6 +301,10 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
 // This function will be called ONLY ONCE when a new card is detected
 void afterNFCRead(const NFCData &nfcData)
 {
+    if (FactoryTest::active())
+    {
+        return; // factory session: no figure handling (the nfc test reads the card itself)
+    }
     // A figure wobbling on the pogo pins (or a child tapping it repeatedly) must not fire a
     // manifest request per bounce: the same UID within 1.5 s is one tap.
     static String lastTapUid;
@@ -326,6 +333,10 @@ void afterNFCRead(const NFCData &nfcData)
 // AFTER a card was successfully read in that session.
 void afterDetachNFC()
 {
+    if (FactoryTest::active())
+    {
+        return;
+    }
     ESP_LOGI(TAG, "=== Hook: afterDetachNFC ===");
     ESP_LOGI(TAG, "NFC session has ended.");
 
@@ -560,6 +571,27 @@ void runCustomerReset(bool all, const char *why, bool speak)
     wifiProv.reset(); // forgets the network and restarts into provisioning
 }
 
+// WiFi (connect, or BLE provisioning when not provisioned) and the pairing invitation.
+static void startWifi()
+{
+    wifiProv.begin();
+    if (!wifiProv.isProvisioned() && !wifiProv.provisioningImpossible())
+    {
+        startSetupWelcome(); // repeated by serviceUxPrompts() while nobody pairs
+    }
+}
+
+void startDeferredWifi()
+{
+    if (!gWifiDeferred)
+    {
+        return;
+    }
+    gWifiDeferred = false;
+    ESP_LOGI(TAG, "factory session over - starting WiFi");
+    startWifi();
+}
+
 // API client + Reverb. Safe to call once WiFi has an IP; idempotent.
 static void startNetworkServices()
 {
@@ -667,8 +699,10 @@ void startFullSystem()
     buttonController.setComboLongHoldTime(10000); // 1+4 only: 10 s = customer reset
 
     // Set up button callbacks
+    // Factory session: the buttons only feed the `buttons` test (FactoryTest reads them).
     buttonController.onSingleClick([](ButtonController::ButtonId button)
                                    {
+        if (FactoryTest::active()) return;
         // Reset sleep timer on any button activity
         sleepController.resetActivity();
         
@@ -694,6 +728,7 @@ void startFullSystem()
 
     buttonController.onHoldStart([](ButtonController::ButtonId button, unsigned long duration)
                                  {
+        if (FactoryTest::active()) return;
         // Reset sleep timer on button hold
         sleepController.resetActivity();
         
@@ -704,6 +739,7 @@ void startFullSystem()
 
     buttonController.onHoldContinuous([](ButtonController::ButtonId button, unsigned long duration)
                                       {
+            if (FactoryTest::active()) return;
             if (button == ButtonController::BUTTON_1) {
             ESP_LOGI(TAG, "Volume up (held for %lu ms)", duration);
                 audioController.volumeUp(); ledController.flash(LedController::FX_VOLUME, audioController.getCurrentVolume());
@@ -722,12 +758,14 @@ void startFullSystem()
     // 10 s a second tone (three falling notes) and the customer reset.
     buttonController.onComboHold([]()
     {
+        if (FactoryTest::active()) return;
         ESP_LOGW(TAG, "COMBO HOLD (1+4) 5 s - release to forget WiFi, keep holding for a full reset");
         ledController.flash(LedController::FX_RESET);
         prompts.say(Prompt::TONE_CHARGE_ON);
     });
     buttonController.onComboReleasedAfterHold([](unsigned long heldMs)
     {
+        if (FactoryTest::active()) return;
         // Forget the WiFi network (stories stay on the card), then restart into BLE provisioning.
         ESP_LOGW(TAG, "COMBO (1+4) released after %lu ms - forgetting the WiFi network", heldMs);
         prompts.sayBlocking(Prompt::WIFI_RESET_DONE, 6000);
@@ -735,6 +773,7 @@ void startFullSystem()
     });
     buttonController.onComboHoldLong([]()
     {
+        if (FactoryTest::active()) return;
         ESP_LOGW(TAG, "COMBO HOLD (1+4) 10 s - customer reset");
         prompts.sayBlocking(Prompt::TONE_SLEEP, 2000);
         runCustomerReset(false, "buttons", true);
@@ -742,6 +781,7 @@ void startFullSystem()
 
     buttonController.onComboHold2([]()
     {
+        if (FactoryTest::active()) return;
         ESP_LOGW(TAG, "COMBO HOLD (2+3) - restarting");
         ledController.flash(LedController::FX_FAIL);
         delay(1500);
@@ -781,13 +821,17 @@ void startFullSystem()
         wifiProv.setProbeTarget(host, port);
         ESP_LOGI(TAG, "portal probe: http://%s:%u/storage/ping.json", host.c_str(), (unsigned)port);
     }
-    wifiProv.begin();
-
     // Voice feedback: Turkish prompts from the SD card (docs/VOICE-PROMPTS.md)
     prompts.begin();
-    if (!wifiProv.isProvisioned() && !wifiProv.provisioningImpossible())
+    if (FactoryTest::active())
     {
-        startSetupWelcome(); // repeated by serviceUxPrompts() while nobody pairs
+        // Factory session: the radio stays as it is until a test asks for it; `ft end` starts it.
+        gWifiDeferred = true;
+        ESP_LOGW(TAG, "factory session: WiFi/BLE start deferred to ft end");
+    }
+    else
+    {
+        startWifi();
     }
 
     wifiProv.setIdleCheck([]() {
@@ -888,6 +932,9 @@ void loop()
 
     // Serial console (Console.cpp; bench commands only with -DTT_BENCH)
     Console::service();
+    // Factory test session and its running test (`ft`, docs/FT-PROTOCOL.md)
+    TT_TIMED("ft", FactoryTest::update());
+    const bool factory = FactoryTest::active();
 
     // Update battery management
     TT_TIMED("battery", battery.update());
@@ -947,7 +994,7 @@ void loop()
         else
         {
             static unsigned long lastMonLog = 0;
-            if (millis() - lastMonLog > 5000)
+            if (!factory && millis() - lastMonLog > 5000) // a factory session keeps the port quiet
             {
                 lastMonLog = millis();
                 ESP_LOGW(TAG, "MONITOR: waiting (bringup=%d, %.3fV, charging=%d) before full start.",
@@ -955,11 +1002,14 @@ void loop()
                          (int)battery.getChargingStatus());
             }
         }
-        updateChargingUx(); // charge bar while docked (bring-up still owns its LED)
+        if (!factory)
+        {
+            updateChargingUx(); // charge bar while docked (bring-up still owns its LED)
+        }
         // Inactivity sleep in monitor mode too (same guards as the full run): a cell between
         // the 3.00 V cutoff and the 3.10 V start threshold on battery used to stay awake
-        // until the cutoff.
-        if (battery.isVbusPresent())
+        // until the cutoff. Never during a factory session.
+        if (battery.isVbusPresent() || factory)
         {
             sleepController.resetActivity();
         }
@@ -984,8 +1034,12 @@ void loop()
     // Update audio controller
     TT_TIMED("audio", audioController.update());
 
-    // Handle WiFi background reconnection (only when credentials exist but not connected)
-    TT_TIMED("wifi", wifiProv.handleBackgroundReconnection());
+    // Handle WiFi background reconnection (only when credentials exist but not connected).
+    // Not before WiFi was started (a factory session defers it).
+    if (!gWifiDeferred)
+    {
+        TT_TIMED("wifi", wifiProv.handleBackgroundReconnection());
+    }
 
     // Update Reverb client only if WiFi is connected and the portal is reachable (not captive)
     if (wifiProv.isInternetReady())
@@ -1041,7 +1095,10 @@ void loop()
         }
         Faults::raise(f, err.substring(0, 39).c_str());
     }
-    TT_TIMED("led", deriveLedScene()); // the LED task renders the scene
+    if (!factory)
+    {
+        TT_TIMED("led", deriveLedScene()); // the LED task renders the scene (FactoryTest owns it in a session)
+    }
 
     // Update Button controller (handles button state changes and callbacks)
     TT_TIMED("buttons", buttonController.update());
@@ -1056,14 +1113,20 @@ void loop()
     }
 
     // Charge bar while docked (transient NFC/audio pulses play over it and it resumes).
-    TT_TIMED("chargeux", updateChargingUx());
+    if (!factory)
+    {
+        TT_TIMED("chargeux", updateChargingUx());
+    }
     if (gResetRequestedBy)
     {
         runCustomerReset(false, gResetRequestedBy, true); // does not return
     }
     TT_TIMED("netstart", serviceNetworkStart());
     TT_TIMED("nethealth", serviceNetworkHealth());
-    TT_TIMED("ux", serviceUxPrompts());
+    if (!factory)
+    {
+        TT_TIMED("ux", serviceUxPrompts()); // no hello, no reminders in a factory session
+    }
     TT_TIMED("battux", updateBatteryUx());
 
     // No sleeping while docked: charging is the toy's "plugged in" UX. resetActivity()
@@ -1071,9 +1134,9 @@ void loop()
     // the full timeout starts fresh instead of sleeping instantly. Manual `sleep`
     // (forceSleep) still works, and the VBUS wake stub covers the inverse case of
     // docking a device that is already asleep on battery.
-    if (battery.isVbusPresent())
+    if (battery.isVbusPresent() || factory)
     {
-        sleepController.resetActivity();
+        sleepController.resetActivity(); // docked, or a factory session: never sleep
     }
     else
     {

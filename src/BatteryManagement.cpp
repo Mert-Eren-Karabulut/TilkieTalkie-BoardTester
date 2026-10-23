@@ -1324,6 +1324,42 @@ bool BatteryManager::enterShipMode() {
     return writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, control2);
 }
 
+bool BatteryManager::armDelayedShipMode() {
+    if (!chargerPresent) {
+        refreshDevicePresence();
+        if (!chargerPresent) {
+            return false;
+        }
+    }
+    uint8_t control2 = 0;
+    if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, control2)) {
+        return false;
+    }
+    // SDRV_CTRL[2:1] = 10b (ship mode), SDRV_DLY (bit0) = 0: the charger waits 10 s before it
+    // opens the BATFET. The station answers first, then the operator unplugs USB.
+    const uint8_t armed = static_cast<uint8_t>((control2 & ~0x07) | (0x02 << 1));
+    ESP_LOGW(TAG, "SHIP MODE armed (10 s delay) - unplug USB now.");
+    return writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, armed);
+}
+
+bool BatteryManager::cancelShipMode() {
+    if (!chargerPresent) {
+        return false;
+    }
+    uint8_t control2 = 0;
+    if (!readRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, control2)) {
+        return false;
+    }
+    // SDRV_CTRL back to 00b (idle); SDRV_DLY back to its POR value 0.
+    const uint8_t idle = static_cast<uint8_t>(control2 & ~0x07);
+    ESP_LOGW(TAG, "SHIP MODE cancelled.");
+    return writeRegister8(BQ25792_ADDRESS, BQ25792_CHARGER_CONTROL_2_REGISTER, idle);
+}
+
+String BatteryManager::describeChargerFaults(uint8_t fault0, uint8_t fault1) {
+    return chargerFaultStatusToString(fault0, fault1);
+}
+
 bool BatteryManager::ensureGaugeSleepConfig() {
     if (!gaugePresent) {
         refreshDevicePresence();
@@ -2048,6 +2084,7 @@ bool BatteryManager::updateChargerMeasurements(bool full) {
     }
 
     currentSystemVoltage = vsysMillivolts / 1000.0f;
+    chargerIbatMilliAmps = static_cast<int16_t>(ibatMilliamps);
     // The ADC runs in one-shot mode (ADC_EN self-clears), so the registers only change when a
     // conversion is re-triggered. That used to happen only at boot / reconfiguration: after an
     // unplug the VBUS ADC kept reading ~5 V forever and the sleep gate never cleared. Re-arm it

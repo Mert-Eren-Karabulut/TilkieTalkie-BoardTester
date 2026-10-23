@@ -19,6 +19,7 @@
 #include <wifi_provisioning/manager.h>
 #include "Bringup.h"
 #include "Diag.h"
+#include "FactoryTest.h"
 #include "Faults.h"
 #include "OtaManager.h"
 #include "Policy.h"
@@ -232,125 +233,6 @@ void Console::serviceChargeMonitor()
 }
 #endif // TT_BENCH
 
-// ---- `ft` factory protocol (docs/PROTOCOL-V2.md §9): one JSON line per answer -------------
-
-static const char *POP_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
-// "TK-ABCD-EFGH", "tk-abcd-efgh" or "ABCDEFGH" -> "ABCDEFGH"; "" when it is not a valid pop.
-static String normalisePop(String pop)
-{
-    pop.toUpperCase();
-    if (pop.startsWith("TK-")) pop = pop.substring(3);
-    pop.replace("-", "");
-    if (pop.length() != 8) return String();
-    for (size_t i = 0; i < pop.length(); ++i)
-    {
-        if (!strchr(POP_ALPHABET, pop[i])) return String();
-    }
-    return pop;
-}
-
-// The label payload: TT1:<uuid>:TK-XXXX-XXXX ("" when no pop is enrolled).
-static String labelPayload()
-{
-    const String pop = config.factoryPop();
-    if (pop.length() != 8) return String();
-    return "TT1:" + getDeviceEfuseMacDecimal() + ":TK-" + pop.substring(0, 4) + "-" + pop.substring(4);
-}
-
-static bool safeToken(const String &v, size_t minLen, size_t maxLen)
-{
-    if (v.length() < minLen || v.length() > maxLen) return false;
-    for (size_t i = 0; i < v.length(); ++i)
-    {
-        const char c = v[i];
-        if (!(isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.')) return false;
-    }
-    return true;
-}
-
-static void ftReply(bool ok, const String &fieldsOrError)
-{
-    // fieldsOrError: for ok, JSON members without braces ("" for none); for !ok, the error text.
-    if (ok)
-    {
-        Serial.printf("{\"ok\":true%s%s}\n", fieldsOrError.length() ? "," : "", fieldsOrError.c_str());
-    }
-    else
-    {
-        Serial.printf("{\"ok\":false,\"error\":\"%s\"}\n", fieldsOrError.c_str());
-    }
-    Serial.flush();
-}
-
-static void ftShow()
-{
-    const String serial = config.factorySerial();
-    const String label = labelPayload();
-    String f = "\"uuid\":\"" + getDeviceEfuseMacDecimal() + "\",\"mac\":\"" + getDeviceEfuseMacHex() + "\",\"serial\":";
-    f += serial.length() ? "\"" + serial + "\"" : String("null");
-    f += String(",\"enrolled\":") + (config.isEnrolled() ? "true" : "false");
-    f += ",\"label\":";
-    f += label.length() ? "\"" + label + "\"" : String("null");
-    ftReply(true, f); // never the secret
-}
-
-static void ftCommand(const String &rest)
-{
-    String parts[4];
-    const int n = splitArgs(rest, parts, 4);
-    const String sub = n > 0 ? parts[0] : String();
-    if (sub == "show")
-    {
-        ftShow();
-    }
-    else if (sub == "enroll")
-    {
-        if (n < 3)
-        {
-            ftReply(false, "usage: ft enroll <secret> <pop> [serial]");
-            return;
-        }
-        const String pop = normalisePop(parts[2]);
-        if (!safeToken(parts[1], 16, 128))
-        {
-            ftReply(false, "bad secret");
-        }
-        else if (pop.isEmpty())
-        {
-            ftReply(false, "bad pop");
-        }
-        else if (n > 3 && !safeToken(parts[3], 1, 32))
-        {
-            ftReply(false, "bad serial");
-        }
-        else if (!config.setFactory(parts[1], pop, n > 3 ? parts[3] : String()))
-        {
-            ftReply(false, "nvs write failed");
-        }
-        else
-        {
-            ftShow(); // what is stored now (the BLE pop applies from the next provisioning start)
-        }
-    }
-    else if (sub == "reset")
-    {
-        const bool all = n > 1 && parts[1] == "--all";
-        if (n > 1 && !all)
-        {
-            ftReply(false, "usage: ft reset [--all]");
-            return;
-        }
-        ftReply(true, String("\"reset\":\"") + (all ? "all" : "customer") + "\"");
-        delay(100);
-        runCustomerReset(all, all ? "ft reset --all" : "ft reset", false); // restarts
-    }
-    else
-    {
-        ftReply(false, "unknown ft command (enroll, show, reset)");
-    }
-}
-
 static void printHelp()
 {
     ESP_LOGI(TAG, "--- Console commands (docs/CONSOLE.md) ---");
@@ -361,7 +243,7 @@ static void printHelp()
     ESP_LOGI(TAG, "  restart           - restart the device");
     ESP_LOGI(TAG, "  config / debug    - stored configuration / debug information");
     ESP_LOGI(TAG, "  efusemac | hubid  - hub UUID (decimal), MAC, label payload TT1:<uuid>:<pop>");
-    ESP_LOGI(TAG, "  ft enroll <secret> <pop> [serial] / ft show / ft reset [--all] - factory protocol (JSON lines)");
+    ESP_LOGI(TAG, "  ft begin|end|show|enroll <secret> <pop> [serial]|test <name> [args]|ok|fail [reason]|abort|result|commit|clean|ship|reset [--all] - factory protocol (JSON lines, docs/FT-PROTOCOL.md)");
     ESP_LOGI(TAG, "  heap / stack      - heap and loop-stack usage");
     ESP_LOGI(TAG, "  timing / tasks    - loop section timing / FreeRTOS task stats");
     ESP_LOGI(TAG, "  diag [on|off]     - periodic diagnostics verbosity");
@@ -431,7 +313,7 @@ static void dispatch(String command)
     }
     else if (command == "ft" || command.startsWith("ft "))
     {
-        ftCommand(command.length() > 3 ? command.substring(3) : String());
+        FactoryTest::command(command.length() > 3 ? command.substring(3) : String());
     }
 #ifdef TT_BENCH
     // The portal does not accept chat from a device (401/403): bench only.
@@ -493,7 +375,7 @@ static void dispatch(String command)
         const String deviceId = getDeviceEfuseMacDecimal();
         const String deviceMacHex = getDeviceEfuseMacHex();
 
-        const String label = labelPayload();
+        const String label = FactoryTest::labelPayload();
         ESP_LOGI(TAG, "--- Device Identity ---");
         ESP_LOGI(TAG, "Hub UUID / efuse MAC (decimal): %s", deviceId.c_str());
         ESP_LOGI(TAG, "Base MAC (hex): %s", deviceMacHex.c_str());

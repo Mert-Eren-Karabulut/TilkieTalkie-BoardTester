@@ -43,6 +43,11 @@ NfcController::NfcController() : I2C_NFC(1), // Use I2C bus 1
     dataLock = xSemaphoreCreateMutex();
 }
 
+uint32_t NfcController::firmwareVersion()
+{
+    return nfc.getFirmwareVersion();
+}
+
 bool NfcController::begin()
 {
     // Release the deep-sleep latch on the I2C lines (parked high by the sleep path so

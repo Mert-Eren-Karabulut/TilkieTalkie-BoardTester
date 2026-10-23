@@ -554,6 +554,26 @@ bool ConfigManager::setFactory(const String &secret, const String &pop, const St
     return ok;
 }
 
+String ConfigManager::factoryRecord(const char *key) {
+    if (!key || (strcmp(key, "tested") != 0 && strcmp(key, "bringup") != 0)) return String();
+    CfgLock g(lock);
+    return factoryString(key);
+}
+
+bool ConfigManager::setFactoryRecord(const char *key, const String &json) {
+    if (!key || (strcmp(key, "tested") != 0 && strcmp(key, "bringup") != 0)) return false;
+    CfgLock g(lock);
+    Preferences fp;
+    if (!fp.begin(FACTORY_NAMESPACE, false)) {
+        ESP_LOGE(TAG, "factory namespace cannot be opened");
+        return false;
+    }
+    const bool ok = fp.putString(key, json) == json.length();
+    fp.end();
+    if (!ok) ESP_LOGE(TAG, "factory record %s (%u bytes) could not be stored", key, (unsigned)json.length());
+    return ok;
+}
+
 void ConfigManager::clearFactory() {
     CfgLock g(lock);
     Preferences fp;

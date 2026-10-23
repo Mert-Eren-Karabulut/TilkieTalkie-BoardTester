@@ -28,6 +28,8 @@ public:
         SCENE_OTA,            // purple progress bar; param = percent
         SCENE_SLEEPING,       // fade to dark
         SCENE_MANUAL,         // direct control (bring-up / console): colour + steady or breathing
+        SCENE_FACTORY,        // factory session idle (`ft begin`): all five dim white, steady
+        SCENE_TEST,           // factory LED test: the LEDs of a mask in one colour (showTestPattern)
     };
 
     enum Effect : uint8_t {
@@ -66,6 +68,9 @@ public:
     int getMaxBrightness() const { return maxBrightness; }
     void showChargeLevel(uint8_t percent, bool charging);
     void stopChargeDisplay();
+    // Factory LED test: LEDs whose bit is set in mask (bit 0 = first LED) at an absolute
+    // intensity (0-255, not scaled by the customer's brightness setting), the others dark.
+    void showTestPattern(uint8_t mask, uint32_t hexColor, int intensity);
     bool isChargeDisplayActive() const { return scene == SCENE_CHARGING; }
 
 private:
@@ -83,6 +88,7 @@ private:
     volatile bool sceneFlag;
     volatile bool lowBattery;
     uint32_t manualColor;
+    uint8_t testMask = 0;
     bool manualBreathing;
     int manualIntensity;
     unsigned long sceneSince;

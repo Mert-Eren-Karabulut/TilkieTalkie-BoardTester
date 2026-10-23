@@ -153,6 +153,16 @@ public:
     bool isPromptPlaying() const { return transientPlayback && currentState == PLAYING; }
     bool consumePlaylistEnded();      // true once after the last playlist track finished
 
+    // Factory tests (FactoryTest.cpp). A sine tone generated on the audio task (no file on the
+    // card needed); refused while anything plays. A temporary volume that is never stored, so
+    // the customer's volume comes back afterwards.
+    bool isInitialized() const { return initialized; }
+    bool startTone(uint16_t hz, uint32_t ms);
+    bool isToneActive() const { return toneRunning.load(); }
+    void stopTone();
+    void setVolumeOverride(int volume);
+    void clearVolumeOverride();
+
     // NFC session check (public for SleepController)
     bool isNfcSessionActive(const String& expectedUid) const;
 
@@ -229,6 +239,14 @@ private:
     PendingFault pendingFaults[MAX_PENDING_FAULTS];
     int pendingFaultCount = 0;
     std::atomic<uint32_t> totalUnderruns{0};
+
+    // Factory tone (audio lock held for all of these except the atomic flag)
+    std::atomic<bool> toneRunning{false};
+    uint32_t toneSamplesLeft = 0;
+    uint32_t tonePhase = 0;      // Q32 phase accumulator
+    uint32_t tonePhaseStep = 0;
+    int volumeOverrideSaved = -1; // the customer's volume while an override is active
+    void serviceTone();           // audio task: feed the I2S queue without blocking
 
     // ES8388 control
     bool initializeES8388();
