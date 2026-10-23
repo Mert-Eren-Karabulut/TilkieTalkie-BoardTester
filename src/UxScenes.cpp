@@ -124,11 +124,17 @@ void updateChargingUx()
 // Single owner of the persistent LED scene while the full system runs. Derived from state on
 // every loop iteration, so no code path can leave a stale animation behind; event feedback
 // uses ledController.flash() and plays on top.
+extern bool gLearnDischarge; // main.cpp (bench learndis)
+
 void deriveLedScene()
 {
     if (gSystemPhase != PHASE_RUNNING)
     {
         return; // monitor / bring-up drive the LED directly
+    }
+    if (gLearnDischarge)
+    {
+        return; // bench learning discharge: the LEDs are the load, held at full white by learndis
     }
     if (ledController.isChargeDisplayActive())
     {
