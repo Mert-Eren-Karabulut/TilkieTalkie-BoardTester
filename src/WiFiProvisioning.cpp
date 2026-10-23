@@ -334,6 +334,12 @@ void WiFiProvisioningManager::startProvisioning() {
 String WiFiProvisioningManager::proofOfPossession() {
     String pop = config.factoryPop();
     if (pop.length() > 0) {
+        // The proof of possession is the pairing code exactly as the label prints it
+        // (TK-XXXX-XXXX), so a parent typing it from the label gets it right; the portal
+        // normalises both spellings on bind. The bare 8 characters are what the factory stores.
+        if (pop.length() == 8) {
+            return "TK-" + pop.substring(0, 4) + "-" + pop.substring(4);
+        }
         return pop;
     }
 #ifdef TT_LEGACY_POP

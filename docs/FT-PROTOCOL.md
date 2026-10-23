@@ -90,7 +90,8 @@ Both repos implement this file; PROTOCOL-V2.md §9 points here.
 
 ## Label
 
-The QR payload is `TT1:<uuid>:TK-XXXX-XXXX`; the human-readable lines are the serial, the pairing
+The QR payload is `TT1:<uuid>:TK-XXXX-XXXX`; the pairing code as printed (`TK-XXXX-XXXX`) is the
+BLE proof of possession the app sends, character for character; the human-readable lines are the serial, the pairing
 code `TK-XXXX-XXXX` and the uuid. Serials are assigned by the portal at enrollment:
 `TT<yy>-<5 digits>` (e.g. `TT26-00042`), unique, sequential.
 

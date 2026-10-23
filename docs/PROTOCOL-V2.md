@@ -13,6 +13,8 @@ implement. FW = firmware, P = portal. Everything here replaces earlier docs wher
     know it. Used to obtain the device token.
   - `pop` (proof of possession / pairing code): 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`
     shown as `TK-XXXX-XXXX`, printed on the label as text and inside the QR, and used as the
+    BLE proof of possession **exactly in that printed form** (`TK-XXXX-XXXX`, upper case, with
+    the dashes); the portal's bind endpoint accepts either spelling. It is also used as the
     BLE provisioning proof-of-possession and as the pairing code the app sends when binding.
 - P: `POST /api/factory/hubs` (admin session or an admin token; the manufacturing panel):
   `{uuid, device_id, hardware_rev, serial?}` → creates or re-enrolls the hub, stores
