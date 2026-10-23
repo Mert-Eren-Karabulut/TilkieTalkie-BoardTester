@@ -131,3 +131,16 @@ failure?, version_code: running}`.
   above) the portal compares `fw.code` with its stale `ota_status`.
 - Signed URL TTL on the portal: 6 h; the firmware re-checks anyway when its offer is older than
   10 min before starting, and once on a 403/410 during the download.
+
+## Bench notes (2026-10-23, 1.3.2 → 1.3.3 → crash-test 1.3.4 against the LAN bench portal)
+- Verified: nudge → check → offer → "waiting for the dock and an idle toy" → `update_start` →
+  download (~45 s on the LAN) → verify → reboot → boot "pending verification" → confirmed when
+  Reverb subscribed (~10 s) → `success`. Crash-test image (abort 3 s after boot): bootloader back
+  to the previous image, `rolled_back` with "crash", release blacklisted, portal stops offering it.
+- The verdict after the reboot does not rely on PENDING_VERIFY alone: a bootloader without the
+  rollback feature (the bench env's bootloader turned out to be one) confirms the image itself,
+  so "the release we rebooted into reports exactly the expected version_code" is the second
+  witness. Without it the first boot of a good image was posted as `failed`.
+- Progress posts (`downloading`, `prompts`, `pending`) are not re-sent: a timed-out "0%" that
+  was re-sent 30 s later landed after "90%" on the portal timeline.
+

@@ -86,6 +86,7 @@ private:
 
     String _installed;   // checksum of /sounds/pack.json ("" when the card has none)
     String _required;    // checksum the portal pairs with the running firmware ("" unknown)
+    String _installedFor; // for_firmware of /sounds/pack.json: "ok" before the first check when it is this build
     Pack _pack;
     String _forVersion;
     std::function<void(bool)> _cb;

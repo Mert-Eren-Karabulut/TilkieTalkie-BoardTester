@@ -150,6 +150,7 @@ void PromptPackManager::begin()
         }
     }
     _installed = haveInstalled ? installed.checksum : String();
+    _installedFor = haveInstalled ? installedFor : String();
     Pack staged;
     String forVersion;
     if (readPackJson(STAGING_DIR, staged, forVersion))
@@ -174,6 +175,7 @@ void PromptPackManager::begin()
         {
             String restoredFor;
             _installed = readPackJson(SOUNDS_DIR, installed, restoredFor) ? installed.checksum : String();
+            _installedFor = _installed.isEmpty() ? String() : restoredFor;
         }
     }
     int missing = 0;
@@ -209,7 +211,9 @@ const char *PromptPackManager::stateName() const
 {
     if (_staging) return "syncing";
     if (_installed.isEmpty()) return "missing";
-    if (_required.isEmpty()) return "unknown";
+    // Before the first check answers (which pack this build is paired with), a complete pack
+    // written for exactly this firmware is "ok" rather than "unknown" on every boot.
+    if (_required.isEmpty()) return _installedFor == firmwareVersion() ? "ok" : "unknown";
     return _required == _installed ? "ok" : "outdated";
 }
 
@@ -490,6 +494,7 @@ bool PromptPackManager::activateStaging()
         }
     }
     _installed = staged.checksum;
+    _installedFor = forVersion;
     ESP_LOGI(TAG, "pack %.12s (%s) is now active", staged.checksum.c_str(), staged.name.c_str());
     return true;
 }

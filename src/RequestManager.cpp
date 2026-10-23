@@ -693,6 +693,10 @@ String RequestManager::getJWTToken()
 // GET /hubs/{uuid}/token, answered with the owner's hub token while the portal allows it.
 String RequestManager::fetchLegacyToken()
 {
+    const unsigned long now = millis();
+    if (tokenBlockedUntil && (long)(now - tokenBlockedUntil) < 0) {
+        return String(); // the portal retired the legacy path (410) or throttled us: wait 15 min
+    }
     String endpoint = hubPath() + "/token";
     ESP_LOGI(TAG, "Requesting JWT token from endpoint: %s", endpoint.c_str());
     
@@ -714,6 +718,14 @@ String RequestManager::fetchLegacyToken()
         // is the "online but not linked" case (it used to look like "offline" to the child).
         linkStateValue = LinkState::NOT_LINKED;
         pendingBound = 0;
+    } else if (code == 410 || code == 429) {
+        // 410: this unit is enrolled on the portal but carries no factory secret (or the legacy
+        // switch is off); every subsystem used to retry the same GET within seconds. One fault,
+        // then 15 min of silence - `ft enroll` is the fix, not retrying.
+        tokenBlockedUntil = now + TOKEN_BACKOFF_MS;
+        if (code == 410) {
+            Faults::raise(Fault::NOT_ENROLLED, "legacy-gone");
+        }
     }
     
     ESP_LOGW(TAG, "JWT token request failed (%d): %s", code, doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "?");

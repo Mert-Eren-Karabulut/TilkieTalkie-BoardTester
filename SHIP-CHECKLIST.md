@@ -112,3 +112,16 @@ in this release has been on a device yet. Bench plan, in order, against the LAN 
 10. Foreign card: card from another uuid → cache wiped once (fault 306), prompt pack kept.
 11. Faults page: events carry `at` (SNTP) and `approx`; the report carries `fw` and `prompts`.
 12. Inventory with a 60+-track figure: parts merged on the hub page, `truncated` shown.
+
+**Bench results 2026-10-23 (LAN bench portal, bench board):** 1 boot/probe/token/Reverb OK;
+2 pack c1f1888c0884 live-synced and activated (28 files, sha verified); 3 `ft enroll` → `POST /token`
+device token (90 d), hub page enrolled; 4 unbind → fault 110 + `not_linked` spoken after the hello,
+bind → cleared; 7 OTA 1.3.2→1.3.3 end to end with "pending verification" and confirmation on Reverb,
+crash-test image rolled back by the bootloader, blacklisted, portal stopped offering it; 11 events
+carry exact `at` times, the report updates firmware and pack on the hub page. Fixed on the way:
+the post-update verdict (a bootloader without rollback made a good update report `failed`), the
+legacy token path hammering a 410, out-of-order progress posts, prompt state "unknown" on boot.
+Not run: 5 customer reset and 6 captive portal (need the app / a captive network), 8 Range
+resume, 9 revoked card, 10 foreign card, 12 60-track inventory (need a figure on the pins / a
+second card). The production build has no `endpoint set`: LAN tests use env:bench.
+

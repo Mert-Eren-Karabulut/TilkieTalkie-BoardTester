@@ -287,14 +287,18 @@ void OtaManager::postStatus(const char *status, int progress, const String &erro
     {
         doc["version_code"] = versionCode;
     }
-    // Posted by the request worker (5xx re-sent after 30 s / 2 min / 10 min); the loop task is
-    // not held up by a slow or dead portal.
+    // Posted by the request worker; the loop task is not held up by a slow or dead portal.
+    // Progress posts are fire-and-forget (a re-sent "downloading 0%" landing after "90%" put
+    // the portal's timeline out of order on the bench); the verdicts (success, failed,
+    // rolled_back, declined) are re-sent after 30 s / 2 min / 10 min on 5xx or a timeout.
+    const bool progressOnly = strcmp(status, "downloading") == 0 || strcmp(status, "prompts") == 0 ||
+                              strcmp(status, "pending") == 0;
     const String statusCopy = status;
     const int progressCopy = progress;
     bool queued = RequestManager::getInstance().postAsync("/hubs/" + deviceId() + "/firmware/status", doc,
         [statusCopy, progressCopy](JsonDocument &, int code) {
             ESP_LOGI(TAG, "status '%s' %d%% -> HTTP %d", statusCopy.c_str(), progressCopy, code);
-        });
+        }, progressOnly ? RequestManager::Retry::NONE : RequestManager::Retry::BACKGROUND);
     if (!queued)
     {
         ESP_LOGW(TAG, "status '%s' %d%% not sent (no network)", status, progress);
@@ -956,7 +960,12 @@ void OtaManager::serviceBootReport(unsigned long now)
     {
         rel = (uint32_t)cfg.getInt(NVS_OTA_LAST_REL, 0); // the image we just abandoned
     }
-    if (!reverted && _bootedFromOta)
+    // "Booted from the update" is normally the PENDING_VERIFY state the bootloader gives a new
+    // image. A bootloader without the rollback feature (or one that already confirmed the image)
+    // leaves no such state, so the record itself is the second witness: the release we rebooted
+    // into reports exactly the version_code it was expected to have.
+    const bool newImageRuns = _bootedFromOta || (rel && want && want == running);
+    if (!reverted && newImageRuns)
     {
         // The new image runs and was confirmed. A version_code different from the release's
         // can only come from a formula mismatch (the portal now derives it from the image):
