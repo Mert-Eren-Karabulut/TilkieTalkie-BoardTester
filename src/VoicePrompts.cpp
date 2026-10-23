@@ -124,7 +124,7 @@ void VoicePrompts::begin()
 
 void VoicePrompts::say(Prompt p)
 {
-    if (!queue || (int)p >= (int)Prompt::COUNT)
+    if (!queue || (int)p >= (int)Prompt::COUNT || muted)
     {
         return;
     }
@@ -167,7 +167,7 @@ bool VoicePrompts::playNow(Prompt p)
 
 void VoicePrompts::sayBlocking(Prompt p, uint32_t maxMs)
 {
-    if (!started)
+    if (!started || muted)
     {
         return;
     }
@@ -190,6 +190,15 @@ void VoicePrompts::update()
 {
     if (!started || !queue)
     {
+        return;
+    }
+    if (muted)
+    {
+        uint8_t dropped;
+        while (xQueueReceive(queue, &dropped, 0) == pdTRUE)
+        {
+            queuedMask.fetch_and(~(1UL << dropped));
+        }
         return;
     }
     AudioController &audio = AudioController::getInstance();

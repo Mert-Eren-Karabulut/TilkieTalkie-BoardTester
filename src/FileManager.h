@@ -357,6 +357,7 @@ public:
     size_t getSDCardUsedSpace();
     size_t getSDCardFreeSpace();
     uint32_t getSDCardFreeMB();   // same cache, in MB (the byte value saturates at 4 GB)
+    bool isFreeSpaceKnown() const { return cachedFreeAt.load() != 0; } // the cache has been filled once
     String getSDCardInfo();
 
     // Download statistics

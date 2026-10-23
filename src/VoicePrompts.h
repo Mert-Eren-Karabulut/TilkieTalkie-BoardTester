@@ -65,6 +65,10 @@ public:
     String path(Prompt p) const;                  // /sounds/tr/<name>.mp3 or /sounds/<tone>.mp3
     bool available(Prompt p) const;               // the file exists on the card
     void setLanguage(const String &code) { language = code; }
+    // Factory session (`ft begin`): nothing is spoken (say() drops, sayBlocking() returns),
+    // and what was queued before is dropped instead of being spoken after `ft end`.
+    void setMuted(bool on) { muted = on; }
+    bool isMuted() const { return muted.load(); }
     static const char *name(Prompt p);
     // The files this firmware expects under /sounds (also embedded in the image as the
     // "TTPROMPTS1:" marker the portal reads when a release is uploaded).
@@ -90,4 +94,5 @@ private:
     std::atomic<uint32_t> lastSaidAt[(int)Prompt::COUNT] = {};
     String language = "tr";
     bool started = false;
+    std::atomic<bool> muted{false};
 };

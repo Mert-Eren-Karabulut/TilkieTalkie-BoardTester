@@ -89,6 +89,9 @@ public:
     void setConditions(std::function<Conditions()> fn) { _conditionsFn = fn; }
     void onNetworkServicesStarted() { _networkStarted = true; } // API base and token are set up
     void notePortalReached(const char *how);                    // e.g. Reverb subscribed
+    // Factory session (`ft begin` .. `ft end`): no checks and no jobs; the boot bookkeeping
+    // (image confirmation, the previous attempt's report) still runs.
+    void setFactoryHold(bool on) { _factoryHold = on; }
 
     State state() const { return _state; }
     const char *stateName() const;   // "idle", "waiting", "downloading", ... for reports
@@ -187,6 +190,7 @@ private:
     int _promptSyncFailures = 0;
 
     bool _networkStarted = false;
+    bool _factoryHold = false;
     bool _portalReached = false;
     bool _bootHealthyMarked = false;
     bool _pendingVerify = false;

@@ -307,6 +307,11 @@ void OtaManager::postStatus(const char *status, int progress, const String &erro
 
 bool OtaManager::checkNow(uint32_t releaseId, const char *reason)
 {
+    if (_factoryHold)
+    {
+        ESP_LOGW(TAG, "check (%s) refused, factory session", reason ? reason : "?");
+        return false;
+    }
     if (inProgress())
     {
         ESP_LOGI(TAG, "check (%s) ignored, update in progress", reason ? reason : "?");
@@ -669,6 +674,11 @@ void OtaManager::onPromptsStaged(bool ok)
 
 bool OtaManager::startJob(const Job &job)
 {
+    if (_factoryHold)
+    {
+        ESP_LOGW(TAG, "job refused, factory session");
+        return false;
+    }
     // Console (bench) path: no waiting rules, no re-check on 403 (there is no offer to refresh).
     if (_state == DOWNLOADING || _state == APPLYING || _state == REBOOTING)
     {
@@ -1056,6 +1066,11 @@ void OtaManager::update()
             postStatus(status, progress, String(error), failure == Failure::NONE ? nullptr : failureName(failure),
                        firmwareVersionCode(), _job.releaseId);
         }
+    }
+
+    if (_factoryHold)
+    {
+        return; // factory session: the state machine waits (no checks, no jobs)
     }
 
     Conditions c;

@@ -85,6 +85,25 @@ public:
     // The PoP BLE provisioning uses: the factory pop, or the legacy PIN (TT_LEGACY_POP), or "".
     String proofOfPossession();
 
+    // ---- Factory tests (FactoryTest.cpp, docs/FT-PROTOCOL.md) ----
+    // Hold: the background reconnection, the portal probe of the loop and the credential
+    // mirroring stand still while a test uses the radio, so a test network never reaches
+    // ConfigManager and nothing reconnects behind the test's back. Releasing it forces a fresh
+    // portal probe of whatever link comes next.
+    void setFactoryHold(bool on);
+    bool factoryHold() const { return factoryHoldOn; }
+    // One portal probe (the same check as after every connection) on the current link.
+    // startFactoryProbe() is false when no probe target is configured or one is still running.
+    bool startFactoryProbe();
+    int factoryProbeResult() const;              // -1 running, 0 captive, 1 ours, 2 no answer
+    String factoryProbeWhy() const;
+    bool hasProbeTarget() const { return !probeHost.isEmpty(); }
+    // BLE advertising under the normal device name with the normal PoP, for the `ble` test.
+    // 1 = started by us (factoryBleStop() ends it), 2 = provisioning already advertising (left
+    // alone), 0 = failed (err says why).
+    int factoryBleStart(String &name, String &err);
+    void factoryBleStop();
+
     // Query underlying library state
     bool isProvisioned();
     bool isProvisioningManagerActive();
@@ -123,6 +142,12 @@ private:
     volatile bool captiveRejectPending = false; // set before the synthetic auth failure is posted
     volatile bool captiveCleanupPending = false;
     volatile unsigned long provStopAt = 0;     // success: stop the manager 30 s later (auto-stop is off)
+
+    // Factory tests
+    volatile bool factoryHoldOn = false;
+    bool factoryBle = false;           // the `ble` test owns the provisioning manager
+    bool factoryBleWifiStarted = false; // ... and started the WiFi driver for it
+    volatile bool btReleased = false;   // BT controller memory went back to the heap this boot
 
     // Wrong password on a provisioned toy
     static const int AUTH_FAIL_LIMIT = 3;

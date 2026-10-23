@@ -196,6 +196,17 @@ void LedController::showChargeLevel(uint8_t percent, bool charging) {
     if (lock) xSemaphoreGive(lock);
 }
 
+void LedController::showTestPattern(uint8_t mask, uint32_t hexColor, int intensity) {
+    if (lock) xSemaphoreTake(lock, portMAX_DELAY);
+    testMask = mask;
+    manualColor = hexColor;
+    manualIntensity = constrain(intensity, 0, LED_MAX_POWER);
+    effect = FX_NONE; // the operator judges the pattern: no event effect on top of it
+    if (scene != SCENE_TEST) sceneSince = millis();
+    scene = SCENE_TEST;
+    if (lock) xSemaphoreGive(lock);
+}
+
 void LedController::stopChargeDisplay() {
     if (scene == SCENE_CHARGING) {
         setScene(SCENE_OFF);
@@ -316,6 +327,17 @@ void LedController::renderScene(unsigned long now) {
 
         case SCENE_MANUAL:
             fillAll(scaled(manualColor, manualBreathing ? (int)(manualIntensity * breathe(now, 2000)) : manualIntensity));
+            break;
+
+        case SCENE_FACTORY:
+            // Absolute level (not pct()): a unit whose customer brightness is 0 still shows it.
+            fillAll(scaled(COLOR_WHITE, 12));
+            break;
+
+        case SCENE_TEST:
+            for (int i = 0; i < NUM_LEDS; ++i) {
+                if (testMask & (1u << i)) frame[i] = scaled(manualColor, manualIntensity);
+            }
             break;
     }
 

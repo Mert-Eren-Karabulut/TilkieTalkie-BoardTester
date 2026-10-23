@@ -237,7 +237,7 @@ void AudioController::end() {
     }
 
     if (volumeDirty) {
-        ConfigManager::getInstance().storeInt("audio_volume", currentVolume);
+        ConfigManager::getInstance().storeInt("audio_volume", volumeOverrideSaved >= 0 ? volumeOverrideSaved : currentVolume); // never a factory override
         volumeDirty = false;
     }
 
@@ -1033,9 +1033,98 @@ bool AudioController::consumePlaylistEnded() {
     return playlistEnded.exchange(false);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Factory tone and volume override (`ft test speaker`)
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+constexpr uint32_t kToneRate = 44100;
+constexpr int16_t kToneAmplitude = 9830; // ~-10 dBFS: audible on the speaker, no clipping at any volume
+int16_t gSineTable[256];
+bool gSineReady = false;
+}
+
+bool AudioController::startTone(uint16_t hz, uint32_t ms) {
+    AudioLock lock(audioMutex);
+    if (!initialized || !audioOutput || currentState != STOPPED || toneRunning) {
+        return false;
+    }
+    if (!gSineReady) {
+        for (int i = 0; i < 256; ++i) {
+            gSineTable[i] = (int16_t)lroundf(sinf(i * TWO_PI / 256.0f) * kToneAmplitude);
+        }
+        gSineReady = true;
+    }
+    // The MP3 decoder sets the format per track; the tone sets its own and the next track
+    // sets its own again.
+    audioOutput->SetRate(kToneRate);
+    audioOutput->SetBitsPerSample(16);
+    audioOutput->SetChannels(2);
+    tonePhase = 0;
+    tonePhaseStep = (uint32_t)(((uint64_t)hz << 32) / kToneRate);
+    toneSamplesLeft = (uint32_t)((uint64_t)kToneRate * ms / 1000);
+    toneRunning = true;
+    setOutputsActive(true);
+    ESP_LOGI(TAG, "factory tone %u Hz for %lu ms", (unsigned)hz, (unsigned long)ms);
+    return true;
+}
+
+void AudioController::stopTone() {
+    AudioLock lock(audioMutex);
+    if (toneRunning) {
+        toneSamplesLeft = 0;
+        serviceTone(); // ends it (outputs down) under the lock
+    }
+}
+
+// Audio task (or stopTone), lock held. ConsumeSample() never blocks: whatever does not fit in
+// the DMA queue now goes in on the next slice.
+void AudioController::serviceTone() {
+    int budget = 2048;
+    while (toneSamplesLeft > 0 && budget-- > 0) {
+        int16_t v = gSineTable[tonePhase >> 24];
+        int16_t frame[2] = {v, v};
+        if (!audioOutput->ConsumeSample(frame)) {
+            return; // queue full
+        }
+        tonePhase += tonePhaseStep;
+        toneSamplesLeft--;
+    }
+    if (toneSamplesLeft == 0) {
+        setOutputsActive(false);
+        toneRunning = false;
+    }
+}
+
+void AudioController::setVolumeOverride(int volume) {
+    AudioLock lock(audioMutex);
+    if (!initialized) {
+        return;
+    }
+    if (volumeOverrideSaved < 0) {
+        volumeOverrideSaved = currentVolume;
+    }
+    currentVolume = constrain(volume, MIN_VOLUME, MAX_VOLUME); // not marked dirty: never stored
+    applyCodecVolume();
+}
+
+void AudioController::clearVolumeOverride() {
+    AudioLock lock(audioMutex);
+    if (!initialized || volumeOverrideSaved < 0) {
+        return;
+    }
+    currentVolume = volumeOverrideSaved;
+    volumeOverrideSaved = -1;
+    applyCodecVolume();
+}
+
 // Audio task, lock held.
 void AudioController::updatePlaybackSlice() {
     if (!initialized) {
+        return;
+    }
+    if (toneRunning) {
+        serviceTone();
         return;
     }
 
@@ -1071,7 +1160,7 @@ void AudioController::update() {
         return;
     }
     if (volumeDirty && millis() - volumeDirtyAt > 2000) {
-        ConfigManager::getInstance().storeInt("audio_volume", currentVolume);
+        ConfigManager::getInstance().storeInt("audio_volume", volumeOverrideSaved >= 0 ? volumeOverrideSaved : currentVolume); // never a factory override
         volumeDirty = false;
     }
     if (promptEnded) {

@@ -91,6 +91,23 @@ bool PromptPackManager::filesComplete(const String &dir, const Pack &pack, int *
     return miss == 0;
 }
 
+bool PromptPackManager::installedStatus(String &checksum, int &files, int &missing)
+{
+    Pack pack;
+    String forVersion;
+    checksum = String();
+    files = 0;
+    missing = 0;
+    if (!readPackJson(SOUNDS_DIR, pack, forVersion))
+    {
+        return false;
+    }
+    checksum = pack.checksum;
+    files = (int)pack.files.size();
+    filesComplete(SOUNDS_DIR, pack, &missing);
+    return true;
+}
+
 void PromptPackManager::begin()
 {
     FileManager &fm = FileManager::getInstance();
