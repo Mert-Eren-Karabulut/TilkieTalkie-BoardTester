@@ -146,21 +146,8 @@ States: IDLE, CHECKING, WAITING, PROMPTS, DOWNLOADING, APPLYING, REBOOTING, FAIL
   queued job; a track is `ready` only after that and manifests include ready tracks only.
   Checksums are always present; the firmware refuses assets without one.
 
-## 9. Factory test protocol (`ft`, over USB serial; the manufacturing panel speaks it)
+## 9. Factory test protocol (`ft`)
 
-Line protocol, one command per line, one JSON line back: `{"ok":true,...}` or
-`{"ok":false,"error":"..."}`.
-- `ft begin` → `{uuid, mac, hw, fw, enrolled, bringup, pack, card}` and holds the toy in
-  factory mode (no sleep, no OTA, prompts off) until `ft end`.
-- `ft enroll <secret> <pop> [serial]`, `ft show`.
-- `ft test <name>` → runs one self-test and returns its result: `leds` (lights each LED, the
-  operator confirms with `ft ok`/`ft fail`), `buttons` (waits for each button, 20 s), `nfc`
-  (waits for a card, returns the uid), `pogo`, `speaker` (plays a tone; the operator confirms),
-  `jack`, `battery` (gauge + charger telemetry, pass if plausible), `pd`, `sd` (write/read
-  speed, pack.json present, file count), `wifi <ssid> <pass>` (connects, probes the portal,
-  disconnects), `ble` (advertises for 10 s), `sleep` (deep-sleep current needs an external
-  meter; returns the shunt reading if present).
-- `ft result` → the collected results; `ft commit` stores `{tested_at, results}` in the
-  `factory` namespace and the panel posts them to `POST /api/factory/hubs/{uuid}/test`.
-- `ft clean` (service reset without the factory namespace), `ft ship` (ship mode with the
-  10 s delay: the operator unplugs within 10 s; wake = USB plug).
+Specified in docs/FT-PROTOCOL.md (framing, session, the test catalogue with pass rules and data,
+results, `ft ship`, the label, the station flow). The manufacturing panel on the portal speaks it
+over WebSerial.
