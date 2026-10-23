@@ -342,13 +342,12 @@ String WiFiProvisioningManager::proofOfPossession() {
         }
         return pop;
     }
-#ifdef TT_LEGACY_POP
-    // Un-enrolled fleet (docs/PROTOCOL-V2.md §1): the old shared PIN until every unit has a pop.
-    ESP_LOGW(TAG, "no factory pop enrolled - using the legacy provisioning PIN (TT_LEGACY_POP)");
+    // Not enrolled (a development board, a bare flash): the shared development PIN, by design
+    // (docs/PROTOCOL-V2.md §1). The printed TK- code applies only once the factory line has
+    // enrolled the unit; that identity lives in the factory NVS namespace and survives OTA
+    // updates and customer resets (only a full flash erase or `ft reset --all` removes it).
+    ESP_LOGW(TAG, "no factory pop enrolled - using the shared development PIN");
     return config.getProvisioningPin();
-#else
-    return String();
-#endif
 }
 
 void WiFiProvisioningManager::printQRCode() {

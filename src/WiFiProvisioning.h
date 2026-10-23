@@ -80,9 +80,9 @@ public:
     bool isHomeNetworkVisible() const { return homeNetworkVisible; }
     
     // No proof of possession for BLE provisioning (no factory pop enrolled, and the build has
-    // no TT_LEGACY_POP fallback): the toy cannot be provisioned and says so (112, red LED).
+    // the development PIN is empty too): the toy cannot be provisioned and says so (112, red LED).
     bool provisioningImpossible() const { return noProofOfPossession; }
-    // The PoP BLE provisioning uses: the factory pop, or the legacy PIN (TT_LEGACY_POP), or "".
+    // The PoP BLE provisioning uses: the printed TK- code of an enrolled unit, else the shared development PIN.
     String proofOfPossession();
 
     // ---- Factory tests (FactoryTest.cpp, docs/FT-PROTOCOL.md) ----

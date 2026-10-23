@@ -824,7 +824,7 @@ void startFullSystem()
     if (config.factoryPop().isEmpty())
     {
         // No factory identity (docs/PROTOCOL-V2.md §1): BLE provisioning uses the legacy PIN
-        // (TT_LEGACY_POP builds) or is impossible; the token comes from the legacy endpoint.
+        // (development PIN) or is impossible; the token comes from the legacy endpoint.
         Faults::raise(Fault::NOT_ENROLLED, "no pop");
     }
     {
