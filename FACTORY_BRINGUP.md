@@ -1,3 +1,5 @@
+> Superseded by [docs/MANUFACTURING.md](docs/MANUFACTURING.md): the station runs bring-up with `ft test bringup`; the bench commands below do not exist in production firmware.
+
 # TilkieTalkie — Factory First-Boot Bring-Up
 
 Guide for flashing a board for the first time. The firmware **configures the battery gauge
@@ -46,7 +48,7 @@ Bring-up runs **once per board** — a flag is saved in NVS. A re-flash does **n
 
 In the serial terminal type **`battery`** and check:
 
-- `Gauge Chem ID: 0x418`, `DA Configuration: 0x10 (1S)`
+- `DA Configuration: 0x10 (1S)` (the Chem ID is whatever the gauge shipped with; the firmware does not program a chemistry, docs/GAUGE-CHEMISTRY.md)
 - `Gauge SafetyStatus: 0x0 (None)`
 - `Full Charge Capacity` non-zero (~3500–4000 mAh)
 - `Battery Current` ≈ the charge current (NOT several times higher) — confirms calibration
@@ -93,7 +95,7 @@ No serial commands, no re-flash. Leave it on the charger and it comes back.
 ## 6. Notes (engineering)
 
 **What bring-up does, per board (first boot only):**
-1. Provisions the gauge for LiFePO4 (1S, Chem ID 0x418, 4000 mAh, charge/current thresholds)
+1. Provisions the gauge for LiFePO4 (1S, 4000 mAh, charge/current thresholds; no chemistry ID)
    — done non-destructively by `battery.begin()`.
 2. Enables the **CUV latch** (Protection Configuration `0x46AE` bit 1) so an undervoltage trip
    stays latched until a charger is present — proper over-discharge protection. Re-applied on

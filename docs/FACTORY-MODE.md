@@ -1,3 +1,5 @@
+> Superseded by [MANUFACTURING.md](MANUFACTURING.md) (station procedure) and [FT-PROTOCOL.md](FT-PROTOCOL.md) (the `ft` protocol); kept as the 2026-10-11 plan.
+
 # Factory mode — plan (2026-10-11, for review before implementation)
 
 Scope: what happens to every board between "flashed for the first time" and "in the box", on
@@ -42,7 +44,7 @@ answer with one JSON line each (`FT {...}`) so the station can parse them.
 | Command | What the firmware does | Pass criterion (automatic unless noted) |
 |---|---|---|
 | `ft begin` | stops sleep/OTA/scenes, answers identity: uuid, eFuse MAC, fw version+code, hw rev, reset reason, bring-up flag | — |
-| `ft power` | VBUS, PD contract (CH224Q), charger state/faults, gauge chem id, cell V, temp, FCC, SOC, `bringup_v1` | VBUS 4.6–5.5 V (or PD 9 V if requested), gauge responds, chem id 0x418, no faults, bring-up done |
+| `ft power` | VBUS, PD contract (CH224Q), charger state/faults, gauge chem id, cell V, temp, FCC, SOC, `bringup_v1` | VBUS 4.6–5.5 V (or PD 9 V if requested), gauge responds, no faults, bring-up done (the chemistry is not checked: the firmware does not program one, docs/GAUGE-CHEMISTRY.md) |
 | `ft sd` | mount, CID serial, free space, 1 MB write + read-back + sha | mounted, read-back ok, write ≥ 0.5 MB/s (threshold to confirm; the bench Powerway card does 0.3) |
 | `ft led <r|g|b|w|off|cycle>` | drives all 5 LEDs | operator confirms colours on the station UI |
 | `ft buttons <s>` | reports every press (which button, ms) for s seconds | all 4 buttons seen (station prompts one at a time) |

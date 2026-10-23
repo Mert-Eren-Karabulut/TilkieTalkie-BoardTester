@@ -27,7 +27,7 @@ feeding the loop watchdog meanwhile; any other answer or silence cancels.
 | group | commands |
 |---|---|
 | system | `help`, `version`, `faults`, `restart`, `config` (no PIN), `debug`, `efusemac` / `hubid`, `heap`, `stack`, `timing`, `tasks`, `diag [on\|off]`, `coredump`, `coredumperase`, `endpoint`, `endpoint clear`, `ota`, `ota check [release_id]` |
-| factory (`ft`) | `ft enroll <secret> <pop> [serial]`, `ft show`, `ft reset [--all]` (below) |
+| factory (`ft`) | `ft begin`, `ft end`, `ft show`, `ft enroll <secret> <pop> [serial]`, `ft test <name> [args]`, `ft ok`, `ft fail [reason]`, `ft abort`, `ft result`, `ft commit`, `ft clean`, `ft ship`, `ft reset [--all]` (below) |
 | WiFi / Reverb | `qr`, `reset`, `stats`, `reverbstatus`, `reverbclean`, `reverbstart` |
 | battery / power | `battery`, `battscan`, `batterycfg`, `batteryclearflags`, `chargekick`, `gaugefets`, `gaugeprot`, `gaugecuvfix`, `gaugebus`, `gaugebus attach`, `pdstatus`, `power`, `poweron` |
 | sleep | `sleep`, `sleep now`, `sleepafter <ms>`, `cancelsleep`, `sleepstatus` |
@@ -42,17 +42,33 @@ feeding the loop watchdog meanwhile; any other answer or silence cancels.
 (1.2.19 and older printed it reversed), whether the unit is enrolled, and the label payload
 `TT1:<uuid>:TK-XXXX-XXXX` once a pop is enrolled.
 
-### Factory protocol `ft` (docs/PROTOCOL-V2.md §9, first commands)
+### Factory protocol `ft` (docs/FT-PROTOCOL.md)
 
-One command per line, one JSON line back on the console: `{"ok":true,...}` or
-`{"ok":false,"error":"..."}`.
+The contract with the portal's manufacturing panel is docs/FT-PROTOCOL.md (shapes, the test
+catalogue, pass rules); the station procedure is docs/MANUFACTURING.md. Every answer is one or
+more JSON lines starting with `{"ft":"<verb>"` (`{"ft":"<verb>","ok":false,"error":"..."}` on a
+refusal, `{"ft":"?","ok":false,"error":"unknown ft command"}` for an unknown verb), written
+straight to the port so the log level never hides them. Implemented in src/FactoryTest.cpp.
 
-| command | answer |
-|---|---|
-| `ft enroll <secret> <pop> [serial]` | stores the factory identity (NVS namespace `factory`) and answers like `ft show`. secret: 16-128 characters of `A-Za-z0-9-_.` (the portal's base64url secret); pop: `TK-XXXX-XXXX` or `XXXXXXXX` from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, stored as the bare 8 upper-case characters (the BLE proof of possession); serial: optional, up to 32 of the same characters |
-| `ft show` | `{"ok":true,"uuid":"...","mac":"AA:BB:CC:DD:EE:FF","serial":"..."\|null,"enrolled":true\|false,"label":"TT1:<uuid>:TK-XXXX-XXXX"\|null}`; never the secret |
-| `ft reset` | `{"ok":true,"reset":"customer"}`, then the customer reset below (the factory namespace survives) and a restart |
-| `ft reset --all` | `{"ok":true,"reset":"all"}`, the same plus the factory namespace (secret, pop, serial, test and bring-up records) |
+| command | session needed | answer |
+|---|---|---|
+| `ft begin` | no (opens it) | the unit's state: uuid, mac, hw, fw, code, enrolled, serial, pop, bringup {state, record}, card, pack, battery, vbus_mv, tested (when committed), session. Again while open: the same answer |
+| `ft end` | no | `{"ft":"end","ok":true}`; a running test ends as aborted; normal operation resumes |
+| `ft show` | no | `{"ft":"show","ok":true,"uuid","mac","serial","enrolled","label"}`; serial null and label "" until enrolled; never the secret |
+| `ft enroll <secret> <pop> [serial]` | no | stores the factory identity (NVS namespace `factory`) → `{"ft":"enroll","ok":true,"uuid","serial","label"}`. secret: 16-128 characters of `A-Za-z0-9-_.` (the portal's base64url secret); pop: `TK-XXXX-XXXX` or `XXXXXXXX` from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, stored as the bare 8 upper-case characters (the BLE proof of possession); serial: optional, up to 32 of the same characters |
+| `ft test <name> [args]` | yes | `{"ft":"test","name","state":"running"}`, progress lines, maybe an `ask`, one `result` line. Names: leds, buttons, nfc, pogo, speaker, jack, battery, pd, sd, `wifi <ssid> <pass>`, ble, bringup, sleep. Refused with `busy` while a test (or ship) runs, `system not started` for the tests that need the full system while the unit is still in battery-monitor mode |
+| `ft ok` / `ft fail [reason]` | yes | answers an `ask`: `{"ft":"ok","ok":true}` then the result line |
+| `ft abort` | — | `{"ft":"abort","ok":true}` then the running test's result with `"error":"aborted"` |
+| `ft result` | yes | `{"ft":"results","ok":true,"pass":<all passed>,"tests":{...}}` (pass is false with no results) |
+| `ft commit` | yes | the record `{"tested_at","fw","pass","tests"}` into the factory key `tested` (≤ 1.5 KB; the per-test data is dropped if it would not fit) → `{"ft":"commit","ok":true}`; the RAM results are cleared |
+| `ft clean` | no | `{"ft":"clean","ok":true}`, then the customer reset below and a restart |
+| `ft ship` | yes | `{"ft":"ship","ok":true,"unplug_within_s":10}` and BQ25792 ship mode with the 10 s delay; `still powered` (cancelled) when VBUS is still there after 15 s; refused with `charge first` under 3.4 V and `busy` during a test |
+| `ft reset` / `ft reset --all` | no | `{"ft":"reset","ok":true,"reset":"customer"\|"all"}`, then the customer reset (with `--all` also the factory namespace: secret, pop, serial, test and bring-up records) and a restart |
+
+Factory mode while a session is open: no deep sleep, no OTA checks or jobs, no voice prompts
+or hello, no figure handling (the buttons, the NFC reader and the pogo switch only feed the
+tests), a dim white LED scene, WiFi and BLE left as they are (a unit whose full system starts
+during the session starts WiFi only at `ft end`), log level WARN. A reboot ends the session.
 
 ## Button holds (volume buttons 1 + 4)
 
@@ -81,7 +97,7 @@ Buttons 2 + 3 held 5 s restart the toy (unchanged).
 | `cat <path>` | print the first 4 KB of a file on the card |
 | `tap <uid>`, `untap` | simulate mounting / removing a figure |
 | `startsystem` | start the full system bypassing the battery gate |
-| `bringupreset` | clear the bring-up flag and re-run the gauge bring-up |
+| `bringupreset` | clear the bring-up flag and re-run the gauge bring-up (production: `ft test bringup`) |
 | `gaugebus release` | hand the battery bus to bqStudio / EV2400 (persists across reboots) |
 | `gauge1s`, `gaugeprog`, `gaugeresetlearn`, `gaugelearned`, `gaugecalcurrent` | gauge provisioning tools |
 | `dfread <hexaddr> [len]`, `dfwrite8 <hexaddr> <hexval>` | gauge data flash |
