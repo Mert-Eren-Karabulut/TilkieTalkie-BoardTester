@@ -39,7 +39,7 @@ Until the factory writes the cards, a missing pack could also be fetched from th
 
 | name | spoken (tr) | when | policy |
 |---|---|---|---|
-| setup_welcome | Merhaba! Ben Tilki. Beni internete bağlamak için telefonundaki Tilki Toki uygulamasını aç ve yeni cihaz ekle'ye dokun. | boot without WiFi credentials; repeated every 90 s, 5 times. Not said by a unit that cannot be provisioned (no factory pop in a build without TT_LEGACY_POP: red LED instead) | drop while playing |
+| setup_welcome | Merhaba! Ben Tilki. Beni internete bağlamak için telefonundaki Tilki Toki uygulamasını aç ve yeni cihaz ekle'ye dokun. | boot without WiFi credentials; repeated every 90 s, 5 times. Not said by a unit that cannot be provisioned at all (no factory code and an empty development PIN: red LED instead) | drop while playing |
 | setup_connecting | Teşekkürler! İnternete bağlanıyorum, birazcık bekle. | credentials received over BLE | |
 | setup_success | Harika, internete bağlandım! Şimdi ilk figürünü üzerime yerleştir. | provisioning ended with the network up | |
 | setup_failed | Bağlanamadım. Kablosuz ağ adını ve şifresini kontrol edip uygulamadan tekrar dene. Hata kodu: Üzüm. | credentials rejected | |
