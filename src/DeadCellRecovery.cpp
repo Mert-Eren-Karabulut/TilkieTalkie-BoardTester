@@ -105,9 +105,11 @@ void serviceLowBatteryCutoff()
                 // two-tier (deep sleep at 3.00V, ship only at 2.85V) so button-wake
                 // survives at empty.
                 VoicePrompts::getInstance().sayBlocking(Prompt::BATTERY_CRITICAL, 6000);
-                ESP_LOGW(TAG, "Disconnecting cell (ship mode) — plug USB to wake.");
+                ESP_LOGW(TAG, "Disconnecting cell (gauge FETs open) - plug USB to wake.");
                 nfcController.powerDown();   // PN532 is on the always-on rail
-                battery.enterShipMode();     // on battery power this does not return
+                // Adem v7 has no ship FET on the charger's SDRV pin (only a capacitor), so the
+                // charger's ship mode does nothing here; the gauge's protection FETs cut the cell.
+                battery.openGaugeFets();     // on battery power this does not return
                 delay(1000);
                 sleepController.forceSleep(); // fallback if the ship-mode write failed
             }

@@ -1447,11 +1447,8 @@ void cmdShip()
         replyError("ship", "charge first");
         return;
     }
-    if (!battery.armDelayedShipMode())
-    {
-        replyError("ship", "charger not answering");
-        return;
-    }
+    // Adem v7 has no ship FET on the charger's SDRV pin: the charger's own ship mode is not
+    // used. Arming is software state; the cut happens through the gauge once VBUS is gone.
     gShipArmed = true;
     gShipImmediateSent = false;
     gShipAt = millis();
@@ -1470,7 +1467,6 @@ void serviceShip()
     if (battery.isVbusPresent())
     {
         if (elapsed < SHIP_CANCEL_MS) return;
-        battery.cancelShipMode();
         gShipArmed = false;
         gLastLedAssert = 0;
         replyError("ship", "still powered");
@@ -1484,12 +1480,10 @@ void serviceShip()
     {
         gShipImmediateSent = true;
         ESP_LOGW(TAG, "VBUS gone - ship mode now");
-        battery.enterShipMode(); // charger ship FET, when the board has one on SDRV
-        battery.openGaugeFets(); // gauge protection FETs: cuts the cell from SYS on any board
+        battery.openGaugeFets(); // gauge protection FETs open: the cell leaves SYS, the unit dies here
         return;
     }
     if (elapsed < SHIP_NOT_ENGAGED_MS) return;
-    battery.cancelShipMode();
     battery.restoreGaugeFetControl(); // never leave a running unit without its cell path
     gShipArmed = false;
     gLastLedAssert = 0;
@@ -1506,7 +1500,6 @@ void cmdEnd()
     }
     if (gShipArmed)
     {
-        battery.cancelShipMode();
         gShipArmed = false;
     }
     if (gActive)

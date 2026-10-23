@@ -76,11 +76,12 @@ Both repos implement this file; PROTOCOL-V2.md §9 points here.
 - `ft result` → `{"ft":"results","ok":true,"pass":<all passed>,"tests":{"leds":{"pass":true,"ms":...,"data":{...}},...}}`.
 - `ft commit` → writes `{"tested_at":<unix or 0>,"fw":"1.3.5","pass":bool,"tests":{...}}` into the factory namespace (key `tested`) → `{"ft":"commit","ok":true}`. `ft begin` reports it under `"tested"`.
 - `ft clean` → same as `ft reset` (factory namespace kept): WiFi, token, card cache, fault ring, volume gone; restarts → `{"ft":"clean","ok":true}` first.
-- `ft ship` → arms the charger's ship mode (BQ25792 SDRV, 10 s delay) and answers
+- `ft ship` → arms ship mode and answers
   `{"ft":"ship","ok":true,"unplug_within_s":10}`; the operator unplugs USB within 10 s and the unit
-  powers down: the moment VBUS is gone the device sends the immediate charger ship command and
-  opens the battery gauge's protection FETs (BQ28Z610 FET_EN cleared), which cuts the cell from
-  the system on any board; the next boot on USB closes them again (wake = plugging USB in). If
+  powers down: the moment VBUS is gone the device opens the battery gauge's protection FETs
+  (BQ28Z610 FET_EN cleared), which cuts the cell from the system; the next boot on USB closes
+  them again (wake = plugging USB in). The charger's own ship mode is not used: Adem v7 has no
+  ship FET on the BQ25792 SDRV pin. If
   the unit is still running 25 s after the unplug, the FETs are restored and the station gets
   `"error":"ship mode did not engage"`. If VBUS is still present after 15 s the
   device cancels and sends `{"ft":"ship","ok":false,"error":"still powered"}`. Refused while a

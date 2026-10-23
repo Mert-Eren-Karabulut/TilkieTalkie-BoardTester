@@ -461,7 +461,10 @@ public:
     // unsealed - this product's gauges ship in FULL ACCESS).
     bool readGaugeDataFlash(uint16_t address, uint8_t *buffer, size_t length);
     bool writeGaugeDataFlash8(uint16_t address, uint8_t value);
-    // BQ25792 ship mode (REG11 SDRV_CTRL=10b): opens the internal BATFET, disconnecting
+    // NOTE (Adem v7): the charger's SDRV pin only carries a 1 nF capacitor, no ship FET, so the
+    // three BQ25792 ship-mode calls below do nothing on this board. They stay for a board that
+    // populates the FET; the shipped product and the low-battery cutoff use openGaugeFets().
+    // BQ25792 ship mode (REG11 SDRV_CTRL=10b): opens the external ship FET, disconnecting
     // the cell from SYS (~µA cell drain). On battery power this kills the system
     // immediately; wake is USB plug-in only (QON is not wired on this board). Writing it
     // with VBUS present is safely ignored by the charger.
