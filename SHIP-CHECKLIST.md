@@ -147,3 +147,13 @@ controller for future toolchain checks. Also in 1.3.8: the SD download bounce bu
 the network comes up instead of at boot, and a memory guard (fault 114) refuses to start BLE
 instead of crashing. Pairing with the app on a fresh unit is still to be done by the owner.
 
+## 1.3.9: ship mode works (2026-10-24)
+Adem v7 has no ship FET on the BQ25792 SDRV pin (a 1 nF capacitor only), so the charger's ship
+mode never cut the cell: after an unplug the unit kept running on the battery. Ship mode now
+clears the gauge's FET_EN (BQ28Z610 protection FETs open) the moment VBUS is gone: verified on
+the bench with the station: dark at once after the unplug, no reaction to buttons, wake on USB,
+gauge FETs closed again by the boot path. The low-battery cutoff uses the same path. Shelf
+drain in that state = the gauge in SLEEP (~100 µA per the BQ28Z610-R1 datasheet) plus the cell's
+self-discharge; the gauge's SHUTDOWN mode (~0.5 µA, wake on charger) is the next step if a
+longer shelf life is needed.
+
