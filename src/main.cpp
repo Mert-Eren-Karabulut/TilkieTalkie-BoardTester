@@ -34,7 +34,7 @@
 // The espidf CMake build compiles every file in src/ regardless of build_src_filter,
 // so the sleep-probe build (env:sleepprobe, -DSLEEP_PROBE_BUILD) excludes this whole
 // application via this guard and provides its own setup()/loop() in sleepprobe_main.cpp.
-#ifndef SLEEP_PROBE_BUILD
+#if !defined(SLEEP_PROBE_BUILD) && !defined(BLE_PROBE_BUILD)
 
 static const char *TAG = "main";
 
@@ -112,6 +112,16 @@ static void probeTargetFrom(const String &apiBase, String &host, uint16_t &port)
         if (!tls) port = (uint16_t)hostPort.substring(colon + 1).toInt();
         if (port == 0) port = 80;
     }
+}
+
+// Arduino core 3.3.7+ frees the BLE controller memory in initArduino() unless the sketch says
+// Bluetooth is in use (only the core's own BLE library says so). This firmware drives BLE
+// through the IDF provisioning manager, so without this hook the controller later initialises
+// into memory that already belongs to the heap and the unit boot-loops on every fresh (erased)
+// flash. Provisioned boots release the memory themselves once BLE is not needed.
+extern "C" bool btInUse(void)
+{
+    return true;
 }
 
 // The Arduino core marks a freshly booted OTA image valid inside initArduino() unless this
@@ -601,6 +611,9 @@ static void startNetworkServices()
     }
     gNetworkServicesStarted = true;
     ESP_LOGI(TAG, "Initializing network services...");
+    // A freshly paired unit: the BLE memory is back on the heap, take the download bounce
+    // buffer now, before TLS and the socket fragment the internal heap.
+    FileManager::getInstance().ensureDownloadBuffers();
     // Apply the configured API base (production unless overridden for the bench).
     requestManager.setBaseUrl(loadEndpoints().apiBase);
     if (!requestManager.begin())

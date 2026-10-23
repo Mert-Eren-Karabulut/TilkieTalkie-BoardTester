@@ -134,3 +134,16 @@ stored home network restored afterwards), buttons + `ft abort`, `ft result`, `ft
 success path (needs the factory network), bring-up re-run, `ft ship` (unplug within 10 s, wake by
 USB), the station page itself in Chrome (WebSerial + ESP Web Tools flash).
 
+## 1.3.8: fresh (erased) units boot-looped at pairing — fixed (2026-10-24 night)
+The station's flash with erase put the bench unit into an unprovisioned boot for the first time
+on this toolchain, and it crashed inside the BLE controller init on every boot. Root cause:
+Arduino core 3.3.7+ frees the BLE controller memory in initArduino() unless the sketch declares
+Bluetooth in use (only the core's own BLE library does); this firmware drives BLE through the
+IDF provisioning manager, so the controller later initialised into heap memory and corrupted it.
+Fix: `extern "C" bool btInUse(void) { return true; }` in main.cpp (provisioned boots still release
+the memory themselves). Verified: an erased unit boots, advertises as TilkieTalkie_<uuid>, `ft begin`
+reports ble_ready; the probe build (`-DBLE_PROBE_BUILD`, src/bleprobe_main.cpp) isolates the BLE
+controller for future toolchain checks. Also in 1.3.8: the SD download bounce buffer is taken when
+the network comes up instead of at boot, and a memory guard (fault 114) refuses to start BLE
+instead of crashing. Pairing with the app on a fresh unit is still to be done by the owner.
+

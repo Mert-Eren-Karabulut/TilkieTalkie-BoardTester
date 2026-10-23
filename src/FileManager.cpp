@@ -1,3 +1,4 @@
+#include "ConfigManager.h"
 #include "FileManager.h"
 #include "Faults.h"
 #include "PsramJson.h"
@@ -49,26 +50,36 @@ FileManager& FileManager::getInstance() {
     return *instance;
 }
 
+bool FileManager::ensureDownloadBuffers() {
+    if (buffersAllocated) {
+        return true;
+    }
+    persistentBufferA = (uint8_t*)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    ringBuffer = (uint8_t*)heap_caps_malloc(RING_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!persistentBufferA || !ringBuffer) {
+        ESP_LOGE(TAG, "CRITICAL: failed to allocate download buffers (32 KB internal + 4 MB PSRAM)");
+        if (persistentBufferA) { free(persistentBufferA); persistentBufferA = nullptr; }
+        if (ringBuffer) { free(ringBuffer); ringBuffer = nullptr; }
+        return false;
+    }
+    buffersAllocated = true;
+    ESP_LOGI(TAG, "download buffers ready (%u KB internal bounce, %u KB PSRAM ring)",
+                  (unsigned)(DOWNLOAD_BUFFER_SIZE / 1024), (unsigned)(RING_SIZE / 1024));
+    return true;
+}
+
 bool FileManager::begin() {
     ESP_LOGI(TAG, "Initializing...");
     
-    // One 32 KB internal DMA bounce buffer (SDMMC cannot DMA from PSRAM) and a 4 MB PSRAM
-    // ring between the network and the card. Allocated once, never freed.
-    if (!buffersAllocated) {
-        persistentBufferA = (uint8_t*)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-        ringBuffer = (uint8_t*)heap_caps_malloc(RING_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!persistentBufferA || !ringBuffer) {
-            ESP_LOGE(TAG, "CRITICAL: failed to allocate download buffers (32 KB internal + 4 MB PSRAM)");
-            if (persistentBufferA) { free(persistentBufferA); persistentBufferA = nullptr; }
-            if (ringBuffer) { free(ringBuffer); ringBuffer = nullptr; }
-            buffersAllocated = false;
-        } else {
-            buffersAllocated = true;
-            ESP_LOGI(TAG, "download buffers ready (%u KB internal bounce, %u KB PSRAM ring)",
-                          (unsigned)(DOWNLOAD_BUFFER_SIZE / 1024), (unsigned)(RING_SIZE / 1024));
-        }
+    // The 32 KB internal DMA bounce buffer (SDMMC cannot DMA from PSRAM) and the 4 MB PSRAM
+    // ring are allocated on first need (ensureDownloadBuffers): a unit that still has to be
+    // paired needs every internal byte for the BLE controller, which failed to start on a
+    // freshly erased unit with the buffer taken at boot. A provisioned unit takes it right
+    // here, before WiFi and TLS fragment the heap.
+    if (ConfigManager::getInstance().hasWiFiCredentials()) {
+        ensureDownloadBuffers();
     }
-    
+
     // Initialize SD card first (needed for persistence)
     if (!initializeSDCard()) {
         ESP_LOGW(TAG, "Failed to initialize SD card");
@@ -746,7 +757,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     }
     asyncState.freeBytesAtStart = cachedFreeBytes.load();
 
-    if (!buffersAllocated || !persistentBufferA || !ringBuffer) {
+    if (!ensureDownloadBuffers()) {
         errorMsg = "Download buffer not available";
         downloadInProgress = false;
         return false;
@@ -1842,7 +1853,7 @@ void FileManager::clearAllRequiredFiles() {
 // Sequential write benchmark with per-write timing. No network involved: isolates the
 // card's own behaviour (e.g. periodic multi-second pauses) from the download pipeline.
 void FileManager::benchmarkSequentialWrite(size_t chunkBytes, int count) {
-    if (!sdCardInitialized || downloadInProgress || !persistentBufferA) {
+    if (!sdCardInitialized || downloadInProgress || !ensureDownloadBuffers()) {
         ESP_LOGI(TAG, "bench unavailable (SD not ready or download in progress)");
         return;
     }

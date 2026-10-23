@@ -25,6 +25,7 @@
     X(110, NOT_LINKED, INFO, "kivi", EVENT, "Toy is online but not linked to an account", "Add the toy in the app with the pairing code on its label") \
     X(112, NOT_ENROLLED, INFO, "", EVENT, "No factory identity, or the portal does not know it", "Enroll the unit at the factory (ft enroll) and on the portal") \
     X(113, CAPTIVE_PORTAL, WARNING, "nar", EVENT, "Network wants a login page (captive portal)", "Use a home network without a login page") \
+    X(114, BLE_NO_MEMORY, ERROR, "", EVENT, "Not enough internal memory to start pairing over BLE", "Restart the toy and report it if it repeats") \
     X(201, FIGURE_UNKNOWN, ERROR, "elma", ON_PLAY, "Portal has no unit for this card", "Register the card (Catalog > Cards > Import)") \
     X(202, FIGURE_NO_CONTENT, ERROR, "elma", ON_PLAY, "Figure exists but has nothing to play", "Add content to the figure, or bind content to the wildcard card") \
     X(203, FIGURE_OFFLINE, ERROR, "armut", ON_PLAY, "Portal unreachable and nothing cached for the card", "Get the toy online once, the stories are then cached") \

@@ -292,6 +292,8 @@ public:
 
     // Initialization and cleanup
     bool begin();
+    // Allocate the download buffers (32 KB internal DMA bounce + 4 MB PSRAM ring) once; idempotent.
+    bool ensureDownloadBuffers();
     void end();
 
     // Main update method (call regularly in loop)

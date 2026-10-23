@@ -98,6 +98,27 @@ ProbeResult runProbe(const char *host, uint16_t port, char *why, size_t whyLen)
     return PROBE_OK;
 }
 
+static const size_t BLE_MIN_FREE_INTERNAL = 60 * 1024;    // controller + protocomm, measured on the bench
+static const size_t BLE_MIN_LARGEST_INTERNAL = 24 * 1024;
+
+// The BLE controller takes its memory from the internal heap and crashes inside its own cleanup
+// when that fails (a freshly erased unit boot-looped on the bench with 57 KB free, fragmented).
+// Refuse to start, with a fault, instead of letting it crash.
+static bool bleMemoryAvailable(const char *what)
+{
+    const size_t freeInt = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "%s: internal heap free=%u largest=%u", what, (unsigned)freeInt, (unsigned)largest);
+    if (freeInt < BLE_MIN_FREE_INTERNAL || largest < BLE_MIN_LARGEST_INTERNAL) {
+        char d[40];
+        snprintf(d, sizeof(d), "free=%u largest=%u", (unsigned)freeInt, (unsigned)largest);
+        ESP_LOGE(TAG, "%s: not enough internal memory for the BLE controller (%s)", what, d);
+        Faults::raise(Fault::BLE_NO_MEMORY, d);
+        return false;
+    }
+    return true;
+}
+
 void probeTask(void *)
 {
     char why[40];
@@ -285,6 +306,12 @@ void WiFiProvisioningManager::startProvisioning() {
     // captive portal must leave provisioning running, so the loop stops it after a success
     // that passed the probe (provStopAt) instead.
     wifi_prov_mgr_disable_auto_stop(1000);
+
+    if (!bleMemoryAvailable("pairing")) {
+        wifi_prov_mgr_deinit();
+        provisioningManagerInitialized = false;
+        return;
+    }
 
     // Start provisioning with the library
     esp_err_t ret = wifi_prov_mgr_start_provisioning(
@@ -884,6 +911,14 @@ int WiFiProvisioningManager::factoryBleStart(String &name, String &err)
         return 0;
     }
     wifi_prov_mgr_disable_auto_stop(1000);
+    if (!bleMemoryAvailable("factory ble test")) {
+        wifi_prov_mgr_deinit();
+        factoryBle = false;
+        if (factoryBleWifiStarted) WiFi.mode(WIFI_OFF);
+        factoryBleWifiStarted = false;
+        err = "not enough internal memory for the BLE controller";
+        return -1;
+    }
     r = wifi_prov_mgr_start_provisioning(WIFI_PROV_SECURITY_1, pop.c_str(), name.c_str(), nullptr);
     if (r != ESP_OK) {
         wifi_prov_mgr_deinit();
