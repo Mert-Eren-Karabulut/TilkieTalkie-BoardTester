@@ -7,6 +7,7 @@
 // Answers are JSON lines written with one Serial.write each: they are not ESP_LOG output (the
 // session lowers the log level to WARN) and a line is never interleaved with a log line.
 
+#include "WiFiProvisioning.h"
 #include "FactoryTest.h"
 #include <esp_log.h>
 #include <esp_wifi.h>
@@ -107,6 +108,7 @@ JsonDocument gData;
 String gArg1, gArg2;
 
 bool gShipArmed = false;
+bool gShipImmediateSent = false; // the no-delay ship write went out after VBUS disappeared
 unsigned long gShipAt = 0;
 unsigned long gLastLedAssert = 0;
 
@@ -1209,6 +1211,10 @@ void replyBegin()
     batt["charging"] = battery.getChargingStatus();
     batt["gauge"] = battery.isGaugePresent();
     d["vbus_mv"] = mv(battery.getVbusVoltage());
+    // A unit paired to a customer network before: the station cleans it before the ble test
+    // and before it ships (docs/FT-PROTOCOL.md, station flow).
+    d["provisioned"] = wifiProv.isProvisioned();
+    d["ble_ready"] = !wifiProv.isBtReleased();
     if (config.factoryRecord("tested").length())
     {
         embedRecord(d["tested"].to<JsonVariant>(), "tested");
@@ -1447,6 +1453,7 @@ void cmdShip()
         return;
     }
     gShipArmed = true;
+    gShipImmediateSent = false;
     gShipAt = millis();
     ledController.pulseLed(0x00FF00); // green breathing: unplug now
     JsonDocument d;
@@ -1469,7 +1476,17 @@ void serviceShip()
         replyError("ship", "still powered");
         return;
     }
-    // Unplugged: the charger opens the BATFET once its 10 s are over and the unit dies here.
+    // Unplugged. The delayed command armed while VBUS was present did not open the BATFET on
+    // the bench (the unit kept running until the 25 s guard), so the moment VBUS is gone the
+    // immediate ship command goes out as well - the same write the low-battery cutoff uses
+    // on battery - and the unit dies right here. The guard below only runs if that failed.
+    if (!gShipImmediateSent)
+    {
+        gShipImmediateSent = true;
+        ESP_LOGW(TAG, "VBUS gone - ship mode now");
+        battery.enterShipMode();
+        return;
+    }
     if (elapsed < SHIP_NOT_ENGAGED_MS) return;
     battery.cancelShipMode();
     gShipArmed = false;

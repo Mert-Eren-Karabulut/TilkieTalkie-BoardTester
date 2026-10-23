@@ -26,8 +26,12 @@ Both repos implement this file; PROTOCOL-V2.md §9 points here.
    "card":{"present":true,"size_mb":29820,"free_mb":29500},
    "pack":{"checksum":"c1f1888c0884...","files":28,"missing":0},
    "battery":{"mv":3912,"soc":48,"temp_c":26,"charging":true,"gauge":true},
-   "vbus_mv":5080,"session":true}
+   "vbus_mv":5080,"provisioned":false,"ble_ready":true,"session":true}
   ```
+  `provisioned` says whether customer WiFi credentials are stored; `ble_ready` is false when the
+  BLE controller memory was released this boot (a provisioned unit does that right after boot),
+  in which case the `ble` test cannot run until `ft clean` and a reboot. `tested` appears only
+  once a record has been committed.
   Factory mode while the session is open: no deep sleep, no OTA checks or jobs, no voice
   prompts or hello, no figure handling (NFC events still feed the `nfc`/`pogo` tests), LEDs show
   a dim white "factory" idle scene, WiFi and BLE untouched until a test asks for them.
@@ -95,4 +99,6 @@ code `TK-XXXX-XXXX` and the uuid. Serials are assigned by the portal at enrollme
    Any failure can be retried; the operator may skip `jack`/`ble` when the station has no plug/phone.
 5. `ft commit` → `POST /api/factory/hubs/{uuid}/test` with the results, the operator and station.
 6. Print the label.
-7. `ft clean` is not needed on a fresh unit; `ft ship`, unplug.
+7. A unit that was ever provisioned (`provisioned` true) must be cleaned before it ships:
+   `ft clean` (restart, reconnect, `ft begin` again); the station offers the same clean at step 2
+   when `ble_ready` is false, so the `ble` test can run. Then `ft ship`, unplug.

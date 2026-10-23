@@ -106,6 +106,9 @@ public:
 
     // Query underlying library state
     bool isProvisioned();
+    // The BLE controller memory went back to the heap this boot (a provisioned toy releases it
+    // right after boot): the factory `ble` test cannot run until a clean and a reboot.
+    bool isBtReleased() const { return btReleased; }
     bool isProvisioningManagerActive();
     
     // Arduino STA events (got IP, disconnected); provisioning events come from the IDF (below)
