@@ -86,7 +86,7 @@ static void printEndpoints()
 #ifdef TT_BENCH
 // Gauge learning-cycle discharge floor (learndis): stop at/below this (loaded) so the
 // controlled drain never drives the LFP cell into the CUV protection trip.
-static const float LEARN_DISCHARGE_FLOOR_V = 2.90f;
+static const float LEARN_DISCHARGE_FLOOR_V = 2.60f;
 
 // --- Gauge-based sleep-current measurement (`sleeptest`) ---
 // The cell path cannot be measured with a series DMM (the burden resistance corrupts
@@ -1379,7 +1379,19 @@ static void dispatch(String command)
     // and GaugingStatus shows FD, then 'learnrest'.
     else if (command == "learndis")
     {
-        bool hiz = battery.setHizMode(true);
+        // With the battery bus handed to an EV2400 (gaugebus release) the firmware cannot
+        // touch the charger or read the cell: no HIZ and no voltage floor. The gauge's own
+        // CUV protection (2.5 V) ends the discharge by opening the FETs, which is exactly the
+        // rest the learning cycle wants; USB must be unplugged so nothing charges meanwhile.
+        bool hiz = false;
+        if (battery.isBusReleased())
+        {
+            ESP_LOGW(TAG, "LEARN: battery bus is released to the EV2400 - no HIZ, no floor. Unplug USB now; the gauge CUV at 2.5 V ends the drain.");
+        }
+        else
+        {
+            hiz = battery.setHizMode(true);
+        }
         sleepController.setInactivityTimeout(Policy::INACTIVITY_TIMEOUT_NEVER); // effectively disable auto-sleep
         sleepController.resetActivity();
         // Max out the LEDs (full-white, max brightness) to add ~300mA load and
@@ -1387,8 +1399,8 @@ static void dispatch(String command)
         ledController.setMaxBrightness(255);
         ledController.simpleLed(0xFFFFFF, 255);
         gLearnDischarge = true; // loop() enforces the LEARN_DISCHARGE_FLOOR_V hard floor
-        ESP_LOGI(TAG, "LEARN: discharge mode %s (charger HIZ=%s, auto-sleep disabled, LEDs full)",
-                 hiz ? "ON" : "FAILED", hiz ? "on" : "?");
+        ESP_LOGI(TAG, "LEARN: discharge mode ON (charger HIZ=%s, auto-sleep disabled, LEDs full)",
+                 hiz ? "on" : (battery.isBusReleased() ? "n/a, bus released" : "FAILED"));
         ESP_LOGW(TAG, "Draining cell; auto-stops at %.2fV to stay clear of CUV. Then 'learnrest'.",
                  LEARN_DISCHARGE_FLOOR_V);
     }
@@ -1761,13 +1773,14 @@ void Console::serviceLearnFloor()
         battery.getBatteryVoltage() <= LEARN_DISCHARGE_FLOOR_V)
     {
         gLearnDischarge = false;
-        battery.setHizMode(false);                   // re-enable the input
+        // The charger stays in HIZ: the empty-point rest that follows must see no charge
+        // current (learnchg lifts it). The toy may sleep now; unplug USB so it does.
         ledController.turnOff();                      // drop the discharge load
         sleepController.setInactivityTimeout(Policy::INACTIVITY_TIMEOUT_SHORT_MS); // see Policy.h
         sleepController.resetActivity();
-        ESP_LOGW(TAG, "LEARN: discharge floor %.2fV reached at %.3fV - stopped.",
+        ESP_LOGW(TAG, "LEARN: discharge floor %.2fV reached at %.3fV - stopped, charger still in HIZ.",
                  LEARN_DISCHARGE_FLOOR_V, battery.getBatteryVoltage());
-        ESP_LOGW(TAG, "Run 'learnrest' now to take the empty-point OCV.");
+        ESP_LOGW(TAG, "Unplug USB now (the toy sleeps in 30 s), rest 5 h, then plug USB and run 'learnchg'.");
     }
 }
 #endif

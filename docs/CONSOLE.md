@@ -101,7 +101,7 @@ Buttons 2 + 3 held 5 s restart the toy (unchanged).
 | `gaugebus release` | hand the battery bus to bqStudio / EV2400 (persists across reboots) |
 | `gauge1s`, `gaugeprog`, `gaugeresetlearn`, `gaugelearned`, `gaugecalcurrent` | gauge provisioning tools |
 | `dfread <hexaddr> [len]`, `dfwrite8 <hexaddr> <hexval>` | gauge data flash |
-| `learndis`, `learnrest`, `learnchg` | gauge learning cycle (discharge stops at 2.90 V) |
+| `learndis`, `learnrest`, `learnchg` | gauge learning cycle (discharge stops at 2.60 V, charger in HIZ so USB can stay connected) |
 | `sleeptest <min> [railon] [nfcawake] [hold]` | sleep current via the gauge; result prints on the wake boot |
 | `chargemon [seconds]` | one charger/gauge line per second (max 300 s) |
 | `pdvolt <5\|9\|12\|15\|20>` | request another USB-PD voltage |
