@@ -1748,6 +1748,33 @@ bool BatteryManager::updateGaugeMeasurements(bool full) {
     return true;
 }
 
+bool BatteryManager::openGaugeFets() {
+    if (!gaugePresent) {
+        refreshDevicePresence();
+        if (!gaugePresent) {
+            return false;
+        }
+    }
+    if (gaugeSealed && !unsealGauge()) {
+        ESP_LOGE(TAG, "SHIP: gauge sealed and unseal failed - FETs stay closed");
+        return false;
+    }
+    uint16_t mfg = 0;
+    if (!readGaugeAltStatus16(BQ28Z610_MANUFACTURING_STATUS_COMMAND, mfg)) {
+        return false;
+    }
+    if ((mfg & 0x0010) == 0) {
+        ESP_LOGW(TAG, "SHIP: gauge FET_EN already clear");
+        return true;
+    }
+    ESP_LOGW(TAG, "SHIP: opening the gauge FETs - the cell leaves the system now, plug USB to wake.");
+    Serial.flush();
+    delay(20);
+    // FET_CONTROL toggles FET_EN; with it clear the gauge keeps CHG and DSG open until the host
+    // toggles it back (restoreGaugeFetControl at the next boot).
+    return writeGaugeAltCommand(BQ28Z610_FET_CONTROL_COMMAND);
+}
+
 bool BatteryManager::restoreGaugeFetControl() {
     if (!gaugePresent) {
         return false;

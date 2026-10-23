@@ -511,6 +511,11 @@ public:
     bool isBusReleased() const { return busReleased; }
     bool isTaskRunning() const { return pollTask != nullptr; }
     bool restoreGaugeFetControl();
+    // Factory ship: clears the gauge's FET_EN so both protection FETs open and the cell is cut
+    // from the system (the charger's own ship mode needs an external ship FET on SDRV, which
+    // this board may not populate). Only meaningful once VBUS is gone: SYS collapses at once.
+    // The next boot on USB finds FET_EN clear and restoreGaugeFetControl() closes the FETs.
+    bool openGaugeFets();
     bool setGaugeSingleCellMode();
     // Calibrate the gauge current sense (CC Gain) against the BQ25792's IBAT ADC.
     // Requires a steady current flowing (e.g. charging). Fixes the ~4.5x over-read.

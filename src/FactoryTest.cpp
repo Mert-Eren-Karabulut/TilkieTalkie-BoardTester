@@ -1484,11 +1484,13 @@ void serviceShip()
     {
         gShipImmediateSent = true;
         ESP_LOGW(TAG, "VBUS gone - ship mode now");
-        battery.enterShipMode();
+        battery.enterShipMode(); // charger ship FET, when the board has one on SDRV
+        battery.openGaugeFets(); // gauge protection FETs: cuts the cell from SYS on any board
         return;
     }
     if (elapsed < SHIP_NOT_ENGAGED_MS) return;
     battery.cancelShipMode();
+    battery.restoreGaugeFetControl(); // never leave a running unit without its cell path
     gShipArmed = false;
     gLastLedAssert = 0;
     ledController.flash(LedController::FX_FAIL);
