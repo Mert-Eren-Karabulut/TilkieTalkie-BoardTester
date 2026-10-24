@@ -53,6 +53,7 @@
     X(506, DEAD_CELL_RECOVERY, WARNING, "", EVENT, "Dead-cell recovery hold engaged", "Leave the toy on the charger") \
     X(507, POWER_BUS_ERROR, WARNING, "", EVENT, "I2C error on the power bus", "Hardware check if it repeats") \
     X(508, BRINGUP_FAILED, ERROR, "", ON_BOOT, "Gauge bring-up (provisioning or current calibration) did not finish", "Charge current held at 300 mA. Re-run ft test bringup at the station on USB with a cell that is not full") \
+    X(509, USB_SOURCE, INFO, "", EVENT, "USB source seen (PD contract or plain 5 V), detail carries voltage and budget", "Nothing to do, diagnostic record of what the charger negotiated") \
     X(601, OTA_CHECK_FAILED, WARNING, "", ON_NETWORK, "Firmware check failed", "Transient unless it repeats, then check the portal") \
     X(602, OTA_DOWNLOAD_FAILED, ERROR, "karpuz", EVENT, "Firmware image download failed", "Check the release file and the link. The toy retries") \
     X(603, OTA_FLASH_FAILED, ERROR, "karpuz", EVENT, "Flash write or activation failed", "Hardware check if it repeats") \

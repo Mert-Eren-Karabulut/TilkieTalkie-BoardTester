@@ -1,3 +1,4 @@
+#include "Faults.h"
 #include "ChargerSupervisor.h"
 #include <esp_log.h>
 #include "Bringup.h"
@@ -186,8 +187,14 @@ void superviseChargerOnUsb()
         pdBudgetChecksLeft--;
         uint8_t pdStatus = 0;
         uint16_t grantedMa = 0;
-        if (battery.readUsbPdStatus(pdStatus, grantedMa) && (pdStatus & 0x08) && grantedMa >= 500)
+        const bool pdRead = battery.readUsbPdStatus(pdStatus, grantedMa);
+        if (pdRead && (pdStatus & 0x08) && grantedMa >= 500)
         {
+            // Diagnostic record of what this source negotiated (readable from the console and
+            // the hub page): voltage and budget, so a picky adapter can be judged afterwards.
+            char d[40];
+            snprintf(d, sizeof(d), "pd %umV %umA", (unsigned)(battery.getVbusVoltage() * 1000.0f), (unsigned)grantedMa);
+            Faults::raise(Fault::USB_SOURCE, d, false);
             const uint16_t limit = grantedMa < 3000 ? grantedMa : 3000;
             // The PD contract IS the input budget: ICO must not "re-detect" it (with
             // the charger's D+/D- unconnected it guesses a legacy ~1.5A and overwrites
@@ -202,6 +209,9 @@ void superviseChargerOnUsb()
         else if (pdBudgetChecksLeft == 0 && !nonPdLimitApplied)
         {
             nonPdLimitApplied = true;
+            char d[40];
+            snprintf(d, sizeof(d), "%s %umV no-pd", pdRead ? "ch224" : "no-ch224", (unsigned)(battery.getVbusVoltage() * 1000.0f));
+            Faults::raise(Fault::USB_SOURCE, d, false);
             ESP_LOGI(TAG, "CHARGER: no PD contract - input limit %u mA, ICO off.", nonPdInputLimitMa);
         }
     }

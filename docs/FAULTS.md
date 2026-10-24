@@ -67,6 +67,7 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 506 | DEAD_CELL_RECOVERY | warning | | recovery hold engaged |
 | 507 | POWER_BUS_ERROR | warning | | I2C error on the power bus |
 | 508 | BRINGUP_FAILED | error | | gauge bring-up gave up (charge-current wait 3 min, provisioning or calibration): the reason is the detail and the factory `bringup` record; charge current stays at 300 mA until a bring-up passes (docs/MANUFACTURING.md) |
+| 509 | USB_SOURCE | info | | one record per USB attach: `pd <mV> <mA>` when the CH224Q holds a PD contract (the budget becomes the input limit), `ch224 <mV> no-pd` for a plain 5 V source, `no-ch224 …` when the controller did not answer; diagnostic only |
 | 601 | OTA_CHECK_FAILED | warning | | firmware check failed |
 | 602 | OTA_DOWNLOAD_FAILED | error | karpuz | image download failed |
 | 603 | OTA_FLASH_FAILED | error | karpuz | flash write / activate failed |
