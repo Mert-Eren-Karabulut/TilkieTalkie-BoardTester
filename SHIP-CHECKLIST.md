@@ -157,3 +157,16 @@ drain in that state = the gauge in SLEEP (~100 µA per the BQ28Z610-R1 datasheet
 self-discharge; the gauge's SHUTDOWN mode (~0.5 µA, wake on charger) is the next step if a
 longer shelf life is needed.
 
+
+## 1.3.11: pack-resistance factory test, USB attach record (2026-10-25)
+- `ft test pack` (station step "Battery pack resistance", between USB PD and SD card): charger
+  input HIZ with the LEDs dark for 8 s, then all LEDs full white for 8 s, R = ΔV/ΔI from the
+  gauge; fails above 100 mΩ (provisional). The bench pack that broke the learning cycles reads
+  341 mΩ; a sound 26700 LFP pack is expected at 20-60. Set the final limit from the first
+  known-good units (their `r_mohm` is in each factory record).
+- Fault 509 USB_SOURCE: every USB attach records the PD contract (`pd <mV> <mA>`) or the plain
+  5 V outcome (`ch224 … no-pd` / `no-ch224 …`), for charger interop diagnosis after the fact.
+- Bench only: `learndis` with the battery bus released, `gaugedump` / `gaugemac` / `gaugeit`.
+- On the portal: release 1.3.11 on beta with its USB image; flash page 1.3.11.
+- Not in this release: the gauge golden image (the learning cycle restarts after the pack is
+  fixed, docs/GAUGE-CHEMISTRY.md 2026-10-25), SOC from the gauge instead of the coulomb count.
