@@ -74,3 +74,14 @@ the gauge's remaining-capacity simulation collapses under its worst-case load se
 1 A peaks (WiFi + audio) sag 0.2-0.3 V, which is the VSYSMIN regulation the charger logs near
 empty. Next: source cells with DC internal resistance ≤ 20 mΩ, screen every pack with the
 station's pack test, then redo chemistry + learning on a good cell.
+
+### 2026-10-26 session 2: calibrated, reset, ready for the learning cycle
+bqStudio (EV2400): voltage calibration against the meter (Cell 1, BAT and PACK, no current):
+Cell1 now equals BAT (3500/3501 mV at 1 A charge, PACK +34 mV = the FET path), the old
+-44/-12/+70 mV offsets are gone. Chemistry 0438 re-applied (Ra table back to the defaults, flag
+FF55), Update Status 04, Qmax 4000, cycle count 0 set by hand (the chemistry update leaves
+them), Load Select 7 → 1 (byte 0x4651; the IT class at 0x4580 is chemistry data, not these
+settings). All verified through the board: `gaugedump` image kept in docs/gauge/dumps/
+(2026-10-26-after-calibration-…). Charging at 1.05 A from ~72 % at 02:20 local; then 5 h rest
+on the brick, flags checked (`VOK`, 0 mA), `learndis`, brick unplugged, LEDs to the trip, 5 h
+rest, bqStudio: expect Update Status 06, export.
