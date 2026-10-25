@@ -295,6 +295,8 @@ static void printHelp()
     ESP_LOGI(TAG, "  gaugebus release  - hand the battery bus to bqStudio (EV2400), persists");
     ESP_LOGI(TAG, "  gauge1s / gaugeprog / gaugeresetlearn / gaugelearned / gaugecalcurrent - gauge provisioning tools");
     ESP_LOGI(TAG, "  dfread <hexaddr> [len] / dfwrite8 <hexaddr> <hexval> - gauge data flash");
+    ESP_LOGI(TAG, "  gaugedump [hexstart hexend] - hex dump of the gauge data flash (default 4000-4800, the golden image)");
+    ESP_LOGI(TAG, "  gaugemac <hexcmd> [len] / gaugeit - raw MAC block / Impedance Track internals (IT Status 1-3)");
     ESP_LOGI(TAG, "  learndis / learnrest / learnchg - gauge learning cycle phases");
     ESP_LOGI(TAG, "  sleeptest <min> [railon] [nfcawake] [hold] - sleep current via the gauge (battery only)");
     ESP_LOGI(TAG, "  chargemon [s]     - one charger/gauge line per second");
@@ -1329,6 +1331,126 @@ static void dispatch(String command)
             bool ok = battery.writeGaugeDataFlash8(addr, val);
             ESP_LOGI(TAG, "dfwrite8 0x%04x <- 0x%02x : %s", addr, val, ok ? "OK (verified)" : "FAILED");
         }
+    }
+    // gaugedump [hexstart hexend] - hex dump of the gauge data flash, 32 bytes per line, printed
+    // as bare "DF 4100: 55 55 ..." lines (no log prefix) so a captured log is a clean image.
+    // Default 0x4000-0x4800: calibration, chemistry tables (OCV 0x4480, Ra 0x4100), learned
+    // state (Qmax/Update Status 0x4206), IT configuration (0x4580) and settings (0x4600+).
+    else if (command == "gaugedump" || command.startsWith("gaugedump "))
+    {
+        String args = command.length() > 9 ? command.substring(9) : String();
+        args.trim();
+        uint32_t start = 0x4000, end = 0x4800;
+        if (args.length() > 0)
+        {
+            int sp = args.indexOf(' ');
+            start = static_cast<uint32_t>(strtol((sp > 0 ? args.substring(0, sp) : args).c_str(), nullptr, 16));
+            end = sp > 0 ? static_cast<uint32_t>(strtol(args.substring(sp + 1).c_str(), nullptr, 16)) : start + 32;
+        }
+        if (end <= start || end > 0x10000) end = start + 32;
+        int errors = 0;
+        const uint32_t t0 = millis();
+        for (uint32_t addr = start; addr < end; addr += 32)
+        {
+            uint8_t buf[32] = {0};
+            const size_t n = (end - addr) < 32 ? static_cast<size_t>(end - addr) : 32;
+            char line[32 * 3 + 24];
+            int pos = snprintf(line, sizeof(line), "DF %04x:", static_cast<unsigned>(addr));
+            bool ok = false;
+            for (int attempt = 0; attempt < 3 && !ok; ++attempt)
+            {
+                ok = battery.readGaugeDataFlash(static_cast<uint16_t>(addr), buf, n);
+                if (!ok) vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            if (ok)
+            {
+                for (size_t i = 0; i < n; i++)
+                {
+                    pos += snprintf(line + pos, sizeof(line) - pos, " %02x", buf[i]);
+                }
+            }
+            else
+            {
+                ++errors;
+                snprintf(line + pos, sizeof(line) - pos, " READ FAILED");
+            }
+            Serial.println(line);
+            vTaskDelay(1);
+        }
+        ESP_LOGI(TAG, "DF END %04x-%04x, %d read errors, %lu ms", static_cast<unsigned>(start),
+                 static_cast<unsigned>(end), errors, static_cast<unsigned long>(millis() - t0));
+    }
+    // gaugemac <hexcmd> [len] - one raw AltManufacturerAccess block as the gauge returns it
+    // (little-endian). IT Status 1/2/3 = 73/74/75, DA Status 1 = 71, Gauging Status = 56.
+    else if (command.startsWith("gaugemac "))
+    {
+        String args = command.substring(9);
+        args.trim();
+        int sp = args.indexOf(' ');
+        uint16_t cmd = static_cast<uint16_t>(strtol((sp > 0 ? args.substring(0, sp) : args).c_str(), nullptr, 16));
+        int len = sp > 0 ? args.substring(sp + 1).toInt() : 32;
+        if (len < 1) len = 1;
+        if (len > 32) len = 32;
+        uint8_t buf[32] = {0};
+        if (battery.readGaugeMacBlock(cmd, buf, len))
+        {
+            String line = "MAC " + String(cmd, HEX) + ":";
+            for (int i = 0; i < len; i++)
+            {
+                char b[6];
+                snprintf(b, sizeof(b), " %02x", buf[i]);
+                line += b;
+            }
+            ESP_LOGI(TAG, "%s", line.c_str());
+        }
+        else
+        {
+            ESP_LOGE(TAG, "gaugemac 0x%04x failed", cmd);
+        }
+    }
+    // gaugeit - Impedance Track internals from IT Status 1/2/3 (bq28z610 TRM 0x0073-0x0075):
+    // the true remaining/full capacity the simulation produced, the Ra scale in use, the depth
+    // of discharge reference points and the Qmax update inputs. Raw bytes are printed too.
+    else if (command == "gaugeit")
+    {
+        uint8_t s1[24] = {0}, s2[24] = {0}, s3[20] = {0};
+        const bool ok1 = battery.readGaugeMacBlock(0x0073, s1, sizeof(s1));
+        const bool ok2 = battery.readGaugeMacBlock(0x0074, s2, sizeof(s2));
+        const bool ok3 = battery.readGaugeMacBlock(0x0075, s3, sizeof(s3));
+        auto u16 = [](const uint8_t *p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); };
+        auto i16 = [](const uint8_t *p) { return static_cast<int16_t>(p[0] | (p[1] << 8)); };
+        auto hex = [](const uint8_t *p, size_t n) {
+            String o;
+            for (size_t i = 0; i < n; i++) { char b[6]; snprintf(b, sizeof(b), " %02x", p[i]); o += b; }
+            return o;
+        };
+        if (ok1)
+        {
+            ESP_LOGI(TAG, "IT1 TrueRemQ %d mAh  InitialQ %d mAh  TrueFCCQ %d mAh  T_sim %.1f C  T_amb %.1f C  RaScale0 %u (1000 = x1.0)  CompRes1 %u",
+                     i16(s1), i16(s1 + 4), i16(s1 + 8), u16(s1 + 12) / 10.0 - 273.15, u16(s1 + 14) / 10.0 - 273.15,
+                     u16(s1 + 16), u16(s1 + 20));
+            ESP_LOGI(TAG, "IT1 raw:%s", hex(s1, sizeof(s1)).c_str());
+        }
+        else ESP_LOGE(TAG, "IT Status 1 read failed");
+        if (ok2)
+        {
+            // layout as the bq28z610 (fw 0.17) returns it: PackGrid U1, LStatus U1, CellGrid0 U1,
+            // CellGrid1 U1, 2 reserved, StateTime U4 (s), DOD0_0 U2, DOD0_1 U2, DOD0PassedQ I2 (mAh),
+            // DOD0PassedE I2 (cWh), DOD0Time U2, DODEOC_0 U2, DODEOC_1 U2. DOD in 1/16384.
+            ESP_LOGI(TAG, "IT2 PackGrid %u  LStatus 0x%02x  CellGrid0 %u  StateTime %lu s  DOD0_0 %u (%.1f %%)  DOD0PassedQ %d mAh  DOD0PassedE %d cWh  DOD0Time %u  DODEOC_0 %u (%.1f %%)",
+                     s2[0], s2[1], s2[2], static_cast<unsigned long>(s2[6] | (s2[7] << 8) | (s2[8] << 16) | (static_cast<uint32_t>(s2[9]) << 24)),
+                     u16(s2 + 10), u16(s2 + 10) * 100.0 / 16384.0, i16(s2 + 14), i16(s2 + 16), u16(s2 + 18), u16(s2 + 20), u16(s2 + 20) * 100.0 / 16384.0);
+            ESP_LOGI(TAG, "IT2 raw:%s", hex(s2, sizeof(s2)).c_str());
+        }
+        else ESP_LOGE(TAG, "IT Status 2 read failed");
+        if (ok3)
+        {
+            // layout per TRM: QMax0 U2, QMax1 U2, QMaxDOD0_0 U2, QMaxDOD0_1 U2, QMaxPassedQ I2, QMaxTime U2, Tk U2, Ta U2, RawDOD0_0 U2, RawDOD0_1 U2
+            ESP_LOGI(TAG, "IT3 QMax0 %u mAh  QMaxDOD0_0 %u (%.1f %%)  QMaxPassedQ %d mAh  QMaxTime %u  RawDOD0_0 %u (%.1f %%)",
+                     u16(s3), u16(s3 + 4), u16(s3 + 4) * 100.0 / 16384.0, i16(s3 + 8), u16(s3 + 10), u16(s3 + 16), u16(s3 + 16) * 100.0 / 16384.0);
+            ESP_LOGI(TAG, "IT3 raw:%s", hex(s3, sizeof(s3)).c_str());
+        }
+        else ESP_LOGE(TAG, "IT Status 3 read failed");
     }
 #endif // TT_BENCH
     else if (command == "gaugeprot")

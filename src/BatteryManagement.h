@@ -401,6 +401,7 @@ private:
     bool unsealGauge();
     bool sealGauge();
     bool readGaugeDataFlashByte(uint16_t address, uint8_t &value);
+    bool readGaugeDataFlashBlock32(uint16_t address, uint8_t *out32);   // one MAC read: 32 bytes
     bool readGaugeDataFlashWord(uint16_t address, uint16_t &value);
     bool readGaugeDataFlashFloat(uint16_t address, float &value);
     bool writeGaugeDataFlashFloat(uint16_t address, float value);
@@ -461,6 +462,10 @@ public:
     // unsealed - this product's gauges ship in FULL ACCESS).
     bool readGaugeDataFlash(uint16_t address, uint8_t *buffer, size_t length);
     bool writeGaugeDataFlash8(uint16_t address, uint8_t value);
+    // Raw AltManufacturerAccess block (IT Status 1/2/3 = 0x0073-0x0075, DA Status 1 = 0x0071)
+    // for bench diagnostics; the command write and the block read run under the bus lock so
+    // the polling task cannot slip a command in between.
+    bool readGaugeMacBlock(uint16_t command, uint8_t *buffer, size_t length);
     // NOTE (Adem v7): the charger's SDRV pin only carries a 1 nF capacitor, no ship FET, so the
     // three BQ25792 ship-mode calls below do nothing on this board. They stay for a board that
     // populates the FET; the shipped product and the low-battery cutoff use openGaugeFets().

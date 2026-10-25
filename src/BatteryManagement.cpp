@@ -1051,16 +1051,68 @@ void BatteryManager::refreshDiagnostics() {
     updateChargingStatus();
 }
 
+namespace {
+struct BusGuard {
+    SemaphoreHandle_t m;
+    explicit BusGuard(SemaphoreHandle_t lock) : m(lock) { if (m) xSemaphoreTakeRecursive(m, portMAX_DELAY); }
+    ~BusGuard() { if (m) xSemaphoreGiveRecursive(m); }
+};
+}
+
 bool BatteryManager::readGaugeDataFlash(uint16_t address, uint8_t *buffer, size_t length) {
     if (!gaugePresent || !buffer) {
         return false;
     }
-    for (size_t i = 0; i < length; ++i) {
-        if (!readGaugeDataFlashByte(static_cast<uint16_t>(address + i), buffer[i])) {
+    BusGuard guard(busLock);
+    size_t done = 0;
+    while (done < length) {
+        const size_t remaining = length - done;
+        const uint16_t at = static_cast<uint16_t>(address + done);
+        if (remaining >= 8) {
+            // Whole 32-byte MAC block (a 2 KB dump is 64 transactions instead of 2048).
+            uint8_t block[32];
+            if (readGaugeDataFlashBlock32(at, block)) {
+                const size_t take = remaining < 32 ? remaining : 32;
+                memcpy(buffer + done, block, take);
+                done += take;
+                continue;
+            }
+        }
+        if (!readGaugeDataFlashByte(at, buffer[done])) {
             return false;
         }
+        ++done;
     }
     return true;
+}
+
+bool BatteryManager::readGaugeDataFlashBlock32(uint16_t address, uint8_t *out32) {
+    uint8_t target[2] = {
+        static_cast<uint8_t>(address & 0xFF),
+        static_cast<uint8_t>((address >> 8) & 0xFF),
+    };
+    uint8_t response[34] = {0};   // address echo + 32 data bytes (0x3E..0x5F)
+    BusGuard guard(busLock);
+    if (!writeRegisters(gaugeAddress, 0x3E, target, sizeof(target))) {
+        return false;
+    }
+    delay(2);
+    if (!readRegisters(gaugeAddress, 0x3E, response, sizeof(response))) {
+        return false;
+    }
+    if (response[0] != target[0] || response[1] != target[1]) {
+        return false;
+    }
+    memcpy(out32, response + 2, 32);
+    return true;
+}
+
+bool BatteryManager::readGaugeMacBlock(uint16_t command, uint8_t *buffer, size_t length) {
+    if (!gaugePresent || !buffer || length == 0 || length > 32) {
+        return false;
+    }
+    BusGuard guard(busLock);
+    return readGaugeAltBlock(command, buffer, length);
 }
 
 bool BatteryManager::writeGaugeDataFlash8(uint16_t address, uint8_t value) {
@@ -2216,13 +2268,6 @@ bool BatteryManager::waitForSCLHigh() {
 // current byte and every subsequent read returns 0x7F/0xBF/0xFF patterns until it sees nine
 // clocks with SDA released followed by a STOP. Slaves do not reset with the host.
 
-namespace {
-struct BusGuard {
-    SemaphoreHandle_t m;
-    explicit BusGuard(SemaphoreHandle_t lock) : m(lock) { if (m) xSemaphoreTakeRecursive(m, portMAX_DELAY); }
-    ~BusGuard() { if (m) xSemaphoreGiveRecursive(m); }
-};
-}
 
 void BatteryManager::setBusReleased(bool released) {
     BusGuard guard(busLock);

@@ -101,6 +101,8 @@ Buttons 2 + 3 held 5 s restart the toy (unchanged).
 | `gaugebus release` | hand the battery bus to bqStudio / EV2400 (persists across reboots) |
 | `gauge1s`, `gaugeprog`, `gaugeresetlearn`, `gaugelearned`, `gaugecalcurrent` | gauge provisioning tools |
 | `dfread <hexaddr> [len]`, `dfwrite8 <hexaddr> <hexval>` | gauge data flash |
+| `gaugedump [hexstart hexend]` | hex dump of the gauge data flash as bare `DF 4100: ..` lines, default `4000 4800` (the whole image: calibration, OCV/Ra tables, learned state, configuration); capture the log to keep a golden image copy |
+| `gaugemac <hexcmd> [len]`, `gaugeit` | one raw AltManufacturerAccess block / Impedance Track internals decoded from IT Status 1-3 (true remaining and full capacity, Ra scale, depth-of-discharge reference points, Qmax inputs) |
 | `learndis`, `learnrest`, `learnchg` | gauge learning cycle (discharge stops at 2.60 V, charger in HIZ so USB can stay connected) |
 | `sleeptest <min> [railon] [nfcawake] [hold]` | sleep current via the gauge; result prints on the wake boot |
 | `chargemon [seconds]` | one charger/gauge line per second (max 300 s) |
