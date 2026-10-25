@@ -466,6 +466,10 @@ public:
     // for bench diagnostics; the command write and the block read run under the bus lock so
     // the polling task cannot slip a command in between.
     bool readGaugeMacBlock(uint16_t command, uint8_t *buffer, size_t length);
+    // Hold the battery bus for a sequence of reads (bench `gaugedump`): the polling task waits
+    // meanwhile, so no MAC access of its own lands between the blocks. Recursive; always pair.
+    void lockBus();
+    void unlockBus();
     // NOTE (Adem v7): the charger's SDRV pin only carries a 1 nF capacitor, no ship FET, so the
     // three BQ25792 ship-mode calls below do nothing on this board. They stay for a board that
     // populates the FET; the shipped product and the low-battery cutoff use openGaugeFets().

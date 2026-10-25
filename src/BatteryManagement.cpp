@@ -1107,6 +1107,14 @@ bool BatteryManager::readGaugeDataFlashBlock32(uint16_t address, uint8_t *out32)
     return true;
 }
 
+void BatteryManager::lockBus() {
+    if (busLock) xSemaphoreTakeRecursive(busLock, portMAX_DELAY);
+}
+
+void BatteryManager::unlockBus() {
+    if (busLock) xSemaphoreGiveRecursive(busLock);
+}
+
 bool BatteryManager::readGaugeMacBlock(uint16_t command, uint8_t *buffer, size_t length) {
     if (!gaugePresent || !buffer || length == 0 || length > 32) {
         return false;

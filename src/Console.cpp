@@ -1350,6 +1350,7 @@ static void dispatch(String command)
         if (end <= start || end > 0x10000) end = start + 32;
         int errors = 0;
         const uint32_t t0 = millis();
+        battery.lockBus(); // the polling task's own MAC reads otherwise land between blocks (24 of 64 failed)
         for (uint32_t addr = start; addr < end; addr += 32)
         {
             uint8_t buf[32] = {0};
@@ -1377,6 +1378,7 @@ static void dispatch(String command)
             Serial.println(line);
             vTaskDelay(1);
         }
+        battery.unlockBus();
         ESP_LOGI(TAG, "DF END %04x-%04x, %d read errors, %lu ms", static_cast<unsigned>(start),
                  static_cast<unsigned>(end), errors, static_cast<unsigned long>(millis() - t0));
     }
