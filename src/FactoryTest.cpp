@@ -90,10 +90,11 @@ constexpr unsigned long SHIP_NOT_ENGAGED_MS = 25000;  // unplugged but still ali
 // wants units shipped around 40 %); the voltage only catches an empty cell.
 constexpr float SHIP_MIN_SOC = 30.0f;
 constexpr float SHIP_MIN_V = 3.20f;
-// pack test (cell-path resistance by a load step, see startPack): a healthy 26700 LFP cell with
-// a sound harness measures 20-60 mOhm this way; the bench harness that broke the learning
-// cycles measured 210-330. Provisional limit until known-good units set the distribution.
-constexpr int PACK_RESISTANCE_MAX_MOHM = 100;
+// pack test (cell-path resistance by a load step, see startPack). The production cell type
+// itself measures 320-340 mOhm this way (both samples, meter-verified at the cell terminals,
+// docs/GAUGE-CHEMISTRY.md 2026-10-26): the limit therefore catches a broken contact, crimp or
+// connector on top of that, not the cell. Tighten it if a lower-impedance cell is adopted.
+constexpr int PACK_RESISTANCE_MAX_MOHM = 450;
 constexpr int PACK_MIN_DELTA_MA = 150;       // smaller load steps give no usable ratio
 constexpr int PACK_MIN_MV = 3100;            // below this the cell may not hold the system alone
 constexpr uint32_t PACK_SETTLE_MS = 2500;    // first sample after the telemetry settled (1 s cadence)
