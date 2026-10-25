@@ -60,3 +60,17 @@ Firmware side (bench build): `gaugedump [start end]` prints the data flash 0x400
 bare `DF xxxx: ..` lines (64 MAC block reads; the golden-image copy through the board),
 `gaugemac <cmd> [len]` prints one raw AltManufacturerAccess block, `gaugeit` decodes IT
 Status 1-3 (true remaining/full capacity, Ra scale, DOD0/DODEOC, Qmax inputs).
+
+### 2026-10-26 verdict: the cells
+Second cell (the production battery, 20 AWG leads) on the same board: `ft test pack` 326 mΩ
+(old cell 341). Meter directly on the cell terminals: 3.502 V while charging at 1 A, 3.255 V a
+few minutes later while discharging at 0.4 A, and the board's battery pads read the same
+3.255 V (gauge BAT pin 3.235-3.246, Cell1 3.204-3.216: the Cell1 register sits ~30 mV below
+BAT at any current, a calibration offset). A 247 mV swing for a 1.45 A change, measured at the
+cell itself, is ~170 mΩ steady-state; a sound 26700 LFP cell swings 30-50 mV. Harness and PCB
+are cleared (no drop between cell terminals and pads, charger node within 30 mΩ of the cell).
+Both cells of this type behave the same: the cell type/batch is high-impedance. Consequences:
+the gauge's remaining-capacity simulation collapses under its worst-case load setting, and
+1 A peaks (WiFi + audio) sag 0.2-0.3 V, which is the VSYSMIN regulation the charger logs near
+empty. Next: source cells with DC internal resistance ≤ 20 mΩ, screen every pack with the
+station's pack test, then redo chemistry + learning on a good cell.
