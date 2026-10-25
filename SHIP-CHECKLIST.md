@@ -170,3 +170,10 @@ longer shelf life is needed.
 - On the portal: release 1.3.11 on beta with its USB image; flash page 1.3.11.
 - Not in this release: the gauge golden image (the learning cycle restarts after the pack is
   fixed, docs/GAUGE-CHEMISTRY.md 2026-10-25), SOC from the gauge instead of the coulomb count.
+
+## 1.3.12: pack-test limit 450 mΩ (2026-10-26)
+The production cell type itself reads 320-340 mΩ on the 8-s load step (meter-verified at the
+cell terminals, docs/GAUGE-CHEMISTRY.md 2026-10-26), so the station's limit now catches a bad
+contact on top of the cell, not the cell. Decision: keep these cells (capacity is good); the
+gauge is configured for them instead (voltage calibration, Load Select = present average
+current, one learning cycle), see docs/GAUGE-CHEMISTRY.md.
