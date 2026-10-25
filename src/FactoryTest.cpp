@@ -35,7 +35,7 @@ VoicePrompts &prompts = VoicePrompts::getInstance();
 
 // ---- The catalogue ---------------------------------------------------------------------------
 
-enum class Test : uint8_t { NONE, LEDS, BUTTONS, NFC, POGO, SPEAKER, JACK, BATTERY, PD, SD, WIFI, BLE, BRINGUP, SLEEP };
+enum class Test : uint8_t { NONE, LEDS, BUTTONS, NFC, POGO, SPEAKER, JACK, BATTERY, PD, PACK, SD, WIFI, BLE, BRINGUP, SLEEP };
 
 struct TestDef
 {
@@ -47,7 +47,8 @@ struct TestDef
 const TestDef kTests[] = {
     {Test::LEDS, "leds", false},     {Test::BUTTONS, "buttons", true}, {Test::NFC, "nfc", true},
     {Test::POGO, "pogo", true},      {Test::SPEAKER, "speaker", true}, {Test::JACK, "jack", true},
-    {Test::BATTERY, "battery", false}, {Test::PD, "pd", false},        {Test::SD, "sd", true},
+    {Test::BATTERY, "battery", false}, {Test::PD, "pd", false},        {Test::PACK, "pack", false},
+    {Test::SD, "sd", true},
     {Test::WIFI, "wifi", true},      {Test::BLE, "ble", true},         {Test::BRINGUP, "bringup", false},
     {Test::SLEEP, "sleep", false},
 };
@@ -89,6 +90,15 @@ constexpr unsigned long SHIP_NOT_ENGAGED_MS = 25000;  // unplugged but still ali
 // wants units shipped around 40 %); the voltage only catches an empty cell.
 constexpr float SHIP_MIN_SOC = 30.0f;
 constexpr float SHIP_MIN_V = 3.20f;
+// pack test (cell-path resistance by a load step, see startPack): a healthy 26700 LFP cell with
+// a sound harness measures 20-60 mOhm this way; the bench harness that broke the learning
+// cycles measured 210-330. Provisional limit until known-good units set the distribution.
+constexpr int PACK_RESISTANCE_MAX_MOHM = 100;
+constexpr int PACK_MIN_DELTA_MA = 150;       // smaller load steps give no usable ratio
+constexpr int PACK_MIN_MV = 3100;            // below this the cell may not hold the system alone
+constexpr uint32_t PACK_SETTLE_MS = 2500;    // first sample after the telemetry settled (1 s cadence)
+constexpr uint32_t PACK_IDLE_MS = 8000;      // charger HIZ, LEDs dark: the charge polarisation decays
+constexpr uint32_t PACK_LOAD_MS = 8000;      // LEDs full white on top: the step the ratio is taken from
 constexpr size_t TESTED_MAX_BYTES = 1500;
 constexpr size_t ERROR_MAX_CHARS = 80;
 
@@ -100,6 +110,9 @@ JsonDocument gResults; // name -> {pass, ms, data, error}; RAM only until `ft co
 Test gTest = Test::NONE;
 const char *gName = "";
 unsigned long gStartedAt = 0;
+int gPackPhase = 0;      // pack test: 0 settle on the cable, 1 HIZ idle, 2 HIZ + LED load
+float gPackV0 = 0.0f, gPackV1 = 0.0f;
+int gPackI0 = 0, gPackI1 = 0;
 unsigned long gStepAt = 0;
 int gStep = 0;
 bool gAsking = false;
@@ -413,6 +426,11 @@ void cleanup(Test t)
         break;
     case Test::BRINGUP:
         bringupAbort("aborted"); // no-op once it ended by itself
+        break;
+    case Test::PACK:
+        gFactoryLoadStep = false;
+        battery.setHizMode(false); // the charger takes the system back; harmless when it never left
+        ledController.setScene(LedController::SCENE_FACTORY);
         break;
     default:
         break;
@@ -791,6 +809,118 @@ void runPd()
     finish(false, err);
 }
 
+// ---- pack: cell-path resistance from a load step ---------------------------------------------
+// The gauge's cell measurement spans the cell, its leads and the connector contacts, and the
+// gauge models all of it: a pack that reads 200+ mOhm makes Impedance Track declare empty at
+// half charge (bench learning cycle 3, 2026-10-25). The station rejects such a pack here.
+// Method: sample V/I on the cable, put the charger input in HIZ with the LEDs dark for
+// PACK_IDLE_MS (the cell carries the idle system, the polarisation left by charging decays:
+// a charge-to-discharge step read 80 mOhm at 4.5 s on a pack whose discharge steps read 210),
+// sample, then light the LEDs full white for PACK_LOAD_MS (about +0.25 A) and sample again.
+// R = dV/dI of that discharge-to-discharge step; the charge-to-idle step is reported as well.
+void packAssertLoad(bool on)
+{
+    if (on) ledController.showTestPattern(0x1F, 0xFFFFFF, 255); // the load: five white LEDs at full
+    else ledController.showTestPattern(0x00, 0x000000, 0);
+    gLastLedAssert = millis();
+}
+
+void startPack()
+{
+    const int cellMv = mv(battery.getBatteryVoltage());
+    char err[80];
+    if (!battery.isGaugePresent() || !battery.hasTelemetry())
+    {
+        finish(false, "gauge not answering");
+        return;
+    }
+    if (cellMv < PACK_MIN_MV)
+    {
+        snprintf(err, sizeof(err), "cell %d mV below %d: charge first", cellMv, PACK_MIN_MV);
+        finish(false, err);
+        return;
+    }
+    gPackPhase = 0;
+    gStepAt = millis();
+    progress("settle", 0, 3);
+}
+
+void stepPack()
+{
+    const unsigned long now = millis();
+    if (gPackPhase == 0)
+    {
+        if (now - gStepAt < PACK_SETTLE_MS) return;
+        gPackV0 = battery.getBatteryVoltage();
+        gPackI0 = battery.getBatteryCurrentMilliAmps();
+        gFactoryLoadStep = true; // charger supervisor and low-battery cutoff stand down
+        if (!battery.setHizMode(true))
+        {
+            finish(false, "charger HIZ failed");
+            return;
+        }
+        packAssertLoad(false);
+        gPackPhase = 1;
+        gStepAt = now;
+        progress("idle", 1, 3);
+        return;
+    }
+    if (gPackPhase == 1)
+    {
+        if (now - gStepAt < PACK_IDLE_MS)
+        {
+            if (now - gLastLedAssert > 300) packAssertLoad(false);
+            return;
+        }
+        gPackV1 = battery.getBatteryVoltage();
+        gPackI1 = battery.getBatteryCurrentMilliAmps();
+        packAssertLoad(true);
+        gPackPhase = 2;
+        gStepAt = now;
+        progress("load step", 2, 3);
+        return;
+    }
+    if (now - gStepAt < PACK_LOAD_MS)
+    {
+        if (now - gLastLedAssert > 300) packAssertLoad(true);
+        return;
+    }
+    const float v2 = battery.getBatteryVoltage();
+    const int i2 = battery.getBatteryCurrentMilliAmps();
+    const int deltaMa = gPackI1 - i2; // idle discharge before, LED load on top: positive
+    const int deltaMv = mv(gPackV1) - mv(v2);
+    const int fastMa = gPackI0 - gPackI1;
+    gData["v0_mv"] = mv(gPackV0);
+    gData["i0_ma"] = gPackI0;
+    gData["v1_mv"] = mv(gPackV1);
+    gData["i1_ma"] = gPackI1;
+    gData["v2_mv"] = mv(v2);
+    gData["i2_ma"] = i2;
+    gData["delta_ma"] = deltaMa;
+    gData["max_mohm"] = PACK_RESISTANCE_MAX_MOHM;
+    if (fastMa >= PACK_MIN_DELTA_MA)
+    {
+        gData["r_fast_mohm"] = (int)lroundf((mv(gPackV0) - mv(gPackV1)) * 1000.0f / fastMa);
+    }
+    char err[80];
+    if (deltaMa < PACK_MIN_DELTA_MA)
+    {
+        snprintf(err, sizeof(err), "load step only %d mA (need %d)", deltaMa, PACK_MIN_DELTA_MA);
+        finish(false, err);
+        return;
+    }
+    const int rMohm = (int)lroundf(deltaMv * 1000.0f / deltaMa);
+    gData["r_mohm"] = rMohm;
+    if (rMohm > PACK_RESISTANCE_MAX_MOHM)
+    {
+        snprintf(err, sizeof(err), "pack %d mOhm above %d (cell, leads or connector)", rMohm,
+                 PACK_RESISTANCE_MAX_MOHM);
+        finish(false, err);
+        return;
+    }
+    finish(true, "");
+}
+
 void startSd()
 {
     if (!fileManager.isSDCardAvailable())
@@ -1132,6 +1262,7 @@ void startTest(const TestDef &def)
     case Test::SD: startSd(); break;
     case Test::WIFI: startWifi(); break;
     case Test::BLE: startBle(); break;
+    case Test::PACK: startPack(); break;
     case Test::BRINGUP: startBringup(); break;
     case Test::SLEEP: finish(false, "not implemented"); break; // no shunt on this hardware
     default: break; // battery, pd: measured on the next pass
@@ -1150,6 +1281,7 @@ void stepTest()
     case Test::JACK: stepJack(); break;
     case Test::BATTERY: runBattery(); break;
     case Test::PD: runPd(); break;
+    case Test::PACK: stepPack(); break;
     case Test::SD: stepSd(); break;
     case Test::WIFI: stepWifi(); break;
     case Test::BLE: stepBle(); break;

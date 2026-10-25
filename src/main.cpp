@@ -61,6 +61,7 @@ unsigned long gFigureLoadingSince = 0;
 bool gSystemError = false;
 int gOtaProgress = -1;
 bool gLearnDischarge = false;
+bool gFactoryLoadStep = false;
 bool gGaugeBusReleased = false;
 
 // Network services (API client + Reverb) start when WiFi is up: in startFullSystem() on a

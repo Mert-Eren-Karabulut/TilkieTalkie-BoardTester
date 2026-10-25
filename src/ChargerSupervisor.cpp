@@ -93,7 +93,7 @@ void superviseChargerOnUsb()
         battery.setChargeEnabled(true); // a new session always charges (EN_CHG off sags VSYS on this board)
     }
 
-    if (gBringupPhase != BRINGUP_INACTIVE || gLearnDischarge || !battery.hasTelemetry())
+    if (gBringupPhase != BRINGUP_INACTIVE || gLearnDischarge || gFactoryLoadStep || !battery.hasTelemetry())
     {
         return;
     }

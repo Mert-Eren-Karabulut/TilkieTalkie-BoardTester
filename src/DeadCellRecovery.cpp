@@ -76,7 +76,7 @@ void runDeadCellRecoveryHold()
 void serviceLowBatteryCutoff()
 {
     static unsigned long lowBattSince = 0;
-    if (!gLearnDischarge && !battery.isVbusPresent() &&
+    if (!gLearnDischarge && !gFactoryLoadStep && !battery.isVbusPresent() &&
         !battery.getChargingStatus() && battery.hasTelemetry())
     {
         float v = battery.getBatteryVoltage();

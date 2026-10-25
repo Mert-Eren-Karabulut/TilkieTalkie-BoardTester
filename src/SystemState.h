@@ -52,6 +52,11 @@ extern int gOtaProgress;                   // 0-100 while an update is being wri
 // production build.
 extern bool gLearnDischarge;
 
+// Factory `ft test pack`: the charger input is in HIZ for a few seconds on purpose (load step
+// for the pack-resistance measurement); the charger supervisor and the low-battery cutoff
+// stand down meanwhile.
+extern bool gFactoryLoadStep;
+
 // `gaugebus release`: the battery bus belongs to an external tool (bqStudio/EV2400) until
 // `gaugebus attach`. Persisted so a wake from deep sleep does not grab the bus back.
 constexpr const char *GAUGEBUS_NVS_KEY = "gaugebus_rel";
