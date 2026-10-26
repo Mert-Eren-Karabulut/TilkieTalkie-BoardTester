@@ -85,3 +85,12 @@ settings). All verified through the board: `gaugedump` image kept in docs/gauge/
 (2026-10-26-after-calibration-…). Charging at 1.05 A from ~72 % at 02:20 local; then 5 h rest
 on the brick, flags checked (`VOK`, 0 mA), `learndis`, brick unplugged, LEDs to the trip, 5 h
 rest, bqStudio: expect Update Status 06, export.
+
+### 2026-10-27 02:35: cycle 4 result — Update Status 05, Qmax 4431, Ra table untouched
+Discharge 4 (09:49-19:40, 0.43 A, `VDQ QEN VOK` all day; `RDIS` set at 3.11 V / ~95 % DOD
+when fast scaling takes over, `VDQ` cleared ten minutes later, `TD`/`FD` after; slept at the
+floor with the brick out) + 7 h rest: Update Status 04 → 05, Qmax 4431 (cycle 1 with the old
+calibration: 4419, so the cells really hold ~4.4 Ah), rest reference taken (VOK, 96 % DOD).
+The Ra table (0x4100) is still the chemistry default with flag FF55: this gauge updates Ra
+only after Qmax has been learned (same as cycle 1 → 3). The VDQ drop at the end did not
+block the Qmax update. One more cycle from 05 gives 06; then export.
