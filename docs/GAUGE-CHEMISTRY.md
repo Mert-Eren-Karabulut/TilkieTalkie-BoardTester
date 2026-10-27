@@ -94,3 +94,13 @@ calibration: 4419, so the cells really hold ~4.4 Ah), rest reference taken (VOK,
 The Ra table (0x4100) is still the chemistry default with flag FF55: this gauge updates Ra
 only after Qmax has been learned (same as cycle 1 → 3). The VDQ drop at the end did not
 block the Qmax update. One more cycle from 05 gives 06; then export.
+
+### 2026-10-27: how VOK behaves on this gauge (saves a day next time)
+`VOK` is not raised while the cell rests. It appears the moment the rest ends and current
+flows, when the gauge commits the open-circuit reading: yesterday at the minute the top-off
+began, this morning fifteen seconds after charging started at the bottom, and today fifteen
+seconds after `learndis` started (`VDQ, QEN, VOK`). Waiting for `VOK` at 0 mA therefore never
+ends (7.5 h lost today). The right readiness test after a charge: termination done (0 mA),
+`REST` set, no `RDIS`, and the rested voltage drifting under ~1 mV per 5 min (3 h or more for
+this LFP cell); then start the discharge and confirm `VDQ`/`VOK` in the first reading under
+load. Cycle 5 discharge started 15:38 from Update Status 05 (Qmax 4431).
