@@ -177,3 +177,10 @@ cell terminals, docs/GAUGE-CHEMISTRY.md 2026-10-26), so the station's limit now 
 contact on top of the cell, not the cell. Decision: keep these cells (capacity is good); the
 gauge is configured for them instead (voltage calibration, Load Select = present average
 current, one learning cycle), see docs/GAUGE-CHEMISTRY.md.
+
+## 1.3.12 promoted to stable (2026-10-27)
+Station flashing (esptool-js in the page) verified on the demo unit after the post-write reset
+fix (portal b176c7f). Release 22 (1.3.12, pack #2 Yelda V2, rollout 100 %, not mandatory) is
+the stable release; 1.3.5-1.3.11 stay on beta. Not in it: the gauge golden image (chemistry
+0438 + learned Qmax/Ra) and SOC from the gauge; units produced now carry the stock chemistry
+0x1210 until a later release replays the image at boot.
