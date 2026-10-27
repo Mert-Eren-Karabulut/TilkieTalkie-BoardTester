@@ -77,6 +77,16 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 5. Volume policy for production (bench runs at 15 % with a 20 % ceiling).
 
 ## Needs hardware / owner
+- NFC board routing error (first batch of NFC boards): the PN532 module's regulator output was
+  tied to the board's supply, two feeds colliding; the module worked but ran hot and the
+  back-fed regulator drew current in sleep, draining the cell. Corrected on the bench units;
+  the unit shipped to the app developer (2026-10) has the old board. Consequence seen there:
+  cell run down past the 3.0 V cutoff (gauge FETs open) and then below the gauge's own
+  shutdown (2.3 V), so on USB the charger sees no battery (STAT LED on with a short blink
+  every 1-2 s) and nothing can close the FETs. Recovery only by charging the cell directly.
+  Firmware/hardware follow-ups: keep the CHG FET closed in the cutoff/ship state (DSG off
+  only) so a charger can always reach the cell while the gauge is alive; next spin: feed the
+  gauge's REGIN from the charger side as well (diode-OR) so a dead cell does not kill the gauge.
 - Gauge: LiFePO4 chemistry + learning cycle in bqStudio (EV2400). Until then SOC is coulomb-counted.
 - Next board spin: ~0.3 Ω cell-to-charger path; VSYS must not depend on the battery path on USB.
 - SD card quality (bench card: 0.3 MB/s sustained writes; it bounds download speed).
