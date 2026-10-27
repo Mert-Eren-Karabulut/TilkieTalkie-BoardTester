@@ -5,6 +5,8 @@
 // esp_brownout_disable() has no public equivalent in IDF 5.5 (the brownout driver API is
 // private); the recovery hold needs it to reach deep sleep through a survivable dip.
 #include <esp_private/brownout.h>
+#include "Faults.h"
+#include "LedController.h"
 #include "Policy.h"
 #include "SystemState.h"
 #include "VoicePrompts.h"
@@ -31,6 +33,20 @@ void runDeadCellRecoveryHold()
 {
     if (!battery.isVbusPresent())
     {
+        return;
+    }
+    if (!battery.isGaugePresent())
+    {
+        // 0.000 V here is "no reading", not a dead cell: the gauge does not answer (cell below
+        // what it runs on, FETs open, or ROM mode for ~15 s after a deep-discharge reset). The
+        // hold would sleep with charging on into an open node, forever (the app developer's unit,
+        // 2026-10-27). The charger stays disabled (applyPowerConfiguration) and the unit stays
+        // awake and reachable; the gauge rescan recovers it the moment the gauge answers.
+        ESP_LOGW(TAG, "No gauge answers on USB: not a dead-cell reading. Charging off, staying awake (fault 115).");
+        char d[32];
+        snprintf(d, sizeof(d), "vbus %.2fV", battery.getVbusVoltage());
+        Faults::raise(Fault::GAUGE_ABSENT, d, false);
+        ledController.flash(LedController::FX_FAIL);
         return;
     }
     const float v = battery.getBatteryVoltage();
@@ -105,11 +121,11 @@ void serviceLowBatteryCutoff()
                 // two-tier (deep sleep at 3.00V, ship only at 2.85V) so button-wake
                 // survives at empty.
                 VoicePrompts::getInstance().sayBlocking(Prompt::BATTERY_CRITICAL, 6000);
-                ESP_LOGW(TAG, "Disconnecting cell (gauge FETs open) - plug USB to wake.");
+                ESP_LOGW(TAG, "Disconnecting cell (gauge DSG FET open, CHG FET stays closed) - plug USB to wake.");
                 nfcController.powerDown();   // PN532 is on the always-on rail
                 // Adem v7 has no ship FET on the charger's SDRV pin (only a capacitor), so the
                 // charger's ship mode does nothing here; the gauge's protection FETs cut the cell.
-                battery.openGaugeFets();     // on battery power this does not return
+                battery.openGaugeFets();     // on battery power this does not return (CUV cuts the cell)
                 delay(1000);
                 sleepController.forceSleep(); // fallback if the ship-mode write failed
             }

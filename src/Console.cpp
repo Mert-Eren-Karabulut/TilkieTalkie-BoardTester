@@ -296,7 +296,9 @@ static void printHelp()
     ESP_LOGI(TAG, "  gauge1s / gaugeprog / gaugeresetlearn / gaugelearned / gaugecalcurrent - gauge provisioning tools");
     ESP_LOGI(TAG, "  dfread <hexaddr> [len] / dfwrite8 <hexaddr> <hexval> - gauge data flash");
     ESP_LOGI(TAG, "  gaugedump [hexstart hexend] - hex dump of the gauge data flash (default 4000-4800, the golden image)");
+    ESP_LOGI(TAG, "  gaugecutoff       - cutoff/ship FET state on USB (DSG open, CHG closed); gaugefets restores");
     ESP_LOGI(TAG, "  gaugemac <hexcmd> [len] / gaugeit - raw MAC block / Impedance Track internals (IT Status 1-3)");
+    ESP_LOGI(TAG, "  gaugedfbyte <hexaddr> [hexval] - read / write one gauge data-flash byte (e.g. 46AE Protection Configuration)");
     ESP_LOGI(TAG, "  learndis / learnrest / learnchg - gauge learning cycle phases");
     ESP_LOGI(TAG, "  sleeptest <min> [railon] [nfcawake] [hold] - sleep current via the gauge (battery only)");
     ESP_LOGI(TAG, "  chargemon [s]     - one charger/gauge line per second");
@@ -1251,6 +1253,18 @@ static void dispatch(String command)
         battery.printBatteryInfo();
     }
 #ifdef TT_BENCH
+    // gaugecutoff: the cutoff / ship-mode FET state (DSG open, CHG kept closed) while on USB, so
+    // the result can be read back; `gaugefets` restores normal FET control.
+    else if (command == "gaugecutoff")
+    {
+        bool success = battery.openGaugeFets();
+        ESP_LOGI(TAG, "Gauge cutoff (CUV threshold raised: DSG open, CHG closed): %s", success ? "OK" : "FAILED");
+        delay(500);
+        battery.refreshDiagnostics();
+        battery.printBatteryInfo();
+    }
+#endif
+#ifdef TT_BENCH
     else if (command == "gauge1s")
     {
         bool success = battery.setGaugeSingleCellMode();
@@ -1381,6 +1395,29 @@ static void dispatch(String command)
         battery.unlockBus();
         ESP_LOGI(TAG, "DF END %04x-%04x, %d read errors, %lu ms", static_cast<unsigned>(start),
                  static_cast<unsigned>(end), errors, static_cast<unsigned long>(millis() - t0));
+    }
+    // gaugedfbyte <hexaddr> [hexval] - read or write one data-flash byte (bench experiments)
+    else if (command.startsWith("gaugedfbyte "))
+    {
+        String args = command.substring(12);
+        args.trim();
+        int sp = args.indexOf(' ');
+        uint16_t addr = static_cast<uint16_t>(strtoul((sp > 0 ? args.substring(0, sp) : args).c_str(), nullptr, 16));
+        uint8_t value = 0;
+        if (sp > 0)
+        {
+            value = static_cast<uint8_t>(strtoul(args.substring(sp + 1).c_str(), nullptr, 16));
+            const bool ok = battery.gaugeDfWriteByte(addr, value);
+            ESP_LOGI(TAG, "DF 0x%04X <- 0x%02X: %s", addr, value, ok ? "OK" : "FAILED");
+        }
+        if (battery.gaugeDfReadByte(addr, value))
+        {
+            ESP_LOGI(TAG, "DF 0x%04X = 0x%02X (%u)", addr, value, value);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "DF 0x%04X read failed", addr);
+        }
     }
     // gaugemac <hexcmd> [len] - one raw AltManufacturerAccess block as the gauge returns it
     // (little-endian). IT Status 1/2/3 = 73/74/75, DA Status 1 = 71, Gauging Status = 56.

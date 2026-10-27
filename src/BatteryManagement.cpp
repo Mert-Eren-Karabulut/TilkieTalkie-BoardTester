@@ -5,6 +5,15 @@
 static const char *TAG = "batt";
 
 namespace {
+struct BusGuard {
+    SemaphoreHandle_t m;
+    explicit BusGuard(SemaphoreHandle_t lock) : m(lock) { if (m) xSemaphoreTakeRecursive(m, portMAX_DELAY); }
+    ~BusGuard() { if (m) xSemaphoreGiveRecursive(m); }
+};
+}
+
+
+namespace {
 // Charge-current limit currently requested by the system (bring-up / deep-discharge
 // recovery). configureChargerDefaults() reapplies the charger config on every device
 // rescan (DEVICE_RESCAN_INTERVAL), so it must honor this instead of unconditionally
@@ -609,6 +618,7 @@ void BatteryManager::refreshDevicePresence() {
 
 bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
     bool ok = true;
+    bool chargeWanted = false; // CE is asserted after the gauge work below (a cut cell is reconnected first)
 
     if (rt6160Present) {
         // RT6160 rail programming is volatile and must be applied on each boot.
@@ -623,12 +633,21 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
         ok = chargerConfigured && chargerAdcEnabled && ok;
         // SAFETY: the BQ25792 powers up with a 4.2 V Li-ion VREG. Charging (CE low) is only
         // enabled once the 3.6 V LFP charge voltage has been read back from the charger.
-        if (verifyChargerVoltageSetting()) {
-            assertChargerEnablePin();
-        } else {
+        if (!verifyChargerVoltageSetting()) {
             releaseChargerEnablePin();
             ESP_LOGE(TAG, "BatteryManager: SAFETY - charge voltage not verified, charger held disabled (CE high)");
             ok = false;
+        } else if (!gaugePresent) {
+            // No gauge answering means no cell the charger can reach (its FETs are open, or the
+            // cell is below what the gauge runs on). Charging into that open node makes the
+            // charger fault and restart every second, which collapses the rail and resets the
+            // ESP: the toy would loop forever, dark and unreachable. Charging stays off until the
+            // gauge answers (the periodic rescan re-applies this); the unit stays awake on USB so
+            // the console / station can see what is wrong (fault 115 GAUGE_ABSENT).
+            releaseChargerEnablePin();
+            ESP_LOGW(TAG, "BatteryManager: no gauge - charger held disabled (CE high) until the gauge answers");
+        } else {
+            chargeWanted = true;
         }
     } else {
         releaseChargerEnablePin();
@@ -654,7 +673,11 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
         // Otherwise the gauge leaves its CHG/DSG FETs open, isolating the cell, and
         // the device runs unbuffered off USB and browns out during network bring-up.
         bool singleCellReady = setGaugeSingleCellMode();
-        bool fetControlReady = restoreGaugeFetControl();
+        uint8_t chargerStatus = 0;
+        const bool usb = chargerPresent
+            && readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_0_REGISTER, chargerStatus)
+            && (chargerStatus & 0x01) != 0;
+        bool fetControlReady = restoreGaugeFetControl(usb);
 
         // Ensure CUV latches until charge (Protection Config bit1) on EVERY boot — this is
         // the only over-discharge protection that runs while the device is off/asleep, and
@@ -677,6 +700,9 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
         ok = gaugeConfigured && ok;
     }
 
+    if (chargeWanted) {
+        assertChargerEnablePin();
+    }
     return ok;
 }
 
@@ -720,6 +746,7 @@ void BatteryManager::printProtectionConfig() {
     uint8_t protCfg = 0, enaA = 0, enaB = 0, cuvDelay = 0;
     uint16_t cuvThr = 0, cuvRec = 0;
     bool ok = true;
+    BusGuard guard(busLock); // no poll between the DF reads (a collision reads back 0)
     ok &= readGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, protCfg);
     ok &= readGaugeDataFlashByte(BQ28Z610_ENABLED_PROTECTIONS_A_ADDRESS, enaA);
     ok &= readGaugeDataFlashByte(BQ28Z610_ENABLED_PROTECTIONS_B_ADDRESS, enaB);
@@ -1049,14 +1076,6 @@ void BatteryManager::refreshDiagnostics() {
     updateGaugeMeasurements(true);
     updateChargerMeasurements(true);
     updateChargingStatus();
-}
-
-namespace {
-struct BusGuard {
-    SemaphoreHandle_t m;
-    explicit BusGuard(SemaphoreHandle_t lock) : m(lock) { if (m) xSemaphoreTakeRecursive(m, portMAX_DELAY); }
-    ~BusGuard() { if (m) xSemaphoreGiveRecursive(m); }
-};
 }
 
 bool BatteryManager::readGaugeDataFlash(uint16_t address, uint8_t *buffer, size_t length) {
@@ -1819,23 +1838,145 @@ bool BatteryManager::openGaugeFets() {
         ESP_LOGE(TAG, "SHIP: gauge sealed and unseal failed - FETs stay closed");
         return false;
     }
+    // Cut the cell with the gauge's own under-voltage protection: raising the CUV threshold
+    // above the cell voltage trips CUV after CUV Delay (2 s), which opens the DSG FET and keeps
+    // the CHG FET closed. On battery the toy goes dark (the ESP dies with the rail); a charger
+    // still reaches the cell through the CHG FET, so from the moment USB is plugged in the cell
+    // charges, the rail is stable, the ESP boots and restoreGaugeFetControl() puts the threshold
+    // back, after which CUV clears (cell above CUV Recovery while charging) and the DSG FET
+    // closes. With both FETs open (the old FET_EN mechanism) the charger saw no battery and
+    // nothing could ever close them again (SHIP-CHECKLIST.md 2026-10-27).
+    uint16_t cuv = 0;
+    if (readGaugeDataFlashWord(BQ28Z610_CUV_THRESHOLD_ADDRESS, cuv)) {
+        if (cuv >= GAUGE_CUT_CUV_MV) {
+            ESP_LOGW(TAG, "SHIP: CUV threshold already raised (%u mV) - the gauge cuts the cell", cuv);
+            return true;
+        }
+        ESP_LOGW(TAG, "SHIP: raising the gauge CUV threshold %u -> %u mV: the DSG FET opens in ~2 s, the CHG FET stays closed. Plug USB to wake.", cuv, GAUGE_CUT_CUV_MV);
+        Serial.flush();
+        if (writeGaugeDataFlashWord(BQ28Z610_CUV_THRESHOLD_ADDRESS, GAUGE_CUT_CUV_MV)) { // verified read-back inside
+            // CUV trips after CUV Delay (2 s) once the gauge evaluates the new threshold; on
+            // battery the toy dies inside this loop. The gauge does not always pick a changed
+            // threshold up at once (seen on the bench: no trip for 14 s with 3700 mV in flash,
+            // the gauge idle at 0 mA), so after 3 s a device reset makes it re-read its
+            // settings: both FETs open for a moment, the gauge comes back, CUV trips 2 s later
+            // and the CHG FET stays closed.
+            for (int i = 0; i < 15; ++i) {
+                delay(200);
+                uint32_t safety = 0;
+                if (readGaugeAltStatus32(BQ28Z610_SAFETY_STATUS_COMMAND, safety) && (safety & 0x1)) {
+                    ESP_LOGW(TAG, "SHIP: cell cut (CUV, DSG FET open, CHG FET closed)");
+                    return true;
+                }
+            }
+            ESP_LOGW(TAG, "SHIP: CUV not tripped in 3 s - gauge reset so it applies the threshold");
+            Serial.flush();
+            delay(20);
+            return writeGaugeAltCommand(BQ28Z610_DEVICE_RESET_COMMAND);
+        }
+        ESP_LOGE(TAG, "SHIP: CUV threshold write failed - falling back to FET_EN");
+    }
+    // Fallback (old mechanism): clear FET_EN, both FETs open. Only reachable when the data-flash
+    // write failed; the charger cannot reach the cell until the next boot restores FET_EN.
     uint16_t mfg = 0;
     if (!readGaugeAltStatus16(BQ28Z610_MANUFACTURING_STATUS_COMMAND, mfg)) {
         return false;
     }
-    if ((mfg & 0x0010) == 0) {
+    if ((mfg & BQ28Z610_MFG_FET_EN) == 0) {
         ESP_LOGW(TAG, "SHIP: gauge FET_EN already clear");
         return true;
     }
-    ESP_LOGW(TAG, "SHIP: opening the gauge FETs - the cell leaves the system now, plug USB to wake.");
+    ESP_LOGW(TAG, "SHIP: opening both gauge FETs (FET_EN) - plug USB to wake.");
     Serial.flush();
     delay(20);
-    // FET_CONTROL toggles FET_EN; with it clear the gauge keeps CHG and DSG open until the host
-    // toggles it back (restoreGaugeFetControl at the next boot).
     return writeGaugeAltCommand(BQ28Z610_FET_CONTROL_COMMAND);
 }
 
-bool BatteryManager::restoreGaugeFetControl() {
+// CUV latched (DSG FET open, CHG FET closed) while a charger is present: get the DSG FET back.
+// With Protection Configuration CUV_RECOV_CHG set, the gauge clears CUV only when the cell is
+// above CUV Recovery AND charge current flows; a full cell behind the DSG body diode takes no
+// current (0 mA on the bench), so the latch never clears by itself and the toy would run on
+// USB only. Ladder: wait for the gauge (charging current), then recovery on voltage alone
+// (CUV_RECOV_CHG cleared for a moment), then a device reset as the last resort.
+bool BatteryManager::reconnectCutCellNow() {
+    uint32_t safety = 0;
+    if (!readGaugeAltStatus32(BQ28Z610_SAFETY_STATUS_COMMAND, safety) || (safety & 0x1) == 0) {
+        return true;
+    }
+    uint8_t raw[2] = {0};
+    uint16_t cellMv = 0;
+    if (readRegisters(gaugeAddress, 0x08, raw, 2)) {
+        cellMv = static_cast<uint16_t>(raw[1] << 8 | raw[0]);
+    }
+    if (cellMv < 3050) {
+        // Below CUV Recovery: only charging lifts the cell. The charger reaches it through the
+        // CHG FET and the DSG body diode (a low cell takes real current there, which also holds
+        // the BAT node steady); the gauge clears CUV on its own once the cell is above 3.0 V with
+        // charge current flowing, and the monitor loop retries this every 10 s meanwhile.
+        for (int i = 0; i < 8; ++i) {
+            delay(200);
+            if (readGaugeAltStatus32(BQ28Z610_SAFETY_STATUS_COMMAND, safety) && (safety & 0x1) == 0) {
+                ESP_LOGW(TAG, "SHIP: CUV cleared (charging), DSG FET closed");
+                return true;
+            }
+        }
+        ESP_LOGW(TAG, "SHIP: CUV latched, cell %u mV below CUV Recovery - charging until the gauge closes the DSG FET", cellMv);
+        return false;
+    }
+    // Above CUV Recovery: a cell this full takes no current through the diode, so the charger
+    // would push into an open BAT node, which collapses the rail (brownout loops on the bench).
+    // Charger off for the moment, recovery on voltage alone, charger back afterwards.
+    const gpio_num_t cePin = static_cast<gpio_num_t>(BATTERY_CHARGER_ENABLE_PIN);
+    const bool ceWasAsserted = gpio_get_level(cePin) == 0;
+    releaseChargerEnablePin();
+    ESP_LOGW(TAG, "SHIP: CUV latched (cell %u mV) - charger paused, reconnecting the cell", cellMv);
+    bool cleared = false;
+    uint8_t protCfg = 0;
+    if (readGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, protCfg) && (protCfg & 0x02)) {
+        if (writeGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, static_cast<uint8_t>(protCfg & ~0x02))) {
+            for (int i = 0; i < 15 && !cleared; ++i) {
+                delay(200);
+                cleared = readGaugeAltStatus32(BQ28Z610_SAFETY_STATUS_COMMAND, safety) && (safety & 0x1) == 0;
+            }
+            writeGaugeDataFlashByte(BQ28Z610_PROTECTION_CONFIG_ADDRESS, protCfg); // latch back on
+            if (cleared) {
+                ESP_LOGW(TAG, "SHIP: CUV cleared on voltage (CUV_RECOV_CHG released for a moment), DSG FET closed");
+            }
+        }
+    }
+    if (!cleared) {
+        ESP_LOGW(TAG, "SHIP: CUV still latched - gauge reset");
+        writeGaugeAltCommand(BQ28Z610_DEVICE_RESET_COMMAND);
+        delay(1200);
+        cleared = readGaugeAltStatus32(BQ28Z610_SAFETY_STATUS_COMMAND, safety) && (safety & 0x1) == 0;
+        if (cleared) {
+            ESP_LOGW(TAG, "SHIP: CUV cleared after the reset, DSG FET closed");
+        } else {
+            ESP_LOGE(TAG, "SHIP: CUV still latched after the reset - the DSG FET stays open");
+        }
+    }
+    if (ceWasAsserted) {
+        assertChargerEnablePin();
+    }
+    return cleared;
+}
+
+bool BatteryManager::isCellCut() const {
+    return gaugePresent && ((gaugeSafetyStatus & 0x1) != 0 || (gaugeOperationStatus & 0x2000) != 0);
+}
+
+bool BatteryManager::gaugeDfReadByte(uint16_t address, uint8_t &value) {
+    return gaugePresent && readGaugeDataFlashByte(address, value);
+}
+
+bool BatteryManager::gaugeDfWriteByte(uint16_t address, uint8_t value) {
+    if (!gaugePresent || (gaugeSealed && !unsealGauge())) {
+        return false;
+    }
+    return writeGaugeDataFlashByte(address, value);
+}
+
+bool BatteryManager::restoreGaugeFetControl(bool reconnectCutCell) {
     if (!gaugePresent) {
         return false;
     }
@@ -1845,14 +1986,40 @@ bool BatteryManager::restoreGaugeFetControl() {
         return false;
     }
 
+    // A cell cut by openGaugeFets() (CUV threshold raised): back to the real threshold. Only
+    // under a charger (reconnectCutCell): a boot on battery inside the cut's window must not
+    // undo it.
+    uint16_t cuv = 0;
+    if (readGaugeDataFlashWord(BQ28Z610_CUV_THRESHOLD_ADDRESS, cuv) && cuv > GAUGE_CUV_MV + 100) {
+        if (!reconnectCutCell) {
+            ESP_LOGW(TAG, "SHIP: cell is cut (CUV threshold %u mV) and no USB - leaving it cut", cuv);
+        } else if (writeGaugeDataFlashWord(BQ28Z610_CUV_THRESHOLD_ADDRESS, GAUGE_CUV_MV)) {
+            ESP_LOGW(TAG, "SHIP: CUV threshold %u -> %u mV restored (the cell was cut for ship / low battery)", cuv, GAUGE_CUV_MV);
+        } else {
+            ESP_LOGE(TAG, "SHIP: could not restore the CUV threshold (%u mV): the DSG FET stays open", cuv);
+        }
+    }
+    if (reconnectCutCell) {
+        reconnectCutCellNow();
+    }
+
     bool ok = readGaugeAltStatus16(BQ28Z610_MANUFACTURING_STATUS_COMMAND, gaugeManufacturingStatus);
     if (ok && (gaugeManufacturingStatus & 0x0008) == 0) {
         ok = writeGaugeAltCommand(BQ28Z610_GAUGING_COMMAND) && ok;
         delay(10);
     }
-    if (ok && (gaugeManufacturingStatus & 0x0010) == 0) {
+    if (ok && (gaugeManufacturingStatus & BQ28Z610_MFG_FET_EN) == 0) {
         ok = writeGaugeAltCommand(BQ28Z610_FET_CONTROL_COMMAND) && ok;
         delay(10);
+    }
+    // The manual CHG bit left behind by openGaugeFets(): clear it once the gauge controls the
+    // FETs again (it is meaningless then, but keeps the status readable).
+    if (ok && (gaugeManufacturingStatus & BQ28Z610_MFG_CHG_TEST) != 0) {
+        uint16_t m = 0;
+        if (readGaugeAltStatus16(BQ28Z610_MANUFACTURING_STATUS_COMMAND, m) && (m & BQ28Z610_MFG_FET_EN) && (m & BQ28Z610_MFG_CHG_TEST)) {
+            writeGaugeAltCommand(BQ28Z610_CHG_FET_COMMAND);
+            delay(10);
+        }
     }
 
     bool refreshed = false;
@@ -2667,6 +2834,7 @@ bool BatteryManager::readGaugeDataFlashWord(uint16_t address, uint16_t &value) {
 }
 
 bool BatteryManager::writeGaugeDataFlashByte(uint16_t address, uint8_t value) {
+    BusGuard guard(busLock); // see writeGaugeDataFlashWord()
     // TI canonical data-memory write: address + data must be written as ONE
     // contiguous block to AltManufacturerAccess (0x3E). Writing the address alone
     // (with a STOP) is interpreted as a read request, so a follow-up write to
@@ -2702,7 +2870,10 @@ bool BatteryManager::writeGaugeDataFlashByte(uint16_t address, uint8_t value) {
 }
 
 bool BatteryManager::writeGaugeDataFlashWord(uint16_t address, uint16_t value) {
-    // Single contiguous block (address + data) to 0x3E, then checksum+length.
+    // Single contiguous block (address + data) to 0x3E, then checksum+length. The bus is held
+    // for the whole sequence: a poll from another task between the block and the trailer (or
+    // before the read-back) resets the gauge's MAC buffer and the write never commits.
+    BusGuard guard(busLock);
     uint8_t block[4] = {
         static_cast<uint8_t>(address & 0xFF),
         static_cast<uint8_t>((address >> 8) & 0xFF),
@@ -2710,6 +2881,7 @@ bool BatteryManager::writeGaugeDataFlashWord(uint16_t address, uint16_t value) {
         static_cast<uint8_t>((value >> 8) & 0xFF),
     };
     if (!writeRegisters(gaugeAddress, 0x3E, block, sizeof(block))) {
+        ESP_LOGW(TAG, "DF write 0x%04X: block write failed", address);
         return false;
     }
 
@@ -2718,6 +2890,7 @@ bool BatteryManager::writeGaugeDataFlashWord(uint16_t address, uint16_t value) {
         0x06,                                                               // length: 2 addr + 2 data + 2
     };
     if (!writeRegisters(gaugeAddress, BQ28Z610_MAC_CHECKSUM_REGISTER, trailer, sizeof(trailer))) {
+        ESP_LOGW(TAG, "DF write 0x%04X: checksum write failed", address);
         return false;
     }
 
@@ -2729,6 +2902,7 @@ bool BatteryManager::writeGaugeDataFlashWord(uint16_t address, uint16_t value) {
             return true;
         }
     }
+    ESP_LOGW(TAG, "DF write 0x%04X: wrote %u, reads back %u", address, value, verify);
     return false;
 }
 

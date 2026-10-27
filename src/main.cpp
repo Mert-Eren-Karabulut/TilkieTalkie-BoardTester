@@ -514,7 +514,7 @@ void setup()
         ledController.pulseLed(SYSTEM_MONITOR_LED);
         ESP_LOGW(TAG, "Bring-up pending — deferring full system until it completes.");
     }
-    else if (battery.hasTelemetry() && battery.getBatteryVoltage() >= Policy::SYSTEM_START_IMMEDIATE_V)
+    else if (battery.hasTelemetry() && !battery.isCellCut() && battery.getBatteryVoltage() >= Policy::SYSTEM_START_IMMEDIATE_V)
     {
         // Clearly healthy cell (on or above the LFP plateau): start right away. Anything
         // lower must prove itself in monitor mode first (sustained-voltage gate in loop).
@@ -977,7 +977,21 @@ void loop()
             (gBringupPhase == BRINGUP_INACTIVE || gBringupPhase == BRINGUP_FAILED);
         static unsigned long readySince = 0;
         bool batteryProven = false;
-        if (battery.hasTelemetry())
+        // A cut cell (gauge CUV latched, DSG FET open: ship / low-battery cutoff, or the gauge's
+        // own under-voltage trip) cannot buffer the full system: the voltage reads fine (the
+        // gauge measures the cell itself) but WiFi browns the USB-only rail out. Stay here and,
+        // under a charger, keep asking the gauge to close the FET.
+        if (battery.isCellCut())
+        {
+            readySince = 0;
+            static unsigned long lastReconnect = 0;
+            if (battery.isVbusPresent() && (lastReconnect == 0 || millis() - lastReconnect > 10000UL))
+            {
+                lastReconnect = millis();
+                battery.restoreGaugeFetControl(true);
+            }
+        }
+        else if (battery.hasTelemetry())
         {
             const float v = battery.getBatteryVoltage();
             if (v >= Policy::SYSTEM_START_IMMEDIATE_V)

@@ -144,8 +144,9 @@ Stick it on the unit. A unit without a passed record does not get a label.
   during rework): it forgets WiFi, the device token, the card cache, the fault ring and the volume
   settings, keeps the factory identity, and restarts (the panel reconnects and opens a new session).
 - `ft ship` (cell at least 3.4 V, otherwise `charge first`: leave it charging and retry): the LEDs
-  breathe green, **unplug the USB cable within 10 seconds**. The unit switches off completely (ship
-  mode, µA drain). It wakes when USB is plugged in again.
+  breathe green, **unplug the USB cable within 10 seconds**. The unit switches off within a few
+  seconds (ship mode, µA drain; it may light up once more for a second before it goes dark, that
+  is normal). It wakes when USB is plugged in again.
 - `still powered`: the cable was still in after 15 s; ship mode was cancelled. Run `ft ship` again
   and unplug right after the answer.
 

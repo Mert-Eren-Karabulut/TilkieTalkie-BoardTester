@@ -1613,7 +1613,7 @@ void serviceShip()
     {
         gShipImmediateSent = true;
         ESP_LOGW(TAG, "VBUS gone - ship mode now");
-        battery.openGaugeFets(); // gauge protection FETs open: the cell leaves SYS, the unit dies here
+        battery.openGaugeFets(); // gauge CUV cut (DSG FET open, CHG closed): the cell leaves SYS, the unit dies here
         return;
     }
     if (elapsed < SHIP_NOT_ENGAGED_MS) return;

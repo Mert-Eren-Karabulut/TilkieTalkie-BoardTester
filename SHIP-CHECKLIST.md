@@ -84,9 +84,11 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
   cell run down past the 3.0 V cutoff (gauge FETs open) and then below the gauge's own
   shutdown (2.3 V), so on USB the charger sees no battery (STAT LED on with a short blink
   every 1-2 s) and nothing can close the FETs. Recovery only by charging the cell directly.
-  Firmware/hardware follow-ups: keep the CHG FET closed in the cutoff/ship state (DSG off
-  only) so a charger can always reach the cell while the gauge is alive; next spin: feed the
-  gauge's REGIN from the charger side as well (diode-OR) so a dead cell does not kill the gauge.
+  Firmware follow-up done in 1.3.13 (below): the cutoff/ship state keeps the CHG FET closed
+  (DSG off only) so a charger always reaches the cell while the gauge is alive, and a unit
+  without a gauge answer stays awake with charging off (fault 115) instead of sleeping into
+  the dead-cell hold. Next spin: feed the gauge's REGIN from the charger side as well
+  (diode-OR) so a dead cell does not kill the gauge.
 - Gauge: LiFePO4 chemistry + learning cycle in bqStudio (EV2400). Until then SOC is coulomb-counted.
 - Next board spin: ~0.3 Ω cell-to-charger path; VSYS must not depend on the battery path on USB.
 - SD card quality (bench card: 0.3 MB/s sustained writes; it bounds download speed).
@@ -187,6 +189,37 @@ cell terminals, docs/GAUGE-CHEMISTRY.md 2026-10-26), so the station's limit now 
 contact on top of the cell, not the cell. Decision: keep these cells (capacity is good); the
 gauge is configured for them instead (voltage calibration, Load Select = present average
 current, one learning cycle), see docs/GAUGE-CHEMISTRY.md.
+
+## 1.3.13: cutoff / ship keeps the charge path, no-gauge boot stays awake (2026-10-27, bench)
+Why: the app developer's unit (NFC back-feed) went through the 3.0 V cutoff, which cleared the
+gauge's FET_EN and opened both FETs; the isolated cell sank below the gauge's shutdown and the
+charger then saw no battery at all, nothing could ever close the FETs again (software could not
+recover it: cell charged directly). Now:
+- `openGaugeFets()` (low-battery cutoff, `ft ship`) raises the gauge's CUV threshold in data
+  flash (0x46B3, 2500 → 3700 mV) so the gauge trips its own under-voltage protection: DSG FET
+  open, CHG FET closed. If CUV has not tripped after 3 s (seen: the gauge kept the old
+  threshold for 14 s while idle) a DEVICE_RESET makes it re-read the flash and trip. On battery
+  the unit dies there (a brief second boot is possible inside the reset window; a boot without
+  USB leaves the cut alone).
+- Boot on USB: `restoreGaugeFetControl(usb)` writes 2500 mV back and runs the reconnect ladder
+  `reconnectCutCellNow()`: cell above 3.05 V → charger paused (CE released: charging into the
+  open BAT node of a full cell collapses the rail, brownout loop on the bench), Protection
+  Configuration CUV_RECOV_CHG released for a moment so CUV clears on voltage, latch back on;
+  else a gauge reset. Cell below 3.05 V → charging on, the gauge clears CUV itself once the cell
+  is above 3.0 V with current flowing (monitor loop retries every 10 s). CE is now asserted
+  only after the gauge work in `applyPowerConfiguration()`.
+- Monitor mode gate: a cut cell (`isCellCut()`: CUV in SafetyStatus or XDSG) never starts the
+  full system (it reads a fine voltage but cannot buffer WiFi).
+- No gauge answer on USB: charger held off (CE high), the dead-cell hold is skipped, fault 115
+  GAUGE_ABSENT, unit awake and reachable by the station; the rescan re-enables charging when
+  the gauge answers.
+- Data-flash writes hold the bus lock for the whole block + checksum + read-back (a poll in
+  between made the write "fail" / read back 0).
+Bench 2026-10-27 (demo unit, USB): cut → CUV 0x1, XDSG, FETs On/Off, 0 mA → the full system
+power-cycled on the USB-only rail → boot: threshold 3700 → 2500, "CUV latched (cell 3537 mV) -
+charger paused", "CUV cleared on voltage", FETs On/On, charging, full system 2 s later, no
+brownout. Pending: on-battery ship test and the battery-unplugged (no gauge) test with the
+operator, then release 1.3.13 beta → stable.
 
 ## 1.3.12 promoted to stable (2026-10-27)
 Station flashing (esptool-js in the page) verified on the demo unit after the post-write reset

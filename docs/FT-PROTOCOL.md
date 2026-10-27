@@ -79,10 +79,13 @@ Both repos implement this file; PROTOCOL-V2.md §9 points here.
 - `ft clean` → same as `ft reset` (factory namespace kept): WiFi, token, card cache, fault ring, volume gone; restarts → `{"ft":"clean","ok":true}` first.
 - `ft ship` → arms ship mode and answers
   `{"ft":"ship","ok":true,"unplug_within_s":10}`; the operator unplugs USB within 10 s and the unit
-  powers down: the moment VBUS is gone the device opens the battery gauge's protection FETs
-  (BQ28Z610 FET_EN cleared), which cuts the cell from the system; the next boot on USB closes
-  them again (wake = plugging USB in). The charger's own ship mode is not used: Adem v7 has no
-  ship FET on the BQ25792 SDRV pin. If
+  powers down: the moment VBUS is gone the device cuts the cell with the gauge's own
+  under-voltage protection (BQ28Z610 CUV threshold raised to 3700 mV in data flash: the DSG FET
+  opens about 3 s later, the CHG FET stays closed, so a charger always reaches the cell; a unit
+  may blink once more during those seconds when the gauge needed a reset to take the new
+  threshold). The next boot on USB puts the threshold back (2500 mV) and closes the DSG FET
+  again (wake = plugging USB in); a boot on battery leaves the cut alone. The charger's own
+  ship mode is not used: Adem v7 has no ship FET on the BQ25792 SDRV pin. If
   the unit is still running 25 s after the unplug, the FETs are restored and the station gets
   `"error":"ship mode did not engage"`. If VBUS is still present after 15 s the
   device cancels and sends `{"ft":"ship","ok":false,"error":"still powered"}`. Refused while a

@@ -29,7 +29,7 @@ feeding the loop watchdog meanwhile; any other answer or silence cancels.
 | system | `help`, `version`, `faults`, `restart`, `config` (no PIN), `debug`, `efusemac` / `hubid`, `heap`, `stack`, `timing`, `tasks`, `diag [on\|off]`, `coredump`, `coredumperase`, `endpoint`, `endpoint clear`, `ota`, `ota check [release_id]` |
 | factory (`ft`) | `ft begin`, `ft end`, `ft show`, `ft enroll <secret> <pop> [serial]`, `ft test <name> [args]`, `ft ok`, `ft fail [reason]`, `ft abort`, `ft result`, `ft commit`, `ft clean`, `ft ship`, `ft reset [--all]` (below) |
 | WiFi / Reverb | `qr`, `reset`, `stats`, `reverbstatus`, `reverbclean`, `reverbstart` |
-| battery / power | `battery`, `battscan`, `batterycfg`, `batteryclearflags`, `chargekick`, `gaugefets`, `gaugeprot`, `gaugecuvfix`, `gaugebus`, `gaugebus attach`, `pdstatus`, `power`, `poweron` |
+| battery / power | `battery`, `battscan`, `batterycfg`, `batteryclearflags`, `chargekick`, `gaugefets`, `gaugeprot`, `gaugecuvfix`, `gaugecutoff`, `gaugedfbyte`, `gaugebus`, `gaugebus attach`, `pdstatus`, `power`, `poweron` |
 | sleep | `sleep`, `sleep now`, `sleepafter <ms>`, `cancelsleep`, `sleepstatus` |
 | files | `sdtree`, `sdinfo`, `sdbench`, `sdwritebench [chunkKB] [count]`, `dlstats`, `dlqueue`, `dlclear`, `required`, `checkfiles`, `cleanup` |
 | audio | `play <path>`, `play`, `pause`, `resume`, `stop`, `next`, `prev`, `playlist`, `track`, `volup`, `voldown`, `volume`, `volume <n>`, `audio`, `amp on\|off\|auto` |
@@ -101,6 +101,8 @@ Buttons 2 + 3 held 5 s restart the toy (unchanged).
 | `gaugebus release` | hand the battery bus to bqStudio / EV2400 (persists across reboots) |
 | `gauge1s`, `gaugeprog`, `gaugeresetlearn`, `gaugelearned`, `gaugecalcurrent` | gauge provisioning tools |
 | `dfread <hexaddr> [len]`, `dfwrite8 <hexaddr> <hexval>` | gauge data flash |
+| `gaugecutoff` | the cutoff / ship-mode cut while on USB (CUV threshold raised to 3700 mV: gauge DSG FET open, CHG FET closed; the full system then usually power-cycles on the USB-only rail and the boot reconnects the cell, which is the field path); `gaugefets` restores by hand |
+| `gaugedfbyte <hexaddr> [hexval]` | read, or write and read back, one gauge data-flash byte (e.g. `gaugedfbyte 46AE` Protection Configuration) |
 | `gaugedump [hexstart hexend]` | hex dump of the gauge data flash as bare `DF 4100: ..` lines, default `4000 4800` (the whole image: calibration, OCV/Ra tables, learned state, configuration); capture the log to keep a golden image copy |
 | `gaugemac <hexcmd> [len]`, `gaugeit` | one raw AltManufacturerAccess block / Impedance Track internals decoded from IT Status 1-3 (true remaining and full capacity, Ra scale, depth-of-discharge reference points, Qmax inputs) |
 | `learndis`, `learnrest`, `learnchg` | gauge learning cycle (discharge stops at 2.60 V, charger in HIZ so USB can stay connected) |

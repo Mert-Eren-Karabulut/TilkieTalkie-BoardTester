@@ -91,7 +91,12 @@ private:
     static const uint8_t BQ28Z610_MAC_LENGTH_REGISTER = 0x61;
 
     // BQ28Z610 alternate commands and persistent DF addresses
-    static const uint16_t BQ28Z610_FET_CONTROL_COMMAND = 0x0022;
+    static const uint16_t BQ28Z610_FET_CONTROL_COMMAND = 0x0022;   // toggles ManufacturingStatus[FET_EN]
+    static const uint16_t BQ28Z610_CHG_FET_COMMAND = 0x001F;       // toggles ManufacturingStatus[CHG_TEST] (manual CHG FET)
+    // ManufacturingStatus bits (TRM): PCHG_TEST 0, CHG_TEST 1, DSG_TEST 2, GAUGE_EN 3, FET_EN 4
+    static const uint16_t BQ28Z610_MFG_CHG_TEST = 0x0002;
+    static const uint16_t BQ28Z610_MFG_DSG_TEST = 0x0004;
+    static const uint16_t BQ28Z610_MFG_FET_EN = 0x0010;
     static const uint16_t BQ28Z610_CHEM_ID_COMMAND = 0x0006;   // AltManufacturerAccess: the real Chemical ID
     static const uint16_t BQ28Z610_GAUGING_COMMAND = 0x0021;
     static const uint16_t BQ28Z610_SAFETY_STATUS_COMMAND = 0x0051;
@@ -160,6 +165,11 @@ private:
     static const uint16_t BQ28Z610_ENABLED_PROTECTIONS_A_ADDRESS = 0x46AF; // bit0 CUV, bit1 COV, bit2 OCC
     static const uint16_t BQ28Z610_ENABLED_PROTECTIONS_B_ADDRESS = 0x46B0;
     static const uint16_t BQ28Z610_CUV_THRESHOLD_ADDRESS = 0x46B3; // mV (default 2500)
+    // The cell cut (low-battery cutoff, ship mode): the CUV threshold is raised to this value so
+    // the gauge trips its own under-voltage protection, which opens the DSG FET and keeps the
+    // CHG FET closed (a charger always reaches the cell); restored to GAUGE_CUV_MV at the next boot.
+    static const uint16_t GAUGE_CUV_MV = 2500;
+    static const uint16_t GAUGE_CUT_CUV_MV = 3700;
     static const uint16_t BQ28Z610_CUV_DELAY_ADDRESS = 0x46B5;     // s  (default 2)
     static const uint16_t BQ28Z610_CUV_RECOVERY_ADDRESS = 0x46B6;  // mV (default 3000)
 
@@ -522,7 +532,14 @@ public:
     void setBusReleased(bool released);
     bool isBusReleased() const { return busReleased; }
     bool isTaskRunning() const { return pollTask != nullptr; }
-    bool restoreGaugeFetControl();
+    // reconnectCutCell: also put a raised CUV threshold (a cell cut by openGaugeFets()) back.
+    // Boot passes "USB present": a cut cell is only reconnected under a charger, so a boot
+    // on battery inside the cut's ~3 s window cannot undo it.
+    bool restoreGaugeFetControl(bool reconnectCutCell = true);
+    bool reconnectCutCellNow();              // CUV latched under a charger: close the DSG FET again
+    bool isCellCut() const;                  // gauge CUV latched / DSG FET open: the cell is not on SYS
+    bool gaugeDfReadByte(uint16_t address, uint8_t &value);   // bench console
+    bool gaugeDfWriteByte(uint16_t address, uint8_t value);   // bench console (unseals)
     // Factory ship: clears the gauge's FET_EN so both protection FETs open and the cell is cut
     // from the system (the charger's own ship mode needs an external ship FET on SDRV, which
     // this board may not populate). Only meaningful once VBUS is gone: SYS collapses at once.
