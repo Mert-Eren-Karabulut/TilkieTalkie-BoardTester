@@ -533,13 +533,30 @@ void BatteryManager::refreshBatteryState() {
         }
     }
 
+    // No gauge answering on USB: charging is held off (an open BAT node makes the charger fault
+    // and collapse the rail), except for a short pulse at boot and every 30 s. A BQ28Z610 that
+    // went to SHUTDOWN (cell pulled and put back, or sunk below its shutdown voltage and then
+    // charged) does not come back when the cell alone returns: it needs a voltage on its PACK
+    // pin, and here only the charger can put one there (bench 2026-10-28: the gauge stayed
+    // silent for minutes after the battery was re-plugged, charger off). The pulse is long
+    // enough to wake it and ends before the charger's first fault into an open node (~1.2 s).
+    if (chargerPresent && !gaugePresent && isVbusPresent()
+        && (lastGaugeWakePulse == 0 || now - lastGaugeWakePulse >= GAUGE_WAKE_PULSE_INTERVAL)) {
+        lastGaugeWakePulse = now;
+        ESP_LOGW(TAG, "BatteryManager: no gauge - charger pulse (%lu ms) to wake a gauge in shutdown", GAUGE_WAKE_PULSE_MS);
+        assertChargerEnablePin();
+        delay(GAUGE_WAKE_PULSE_MS);
+        releaseChargerEnablePin();
+        lastDeviceScan = now - DEVICE_RESCAN_INTERVAL + 1500; // look for it again in 1.5 s
+    }
+
     if (chargerPresent && now - lastChargerSanityCheck >= CHARGER_SANITY_INTERVAL) {
         lastChargerSanityCheck = now;
         if (!verifyChargerVoltageSetting()) {
             ESP_LOGW(TAG, "BatteryManager: charger configuration lost (VREG mismatch) - reconfiguring");
             chargerConfigured = configureChargerDefaults();
             chargerAdcEnabled = enableChargerAdc();
-            if (verifyChargerVoltageSetting()) {
+            if (verifyChargerVoltageSetting() && gaugePresent) {
                 assertChargerEnablePin();
             } else {
                 releaseChargerEnablePin();

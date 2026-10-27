@@ -250,6 +250,11 @@ private:
     static constexpr int SMOOTHING_SAMPLES = 10;
     static constexpr float CALIBRATION_OFFSET = 0.0;     // Adjust based on actual measurements
     static constexpr unsigned long DEVICE_RESCAN_INTERVAL = 5000;
+    // No gauge on USB: a charger pulse on the BAT/PACK node wakes a BQ28Z610 out of SHUTDOWN
+    // (TI: the cell alone never does, PACK needs >= 100 ms above Charger Present Threshold).
+    static constexpr unsigned long GAUGE_WAKE_PULSE_MS = 300;
+    static constexpr unsigned long GAUGE_WAKE_PULSE_INTERVAL = 30000;
+    unsigned long lastGaugeWakePulse = 0;
     
     // Private members
     float voltageBuffer[SMOOTHING_SAMPLES];

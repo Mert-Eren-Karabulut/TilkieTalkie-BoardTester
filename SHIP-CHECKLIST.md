@@ -211,15 +211,25 @@ recover it: cell charged directly). Now:
 - Monitor mode gate: a cut cell (`isCellCut()`: CUV in SafetyStatus or XDSG) never starts the
   full system (it reads a fine voltage but cannot buffer WiFi).
 - No gauge answer on USB: charger held off (CE high), the dead-cell hold is skipped, fault 115
-  GAUGE_ABSENT, unit awake and reachable by the station; the rescan re-enables charging when
-  the gauge answers.
+  GAUGE_ABSENT, unit awake and reachable by the station. Except for a 300 ms charger pulse at
+  boot and every 30 s: a BQ28Z610 in SHUTDOWN (cell pulled and put back, or sunk below its
+  shutdown voltage and charged a little) never comes back on the cell alone, it needs a voltage
+  on its PACK pin, which only the charger can put there (TI E2E; bench 2026-10-28: after the
+  battery was re-plugged on USB the gauge stayed silent for minutes with the charger off, and
+  answered 2 s after the first pulse). The rescan then re-applies the power configuration and
+  charging is on again.
 - Data-flash writes hold the bus lock for the whole block + checksum + read-back (a poll in
   between made the write "fail" / read back 0).
 Bench 2026-10-27 (demo unit, USB): cut → CUV 0x1, XDSG, FETs On/Off, 0 mA → the full system
 power-cycled on the USB-only rail → boot: threshold 3700 → 2500, "CUV latched (cell 3537 mV) -
 charger paused", "CUV cleared on voltage", FETs On/On, charging, full system 2 s later, no
-brownout. Pending: on-battery ship test and the battery-unplugged (no gauge) test with the
-operator, then release 1.3.13 beta → stable.
+brownout.
+Bench 2026-10-28 with the operator: `ft ship` on battery → "VBUS gone - ship mode now", dark
+~3 s after the unplug (no flicker seen), USB back → threshold restored, "CUV cleared on
+voltage", 75 mA charging, full system. Battery pulled on USB → the unit power-cycled (rail),
+booted with "no gauge", fault 115, stayed reachable (MONITOR, charging off); battery back →
+gauge silent until the wake pulse was added → then present 2 s after the pulse, FETs On/On,
+VBAT present, full system 10 s later.
 
 ## 1.3.12 promoted to stable (2026-10-27)
 Station flashing (esptool-js in the page) verified on the demo unit after the post-write reset
