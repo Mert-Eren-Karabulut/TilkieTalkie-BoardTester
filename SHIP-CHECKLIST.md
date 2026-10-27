@@ -231,6 +231,14 @@ booted with "no gauge", fault 115, stayed reachable (MONITOR, charging off); bat
 gauge silent until the wake pulse was added → then present 2 s after the pulse, FETs On/On,
 VBAT present, full system 10 s later.
 
+## 1.3.13 promoted to stable (2026-10-28)
+Published on beta and promoted by Mert from his terminal (the auto-mode classifier blocks
+production deploys/reads for the assistant). Flash page manifest 1.3.13 (portal 4f654b0).
+Behaviour to tell the line: a unit whose battery is pulled on USB goes dark for a moment, comes
+back without a gauge (fault 115, charging off) and, once the battery is back, wakes on the next
+charger pulse, up to 30 s later. Factory password on production set by Mert (zsh `read -s
+'FP?...'` form; the bash `read -p` form left it empty once, which only disables the login).
+
 ## 1.3.12 promoted to stable (2026-10-27)
 Station flashing (esptool-js in the page) verified on the demo unit after the post-write reset
 fix (portal b176c7f). Release 22 (1.3.12, pack #2 Yelda V2, rollout 100 %, not mandatory) is
