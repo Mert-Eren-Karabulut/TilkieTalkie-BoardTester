@@ -1277,7 +1277,7 @@ static void dispatch(String command)
         ESP_LOGI(TAG, "Gauge provisioning: %s", success ? "OK" : "FAILED");
         battery.printBatteryInfo();
     }
-    else if (command == "gaugeresetlearn")
+    else if (command == "gaugeresetlearn confirm")
     {
         bool success = battery.resetGaugeLearningState();
         ESP_LOGI(TAG, "Gauge learning reset: %s", success ? "OK" : "FAILED");
@@ -1522,7 +1522,14 @@ static void dispatch(String command)
     // SYS doesn't collapse and glitch I2C writes), then mark the gauge "learned"
     // (Update Status 0x06 + reseed QMax) so it computes FCC from QMax + chem Ra.
     // Pre-req: cell already charged to ~3.3V so the battery holds SYS up in HIZ.
-    else if (command == "gaugelearned")
+    // DESTRUCTIVE: seeds Qmax back to Design Capacity, Update Status to 0x04 and resets the
+    // gauge, which also throws away the learning cycle in progress (2026-10-28: sent by
+    // mistake as a read-out while cycle 5 was two hours from its end). Needs "confirm".
+    else if (command == "gaugelearned" || command == "gaugeresetlearn")
+    {
+        ESP_LOGW(TAG, "%s wipes the gauge's learned Qmax / Update Status and resets it. Run '%s confirm' if that is what you want; 'gaugeit' / 'battery' only read.", command.c_str(), command.c_str());
+    }
+    else if (command == "gaugelearned confirm")
     {
         ESP_LOGI(TAG, "LEARN: stabilizing rail (HIZ) then marking gauge learned...");
         battery.setHizMode(true);

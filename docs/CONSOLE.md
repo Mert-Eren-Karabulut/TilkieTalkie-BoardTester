@@ -99,7 +99,7 @@ Buttons 2 + 3 held 5 s restart the toy (unchanged).
 | `startsystem` | start the full system bypassing the battery gate |
 | `bringupreset` | clear the bring-up flag and re-run the gauge bring-up (production: `ft test bringup`) |
 | `gaugebus release` | hand the battery bus to bqStudio / EV2400 (persists across reboots) |
-| `gauge1s`, `gaugeprog`, `gaugeresetlearn`, `gaugelearned`, `gaugecalcurrent` | gauge provisioning tools |
+| `gauge1s`, `gaugeprog`, `gaugeresetlearn confirm`, `gaugelearned confirm`, `gaugecalcurrent` | gauge provisioning tools. The two `confirm` ones seed Qmax back to Design Capacity, write Update Status 0x04 and reset the gauge: the learned state and any learning cycle in progress are gone. Without `confirm` they only print a warning; `gaugeit` and `battery` are the read-outs |
 | `dfread <hexaddr> [len]`, `dfwrite8 <hexaddr> <hexval>` | gauge data flash |
 | `gaugecutoff` | the cutoff / ship-mode cut while on USB (CUV threshold raised to 3700 mV: gauge DSG FET open, CHG FET closed; the full system then usually power-cycles on the USB-only rail and the boot reconnects the cell, which is the field path); `gaugefets` restores by hand |
 | `gaugedfbyte <hexaddr> [hexval]` | read, or write and read back, one gauge data-flash byte (e.g. `gaugedfbyte 46AE` Protection Configuration) |
