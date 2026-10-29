@@ -345,6 +345,7 @@ void NfcController::serviceReaderHealth()
     if (probeReader())
     {
         healthProbeFailures = 0;
+        Faults::clear(Fault::NFC_INIT_FAILED); // a reader that answers never carries 701 (also clears an injected one)
         return;
     }
     if (++healthProbeFailures < 3)
