@@ -1,5 +1,12 @@
 # Gauge chemistry: what bqStudio's database tells us (2026-10-13)
 
+**Current state (2026-10-29):** the calibration unit's BQ28Z610 is learned (chemistry 0438,
+Update Status 06, Qmax 4443 mAh, Ra table 139–219 mΩ on the plateau). Its data flash is the
+golden image `src/GaugeGoldenImage.{h,cpp}`, replayed by the firmware onto every gauge that
+still has the stock chemistry (section "Firmware: the learned image is replayed at boot"), and
+the firmware's battery percentage is the gauge's RelativeStateOfCharge. The bqStudio exports
+and dumps live in `docs/gauge/` (not in git). Everything below is the record of how it got there.
+
 Question: can the LiFePO4 chemistry for the BQ28Z610 be built by the firmware from bqStudio's
 chemistry database, without an EV2400 session? Looked at a bqStudio 1.3.1xx install
 (`chemistry/` folder, the bq28z610 `.bqz`, the chemistry plugins).

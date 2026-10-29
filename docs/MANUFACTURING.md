@@ -1,11 +1,9 @@
 # Manufacturing: the test station, step by step
 
-The technician's procedure for every unit between "assembled" and "in the box". It replaces
-docs/FACTORY-MODE.md (the 2026-10-11 plan) and FACTORY_BRINGUP.md (the LED-only bring-up guide).
-The station is the manufacturing panel of the portal (`/admin/manufacturing`, Chrome with
+The technician's procedure for every unit between "assembled" and "in the box". The station is the manufacturing panel of the portal (`/admin/manufacturing`, Chrome with
 WebSerial); it speaks the `ft` protocol of docs/FT-PROTOCOL.md over the USB cable. You never type
-console commands on a production unit: the panel does it, and the bench commands of the old guides
-(`bringupreset`, `gaugeprog`, `startsystem`, ...) do not exist in production firmware.
+console commands on a production unit: the panel does it, and the bench commands (`bringupreset`,
+`gaugeprog`, `startsystem`, ...) do not exist in production firmware.
 
 ## 1. What the station needs
 
@@ -89,8 +87,7 @@ BRINGUP_FAILED and charges at 300 mA only); it must not be shipped until a bring
 
 The gauge chemistry is **not** checked here: the firmware does not program a chemistry, the gauge
 reports whatever ID it shipped with (the bring-up record shows it as `chem_id`) until the golden
-data-flash image from a bqStudio session exists (docs/GAUGE-CHEMISTRY.md). Ignore any old
-instruction that expects Chem ID 0x418.
+data-flash image is replayed by the firmware itself (docs/GAUGE-CHEMISTRY.md).
 
 ### Step 3: enroll
 

@@ -26,3 +26,6 @@ docs/gauge/*.bq.fs
 docs/gauge/*.df.fs
 docs/gauge/*.senc
 docs/gauge/*.bqz
+
+# PlatformIO sdkconfig backups
+sdkconfig.*.old

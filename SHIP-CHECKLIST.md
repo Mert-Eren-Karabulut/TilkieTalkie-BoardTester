@@ -1,8 +1,8 @@
-# Ship checklist (firmware) — 2026-10-11, evening
+# Ship checklist (firmware): the running log
 
-Status of the firmware on `IDF-Migration` (release 1.2.0, code 10200, on the bench board
-against production) against "ready to put on the shelves". Narrative in
-NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.md.
+Status of the firmware on `IDF-Migration` against "ready to put on the shelves", newest
+sections at the end. Current stable release: 1.3.13 (2026-10-28). The station and the factory
+flow: docs/MANUFACTURING.md; releases: docs/RELEASE.md; the board: docs/HARDWARE.md.
 
 ## Verified on the bench
 - Boot, WiFi, token over HTTPS (CA bundle), Reverb wss + `private-device.{uuid}`, reports, commands.
@@ -52,7 +52,7 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 - 1.2.17: the WiFi recovery and the wifi_lost prompt apply only while the stored network is in range
   (periodic scan for the SSID). Away from home the toy stays quiet, plays from the card and looks for
   the network every 2 minutes; no radio resets, no restarts.
-- 1.2.18: fault codes (docs/FAULTS.md) end to end; the audit's safe fixes (docs/AUDIT-2026-10-16.md):
+- 1.2.18: fault codes (docs/FAULTS.md) end to end; the audit's safe fixes (audit of 2026-10-16):
   console in Console.cpp with bench commands behind -DTT_BENCH (env:bench, never shipped), main.cpp
   split into modules, download give-ups complete the figure, batched queue writes, races closed, audio
   lock discipline and the volume-beep bug, skips for bad tracks, OTA check timeout, prompt pack
@@ -89,15 +89,29 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
   without a gauge answer stays awake with charging off (fault 115) instead of sleeping into
   the dead-cell hold. Next spin: feed the gauge's REGIN from the charger side as well
   (diode-OR) so a dead cell does not kill the gauge.
-- Gauge: LiFePO4 chemistry + learning cycle in bqStudio (EV2400).
-- Next board spin: ~0.3 Ω cell-to-charger path; VSYS must not depend on the battery path on USB.
+- Gauge: learned on 2026-10-29 (Update Status 06) and replayed onto every unit by the firmware;
+  the percentage comes from the gauge. Done.
+- Next board spin: docs/HARDWARE.md "Observations"; VSYS must not depend on the battery path on
+  USB. (The ~0.3 Ω seen in October is the cells themselves, not the path.)
 - SD card quality (bench card: 0.3 MB/s sustained writes; it bounds download speed).
 - Asset downloads are plain HTTP (AsyncTCP, no TLS) verified by the sha256 from the TLS
   manifest. nginx must keep serving `/storage` over port 80 (no forced HTTPS redirect).
 - Listening check of the audio path, LED patterns, button mapping.
 
-## Factory mode — next phase
-Plan with open decisions: docs/FACTORY-MODE.md.
+## Remaining (collected from the 2026-10 audits, unverified unless noted)
+- Release hygiene: `build_type = debug` and `CONFIG_COMPILER_OPTIMIZATION_DEBUG` (-Og) are still
+  set; log levels; `BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP` not set.
+- No secure boot / flash encryption: the device token and the WiFi password are readable over USB.
+- Pogo pin in the ext1 wake mask: a figure left on the pins after the playlist → sleep → wake →
+  autoplay loop (`SleepController.cpp`).
+- NFC: finite passive-activation retries and RF off after a read (PN532 field left on).
+- A card removed at runtime needs a reboot (no hot-swap); `uid_mappings` is one unbounded JSON
+  string in a 20 KB NVS partition.
+- Battery: a frozen gauge should fall back to the charger's VBAT so the 3.0 V cutoff still fires;
+  one bus lock across charger/gauge read-modify-write (REG0F race); 1 A applied at a dead-cell
+  wake before the hold drops it to 300 mA.
+- Code shape: AudioController / BatteryManagement / RequestManager are large; splits pending.
+- Portal: MySQL instead of SQLite, `APP_DEBUG=false`, off-box backups, `REVERB_ALLOWED_ORIGINS`.
 
 ## 1.3.0 (protocol v2, 2026-10-23) — not yet run on hardware
 Built and merged from two reviewed branches (docs/PROTOCOL-V2.md, docs/OTA-STATE-MACHINE.md); nothing
@@ -251,9 +265,8 @@ demo unit: 77 % = 3316 / 4319 mAh, `ft begin` soc 77. Not yet released.
 ## Gauge learned: Update Status 06 (2026-10-29)
 Cycle 6 on the calibration unit (docs/GAUGE-CHEMISTRY.md 2026-10-29): Qmax 4443 mAh, Ra table
 139–219 mΩ on the plateau, TrueFCC 4317 mAh. Golden image dumped (docs/gauge/dumps/, gitignored).
-Open: replay the image at bring-up (chemistry 0438 + Qmax + Ra + Update Status 06) so every
-produced unit starts learned, then SOC from the gauge instead of the coulomb counter; bqStudio
-export for the record.
+Both follow-ups landed the same day (sections above): the image is replayed by the firmware
+and the percentage is the gauge's; the bqStudio export (gg.csv + srec) is in docs/gauge/.
 
 ## 1.3.13 promoted to stable (2026-10-28)
 Published on beta and promoted by Mert from his terminal (the auto-mode classifier blocks

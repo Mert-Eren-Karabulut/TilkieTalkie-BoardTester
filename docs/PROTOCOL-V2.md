@@ -1,6 +1,6 @@
 # Protocol v2: identity, pairing, entitlement, updates, resets (decisions of 2026-10-23)
 
-Owner decisions (docs/SYSTEM-AUDIT-2026-10-22.md §A) turned into one contract both repos
+Owner decisions of 2026-10-23 turned into one contract both repos
 implement. FW = firmware, P = portal. Everything here replaces earlier docs where they differ.
 
 ## 1. Identity and enrollment

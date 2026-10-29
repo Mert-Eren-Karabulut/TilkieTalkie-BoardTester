@@ -507,7 +507,7 @@ static void dispatch(String command)
         fileManager.benchmarkSequentialWrite((size_t)chunkKb * 1024, count);
     }
 #ifdef TT_BENCH
-    // No confirmation and arbitrary URLs/paths: bench only (docs/SYSTEM-AUDIT-2026-10-22.md).
+    // No confirmation and arbitrary URLs/paths: bench only (docs/CONSOLE.md).
     else if (command == "sdformat")
     {
         fileManager.formatSDCard();
