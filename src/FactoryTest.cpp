@@ -122,6 +122,8 @@ JsonDocument gData;
 String gArg1, gArg2;
 
 bool gShipArmed = false;
+unsigned long gLastCommandAt = 0;      // last `ft` line (session idle timeout)
+unsigned long gVbusGoneSince = 0;       // USB gone while the session is open
 bool gShipImmediateSent = false; // the no-delay ship write went out after VBUS disappeared
 unsigned long gShipAt = 0;
 unsigned long gLastLedAssert = 0;
@@ -1688,6 +1690,7 @@ String labelPayload()
 
 void command(const String &argsIn)
 {
+    gLastCommandAt = millis();
     String args = argsIn;
     args.trim();
     const int sp = args.indexOf(' ');
@@ -1774,6 +1777,29 @@ void command(const String &argsIn)
 
 void update()
 {
+    // A session that nobody ends: the station page closed, the cable pulled without `ft ship`.
+    // The toy then stayed muted with every update check refused for the whole boot (a unit sat
+    // online on 1.3.17 ignoring a mandatory release, 2026-10-30). Ten minutes without an `ft`
+    // line, or 30 s without USB, end it like `ft end` (results stay committed if they were).
+    if (gActive && gTest == Test::NONE && !gShipArmed)
+    {
+        const unsigned long now = millis();
+        if (!battery.isVbusPresent())
+        {
+            if (!gVbusGoneSince) gVbusGoneSince = now ? now : 1;
+        }
+        else
+        {
+            gVbusGoneSince = 0;
+        }
+        const bool idle = gLastCommandAt && now - gLastCommandAt > 10UL * 60UL * 1000UL;
+        const bool unplugged = gVbusGoneSince && now - gVbusGoneSince > 30000UL;
+        if (idle || unplugged)
+        {
+            ESP_LOGW(TAG, "factory session ended by itself (%s)", unplugged ? "USB gone" : "10 min without a command");
+            deactivate();
+        }
+    }
     if (!gActive)
     {
         return;

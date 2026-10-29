@@ -37,6 +37,9 @@ Both repos implement this file; PROTOCOL-V2.md §9 points here.
   a dim white "factory" idle scene, WiFi and BLE untouched until a test asks for them.
   `ft begin` twice is fine (same answer). A reboot ends the session.
 - `ft end` → `{"ft":"end","ok":true}`; normal operation resumes (log level back to INFO).
+  A session nobody ends (page closed, cable pulled without `ft ship`) ends by itself after 10
+  minutes without an `ft` line, or 30 s without USB: the toy was otherwise left muted with every
+  update check refused for the whole boot (2026-10-30).
 - `ft show` (no session needed) → identity: `{"ft":"show","ok":true,"uuid","mac","serial","enrolled","label"}` (never the secret; `label` is `TT1:<uuid>:TK-XXXX-XXXX` or "" when no pop).
 - `ft enroll <secret> <pop> [serial]` → stores the factory identity (pop accepted as `TK-XXXX-XXXX`
   or 8 bare characters, stored bare) → `{"ft":"enroll","ok":true,"uuid","serial","label"}`.
