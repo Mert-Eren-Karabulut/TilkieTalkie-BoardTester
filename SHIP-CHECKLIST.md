@@ -345,3 +345,16 @@ red but no sentence (701 was still raised silently at runtime); fixed in 8749de3
 first reminder after a minute, then every 10 min) and confirmed: board back → "NFC reader is
 back", red gone. 1.3.16 (4d7618f, app sha c9dbc203…, USB sha 3560af46…) carries those two fixes
 and is the one to publish and promote; 1.3.15 stays on beta behind it.
+
+## 1.3.17: network services never started on a provisioned unit (2026-10-29 night)
+TT26-00001 (the app developer's unit, revived and re-flashed with 1.3.16 at the station): WiFi
+provisioned and connected, but "NET: waiting for memory before starting the network services
+(43659 free)" every 10 s for the whole boot: no token, no WebSocket. The gate in
+`serviceNetworkStart()` wanted 55 KB free internal; a provisioned unit has the WiFi stack up, the
+BLE memory released and the 32 KB internal DMA bounce for the SD writer taken at boot (demo unit
+for scale: 88 KB before BLE, 47.7 KB with BLE active). TLS and the sockets are in PSRAM
+(sdkconfig), so 55 KB was more than the start needs. dc0199f: the bounce is 16 KB; after 60 s on
+WiFi the gate accepts 36 KB free with a 10 KB largest block (logged); 5 min below that raises
+803 HEAP_LOW once. 1.3.17 (c24c4a8, app sha dfdd41af…, USB sha 2877692d…) carries it; publish,
+then re-flash TT26-00001 from the station (its card also has the old 26-file pack: the new one
+downloads by itself once the network is up).
