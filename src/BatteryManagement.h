@@ -241,14 +241,6 @@ private:
     // and they aren't needed: the BQ25792 caps charge at 3.6V (no overcharge) and the
     // default CUV (trip 2500 / recovery 3000mV) is fine for normal LFP use.
 
-    // Battery voltage constants (single cell LiFePO4 / LFP)
-    static constexpr float BATTERY_MIN_VOLTAGE = 2.5;    // Discharge cutoff
-    static constexpr float BATTERY_MAX_VOLTAGE = 3.6;    // Maximum charge voltage
-    static constexpr float BATTERY_NOMINAL_VOLTAGE = 3.2; // Nominal voltage
-    
-    // Smoothing and calibration
-    static constexpr int SMOOTHING_SAMPLES = 10;
-    static constexpr float CALIBRATION_OFFSET = 0.0;     // Adjust based on actual measurements
     static constexpr unsigned long DEVICE_RESCAN_INTERVAL = 5000;
     // No gauge on USB: a charger pulse on the BAT/PACK node wakes a BQ28Z610 out of SHUTDOWN
     // (TI: the cell alone never does, PACK needs >= 100 ms above Charger Present Threshold).
@@ -257,21 +249,19 @@ private:
     unsigned long lastGaugeWakePulse = 0;
     
     // Private members
-    float voltageBuffer[SMOOTHING_SAMPLES];
-    int bufferIndex;
-    bool bufferFilled;
     unsigned long lastUpdate;
     static constexpr unsigned long UPDATE_INTERVAL = 1000; // Update every 1 second
     
-    // Battery state
+    // Battery state. The voltage is the gauge's (the charger's VBAT ADC only without a gauge),
+    // the percentage is the gauge's RelativeStateOfCharge (0x2C) and nothing else: every gauge
+    // carries the learned image (GaugeGoldenImage.h), so its state of charge is authoritative.
+    // stateOfChargeValid is true while the gauge answers; the last percentage stays readable
+    // for displays, decisions must check hasStateOfCharge().
     float currentVoltage;
     float currentPercentage;
+    bool stateOfChargeValid = false;
     float currentTemperatureCelsius;
     uint32_t implausibleGaugeReads = 0;  // polls rejected by the plausibility check
-    bool gaugeSocTrusted = false;         // false: percentage comes from coulomb counting anchored on the LFP OCV curve
-    float ccSocPercent = -1.0f;           // coulomb-counted SOC while the gauge is unlearned
-    unsigned long ccLastMs = 0;
-    unsigned long ccRestSince = 0;
     uint8_t rt6160MissCount = 0;          // consecutive failed presence probes
     uint8_t chargerMissCount = 0;
     uint8_t gaugeMissCount = 0;
@@ -361,8 +351,6 @@ private:
     BatteryManager();
     
     // Helper methods
-    float calculateSmoothedVoltage();
-    float voltageToPercentage(float voltage);
     void refreshBatteryState();
     void refreshDevicePresence();
     void updateChargingStatus();
@@ -521,7 +509,6 @@ public:
     // Cell temperature from the gauge's TS1 thermistor (°C) — drives the charge-current
     // temperature guard (datasheet charge window 0-60°C).
     float getTemperatureC() const { return currentTemperatureCelsius; }
-    bool isGaugeSocTrusted() const { return gaugeSocTrusted; }
     bool isGaugeChargeInhibited() const { return gaugePresent && (gaugeOperationStatus & 0x4000) != 0; } // XCHG: gauge declared full / inhibits charge
     void printChargeMonitorLine(unsigned long t);  // one compact diagnostic line (full poll)
     int getBatteryCurrentMilliAmps() const { return currentBatteryCurrentMilliAmps; } // + charging, - discharging
@@ -574,9 +561,12 @@ public:
     // gauge-based sleep-current measurement (`sleeptest`), since a series DMM in the
     // cell path corrupts the gauge's impedance tracking.
     uint16_t getRemainingCapacityMilliAmpHours() const { return currentRemainingCapacityMilliAmpHours; }
+    // The gauge's state of charge (RelativeStateOfCharge). Keeps the last value while the gauge
+    // is silent: check hasStateOfCharge() before deciding anything on it.
     float getBatteryPercentage() const { return currentPercentage; }
+    bool hasStateOfCharge() const { return stateOfChargeValid; }
     bool getChargingStatus() const { return isCharging; }
-    bool hasTelemetry() const { return telemetryValid; }
+    bool hasTelemetry() const { return telemetryValid; } // a voltage reading exists (gauge, or charger ADC without a gauge)
     bool isGaugePresent() const { return gaugePresent; }
     // Factory test (`ft test battery`, bring-up record): cached values of the last poll.
     uint16_t getDesignCapacityMilliAmpHours() const { return gaugeDesignCapacityMilliAmpHours; }
@@ -598,9 +588,9 @@ public:
     }
 
     // Battery status methods
-    bool isBatteryLow() const { return telemetryValid && currentPercentage < Policy::LOW_BATTERY_PERCENT; }
-    bool isBatteryCritical() const { return telemetryValid && currentPercentage < 5.0; }
-    bool isBatteryFull() const { return telemetryValid && currentPercentage >= 95.0 && isCharging; }
+    bool isBatteryLow() const { return stateOfChargeValid && currentPercentage < Policy::LOW_BATTERY_PERCENT; }
+    bool isBatteryCritical() const { return stateOfChargeValid && currentPercentage < 5.0; }
+    bool isBatteryFull() const { return stateOfChargeValid && currentPercentage >= 95.0 && isCharging; }
     
     // Utility methods
     String getBatteryStatusString() const;

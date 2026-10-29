@@ -79,7 +79,7 @@ void updateChargingUx()
     const bool showCharge = battery.isVbusPresent() &&
                             gBringupPhase == BRINGUP_INACTIVE &&
                             !gLearnDischarge &&
-                            battery.hasTelemetry() &&
+                            battery.hasStateOfCharge() &&
                             chargeBarAllowed();
     if (showCharge)
     {
@@ -153,7 +153,7 @@ void deriveLedScene()
         return;
     }
 
-    const bool lowBattery = battery.hasTelemetry() && !battery.getChargingStatus() && battery.getBatteryPercentage() < Policy::LOW_BATTERY_PERCENT;
+    const bool lowBattery = battery.hasStateOfCharge() && !battery.getChargingStatus() && battery.getBatteryPercentage() < Policy::LOW_BATTERY_PERCENT;
     ledController.setLowBattery(lowBattery);
 
     if (audioController.isPlaying() && !audioController.isPromptPlaying())
@@ -312,7 +312,7 @@ void serviceUxPrompts()
 void updateBatteryUx()
 {
     static int lastWarnStep = 100;
-    if (gSystemPhase != PHASE_RUNNING || !battery.hasTelemetry())
+    if (gSystemPhase != PHASE_RUNNING || !battery.hasStateOfCharge())
     {
         return;
     }

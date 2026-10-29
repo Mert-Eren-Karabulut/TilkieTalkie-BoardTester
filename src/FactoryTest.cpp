@@ -1575,6 +1575,11 @@ void cmdShip()
         replyError("ship", "no battery telemetry");
         return;
     }
+    if (!battery.hasStateOfCharge())
+    {
+        replyError("ship", "no gauge");
+        return;
+    }
     if (battery.getBatteryVoltage() < SHIP_MIN_V || battery.getBatteryPercentage() < SHIP_MIN_SOC)
     {
         replyError("ship", "charge first");

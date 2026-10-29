@@ -541,7 +541,7 @@ static OtaManager::Conditions otaConditions()
     c.paused = audioController.isPaused();
     c.figure = nfcController.isPogoSwitchActive() || nfcController.isCardPresent();
     c.storyDownload = fileManager.hasActiveDownload();
-    c.batteryKnown = battery.hasTelemetry();
+    c.batteryKnown = battery.hasStateOfCharge();
     c.batteryPercent = battery.getBatteryPercentage();
     return c;
 }

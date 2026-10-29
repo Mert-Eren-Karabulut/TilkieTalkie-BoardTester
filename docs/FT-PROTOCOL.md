@@ -89,8 +89,9 @@ Both repos implement this file; PROTOCOL-V2.md §9 points here.
   the unit is still running 25 s after the unplug, the FETs are restored and the station gets
   `"error":"ship mode did not engage"`. If VBUS is still present after 15 s the
   device cancels and sends `{"ft":"ship","ok":false,"error":"still powered"}`. Refused while a
-  test runs or when the cell is under 30 % state of charge or 3.2 V (`"error":"charge first"`;
-  LiFePO4 rests near 3.3 V from half charge up, so the gauge's state of charge is the gate).
+  test runs, when the gauge does not answer (`"error":"no gauge"`) or when the cell is under
+  30 % state of charge or 3.2 V (`"error":"charge first"`; LiFePO4 rests near 3.3 V from half
+  charge up, so the gauge's state of charge is the gate).
 
 ## Label
 

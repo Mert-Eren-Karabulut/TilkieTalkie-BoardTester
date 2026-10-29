@@ -53,8 +53,9 @@ provisioning step, at every boot:
 
 Verified 2026-10-29 on the demo unit (stock 0x1210, Update Status 04): replayed at the first boot
 on USB in 7 s, read-back OK, the gauge reported TrueFCC 4318 mAh right away, and a full dump
-afterwards differs from the learned unit only inside 0x4000-0x40FF. The coulomb-counted SOC in the
-firmware is the next thing to retire in favour of the gauge's.
+afterwards differs from the learned unit only inside 0x4000-0x40FF. Since the same day the
+firmware's percentage is the gauge's RelativeStateOfCharge (the coulomb counter and the voltage
+curve written before the calibration are gone, SHIP-CHECKLIST.md).
 
 ## 2026-10-25: the learning cycles found a 300 mΩ pack, not a chemistry problem
 Third learning discharge (chem 0438, `VDQ/QEN/VOK`, no `RDIS`, 430 mA via `learndis`): after

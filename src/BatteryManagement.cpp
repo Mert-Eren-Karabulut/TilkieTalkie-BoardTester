@@ -220,10 +220,8 @@ String gaugeGaugingStatusToString(uint32_t status) {
 // Static member initialization
 BatteryManager* BatteryManager::instance = nullptr;
 
-BatteryManager::BatteryManager() 
-    : bufferIndex(0)
-    , bufferFilled(false)
-    , lastUpdate(0)
+BatteryManager::BatteryManager()
+    : lastUpdate(0)
     , currentVoltage(0.0)
     , currentPercentage(0.0)
     , currentTemperatureCelsius(0.0)
@@ -295,10 +293,6 @@ BatteryManager::BatteryManager()
     , lastDeviceScan(0)
 {
     busLock = xSemaphoreCreateRecursiveMutex();
-    // Initialize voltage buffer
-    for (int i = 0; i < SMOOTHING_SAMPLES; i++) {
-        voltageBuffer[i] = 0.0;
-    }
 }
 
 BatteryManager& BatteryManager::getInstance() {
@@ -452,62 +446,6 @@ void BatteryManager::update() {
     }
 }
 
-float BatteryManager::calculateSmoothedVoltage() {
-    if (!bufferFilled && bufferIndex == 0) {
-        return voltageBuffer[0];  // Not enough samples yet
-    }
-    
-    float sum = 0.0;
-    int samples = bufferFilled ? SMOOTHING_SAMPLES : bufferIndex;
-    
-    for (int i = 0; i < samples; i++) {
-        sum += voltageBuffer[i];
-    }
-    
-    return sum / samples;
-}
-
-float BatteryManager::voltageToPercentage(float voltage) {
-    // Clamp voltage to valid range
-    if (voltage <= BATTERY_MIN_VOLTAGE) {
-        return 0.0;
-    }
-    if (voltage >= BATTERY_MAX_VOLTAGE) {
-        return 100.0;
-    }
-    
-    // LiFePO4 1S has a very flat discharge curve (long ~3.2-3.3V plateau), so
-    // voltage->SOC is only a coarse fallback for when the gauge RSOC is
-    // unavailable. Piecewise-linear interpolation over an approximate LFP curve.
-    struct CurvePoint { float voltage; float percentage; };
-    static const CurvePoint curve[] = {
-        {3.60f, 100.0f},
-        {3.40f,  95.0f},
-        {3.35f,  90.0f},
-        {3.32f,  80.0f},
-        {3.30f,  70.0f},
-        {3.28f,  55.0f},
-        {3.25f,  40.0f},
-        {3.22f,  25.0f},
-        {3.20f,  18.0f},
-        {3.10f,  10.0f},
-        {3.00f,   5.0f},
-        {2.80f,   2.0f},
-        {2.50f,   0.0f},
-    };
-    const int pointCount = sizeof(curve) / sizeof(curve[0]);
-
-    for (int i = 0; i < pointCount - 1; i++) {
-        if (voltage <= curve[i].voltage && voltage >= curve[i + 1].voltage) {
-            float span = curve[i].voltage - curve[i + 1].voltage;
-            float t = span > 0.0f ? (voltage - curve[i + 1].voltage) / span : 0.0f;
-            float percentage = curve[i + 1].percentage + t * (curve[i].percentage - curve[i + 1].percentage);
-            return constrain(percentage, 0.0f, 100.0f);
-        }
-    }
-
-    return 0.0f;
-}
 
 void BatteryManager::refreshBatteryState() {
     unsigned long now = millis();
@@ -574,27 +512,11 @@ void BatteryManager::refreshBatteryState() {
     bool chargerUpdated = updateChargerMeasurements(full);
 
     telemetryValid = gaugeUpdated || chargerUpdated;
-
-    if (gaugeUpdated) {
-        voltageBuffer[bufferIndex] = currentVoltage;
-        bufferIndex = (bufferIndex + 1) % SMOOTHING_SAMPLES;
-        if (!bufferFilled && bufferIndex == 0) {
-            bufferFilled = true;
-        }
-
-        currentVoltage = calculateSmoothedVoltage() + CALIBRATION_OFFSET;
-    } else if (chargerUpdated) {
-        voltageBuffer[bufferIndex] = currentVoltage;
-        bufferIndex = (bufferIndex + 1) % SMOOTHING_SAMPLES;
-        if (!bufferFilled && bufferIndex == 0) {
-            bufferFilled = true;
-        }
-
-        currentVoltage = calculateSmoothedVoltage();
-        currentPercentage = voltageToPercentage(currentVoltage);
-    } else {
+    // The gauge poll sets the voltage and the state of charge itself; without a gauge the
+    // charger poll supplies the voltage (its VBAT ADC) and the state of charge is unknown.
+    stateOfChargeValid = gaugeUpdated;
+    if (!telemetryValid) {
         currentVoltage = 0.0f;
-        currentPercentage = 0.0f;
         isCharging = false;
     }
 
@@ -833,7 +755,7 @@ void BatteryManager::printBatteryInfo() const {
     }
 
     Serial.println("Voltage: " + String(currentVoltage, 3) + "V");
-    Serial.println("Percentage: " + String(currentPercentage, 1) + "%");
+    Serial.println("Percentage: " + String(currentPercentage, 1) + "%" + (stateOfChargeValid ? "" : " (stale: gauge not answering)"));
     Serial.println("Temperature: " + String(currentTemperatureCelsius, 1) + "C");
     Serial.println("Battery Current: " + String(currentBatteryCurrentMilliAmps) + "mA");
     Serial.println("Remaining Capacity: " + String(currentRemainingCapacityMilliAmpHours) + "mAh");
@@ -1784,43 +1706,18 @@ bool BatteryManager::updateGaugeMeasurements(bool full) {
     // "4629 C" and suspended charging. Anything a 1S LiFePO4 pack cannot physically report is
     // treated as a failed poll (previous values stay in place) instead of a measurement.
     const float tempC = (temperatureDeciKelvin / 10.0f) - 273.15f;
-    if (tempC < -30.0f || tempC > 100.0f || voltageMillivolts < 1500 || voltageMillivolts > 4500) {
+    if (tempC < -30.0f || tempC > 100.0f || voltageMillivolts < 1500 || voltageMillivolts > 4500
+        || relativeStateOfCharge > 100) {
         implausibleGaugeReads++;
         if (implausibleGaugeReads <= 5 || (implausibleGaugeReads % 50) == 0) {
-            ESP_LOGW(TAG, "BatteryManager: implausible gauge poll ignored (%.1f C, %u mV, #%u)",
-                          tempC, (unsigned)voltageMillivolts, (unsigned)implausibleGaugeReads);
+            ESP_LOGW(TAG, "BatteryManager: implausible gauge poll ignored (%.1f C, %u mV, SOC %u, #%u)",
+                          tempC, (unsigned)voltageMillivolts, (unsigned)relativeStateOfCharge, (unsigned)implausibleGaugeReads);
         }
         return false;
     }
 
     currentVoltage = voltageMillivolts / 1000.0f;
-    currentPercentage = constrain(relativeStateOfCharge > 100 ? (relativeStateOfCharge & 0xFF) : relativeStateOfCharge, 0, 100);
-    // The gauge still runs the Li-ion default chemistry and has not learned this pack (FCC of
-    // ~100 mAh against a 4000 mAh design, "fully discharged" at 3.25 V): until it is calibrated
-    // its SOC is meaningless. Fall back to the LFP open-circuit curve, corrected for the ~100 mOhm
-    // pack path, whenever the gauge's full-charge capacity is implausible.
-    gaugeSocTrusted = fullChargeCapacity >= 1000;
-    if (!gaugeSocTrusted) {
-        // Coulomb counting on the gauge's (accurate) current, anchored on the LFP OCV curve
-        // whenever the pack has rested for two minutes, 100 % when the charger terminates.
-        // The flat LFP curve makes a pure voltage estimate swing with every 50 mA of load.
-        const unsigned long now = millis();
-        const float hours = ccLastMs ? (now - ccLastMs) / 3600000.0f : 0.0f;
-        ccLastMs = now;
-        const bool resting = batteryCurrent > -25 && batteryCurrent < 25;
-        if (resting) { if (!ccRestSince) ccRestSince = now; } else { ccRestSince = 0; }
-        const float ocvPercent = voltageToPercentage(currentVoltage - (batteryCurrent / 1000.0f) * 0.10f);
-        if (ccSocPercent < 0.0f || (resting && now - ccRestSince > 120000UL)) {
-            ccSocPercent = ocvPercent;
-        } else {
-            ccSocPercent += (batteryCurrent * hours) / (float)DEFAULT_GAUGE_DESIGN_CAPACITY_MAH * 100.0f;
-        }
-        if (isChargeDone() || (gaugeOperationStatus & 0x4000)) {
-            ccSocPercent = 100.0f; // charger termination or the gauge's own full-charge verdict
-        }
-        ccSocPercent = constrain(ccSocPercent, 0.0f, 100.0f);
-        currentPercentage = ccSocPercent;
-    }
+    currentPercentage = static_cast<float>(relativeStateOfCharge); // the gauge's RelativeStateOfCharge, 0-100
     currentTemperatureCelsius = tempC;
     currentBatteryCurrentMilliAmps = batteryCurrent;
     currentRemainingCapacityMilliAmpHours = remainingCapacity;

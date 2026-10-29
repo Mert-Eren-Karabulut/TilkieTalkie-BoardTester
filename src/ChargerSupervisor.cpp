@@ -233,7 +233,7 @@ void superviseChargerOnUsb()
     }
     if (fullHold)
     {
-        const bool cellDown = v < 3.30f || battery.getBatteryPercentage() < 90.0f;
+        const bool cellDown = v < 3.30f || (battery.hasStateOfCharge() && battery.getBatteryPercentage() < 90.0f);
         if (cellDown && !battery.isGaugeChargeInhibited() && !battery.isChargeDone())
         {
             fullHold = false;
@@ -243,14 +243,16 @@ void superviseChargerOnUsb()
     }
 
     // Never "kick" after Charge Done: toggling EN_CHG there starts a fresh CC/CV cycle every
-    // 10 s, so the cell never rests at full (which the gauge needs to learn capacity). The gauge
-    // is not calibrated (SOC reads 0 %), so "full" is judged from the cell: a LiFePO4 cell that
-    // rests at or above 3.40 V with no current is above ~95 %. And a charger that drops out
-    // three times in a row is not going to be fixed by a fourth kick: back off for an hour.
+    // 10 s, so the cell never rests at full (which the gauge needs to learn capacity). "Full" is
+    // the gauge's state of charge (95 % and up), with the cell itself as the backstop while the
+    // gauge is silent: a LiFePO4 cell that rests at or above 3.40 V with no current is above
+    // ~95 %. And a charger that drops out three times in a row is not going to be fixed by a
+    // fourth kick: back off for an hour.
     static uint8_t kicksInRow = 0;
     static bool kickBackoff = false;           // three kicks failed: wait an hour
     static unsigned long kickBackoffSince = 0; // wrap-safe: elapsed time since the back-off began
-    const bool cellLooksFull = v >= 3.40f && fabsf((float)battery.getBatteryCurrentMilliAmps()) < 60.0f;
+    const bool cellLooksFull = (battery.hasStateOfCharge() && battery.getBatteryPercentage() >= 95.0f)
+        || (v >= 3.40f && fabsf((float)battery.getBatteryCurrentMilliAmps()) < 60.0f);
     if (battery.getChargingStatus() && millis() - lastChargeKick > 60000)
     {
         kicksInRow = 0; // a full minute of charging after a kick: the kicks were useful

@@ -69,7 +69,7 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
 0. Out-of-box run #2 with the prompts and the pack on the card (pairing, update, first figure, buttons, sleep).
 1. Deep sleep on battery and wake by button verified 2026-10-12 (sleep after 5 min idle; wake: LEDs at once, hello at 6.5 s, portal at ~11 s). Still open: sleep current (`sleeptest`).
 2. BLE provisioning on NimBLE (needs the mobile app once).
-3. Low-battery path: forced sleep at the critical threshold uses the coulomb-counted SOC — re-check after gauge calibration.
+3. Low-battery path: forced sleep at the critical threshold voltage-based (3.00 V debounced), not the state of charge.
 4. Time to first story on a never-tapped figure = first track download (SD-bound, ~2.4 Mbps:
    ~10 s for a 3 MB track). Streaming the first track while it downloads would cut that to ~2 s;
    deferred (touches FileManager, ReadAheadFileSource, AudioController; design: reader re-opens
@@ -89,7 +89,7 @@ NIGHT-REPORT-2026-10-11.md, plan in PLAN.md, factory mode in docs/FACTORY-MODE.m
   without a gauge answer stays awake with charging off (fault 115) instead of sleeping into
   the dead-cell hold. Next spin: feed the gauge's REGIN from the charger side as well
   (diode-OR) so a dead cell does not kill the gauge.
-- Gauge: LiFePO4 chemistry + learning cycle in bqStudio (EV2400). Until then SOC is coulomb-counted.
+- Gauge: LiFePO4 chemistry + learning cycle in bqStudio (EV2400).
 - Next board spin: ~0.3 Ω cell-to-charger path; VSYS must not depend on the battery path on USB.
 - SD card quality (bench card: 0.3 MB/s sustained writes; it bounds download speed).
 - Asset downloads are plain HTTP (AsyncTCP, no TLS) verified by the sha256 from the TLS
@@ -236,8 +236,17 @@ VBAT present, full system 10 s later.
 0x47FF) is written onto every gauge that still has the stock chemistry or Update Status 04, at the
 first boot on USB, then verified (docs/GAUGE-CHEMISTRY.md). Demo unit: 0x1210/04 → 0438/06/Qmax
 4443 in 7 s. Fleet effect once released: a unit on this firmware gets the image at its next boot
-on USB (one gauge reset, ~7 s, charging continues). SOC still comes from the firmware's coulomb
-counter; switching it to the gauge is next. Not yet released.
+on USB (one gauge reset, ~7 s, charging continues). Not yet released.
+
+## State of charge from the gauge (2026-10-29, bench)
+The percentage is now the gauge's RelativeStateOfCharge and nothing else: the coulomb counter
+anchored on an LFP voltage curve, the voltage-to-percentage table, the 10-sample voltage
+smoothing and the "gauge SOC trusted" switch (all written before the gauge was calibrated) are
+gone. `hasStateOfCharge()` is true while the gauge answers; the low-battery LED and voice
+steps, the OTA 15 % abort, `ft ship` ("no gauge") and the charger's full-hold check gate on it,
+the last value stays readable for the bar and the portal report. Without a gauge the voltage
+still comes from the charger's ADC (cutoff and start gates are voltage-based). Verified on the
+demo unit: 77 % = 3316 / 4319 mAh, `ft begin` soc 77. Not yet released.
 
 ## Gauge learned: Update Status 06 (2026-10-29)
 Cycle 6 on the calibration unit (docs/GAUGE-CHEMISTRY.md 2026-10-29): Qmax 4443 mAh, Ra table
