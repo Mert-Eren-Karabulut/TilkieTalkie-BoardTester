@@ -283,7 +283,7 @@ the stable release; 1.3.5-1.3.11 stay on beta. Not in it: the gauge golden image
 0438 + learned Qmax/Ra) and SOC from the gauge; units produced now carry the stock chemistry
 0x1210 until a later release replays the image at boot.
 
-## 1.3.14 built, not yet published (2026-10-29 night)
+## 1.3.14 on beta (2026-10-29 morning)
 Contents: the learned gauge image replayed onto stock gauges at the first boot on USB
 (GaugeGoldenImage), the battery percentage from the gauge's RelativeStateOfCharge (coulomb
 counter and voltage curve removed), `gaugelearned` / `gaugeresetlearn` behind `confirm`, the
@@ -291,5 +291,7 @@ repo cleanup (docs/HARDWARE.md, docs/BENCH.md, docs/RELEASE.md, README.md). Imag
 `releases/` (app sha 61cb0b3c…, USB image sha bf9666b2…). Verified on the demo unit (bench
 build of the same tree): image replay 0x1210/04 → 0438/06 in 7 s, percentage 77 % = 3316 /
 4319 mAh. Fleet effect: every unit on this firmware gets the image once at its next boot on USB
-(one gauge reset, ~7 s) and reports the gauge's percentage from then on. Publish with
-docs/RELEASE.md step 2 (beta), promote after a day on the bench unit.
+(one gauge reset, ~7 s) and reports the gauge's percentage from then on. Published on beta
+(release with pack #2 Yelda V2, USB image sha bf9666b2…, flash page manifest 1.3.14, portal
+091e3fd); the demo unit runs the same production image from USB. Promote to stable after a
+day on it.
