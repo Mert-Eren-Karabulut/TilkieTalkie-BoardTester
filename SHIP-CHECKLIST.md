@@ -231,6 +231,13 @@ booted with "no gauge", fault 115, stayed reachable (MONITOR, charging off); bat
 gauge silent until the wake pulse was added → then present 2 s after the pulse, FETs On/On,
 VBAT present, full system 10 s later.
 
+## Gauge learned: Update Status 06 (2026-10-29)
+Cycle 6 on the calibration unit (docs/GAUGE-CHEMISTRY.md 2026-10-29): Qmax 4443 mAh, Ra table
+139–219 mΩ on the plateau, TrueFCC 4317 mAh. Golden image dumped (docs/gauge/dumps/, gitignored).
+Open: replay the image at bring-up (chemistry 0438 + Qmax + Ra + Update Status 06) so every
+produced unit starts learned, then SOC from the gauge instead of the coulomb counter; bqStudio
+export for the record.
+
 ## 1.3.13 promoted to stable (2026-10-28)
 Published on beta and promoted by Mert from his terminal (the auto-mode classifier blocks
 production deploys/reads for the assistant). Flash page manifest 1.3.13 (portal 4f654b0).

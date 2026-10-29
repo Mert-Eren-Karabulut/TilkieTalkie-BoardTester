@@ -104,3 +104,30 @@ ends (7.5 h lost today). The right readiness test after a charge: termination do
 `REST` set, no `RDIS`, and the rested voltage drifting under ~1 mV per 5 min (3 h or more for
 this LFP cell); then start the discharge and confirm `VDQ`/`VOK` in the first reading under
 load. Cycle 5 discharge started 15:38 from Update Status 05 (Qmax 4431).
+
+## 2026-10-29: cycle 6 → Update Status 06, the gauge is learned
+
+Cycle 5 was lost on 2026-10-28 (a destructive console command sent by mistake two hours before
+its end; Qmax 4418 / Update Status 05 written back by hand, docs/CONSOLE.md). Cycle 6, run by a
+watcher script over the serial link: charge on the brick 01:27–05:56 (fast charge 1.06 A, taper,
+gauge FC/TC at 3.60 V, charger stayed in CV hold with the LED on), rest 05:56–11:03 at 0 mA on
+USB (RDIS cleared 06:01, VDQ + VOK raised 09:32, i.e. when the gauge finished its relax), `learndis`
+11:03 (LEDs full white, −420 → −480 mA), brick unplugged 17:02 (must be out before the knee: a
+brownout restart near the end re-enables the charger), 3.05 V at 19:45, TD at 20:39, ESP brownout
+≈ 20:55 at ~2.8 V with 4193 mAh out; the firmware's cutoff then cut the cell (CUV mechanism,
+1.3.13) and it rested cut off until 06:00.
+
+Result after the boot on the brick (06:0x, cell 3.075 V, 312 mA charging):
+- Update Status **0x06**, GaugingStatus 0x71815 (QMax updated, VDQ, QEN, VOK, TD, FD).
+- Qmax 4443 mAh (cycle 4 gave 4431, written back as 4418), TrueFCC 4317 mAh, RaScale 1000.
+- Ra table (0x4100, flag 0x0055 = learned, 15 grid points, 2^-10 Ω): 142 179 193 186 182 184 194
+  201 214 225 216 222 282 339 597 → 139–219 mΩ over the plateau, 275 / 331 / 583 mΩ in the last
+  three grids. Consistent with the 170 mΩ measured at the terminals (2026-10-26); the previous
+  learned-then-collapsed table (272–402 mΩ with Load Select 7) is gone.
+- The cutoff's CUV cut did not disturb the learning: the bottom rest with the DSG FET open was
+  the second OCV point the gauge needed, Qmax and Ra were committed during it.
+
+Image: docs/gauge/dumps/2026-10-29-learned-us06.dfdump.txt (gitignored; 0x4000–0x4800 via
+`gaugedump`). Next: bqStudio export over the EV2400 for the record (`gaugebus release`, then
+`gaugebus attach`), and the firmware replay of this image at bring-up so production units start
+learned (SHIP-CHECKLIST.md "Needs hardware / owner" → firmware).
