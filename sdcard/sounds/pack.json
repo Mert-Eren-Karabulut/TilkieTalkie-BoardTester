@@ -1,5 +1,5 @@
 {
-  "checksum": "c1f1888c0884747866dead921eb29edd4fbd09c2884a914070d1813519889d07",
+  "checksum": "faefcbd120318661ee6743b889c4f1dca27b9874cb76114d0894f647440ff5ab",
   "language": "tr",
   "files": [
     {
@@ -23,9 +23,24 @@
       "s": 6269
     },
     {
+      "p": "tr/account_fault.mp3",
+      "h": "411d35580996dd29b17ae6475b9b878f706a5c42d45e335a104a2353a061f834",
+      "s": 62275
+    },
+    {
+      "p": "tr/audio_fault.mp3",
+      "h": "4f32902c56150a8238ddd5a4e6dc73f0ddc5f68ce3c448b506ecd4e7c109780b",
+      "s": 33645
+    },
+    {
       "p": "tr/battery_critical.mp3",
       "h": "5597010f94c5a7329e631b831087618d3ec934495dee56cf3608c6ea571d5611",
       "s": 31555
+    },
+    {
+      "p": "tr/battery_fault.mp3",
+      "h": "e91fb800ffb5b4702fae6999d3885b21ee6ef6f6ae8ec4b536702e46f0905a69",
+      "s": 63529
     },
     {
       "p": "tr/battery_low.mp3",
@@ -73,19 +88,29 @@
       "s": 36780
     },
     {
+      "p": "tr/nfc_fault.mp3",
+      "h": "4fbc5633b5f593a5792bdc4a0b5321b8dd632041c5499d0177afe9d25f79c998",
+      "s": 56842
+    },
+    {
       "p": "tr/nfc_read_trouble.mp3",
       "h": "53745694bac6ddbc4d55a1996fc56f55dfe6564ff1b38e9618eae4fb2be250ee",
       "s": 38034
     },
     {
       "p": "tr/not_linked.mp3",
-      "h": "42fb6d8285fa92afa2a5657b171ba85641a287a1e1b44de16f4c2262162a7e03",
-      "s": 34690
+      "h": "abbe54c734c80bebc80472093a2001bcb670bbc1f1e0d29682f68a17f64d7055",
+      "s": 47438
     },
     {
       "p": "tr/playlist_end.mp3",
       "h": "ce2e929664a3236c726486d3285660ebee5e1943c8de5b55d44c41dec941450d",
       "s": 50155
+    },
+    {
+      "p": "tr/portal_fault.mp3",
+      "h": "950fbc3ec5eb5456b97824fb9cedf5336b3ba53fe0e2897807588114dd70b492",
+      "s": 49528
     },
     {
       "p": "tr/setup_captive.mp3",
@@ -111,6 +136,11 @@
       "p": "tr/setup_welcome.mp3",
       "h": "7c90a5469dc96baa136de91f6468b978ef1b2539522a81655973580595d0dd68",
       "s": 71262
+    },
+    {
+      "p": "tr/storage_full.mp3",
+      "h": "e941288463659c73454e4f5bd5a2fccdf986b452491d27cb686d94f748c49cc8",
+      "s": 52035
     },
     {
       "p": "tr/update_done.mp3",

@@ -61,8 +61,14 @@ Until the factory writes the cards, a missing pack could also be fetched from th
 | update_start | Kendimi güncelliyorum, birkaç dakika sürebilir. Bu sırada beni kapatma. | OTA download started (toy is idle by policy) | |
 | update_done | Güncelleme tamamlandı! | first boot on a new firmware, once confirmed | |
 | update_failed | Güncelleme başarısız oldu, daha sonra yeniden deneyeceğim. Hata kodu: Karpuz. | OTA failed | |
-| not_linked | Henüz bir hesaba bağlı değilim. Beni uygulamadan ekle. | online but no account owns the toy (110 NOT_LINKED, Kivi): once per boot after idle_hello, only while idle (no figure, nothing playing), at most once a day | |
+| not_linked | Henüz bir hesaba bağlı değilim. Beni uygulamadan ekle. Hata kodu: Kivi. | online but no account owns the toy (110 NOT_LINKED, Kivi): once per boot after idle_hello, only while idle (no figure, nothing playing), at most once a day | |
 | setup_captive | Bu ağ bir giriş sayfası istiyor, lütfen başka bir ağ seç. Hata kodu: Nar. | pairing: the network the app sent wants a login page (113 CAPTIVE_PORTAL); the app is told the connection failed and pairing goes on | |
+| nfc_fault | Figür okuyucumda bir sorun var. Beni kapatıp yeniden açmayı dene. Hata kodu: Çilek. | NFC reader not answering (701), at boot or at runtime; repeated every 10 min while it stays | 10 min |
+| battery_fault | Pil sistemimde bir sorun var. Şarj kablosunu çıkarıp yeniden takmayı dene. Hata kodu: Ananas. | gauge silent (503), charger fault (504), dead-cell recovery (506), power bus error (507) | 10 min |
+| account_fault | Hesap bağlantımda bir sorun var. Beni uygulamadan yeniden eşleştirmeyi dene. Hata kodu: Limon. | token rejected (107), channel refused (108), not enrolled (112) | 10 min |
+| portal_fault | Sunucuya ulaşamıyorum, biraz sonra yeniden dene. Hata kodu: Şeftali. | online, but the portal refused or did not answer for a figure (106) | 60 s |
+| storage_full | Hafızam doldu. Uygulamadan eski hikâyeleri silmeyi dene. Hata kodu: Erik. | no space on the card for a download (303) | 60 s |
+| audio_fault | Bu hikâyeyi çalamadım. Hata kodu: Mandalina. | a track could not be decoded (402) or the playlist waited too long (405) | 10 s |
 | tone_charge_on | two rising notes | charger plugged; volume buttons held 5 s (release = forget WiFi) | interrupt |
 | tone_charge_off | two falling notes | charger unplugged | interrupt |
 | tone_sleep | three soft falling notes | going to deep sleep; volume buttons held 10 s (customer reset) | blocking |
@@ -72,9 +78,9 @@ toy is online, battery or not).
 
 ## Error codes (fruit names)
 
-Spoken inside the prompt and sent to the portal as `device_report.last_error` so support can
-map a child's "it said Elma" to a cause. The portal does not store the field yet (next step:
-column + show on the hub page).
+Spoken inside the prompt; the same fruit is the `fruit` of the fault code in the catalogue
+(docs/FAULTS.md, `resources/device-faults.json` on the portal), so support can map a child's
+"it said Elma" to the code on the hub page. One fruit per failure category.
 
 | code | meaning | prompt |
 |---|---|---|
@@ -87,6 +93,12 @@ column + show on the hub page).
 | kivi | online, but not linked to an account (add the toy in the app) | not_linked |
 | nar | the network wants a login page (captive portal), pick another one | setup_captive |
 | muz | SD card problem (301 at boot, 307 pulled while running; the toy cannot speak without the card) | LED red, also while docked |
+| çilek | NFC reader not answering (701) | nfc_fault |
+| ananas | battery system: gauge, charger, power rail (503, 504, 506, 507) | battery_fault |
+| limon | account: token, channel or enrollment refused (107, 108, 112) | account_fault |
+| şeftali | online but the server refused or did not answer (106) | portal_fault |
+| erik | card full (303) | storage_full |
+| mandalina | a story could not be played (402, 405) | audio_fault |
 
 ## Remote update: prompt packs
 

@@ -21,7 +21,7 @@ const char kPromptSchema[] __attribute__((used)) =
 #undef TT_SPEECH_PATH
 #undef TT_TONE_PATH
 const char *TAG = "prompts";
-static_assert((int)Prompt::COUNT <= 32, "queuedMask holds one bit per prompt");
+static_assert((int)Prompt::COUNT <= 64, "queuedMask holds one bit per prompt");
 }
 
 VoicePrompts &VoicePrompts::getInstance()
@@ -84,6 +84,12 @@ const VoicePrompts::Policy &VoicePrompts::policy(Prompt p)
         {false, 60000},     // UPDATE_DONE
         {false, 60000},     // UPDATE_FAILED
         {false, 60000},     // NOT_LINKED (UxScenes: once per boot after the hello, then daily, idle only)
+        {false, 600000},    // NFC_FAULT (and the 10-min reminder while active)
+        {false, 600000},    // BATTERY_FAULT
+        {false, 600000},    // ACCOUNT_FAULT
+        {false, 60000},     // PORTAL_FAULT
+        {false, 60000},     // STORAGE_FULL
+        {false, 10000},     // AUDIO_FAULT
         {false, 5000},      // SETUP_CAPTIVE
         {true, 1500},       // TONE_CHARGE_ON
         {true, 1500},       // TONE_CHARGE_OFF
@@ -128,7 +134,7 @@ void VoicePrompts::say(Prompt p)
     {
         return;
     }
-    const uint32_t bit = 1UL << (int)p;
+    const uint64_t bit = 1ULL << (int)p;
     // Claim the bit first: of two tasks saying the same prompt at once, exactly one queues it.
     if (queuedMask.fetch_or(bit) & bit)
     {
@@ -197,7 +203,7 @@ void VoicePrompts::update()
         uint8_t dropped;
         while (xQueueReceive(queue, &dropped, 0) == pdTRUE)
         {
-            queuedMask.fetch_and(~(1UL << dropped));
+            queuedMask.fetch_and(~(1ULL << dropped));
         }
         return;
     }
@@ -211,7 +217,7 @@ void VoicePrompts::update()
     {
         return;
     }
-    queuedMask.fetch_and(~(1UL << id));
+    queuedMask.fetch_and(~(1ULL << id));
     const Prompt p = (Prompt)id;
     const bool storyPlaying = audio.isPlaying() && !audio.isPromptPlaying();
     if (storyPlaying && !policy(p).interrupt)

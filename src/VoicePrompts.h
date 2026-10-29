@@ -37,6 +37,12 @@
     X(UPDATE_DONE, "update_done")           /* first boot on a new firmware */                     \
     X(UPDATE_FAILED, "update_failed")       /* OTA failed (Karpuz) */                              \
     X(NOT_LINKED, "not_linked")             /* online, but no account owns the toy (Kivi) */       \
+    X(NFC_FAULT, "nfc_fault")               /* reader not answering (Çilek) */                      \
+    X(BATTERY_FAULT, "battery_fault")       /* gauge / charger / rail fault (Ananas) */             \
+    X(ACCOUNT_FAULT, "account_fault")       /* token, channel or enrollment refused (Limon) */      \
+    X(PORTAL_FAULT, "portal_fault")         /* online but the server does not answer (Şeftali) */    \
+    X(STORAGE_FULL, "storage_full")         /* no space on the card (Erik) */                        \
+    X(AUDIO_FAULT, "audio_fault")           /* a story could not be played (Mandalina) */            \
     X(SETUP_CAPTIVE, "setup_captive")       /* provisioning: the network wants a login page (Nar) */
 #define TT_TONE_PROMPTS(X)                                                                         \
     X(TONE_CHARGE_ON, "tone_charge_on")     /* charger plugged */                                  \
@@ -90,7 +96,7 @@ private:
     // say() runs on any task (the WiFi event task during provisioning, the loop): the "already
     // queued" mask and the repeat timestamps are atomics, the queue is a FreeRTOS queue.
     QueueHandle_t queue = nullptr;
-    std::atomic<uint32_t> queuedMask{0};
+    std::atomic<uint64_t> queuedMask{0};
     std::atomic<uint32_t> lastSaidAt[(int)Prompt::COUNT] = {};
     String language = "tr";
     bool started = false;

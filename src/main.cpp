@@ -203,7 +203,16 @@ void onFigureDownloadComplete(const String &uid, const String &figureName, bool 
             const String detail = "uid=" + uid;
             if (error.indexOf("unreachable") >= 0 || error.indexOf("Offline") >= 0)
             {
-                Faults::raise(Fault::FIGURE_OFFLINE, detail.c_str());
+                // Online but the portal did not answer properly (refused token, 5xx, timeout) is
+                // "the server" (Şeftali), not "no internet" (Armut).
+                if (WiFi.isConnected())
+                {
+                    Faults::raise(Fault::PORTAL_UNREACHABLE, detail.c_str());
+                }
+                else
+                {
+                    Faults::raise(Fault::FIGURE_OFFLINE, detail.c_str());
+                }
             }
             else if (error.indexOf("downloaded") >= 0)
             {
@@ -440,6 +449,19 @@ void setup()
         case Fault::OTA_FLASH_FAILED:
         case Fault::OTA_SHA_MISMATCH: prompts.say(Prompt::UPDATE_FAILED); break;
         case Fault::NFC_READ_TROUBLE: prompts.say(Prompt::NFC_READ_TROUBLE); break;
+        case Fault::NFC_INIT_FAILED: prompts.say(Prompt::NFC_FAULT); break;
+        case Fault::GAUGE_ABSENT:
+        case Fault::GAUGE_NO_TELEMETRY:
+        case Fault::CHARGER_FAULT:
+        case Fault::DEAD_CELL_RECOVERY:
+        case Fault::POWER_BUS_ERROR: prompts.say(Prompt::BATTERY_FAULT); break;
+        case Fault::TOKEN_REJECTED:
+        case Fault::WS_AUTH_FAILED:
+        case Fault::NOT_ENROLLED: prompts.say(Prompt::ACCOUNT_FAULT); break;
+        case Fault::PORTAL_UNREACHABLE: prompts.say(Prompt::PORTAL_FAULT); break;
+        case Fault::SD_FULL: prompts.say(Prompt::STORAGE_FULL); break;
+        case Fault::DECODER_FAILED:
+        case Fault::PLAYLIST_STUCK: prompts.say(Prompt::AUDIO_FAULT); break;
         case Fault::BATTERY_LOW: prompts.say(Prompt::BATTERY_LOW); break;
         case Fault::NOT_LINKED: scheduleNotLinkedPrompt(); break; // spoken when idle, after the hello, at most daily
         case Fault::CAPTIVE_PORTAL: prompts.say(Prompt::SETUP_CAPTIVE); break;

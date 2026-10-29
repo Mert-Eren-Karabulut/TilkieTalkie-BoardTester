@@ -25,7 +25,13 @@
     "update_start": "Kendimi güncelliyorum, birkaç dakika sürebilir. Bu sırada beni kapatma.",
     "update_done": "Güncelleme tamamlandı!",
     "update_failed": "Güncelleme başarısız oldu, daha sonra yeniden deneyeceğim. Hata kodu: Karpuz.",
-    "not_linked": "Henüz bir hesaba bağlı değilim. Beni uygulamadan ekle.",
-    "setup_captive": "Bu ağ bir giriş sayfası istiyor, lütfen başka bir ağ seç. Hata kodu: Nar."
+    "not_linked": "Henüz bir hesaba bağlı değilim. Beni uygulamadan ekle. Hata kodu: Kivi.",
+    "setup_captive": "Bu ağ bir giriş sayfası istiyor, lütfen başka bir ağ seç. Hata kodu: Nar.",
+    "nfc_fault": "Figür okuyucumda bir sorun var. Beni kapatıp yeniden açmayı dene. Hata kodu: Çilek.",
+    "battery_fault": "Pil sistemimde bir sorun var. Şarj kablosunu çıkarıp yeniden takmayı dene. Hata kodu: Ananas.",
+    "account_fault": "Hesap bağlantımda bir sorun var. Beni uygulamadan yeniden eşleştirmeyi dene. Hata kodu: Limon.",
+    "portal_fault": "Sunucuya ulaşamıyorum, biraz sonra yeniden dene. Hata kodu: Şeftali.",
+    "storage_full": "Hafızam doldu. Uygulamadan eski hikâyeleri silmeyi dene. Hata kodu: Erik.",
+    "audio_fault": "Bu hikâyeyi çalamadım. Hata kodu: Mandalina."
   }
 }

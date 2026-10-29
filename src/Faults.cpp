@@ -591,6 +591,19 @@ String Faults::reportJson()
 
 void Faults::setSpeaker(std::function<void(Fault)> fn) { g_speaker = fn; }
 
+bool Faults::remindActive()
+{
+    int best = -1;
+    for (int i = 0; i < g_activeCount; ++i) {
+        const int idx = g_active[i].idx;
+        if (!kCatalog[idx].fruit[0]) continue; // only faults with a sentence
+        if (best < 0 || kCatalog[idx].severity > kCatalog[best].severity) best = idx;
+    }
+    if (best < 0 || !g_speaker) return false;
+    g_speaker((Fault)kCatalog[best].code);
+    return true;
+}
+
 const char *Faults::schema() { return kFaultSchema + 10; }
 
 void Faults::printStatus()

@@ -18,15 +18,15 @@
     X(103, WIFI_NO_LINK, ERROR, "portakal", ON_NETWORK, "Home network in range but no link", "Restart the router and check the password. The toy retries by itself") \
     X(104, WIFI_OUT_OF_RANGE, INFO, "", ON_NETWORK, "Provisioned network not in range", "Normal away from home, the toy plays from the card") \
     X(105, WIFI_RADIO_RESET, WARNING, "", EVENT, "Reconnects kept failing, radio was reset", "If it repeats at home, check the router (band steering, DHCP)") \
-    X(106, PORTAL_UNREACHABLE, WARNING, "", ON_NETWORK, "API request failed at transport level", "Check portal availability and the toy's internet access") \
-    X(107, TOKEN_REJECTED, ERROR, "", ON_NETWORK, "Portal rejected the hub token after a refresh", "Check the hub's owner binding, re-bind the hub in the app") \
-    X(108, WS_AUTH_FAILED, ERROR, "", ON_NETWORK, "WebSocket channel authorisation refused", "Check Reverb and the hub's token") \
+    X(106, PORTAL_UNREACHABLE, WARNING, "şeftali", ON_NETWORK, "API request failed at transport level", "Check portal availability and the toy's internet access") \
+    X(107, TOKEN_REJECTED, ERROR, "limon", ON_NETWORK, "Portal rejected the hub token after a refresh", "Check the hub's owner binding, re-bind the hub in the app") \
+    X(108, WS_AUTH_FAILED, ERROR, "limon", ON_NETWORK, "WebSocket channel authorisation refused", "Check Reverb and the hub's token") \
     X(109, WS_DISCONNECTED, INFO, "", EVENT, "WebSocket dropped", "Normal on flaky links, watch the count") \
     X(110, NOT_LINKED, INFO, "kivi", EVENT, "Toy is online but not linked to an account", "Add the toy in the app with the pairing code on its label") \
-    X(112, NOT_ENROLLED, INFO, "", EVENT, "No factory identity, or the portal does not know it", "Enroll the unit at the factory (ft enroll) and on the portal") \
+    X(112, NOT_ENROLLED, INFO, "limon", EVENT, "No factory identity, or the portal does not know it", "Enroll the unit at the factory (ft enroll) and on the portal") \
     X(113, CAPTIVE_PORTAL, WARNING, "nar", EVENT, "Network wants a login page (captive portal)", "Use a home network without a login page") \
     X(114, BLE_NO_MEMORY, ERROR, "", EVENT, "Not enough internal memory to start pairing over BLE", "Restart the toy and report it if it repeats") \
-    X(115, GAUGE_ABSENT, ERROR, "", EVENT, "Battery gauge does not answer while on USB, charging held off", "Cell too low for the gauge or a deep-discharge reset: leave it on USB a minute, else charge the cell directly") \
+    X(115, GAUGE_ABSENT, ERROR, "ananas", EVENT, "Battery gauge does not answer while on USB, charging held off", "Cell too low for the gauge or a deep-discharge reset: leave it on USB a minute, else charge the cell directly") \
     X(201, FIGURE_UNKNOWN, ERROR, "elma", ON_PLAY, "Portal has no unit for this card", "Register the card (Catalog > Cards > Import)") \
     X(202, FIGURE_NO_CONTENT, ERROR, "elma", ON_PLAY, "Figure exists but has nothing to play", "Add content to the figure, or bind content to the wildcard card") \
     X(203, FIGURE_OFFLINE, ERROR, "armut", ON_PLAY, "Portal unreachable and nothing cached for the card", "Get the toy online once, the stories are then cached") \
@@ -38,22 +38,22 @@
     X(301, SD_MOUNT_FAILED, CRITICAL, "muz", ON_BOOT, "SD card missing or unreadable at boot", "Reseat or replace the card (tools/sdcard-prepare.sh)") \
     X(302, SD_WRITE_FAILED, ERROR, "muz", EVENT, "A write or rename on the card failed", "Card wearing out or corrupt: replace it") \
     X(307, SD_CARD_REMOVED, CRITICAL, "muz", ON_BOOT, "SD card went away while running", "Put the card back, the toy picks it up by itself") \
-    X(303, SD_FULL, ERROR, "muz", EVENT, "No space left for a download", "Delete stories from the hub page or use a bigger card") \
+    X(303, SD_FULL, ERROR, "erik", EVENT, "No space left for a download", "Delete stories from the hub page or use a bigger card") \
     X(304, SD_FILE_CORRUPT, WARNING, "", EVENT, "A json file on the card was unreadable and recreated", "Watch the count. Replace a card that keeps corrupting files") \
     X(305, SD_SLOW, INFO, "", EVENT, "Card write stall above 3 s", "Slow card, affects download speed only") \
     X(306, CARD_FOREIGN, INFO, "", EVENT, "Card came from another toy, its story cache was wiped", "Normal after moving a card between toys") \
     X(401, AUDIO_INIT_FAILED, CRITICAL, "", ON_BOOT, "Codec or I2S initialisation failed", "Hardware fault: return the unit") \
-    X(402, DECODER_FAILED, ERROR, "", ON_PLAY, "A file could not start decoding", "Check the file (MP3) on the portal") \
+    X(402, DECODER_FAILED, ERROR, "mandalina", ON_PLAY, "A file could not start decoding", "Check the file (MP3) on the portal") \
     X(403, AUDIO_UNDERRUN, INFO, "", EVENT, "Read-ahead ran dry during playback", "Slow card, watch the count") \
     X(404, PROMPT_FILE_MISSING, WARNING, "", ON_BOOT, "A prompt file is missing on the card", "Assign a complete prompt pack to the release") \
-    X(405, PLAYLIST_STUCK, WARNING, "", ON_PLAY, "Waited for a download for too long", "Check the link and the storage URL") \
+    X(405, PLAYLIST_STUCK, WARNING, "mandalina", ON_PLAY, "Waited for a download for too long", "Check the link and the storage URL") \
     X(501, BATTERY_LOW, INFO, "", ON_BOOT, "Battery at 20 % or below", "Charge the toy") \
     X(502, BATTERY_CRITICAL, WARNING, "", ON_BOOT, "Cutoff reached, toy went to sleep", "Charge the toy") \
-    X(503, GAUGE_NO_TELEMETRY, ERROR, "", ON_BOOT, "Battery gauge not answering", "Hardware check: gauge bus") \
-    X(504, CHARGER_FAULT, ERROR, "", EVENT, "Charger reported a fault", "Check the charger/adapter, hardware check if it repeats") \
+    X(503, GAUGE_NO_TELEMETRY, ERROR, "ananas", ON_BOOT, "Battery gauge not answering", "Hardware check: gauge bus") \
+    X(504, CHARGER_FAULT, ERROR, "ananas", EVENT, "Charger reported a fault", "Check the charger/adapter, hardware check if it repeats") \
     X(505, BROWNOUT_RESET, ERROR, "", EVENT, "Reset by brownout", "Weak cell or adapter, check the battery") \
-    X(506, DEAD_CELL_RECOVERY, WARNING, "", EVENT, "Dead-cell recovery hold engaged", "Leave the toy on the charger") \
-    X(507, POWER_BUS_ERROR, WARNING, "", EVENT, "I2C error on the power bus", "Hardware check if it repeats") \
+    X(506, DEAD_CELL_RECOVERY, WARNING, "ananas", EVENT, "Dead-cell recovery hold engaged", "Leave the toy on the charger") \
+    X(507, POWER_BUS_ERROR, WARNING, "ananas", EVENT, "I2C error on the power bus", "Hardware check if it repeats") \
     X(508, BRINGUP_FAILED, ERROR, "", ON_BOOT, "Gauge bring-up (provisioning or current calibration) did not finish", "Charge current held at 300 mA. Re-run ft test bringup at the station on USB with a cell that is not full") \
     X(509, USB_SOURCE, INFO, "", EVENT, "USB source seen (PD contract or plain 5 V), detail carries voltage and budget", "Nothing to do, diagnostic record of what the charger negotiated") \
     X(601, OTA_CHECK_FAILED, WARNING, "", ON_NETWORK, "Firmware check failed", "Transient unless it repeats, then check the portal") \
@@ -64,7 +64,7 @@
     X(606, OTA_CRASH_LOOP_REVERT, CRITICAL, "", EVENT, "Crash-loop guard switched partitions", "The firmware crashes at boot, revoke the release") \
     X(607, PROMPT_PACK_FAILED, WARNING, "", EVENT, "Prompt pack could not be downloaded", "Check the pack files over port 80") \
     X(608, PROMPT_PACK_ACTIVATE_FAILED, ERROR, "", EVENT, "Staged prompt pack could not be swapped in", "Check the card. The toy retries at the next check") \
-    X(701, NFC_INIT_FAILED, CRITICAL, "", ON_BOOT, "NFC reader not answering", "Reseat the NFC board, hardware fault if it stays") \
+    X(701, NFC_INIT_FAILED, CRITICAL, "çilek", ON_BOOT, "NFC reader not answering", "Reseat the NFC board, hardware fault if it stays") \
     X(702, NFC_READ_TROUBLE, WARNING, "", ON_PLAY, "Figure on the pins but no card read", "Reseat the figure, replace the card if it repeats") \
     X(703, NFC_RESET, INFO, "", EVENT, "NFC reader watchdog reset", "Watch the count") \
     X(801, WATCHDOG_RESET, ERROR, "", EVENT, "Task watchdog reset", "Firmware hang, report with the firmware version") \
@@ -114,6 +114,9 @@ namespace Faults
     String reportJson();                         // "active":[{"c":103,"since_s":12}],"last":{"c":204,"age_s":30,"d":"..."}
     // The loop wires the prompt side (raise -> prompt) so Faults stays free of VoicePrompts.
     void setSpeaker(std::function<void(Fault)> fn);
+    // Speak the most severe active fault's prompt again (UxScenes: every 10 min while a critical
+    // fault stays active, so a dead reader keeps saying its code). false when nothing is active.
+    bool remindActive();
     const char *schema();                        // the embedded catalogue (after the marker)
     void printStatus();                          // console
 }

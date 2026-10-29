@@ -32,14 +32,14 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 103 | WIFI_NO_LINK | error | portakal | home network in range, no link for 60 s |
 | 104 | WIFI_OUT_OF_RANGE | info | | provisioned, network not in range (toy away from home) |
 | 105 | WIFI_RADIO_RESET | warning | | reconnect escalation reset the radio |
-| 106 | PORTAL_UNREACHABLE | warning | | API request failed at transport level |
-| 107 | TOKEN_REJECTED | error | | 401 even after a token refresh |
-| 108 | WS_AUTH_FAILED | error | | channel authorisation refused |
+| 106 | PORTAL_UNREACHABLE | warning | şeftali | API request failed at transport level |
+| 107 | TOKEN_REJECTED | error | limon | 401 even after a token refresh |
+| 108 | WS_AUTH_FAILED | error | limon | channel authorisation refused |
 | 109 | WS_DISCONNECTED | info | | socket dropped (counted) |
 | 110 | NOT_LINKED | info | kivi | online, but `GET /api/hubs/{uuid}` says `bound: false` (or the legacy token endpoint answered 404); raised at boot and then daily, cleared (`Faults::clear`) once bound; the `not_linked` prompt is spoken once per boot after the hello, idle only, at most daily |
-| 112 | NOT_ENROLLED | info | | no factory pop at boot (detail `no pop`), or the token POST answered 404 (detail `404`) / 401 (detail `secret`), or the legacy GET answered 410 (detail `legacy-gone`: the portal knows a secret this unit does not have, `ft enroll` it); retried every 15 min |
+| 112 | NOT_ENROLLED | info | limon | no factory pop at boot (detail `no pop`), or the token POST answered 404 (detail `404`) / 401 (detail `secret`), or the legacy GET answered 410 (detail `legacy-gone`: the portal knows a secret this unit does not have, `ft enroll` it); retried every 15 min |
 | 113 | CAPTIVE_PORTAL | warning | nar | the portal probe (`/storage/ping.json`) got an answer that is not ours (redirect, HTML, other body): during pairing the network is rejected and `setup_captive` is spoken; a provisioned toy stays offline silently and re-probes every 2 min. No answer at all is 106 (silent, once per link), and pairing accepts such a network |
-| 115 | GAUGE_ABSENT | error | | the gauge does not answer while the toy is on USB: the cell is below what the gauge runs on, its FETs are open, or it is in ROM mode for ~15 s after a deep-discharge reset. Charging is held off (an open battery node makes the charger fault and reset the ESP every second) and the toy stays awake and reachable over USB; the gauge rescan recovers it when the gauge answers. Persisting: charge the cell directly | detail `vbus <V>` |
+| 115 | GAUGE_ABSENT | error | ananas | the gauge does not answer while the toy is on USB: the cell is below what the gauge runs on, its FETs are open, or it is in ROM mode for ~15 s after a deep-discharge reset. Charging is held off (an open battery node makes the charger fault and reset the ESP every second) and the toy stays awake and reachable over USB; the gauge rescan recovers it when the gauge answers. Persisting: charge the cell directly | detail `vbus <V>` |
 | 114 | BLE_NO_MEMORY | error | | the internal heap is too small or too fragmented for the BLE controller when pairing (or the factory `ble` test) should start; pairing is not started instead of crashing. Seen only if something else took the memory; restart the toy |
 | 201 | FIGURE_UNKNOWN | error | elma | portal has no unit for this card |
 | 202 | FIGURE_NO_CONTENT | error | elma | figure exists, nothing to play |
@@ -51,23 +51,23 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 208 | CONTENT_SYNC_FAILED | warning | | background re-check failed |
 | 301 | SD_MOUNT_FAILED | critical | muz | card missing or unreadable at boot |
 | 302 | SD_WRITE_FAILED | error | muz | write or rename failed |
-| 303 | SD_FULL | error | muz | no space for a download |
+| 303 | SD_FULL | error | erik | no space for a download |
 | 307 | SD_CARD_REMOVED | critical | muz | card went away while running (probe every 5 s / an I/O error); clears when the card is back and mounted again |
 | 304 | SD_FILE_CORRUPT | warning | | manifest / queue / pack json unreadable (recreated) |
 | 305 | SD_SLOW | info | | write stall above 3 s |
 | 306 | CARD_FOREIGN | info | | `/.device` on the card names another toy: its story cache was wiped (detail `prev=<uuid>`) |
 | 401 | AUDIO_INIT_FAILED | critical | | codec / I2S init failed |
-| 402 | DECODER_FAILED | error | | a file could not start decoding |
+| 402 | DECODER_FAILED | error | mandalina | a file could not start decoding |
 | 403 | AUDIO_UNDERRUN | info | | read-ahead ran dry (counted) |
 | 404 | PROMPT_FILE_MISSING | warning | | pack incomplete on the card |
-| 405 | PLAYLIST_STUCK | warning | | waited for a download for too long |
+| 405 | PLAYLIST_STUCK | warning | mandalina | waited for a download for too long |
 | 501 | BATTERY_LOW | info | | 20 % and below on battery |
 | 502 | BATTERY_CRITICAL | warning | | cutoff reached, going to sleep |
-| 503 | GAUGE_NO_TELEMETRY | error | | gauge not answering |
-| 504 | CHARGER_FAULT | error | | charger fault bits set |
+| 503 | GAUGE_NO_TELEMETRY | error | ananas | gauge not answering |
+| 504 | CHARGER_FAULT | error | ananas | charger fault bits set |
 | 505 | BROWNOUT_RESET | error | | reset reason brownout |
-| 506 | DEAD_CELL_RECOVERY | warning | | recovery hold engaged |
-| 507 | POWER_BUS_ERROR | warning | | I2C error on the power bus |
+| 506 | DEAD_CELL_RECOVERY | warning | ananas | recovery hold engaged |
+| 507 | POWER_BUS_ERROR | warning | ananas | I2C error on the power bus |
 | 508 | BRINGUP_FAILED | error | | gauge bring-up gave up (charge-current wait 3 min, provisioning or calibration): the reason is the detail and the factory `bringup` record; charge current stays at 300 mA until a bring-up passes (docs/MANUFACTURING.md) |
 | 509 | USB_SOURCE | info | | one record per USB attach: `pd <mV> <mA>` when the CH224Q holds a PD contract (the budget becomes the input limit), `ch224 <mV> no-pd` for a plain 5 V source, `no-ch224 …` when the controller did not answer; diagnostic only |
 | 601 | OTA_CHECK_FAILED | warning | | firmware check failed |
@@ -78,7 +78,7 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 606 | OTA_CRASH_LOOP_REVERT | critical | | crash-loop guard switched partitions |
 | 607 | PROMPT_PACK_FAILED | warning | | pack could not be downloaded |
 | 608 | PROMPT_PACK_ACTIVATE_FAILED | error | | staging could not be swapped in |
-| 701 | NFC_INIT_FAILED | critical | | reader not answering: at boot, or three idle probes in a row; retried every 10 s, clears when it answers; red LED while active |
+| 701 | NFC_INIT_FAILED | critical | çilek | reader not answering: at boot, or three idle probes in a row; retried every 10 s, clears when it answers; red LED while active |
 | 702 | NFC_READ_TROUBLE | warning | | figure on the pins, no card read |
 | 703 | NFC_RESET | info | | reader watchdog reset |
 | 801 | WATCHDOG_RESET | error | | task watchdog reset |

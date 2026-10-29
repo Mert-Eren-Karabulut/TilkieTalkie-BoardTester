@@ -199,6 +199,16 @@ void deriveLedScene()
 // Voice feedback that depends on state rather than on an event.
 void serviceUxPrompts()
 {
+    // A critical fault that stays (dead reader, dead codec, card gone) repeats its code every
+    // 10 min; the prompt policy keeps it from stacking. Card faults cannot be spoken anyway.
+    {
+        static unsigned long lastReminder = 0;
+        if (Faults::hasActive(Severity::CRITICAL) && millis() - lastReminder > 600000UL)
+        {
+            lastReminder = millis();
+            Faults::remindActive();
+        }
+    }
     if (gSystemPhase != PHASE_RUNNING)
     {
         return;
