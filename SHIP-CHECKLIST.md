@@ -296,3 +296,31 @@ build of the same tree): image replay 0x1210/04 → 0438/06 in 7 s, percentage 7
 091e3fd); the demo unit runs the same production image from USB. Promoted to stable the same
 morning on Mert's word (rollout 100 %, not mandatory): hubs on stable take it at their next
 check and replay the gauge image at their next boot on USB.
+
+## Readiness pass: failure feedback and recovery (2026-10-29/30, towards 1.3.15)
+A read-only map of every failure path (fault code, LED, voice, recovery) found the mechanisms in
+place but the plumbing between them broken. Fixed in three batches (2d12427, d111c54):
+- Voice: a fault's prompt is spoken on every raise (the 10-min log dedupe used to mute repeats:
+  a second empty figure, a second wrong password, and `download_failed` was never heard);
+  `battery_low` and `nfc_read_trouble` were unreachable (no fruit word, gated on it); a
+  postponed OTA (unplugged / under 15 %) is no longer "update failed"; 206 says "no stories".
+- LEDs: a critical fault is red while docked too (the charge bar won before); the green "ready"
+  flash only when the boot succeeded; a rejected WiFi password shows dim amber, not an off toy.
+- Fault bookkeeping: a raise before `Faults::begin()` no longer wipes the stored events (115,
+  606); a critical fault evicts the oldest lesser one from the full active set; BATTERY_LOW,
+  TOKEN_REJECTED, PORTAL_UNREACHABLE, WS_AUTH_FAILED, OTA_CHECK_FAILED, PROMPT_FILE_MISSING clear
+  when their condition ends; WiFi-task raises go through the loop; the cutoff no longer persists
+  LED brightness 255; one missed gauge poll no longer invalidates the percentage.
+- Parts that fail while running: SD card probed every 5 s (and after a read error) → 307 red,
+  playback stopped, remount every 5 s, prompts reloaded when it is back (301 from boot clears the
+  same way); NFC reader probed every 10 s idle → 701 (now critical, red) until it answers, boot
+  failure retried every 10 s, a figure on a dead reader still gets the read-trouble prompt; the
+  codec is retried every 10 s. `gSystemError` is gone.
+- Sleep and buttons: pins already high at sleep time (figure left on, floating pogo line without
+  the NFC board, stuck button) leave the wake mask; buttons held at power-up are ignored until
+  released; pairing holds the 5-min sleep (bounded to 20 min).
+Bench so far: `fault 501/701/204/301` from the console speak and list as expected; the unplug
+tests (card out/in, NFC board out/in with a figure on the pins) are the acceptance test for the
+recovery paths. Still open from the map: Armut ("not connected") is spoken for portal 4xx/5xx
+while online (a new prompt would need a new pack); a card full (303) is silent; 502-507 are never
+raised; no card-detect pin, so "card out" is noticed by the 5 s probe. Console: `fault <code>`.
