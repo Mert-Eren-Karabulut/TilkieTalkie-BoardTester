@@ -18,3 +18,11 @@ docs/gauge/lfp-chem-ids.txt
 .DS_Store
 .worktrees/
 docs/gauge/dumps/
+
+# TI bqStudio exports (licensed): never in git
+docs/gauge/*.gg.csv
+docs/gauge/*.srec
+docs/gauge/*.bq.fs
+docs/gauge/*.df.fs
+docs/gauge/*.senc
+docs/gauge/*.bqz
