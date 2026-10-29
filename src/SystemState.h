@@ -93,3 +93,4 @@ String getDeviceEfuseMacHex();
 void runCustomerReset(bool all, const char *why, bool speak);
 // From a callback that must not block (the Reverb `factory-reset` command): runs from the loop.
 void requestCustomerReset(const char *why);
+void requestUnboundCleanup(bool rebound); // ReverbClient "unbound" command (value "rebound" = another account took over)

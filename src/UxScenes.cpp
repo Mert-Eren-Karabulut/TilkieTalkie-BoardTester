@@ -315,6 +315,19 @@ void serviceUxPrompts()
     {
         gWifiLostAnnounced = false;
     }
+    // The home network is not there at all (the toy moved house, or was sold with the old
+    // owner's WiFi still stored): nothing is said about the internet, but the way back into
+    // pairing is: once per boot after two minutes, then every six hours.
+    else if (provisioned && !wifiProv.isProvisioningManagerActive() && !wifiProv.isHomeNetworkVisible() &&
+             now - gFullSystemStartedAt > 120000UL)
+    {
+        static unsigned long lastAbsentHint = 0;
+        if (!lastAbsentHint || now - lastAbsentHint > 6UL * 60UL * 60UL * 1000UL)
+        {
+            lastAbsentHint = now ? now : 1;
+            prompts.say(Prompt::WIFI_RESET_HINT);
+        }
+    }
     // Figure on the pogo pins but no card read within 3 s (decided by NfcController, once per session).
     if (nfcController.consumeReadTrouble())
     {

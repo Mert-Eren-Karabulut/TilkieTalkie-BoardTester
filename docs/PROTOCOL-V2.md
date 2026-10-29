@@ -138,6 +138,13 @@ States: IDLE, CHECKING, WAITING, PROMPTS, DOWNLOADING, APPLYING, REBOOTING, FAIL
   pop, serial, bring-up record) survives.
 - **Service reset** (`ft reset` over USB): everything the customer reset does plus bring-up
   re-run; the `factory` namespace survives unless `ft reset --all`.
+- **Unbound** (the owner removed the toy in the app, an admin unbound the last account, or
+  another account claimed it with the pairing code): the portal sends the device command
+  `unbound` (value `rebound` when another account took over); a toy that was offline notices
+  at its next hub check (`bound: false` after it had been bound, remembered in NVS). The toy
+  deletes the custom tracks (`/assets/custom_tracks`) and drops them from its cached figure
+  manifests; portal stories, the WiFi credentials and the device token stay. Not a reset: the
+  same family can add the toy again without re-pairing.
 - Buttons 1+4 held 5 s keeps today's meaning (forget WiFi only).
 
 ## 8. Audio formats

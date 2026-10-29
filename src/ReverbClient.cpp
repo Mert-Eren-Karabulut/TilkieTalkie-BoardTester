@@ -22,6 +22,7 @@
 #include <esp_log.h>
 
 void requestCustomerReset(const char *why); // main.cpp (SystemState.h): the customer reset, run from the loop
+void requestUnboundCleanup(bool rebound);    // main.cpp: the toy left its account (custom tracks go)
 
 static const char *TAG = "reverb";
 
@@ -1056,6 +1057,13 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
     else if (lowerType == "set-report-interval")
     {
         setReportInterval(hasValue ? (uint32_t)value.toInt() : 5);
+    }
+    else if (lowerType == "unbound")
+    {
+        // The portal: the owner removed the toy from the account (value empty) or another
+        // account claimed it with the pairing code (value "rebound"). Run from the loop task.
+        ESP_LOGW(TAG, "unbound command (%s)", hasValue ? value.c_str() : "unbound");
+        requestUnboundCleanup(hasValue && value == "rebound");
     }
     else if (lowerType == "factory-reset")
     {

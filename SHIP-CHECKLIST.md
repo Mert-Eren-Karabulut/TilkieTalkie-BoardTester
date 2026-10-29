@@ -378,3 +378,14 @@ intermittent BLE-test failure still needs a failing session log). Speeds on the 
 7.6 MB/s (`sdwritebench`); a 4 MB track 1.52 Mbps with WiFi modem sleep on, 2.26 Mbps with it off
 (now off while downloads run, a981…: see git), SD writes 0.7 s of the transfer. The WiFi buffer
 settings were tried smaller and reverted (no gain, and download speed is a priority).
+
+## Unbind and the second-hand toy (2026-10-30, towards 1.3.18)
+Policy (Mert): on unbind only the family's own recordings go; portal stories stay. Firmware:
+`unbound` device command (value `rebound` = another account claimed the toy) and the hub check
+(bound:false after `hub_bound` was 1 in NVS, i.e. an unbind that happened while offline) run
+`runUnboundCleanup()`: playback stopped, `/assets/custom_tracks` deleted, custom tracks dropped
+from the cached manifests, NOT_LINKED raised (spoken daily); WiFi, token and stories kept. The
+reset hint (hold both volume buttons 5 s) is now spoken two minutes after a boot with the home
+network absent, then every 6 h, so a second-hand buyer learns how to pair. Portal 554fd51 sends
+the command on app/admin unbind and on a takeover; the app handoff documents it. Bench: `unbound`
+on the demo unit → 0 files (no custom tracks there), the figure's 3 stories still play.

@@ -44,7 +44,7 @@ Until the factory writes the cards, a missing pack could also be fetched from th
 | setup_success | Harika, internete bağlandım! Şimdi ilk figürünü üzerime yerleştir. | provisioning ended with the network up | |
 | setup_failed | Bağlanamadım. Kablosuz ağ adını ve şifresini kontrol edip uygulamadan tekrar dene. Hata kodu: Üzüm. | credentials rejected | |
 | wifi_lost | İnternete bağlanamıyorum. Modemin açık olduğundan emin ol. Hata kodu: Portakal. | provisioned, the home network is in range (scan) but no link 60 s after boot; again every 10 min, every 6 h once the router has rejected the stored password 3 times in a row (docs/FAULTS.md). Out of range (toy used away from home, playing from the card) or behind a captive portal: silent | |
-| wifi_reset_hint | Kablosuz ağın değiştiyse iki ses tuşuna birlikte beş saniye basılı tut, sonra beni uygulamadan yeniden bağla. | right after wifi_lost | |
+| wifi_reset_hint | Kablosuz ağın değiştiyse iki ses tuşuna birlikte beş saniye basılı tut, sonra beni uygulamadan yeniden bağla. | right after wifi_lost | after wifi_lost (home network visible, no link); on its own two minutes after a boot with the home network absent (toy moved or sold), then every 6 h | 60 s |
 | wifi_reset_done | Ağ ayarlarını sildim. Şimdi beni uygulamadan yeniden bağlayabilirsin. | volume buttons released after 5 s (forget WiFi, stories stay on the card), or after the 10 s customer reset / the `factory-reset` command | blocking, then restart |
 | idle_hello | Merhaba! Bir hikâye dinlemek için figürünü üzerime koy. | provisioned boot, no figure on the pins (3 s in) | |
 | nfc_read_trouble | Figürü okuyamadım. Lütfen kaldırıp yeniden yerleştir. | figure on the pins, no card read for 3 s (also with a dead reader, 701) | 10 s |

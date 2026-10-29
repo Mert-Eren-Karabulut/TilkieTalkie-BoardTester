@@ -903,6 +903,12 @@ static void dispatch(String command)
         Faults::printStatus();
     }
 #ifdef TT_BENCH
+    // unbound [rebound] - what the toy does when the portal says it left its account
+    else if (command == "unbound" || command == "unbound rebound")
+    {
+        requestUnboundCleanup(command.endsWith("rebound"));
+        ESP_LOGI(TAG, "unbound cleanup requested%s", command.endsWith("rebound") ? " (rebound)" : "");
+    }
     // fault <code> [silent] - raise a catalogue fault as if the firmware had (LED scene, voice,
     // event log, portal upload); for exercising the feedback paths on the bench.
     else if (command.startsWith("fault "))

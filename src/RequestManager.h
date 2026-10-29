@@ -203,6 +203,13 @@ public:
     String getFigureIdFromUid(const String &uid);
     // Customer reset / a card from another toy: drop every uid -> figure mapping (NVS too).
     void forgetAllUidMappings();
+    // The toy was unbound from its account (owner sold or removed it): the personal recordings
+    // (custom tracks, /assets/custom_tracks) are deleted and dropped from the cached figure
+    // manifests; portal stories stay. Returns the number of files removed.
+    int forgetCustomTracks(const char *why);
+    // Set by the hub check when a toy that was bound is not any more (an unbind that happened
+    // while it was offline); main.cpp runs the cleanup from the loop.
+    bool consumeUnbindCleanup() { const bool p = unbindCleanupPending; unbindCleanupPending = false; return p; }
 
 private:
     static volatile bool portalReachableFlag;
@@ -230,6 +237,7 @@ private:
     unsigned long nextLinkCheckAt = 0;
     volatile int8_t pendingBound = -1;             // set by a validation on any task, applied on the loop (-1 none)
     volatile LinkState linkStateValue = LinkState::UNKNOWN;
+    bool unbindCleanupPending = false;
 
     // NVS storage for UID to Figure ID mappings
     static const char* NVS_NAMESPACE;

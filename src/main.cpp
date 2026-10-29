@@ -570,10 +570,34 @@ static OtaManager::Conditions otaConditions()
 }
 
 static const char *gResetRequestedBy = nullptr;
+static int gUnboundRequested = 0; // 1: unbound (say not linked), 2: another account took the toy
 
 void requestCustomerReset(const char *why)
 {
     gResetRequestedBy = why ? why : "request";
+}
+
+void requestUnboundCleanup(bool rebound)
+{
+    gUnboundRequested = rebound ? 2 : 1;
+}
+
+// The toy left its account (the owner removed it in the app, or a new owner claimed it with
+// the pairing code). Personal recordings go, portal stories and WiFi stay (docs/PROTOCOL-V2.md
+// §7): the same family re-adding the toy keeps its stories and never re-pairs.
+static void runUnboundCleanup(bool rebound)
+{
+    ESP_LOGW(TAG, "=== toy %s ===", rebound ? "taken over by another account" : "unbound from its account");
+    if (audioController.isPlaying() || audioController.isPaused())
+    {
+        audioController.stop();
+        audioController.clearPlaylist();
+    }
+    requestManager.forgetCustomTracks(rebound ? "rebound" : "unbound");
+    if (!rebound)
+    {
+        Faults::raise(Fault::NOT_LINKED, "unbound"); // spoken by the daily not_linked schedule
+    }
 }
 
 void runCustomerReset(bool all, const char *why, bool speak)
@@ -1195,6 +1219,16 @@ void loop()
     if (!factory)
     {
         TT_TIMED("chargeux", updateChargingUx());
+    }
+    if (gUnboundRequested)
+    {
+        const bool rebound = gUnboundRequested == 2;
+        gUnboundRequested = 0;
+        runUnboundCleanup(rebound);
+    }
+    if (requestManager.consumeUnbindCleanup())
+    {
+        runUnboundCleanup(false);
     }
     if (gResetRequestedBy)
     {

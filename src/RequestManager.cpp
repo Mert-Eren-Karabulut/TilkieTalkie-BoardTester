@@ -1,4 +1,5 @@
 #include "RequestManager.h"
+#include "ConfigManager.h"
 #include "ReverbClient.h"
 #include "CaBundle.h"
 #include "PsramJson.h"
@@ -1002,6 +1003,13 @@ void RequestManager::applyBound(JsonVariantConst doc)
         static unsigned long lastRaisedAt = 0;
         const bool first = linkStateValue != LinkState::NOT_LINKED;
         linkStateValue = LinkState::NOT_LINKED;
+        // "hub_bound" in NVS remembers that this toy once belonged to an account: an unbind that
+        // happened while it was offline is noticed here, at the first check that says bound=false.
+        if (ConfigManager::getInstance().getInt("hub_bound", 0) == 1) {
+            ConfigManager::getInstance().storeInt("hub_bound", 0);
+            ESP_LOGW(TAG, "hub was unbound from its account while away - personal recordings go");
+            unbindCleanupPending = true;
+        }
         if (first || !lastRaisedAt || millis() - lastRaisedAt >= DAY_MS) {
             lastRaisedAt = millis() ? millis() : 1;
             ESP_LOGI(TAG, "hub is not linked to an account");
@@ -1012,6 +1020,9 @@ void RequestManager::applyBound(JsonVariantConst doc)
             ESP_LOGI(TAG, "hub is linked to an account now");
         }
         linkStateValue = LinkState::LINKED;
+        if (ConfigManager::getInstance().getInt("hub_bound", 0) != 1) {
+            ConfigManager::getInstance().storeInt("hub_bound", 1);
+        }
         Faults::clear(Fault::NOT_LINKED);
     }
 }
@@ -1515,6 +1526,50 @@ String RequestManager::getFigureIdFromUid(const String &uid)
         return jsonValueToString(manifest["figure"]["id"]);
     }
     return String();
+}
+
+int RequestManager::forgetCustomTracks(const char *why)
+{
+    FileManager &fileManager = FileManager::getInstance();
+    int removed = 0;
+    // The recordings themselves: one directory on the card (docs/PROTOCOL-V2.md, the portal's
+    // assets/custom_tracks/<id>.<ext>).
+    static const char *CUSTOM_DIR = "/assets/custom_tracks";
+    for (const String &name : fileManager.listFiles(CUSTOM_DIR)) {
+        const String path = name.startsWith("/") ? name : String(CUSTOM_DIR) + "/" + name;
+        if (fileManager.deleteFileAndRemoveFromRequired(path)) {
+            removed++;
+        }
+    }
+    // The cached figure manifests: drop the custom tracks so an offline tap does not look for
+    // files that are gone; the portal stories in them stay playable.
+    int manifests = 0;
+    for (const String &name : fileManager.listFiles(SD_MANIFEST_DIR)) {
+        String uid = name.startsWith("/") ? name.substring(name.lastIndexOf('/') + 1) : name;
+        if (!uid.endsWith(".json")) continue;
+        uid = uid.substring(0, uid.length() - 5);
+        JsonDocument doc;
+        if (!loadUnitManifest(uid, doc)) continue;
+        bool changed = false;
+        if (doc["custom_tracks"].is<JsonArray>() && doc["custom_tracks"].as<JsonArray>().size() > 0) {
+            doc.remove("custom_tracks");
+            changed = true;
+        }
+        if (doc["asset_manifest"].is<JsonArray>()) {
+            JsonArray assets = doc["asset_manifest"].as<JsonArray>();
+            for (size_t i = assets.size(); i-- > 0;) {
+                if (assets[i]["asset_type"].as<String>() == "custom_track") {
+                    assets.remove(i);
+                    changed = true;
+                }
+            }
+        }
+        if (changed && saveUnitManifest(uid, doc)) {
+            manifests++;
+        }
+    }
+    ESP_LOGW(TAG, "custom tracks forgotten (%s): %d file(s) removed, %d manifest(s) rewritten", why ? why : "?", removed, manifests);
+    return removed;
 }
 
 void RequestManager::forgetAllUidMappings()
