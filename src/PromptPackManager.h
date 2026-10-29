@@ -49,7 +49,8 @@ public:
     // sd`). False when there is no readable pack.json; files = entries listed, missing = absent
     // or of the wrong size.
     bool installedStatus(String &checksum, int &files, int &missing);
-    void noteRequired(const String &checksum) { _required = checksum; } // what the portal pairs with this firmware
+    void noteRequired(const String &checksum) { _required = checksum; }
+    const String &requiredChecksum() const { return _required; } // what the portal pairs with this firmware
     const char *stateName() const;   // ok | outdated | syncing | missing | unknown (device report)
 
     // Download `pack` into /sounds.staging for firmware `forVersion`; files already there are

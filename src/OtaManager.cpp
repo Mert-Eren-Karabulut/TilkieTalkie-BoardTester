@@ -1248,6 +1248,12 @@ void OtaManager::printStatus()
     ESP_LOGI(TAG, "next periodic check in %ld s, crash resets in a row %u, rolled back [%s]",
                   (long)((long)_nextCheckAt - (long)millis()) / 1000, (unsigned)g_otaCrashCount,
                   ConfigManager::getInstance().getString(NVS_OTA_BLACKLIST, "").c_str());
+    {
+        PromptPackManager &ppm = PromptPackManager::getInstance();
+        ESP_LOGI(TAG, "prompt pack: %s (installed %s, paired with this release %s)", ppm.stateName(),
+                 ppm.installedChecksum().isEmpty() ? "none" : ppm.installedChecksum().substring(0, 12).c_str(),
+                 ppm.requiredChecksum().isEmpty() ? "not learnt yet" : ppm.requiredChecksum().substring(0, 12).c_str());
+    }
 }
 
 bool OtaManager::consumeJustFailed()
