@@ -31,9 +31,30 @@ current, temperature every second, C/10 discharge). The firmware can record that
 adapter needed. Alternatively pick the entry whose characterised cell matches ours from the
 local list (`docs/gauge/lfp-chem-ids.txt`, not committed).
 
-## Firmware plan (unchanged)
-Flashstream/data-flash image replay at bring-up, versioned, verified by Chem ID, capacity,
-Update Status, Qmax/Ra sanity; coulomb-counted SOC stays until then. See docs/FACTORY-MODE.md.
+## Firmware: the learned image is replayed at boot (2026-10-29)
+`tools/gauge-image.py docs/gauge/dumps/<learned>.dfdump.txt --chem-id 0438` turns the dump into
+`src/GaugeGoldenImage.{h,cpp}`: data flash 0x4100-0x47FF (Ra tables, State with Qmax / Update
+Status, the chemistry tables of 0438, the IT and settings classes as validated on the calibration
+unit) plus the expected values (chem ID, Qmax, Update Status, Ra flag) and the source's sha256.
+0x4000-0x40FF (cell / pack / CC gains and offsets, lifetime counters) is never part of it: that
+stays each unit's own.
+
+`BatteryManager::replayGaugeGoldenImage()` runs in `applyPowerConfiguration()` after the
+provisioning step, at every boot:
+- chemistry 0438 + Update Status 06 + Ra flag 0x0055 → `applied`, nothing to do;
+- chemistry 0438 + Update Status 05 → `learning` (a bench learning cycle in progress), untouched;
+- anything else (stock 0x1210, or Update Status 04 after `gaugelearned confirm`) → `stock`: on
+  USB the 56 blocks are written (32-byte MAC writes, each read back; ~5 s), DEVICE_RESET, and the
+  chem ID / Update Status / Qmax / Ra flag are read back (`applied`, else `failed`). On battery
+  the write waits for a boot on USB (the reset would drop the rail under the ESP).
+- `gaugeimage inhibit` (bench console, NVS) blocks the replay on a unit that is about to run a
+  learning cycle from Update Status 04; `gaugeimage allow` lifts it, `gaugeimage apply` forces a
+  rewrite, `gaugeimage` alone prints the state. `ft begin` reports it as `gauge.image`.
+
+Verified 2026-10-29 on the demo unit (stock 0x1210, Update Status 04): replayed at the first boot
+on USB in 7 s, read-back OK, the gauge reported TrueFCC 4318 mAh right away, and a full dump
+afterwards differs from the learned unit only inside 0x4000-0x40FF. The coulomb-counted SOC in the
+firmware is the next thing to retire in favour of the gauge's.
 
 ## 2026-10-25: the learning cycles found a 300 mΩ pack, not a chemistry problem
 Third learning discharge (chem 0438, `VDQ/QEN/VOK`, no `RDIS`, 430 mA via `learndis`): after

@@ -70,6 +70,7 @@ static void writeRecord(bool done, const char *reason)
     char chem[8];
     snprintf(chem, sizeof(chem), "0x%04X", (unsigned)battery.getGaugeChemId());
     g["chem_id"] = chem;
+    g["image"] = battery.goldenImageStateName(); // learned image: applied / stock / learning / inhibited / failed
     g["design_mah"] = battery.getDesignCapacityMilliAmpHours();
     g["mv"] = (int)lroundf(battery.getBatteryVoltage() * 1000.0f);
     g["temp_c"] = (int)lroundf(battery.getTemperatureC());

@@ -31,7 +31,7 @@ the charger's VSYS OVP).
 | LED | meaning |
 |---|---|
 | five LEDs dim white, steady | factory session open, nothing running (the panel is connected) |
-| solid blue | bring-up: provisioning the gauge |
+| solid blue | bring-up: provisioning the gauge and loading the learned gauge image (a few seconds) |
 | amber, breathing | bring-up: waiting for charge current (USB power, cell not full) |
 | solid cyan | bring-up: calibrating the current sense (a few seconds) |
 | solid green (briefly) | bring-up passed |

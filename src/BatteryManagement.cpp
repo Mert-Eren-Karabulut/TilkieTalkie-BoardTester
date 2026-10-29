@@ -1,4 +1,6 @@
 #include "BatteryManagement.h"
+#include "GaugeGoldenImage.h"
+#include <Preferences.h>
 #include <driver/gpio.h>
 #include <esp_log.h>
 
@@ -673,10 +675,19 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
     // Skip all gauge data-flash work while the gauge is still in ROM mode (fallback
     // address 0x0B for ~15s after a deep-discharge reset): DF reads/writes only fail
     // and spam errors there. The periodic device rescan retries once it answers at 0x55.
+    uint8_t chargerStatus = 0;
+    const bool usb = chargerPresent
+        && readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_0_REGISTER, chargerStatus)
+        && (chargerStatus & 0x01) != 0;
+
     if (gaugePresent && gaugeAddress == BQ28Z610_PRIMARY_ADDRESS) {
         // BQ28Z610 data-flash provisioning is persistent, but boards for this product are always 1S
         // and may ship with FET control disabled.
         bool provisioned = ensureGaugeProvisioned(forceGaugeProvision);
+
+        // The learned image (chemistry, Ra, Qmax, Update Status 06) onto a stock gauge. Written only
+        // on USB (the reset would kill the ESP on battery); classified either way for ft begin.
+        replayGaugeGoldenImage(false, usb || forceGaugeProvision);
 
         // NOTE: CUV protection thresholds are NOT written here. The Protections-class
         // data flash silently rejects writes via the working MAC method (confirmed by
@@ -690,10 +701,6 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
         // Otherwise the gauge leaves its CHG/DSG FETs open, isolating the cell, and
         // the device runs unbuffered off USB and browns out during network bring-up.
         bool singleCellReady = setGaugeSingleCellMode();
-        uint8_t chargerStatus = 0;
-        const bool usb = chargerPresent
-            && readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_0_REGISTER, chargerStatus)
-            && (chargerStatus & 0x01) != 0;
         bool fetControlReady = restoreGaugeFetControl(usb);
 
         // Ensure CUV latches until charge (Protection Config bit1) on EVERY boot — this is
@@ -1120,6 +1127,37 @@ bool BatteryManager::readGaugeDataFlash(uint16_t address, uint8_t *buffer, size_
         ++done;
     }
     return true;
+}
+
+bool BatteryManager::writeGaugeDataFlashBlock32(uint16_t address, const uint8_t *data32) {
+    // TI canonical data-memory write, 32 bytes at once: address + data as one block to 0x3E, then
+    // checksum + length (data bytes + 4) at 0x60/0x61. The bus is held for the whole sequence and
+    // the read-back polls for the commit (see writeGaugeDataFlashWord()).
+    BusGuard guard(busLock);
+    uint8_t block[34] = {
+        static_cast<uint8_t>(address & 0xFF),
+        static_cast<uint8_t>((address >> 8) & 0xFF),
+    };
+    memcpy(block + 2, data32, 32);
+    if (!writeRegisters(gaugeAddress, 0x3E, block, sizeof(block))) {
+        return false;
+    }
+    uint8_t sum = 0;
+    for (size_t i = 0; i < sizeof(block); ++i) {
+        sum = static_cast<uint8_t>(sum + block[i]);
+    }
+    uint8_t trailer[2] = { static_cast<uint8_t>(~sum), static_cast<uint8_t>(sizeof(block) + 2) };
+    if (!writeRegisters(gaugeAddress, BQ28Z610_MAC_CHECKSUM_REGISTER, trailer, sizeof(trailer))) {
+        return false;
+    }
+    uint8_t verify[32];
+    for (int attempt = 0; attempt < 25; ++attempt) {
+        delay(20);
+        if (readGaugeDataFlashBlock32(address, verify) && memcmp(verify, data32, 32) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool BatteryManager::readGaugeDataFlashBlock32(uint16_t address, uint8_t *out32) {
@@ -1907,6 +1945,135 @@ bool BatteryManager::openGaugeFets() {
     Serial.flush();
     delay(20);
     return writeGaugeAltCommand(BQ28Z610_FET_CONTROL_COMMAND);
+}
+
+static const char *kGoldenImagePrefs = "gauge";
+static const char *kGoldenImageOffKey = "img_off";
+
+bool BatteryManager::isGoldenImageInhibited() {
+    Preferences prefs;
+    if (!prefs.begin(kGoldenImagePrefs, true)) {
+        return false;
+    }
+    const bool off = prefs.getBool(kGoldenImageOffKey, false);
+    prefs.end();
+    return off;
+}
+
+void BatteryManager::setGoldenImageInhibited(bool inhibited) {
+    Preferences prefs;
+    if (prefs.begin(kGoldenImagePrefs, false)) {
+        if (inhibited) {
+            prefs.putBool(kGoldenImageOffKey, true);
+        } else {
+            prefs.remove(kGoldenImageOffKey);
+        }
+        prefs.end();
+    }
+}
+
+const char *BatteryManager::goldenImageStateName() const {
+    switch (gaugeGoldenImage) {
+        case IMAGE_APPLIED: return "applied";
+        case IMAGE_LEARNING: return "learning";
+        case IMAGE_STOCK: return "stock";
+        case IMAGE_INHIBITED: return "inhibited";
+        case IMAGE_FAILED: return "failed";
+        default: return "unknown";
+    }
+}
+
+// The learned image (GaugeGoldenImage.h): chemistry tables, Ra table, Qmax, Update Status 06 and
+// the validated settings from the calibration unit, 0x4100-0x47FF. A gauge with the stock
+// chemistry (MAC 0x0006 != CHEM_ID) or an unlearned state (Update Status 0x04) gets it; one that
+// is learning on the bench (right chemistry, Update Status 0x05) is left alone, as is one that
+// already carries it. The per-unit calibration (0x4000-0x40FF) is never touched.
+bool BatteryManager::replayGaugeGoldenImage(bool force, bool allowWrite) {
+    if (!gaugePresent || gaugeAddress != BQ28Z610_PRIMARY_ADDRESS || busReleased) {
+        return false;
+    }
+    uint16_t chem = 0, raFlag = 0, qmax = 0;
+    uint8_t us = 0;
+    bool ok = readGaugeChemId(chem);
+    ok = readGaugeDataFlashByte(BQ28Z610_UPDATE_STATUS_ADDRESS, us) && ok;
+    ok = readGaugeDataFlashWord(GaugeGoldenImage::START, raFlag) && ok;
+    ok = readGaugeDataFlashWord(BQ28Z610_QMAX_CELL_1_ADDRESS, qmax) && ok;
+    if (!ok) {
+        ESP_LOGW(TAG, "GAUGE IMAGE: cannot read the gauge state");
+        return false;
+    }
+    gaugeChemId = chem;
+    const bool chemOk = chem == GaugeGoldenImage::CHEM_ID;
+    const bool applied = chemOk && us == GaugeGoldenImage::UPDATE_STATUS && raFlag == GaugeGoldenImage::RA_FLAG;
+    const bool learning = chemOk && us == 0x05;
+    if (!force) {
+        if (applied) {
+            gaugeGoldenImage = IMAGE_APPLIED;
+            return true;
+        }
+        if (learning) {
+            gaugeGoldenImage = IMAGE_LEARNING;
+            ESP_LOGI(TAG, "GAUGE IMAGE: gauge is learning (chem 0x%04X, Update Status 0x%02X) - not replayed", chem, us);
+            return true;
+        }
+        if (isGoldenImageInhibited()) {
+            gaugeGoldenImage = IMAGE_INHIBITED;
+            ESP_LOGW(TAG, "GAUGE IMAGE: replay inhibited on this unit (gaugeimage allow to lift); chem 0x%04X, Update Status 0x%02X", chem, us);
+            return false;
+        }
+    }
+    if (!allowWrite) {
+        gaugeGoldenImage = IMAGE_STOCK;
+        ESP_LOGW(TAG, "GAUGE IMAGE: stock gauge (chem 0x%04X, Update Status 0x%02X, Ra flag 0x%04X) - replay waits for a boot on USB", chem, us, raFlag);
+        return false;
+    }
+    if (gaugeSealed && !unsealGauge()) {
+        ESP_LOGE(TAG, "GAUGE IMAGE: gauge sealed and unseal failed");
+        gaugeGoldenImage = IMAGE_FAILED;
+        return false;
+    }
+    ESP_LOGW(TAG, "GAUGE IMAGE: replaying %s (sha %s) onto this gauge: chem 0x%04X -> 0x%04X, Update Status 0x%02X -> 0x%02X, Qmax %u -> %u",
+             GaugeGoldenImage::SOURCE, GaugeGoldenImage::SHA, chem, GaugeGoldenImage::CHEM_ID, us, GaugeGoldenImage::UPDATE_STATUS, qmax, GaugeGoldenImage::QMAX_CELL1_MAH);
+    const unsigned long t0 = millis();
+    size_t written = 0;
+    for (size_t off = 0; off < GaugeGoldenImage::SIZE; off += 32) {
+        const uint16_t addr = static_cast<uint16_t>(GaugeGoldenImage::START + off);
+        bool blockOk = false;
+        for (int attempt = 0; attempt < 3 && !blockOk; ++attempt) {
+            blockOk = writeGaugeDataFlashBlock32(addr, GaugeGoldenImage::DATA + off);
+        }
+        if (!blockOk) {
+            ESP_LOGE(TAG, "GAUGE IMAGE: block 0x%04X did not take after 3 attempts (%u blocks written) - gauge reset, state left as is", addr, (unsigned)written);
+            gaugeGoldenImage = IMAGE_FAILED;
+            writeGaugeAltCommand(BQ28Z610_DEVICE_RESET_COMMAND);
+            delay(1500);
+            return false;
+        }
+        ++written;
+    }
+    ESP_LOGI(TAG, "GAUGE IMAGE: %u blocks written in %lu ms, resetting the gauge", (unsigned)written, millis() - t0);
+    writeGaugeAltCommand(BQ28Z610_DEVICE_RESET_COMMAND);
+    delay(1500);
+    bool verified = false;
+    for (int attempt = 0; attempt < 8 && !verified; ++attempt) {
+        delay(300);
+        chem = 0; us = 0; raFlag = 0; qmax = 0;
+        verified = readGaugeChemId(chem)
+            && readGaugeDataFlashByte(BQ28Z610_UPDATE_STATUS_ADDRESS, us)
+            && readGaugeDataFlashWord(GaugeGoldenImage::START, raFlag)
+            && readGaugeDataFlashWord(BQ28Z610_QMAX_CELL_1_ADDRESS, qmax)
+            && chem == GaugeGoldenImage::CHEM_ID && us == GaugeGoldenImage::UPDATE_STATUS
+            && raFlag == GaugeGoldenImage::RA_FLAG && qmax == GaugeGoldenImage::QMAX_CELL1_MAH;
+    }
+    gaugeChemId = chem;
+    if (verified) {
+        gaugeGoldenImage = IMAGE_APPLIED;
+        ESP_LOGW(TAG, "GAUGE IMAGE: applied and verified (chem 0x%04X, Update Status 0x%02X, Qmax %u, Ra flag 0x%04X)", chem, us, qmax, raFlag);
+    } else {
+        gaugeGoldenImage = IMAGE_FAILED;
+        ESP_LOGE(TAG, "GAUGE IMAGE: read-back mismatch after the reset (chem 0x%04X, Update Status 0x%02X, Qmax %u, Ra flag 0x%04X)", chem, us, qmax, raFlag);
+    }
+    return verified;
 }
 
 // CUV latched (DSG FET open, CHG FET closed) while a charger is present: get the DSG FET back.

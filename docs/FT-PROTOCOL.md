@@ -69,7 +69,7 @@ Both repos implement this file; PROTOCOL-V2.md §9 points here.
 | `sd` | card present; writes and reads back 2 MB; pack.json present and complete | write ≥ 0.2 MB/s, read ≥ 1 MB/s, pack complete | `{"size_mb","write_mbps","read_mbps","pack":"<checksum>","missing":0}` |
 | `wifi <ssid> <pass>` | connects to the given network (20 s), probes `http://<endpoint host>/storage/ping.json` as PROTOCOL-V2 §6, disconnects; the stored customer credentials are not touched; `<pass>` may be empty for an open network; `<ssid>` may not contain spaces | connected and probe body matched | `{"rssi","ip","probe":true,"ms"}` |
 | `ble` | starts the provisioning advertiser for 10 s under the normal device name, then stops it | the stack started | `{"name":"..."}` |
-| `bringup` | runs the bring-up state machine again (gauge provisioning, charge current, calibration) with a 3 min budget; progress per state; the record is written to the factory namespace | reached the done state | `{"state","record":{...}}` |
+| `bringup` | runs the bring-up state machine again (gauge provisioning, the learned gauge image, charge current, calibration) with a 3 min budget; progress per state; the record is written to the factory namespace | reached the done state | `{"state","record":{...}}` |
 | `sleep` | not implemented on this hardware (no shunt) | always fails with `"error":"not implemented"` | |
 
 ## Results, commit, end of line

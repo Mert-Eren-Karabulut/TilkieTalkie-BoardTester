@@ -343,6 +343,7 @@ private:
     int16_t gaugeTrueRemainingCapacityMilliAmpHours;
     uint16_t gaugeTrueFullChargeCapacityMilliAmpHours;
     uint8_t gaugeUpdateStatus;
+    uint8_t gaugeGoldenImage = 0; // GoldenImage state (see goldenImageStateName())
     unsigned long lastDeviceScan;
     // Reconfigure-on-transition bookkeeping (see refreshBatteryState()).
     bool prevRt6160Present = false;
@@ -417,6 +418,7 @@ private:
     bool sealGauge();
     bool readGaugeDataFlashByte(uint16_t address, uint8_t &value);
     bool readGaugeDataFlashBlock32(uint16_t address, uint8_t *out32);   // one MAC read: 32 bytes
+    bool writeGaugeDataFlashBlock32(uint16_t address, const uint8_t *data32); // one MAC write: 32 bytes, verified
     bool readGaugeDataFlashWord(uint16_t address, uint16_t &value);
     bool readGaugeDataFlashFloat(uint16_t address, float &value);
     bool writeGaugeDataFlashFloat(uint16_t address, float value);
@@ -449,6 +451,15 @@ public:
     // first-boot bring-up to skip provisioning/calibration when they are already done,
     // avoiding a gauge reset that would open the FETs and brown out the system.
     bool isGaugeProvisioned();        // chem/1S/design-capacity look correct
+    // The learned data-flash image (src/GaugeGoldenImage.h, docs/GAUGE-CHEMISTRY.md): written onto a
+    // gauge that still has the stock chemistry or an unlearned state (Update Status 0x04), then a
+    // device reset and a read-back. allowWrite=false only classifies (a reset on battery kills the
+    // ESP mid-boot, so the write waits for a USB boot). force rewrites regardless of the state.
+    enum GoldenImage : uint8_t { IMAGE_UNKNOWN = 0, IMAGE_APPLIED, IMAGE_LEARNING, IMAGE_STOCK, IMAGE_INHIBITED, IMAGE_FAILED };
+    bool replayGaugeGoldenImage(bool force, bool allowWrite);
+    const char *goldenImageStateName() const;
+    static bool isGoldenImageInhibited();           // NVS flag for bench learning cycles (gaugeimage inhibit)
+    static void setGoldenImageInhibited(bool inhibited);
     bool isCurrentSenseCalibrated();  // CC Gain has moved away from the factory default
     // Re-probes the gauge address and returns true only when it is responding at its normal
     // operating address (not ROM mode 0x0B) AND looks provisioned. The bq28z610 boots in ROM

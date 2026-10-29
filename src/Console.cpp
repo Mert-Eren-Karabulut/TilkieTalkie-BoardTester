@@ -18,6 +18,7 @@
 #include <SD_MMC.h>
 #include <wifi_provisioning/manager.h>
 #include "Bringup.h"
+#include "GaugeGoldenImage.h"
 #include "Diag.h"
 #include "FactoryTest.h"
 #include "Faults.h"
@@ -299,6 +300,7 @@ static void printHelp()
     ESP_LOGI(TAG, "  gaugecutoff       - cutoff/ship FET state on USB (DSG open, CHG closed); gaugefets restores");
     ESP_LOGI(TAG, "  gaugemac <hexcmd> [len] / gaugeit - raw MAC block / Impedance Track internals (IT Status 1-3)");
     ESP_LOGI(TAG, "  gaugedfbyte <hexaddr> [hexval] - read / write one gauge data-flash byte (e.g. 46AE Protection Configuration)");
+    ESP_LOGI(TAG, "  gaugeimage [apply|inhibit|allow] - learned gauge image: state / force rewrite / NVS inhibit for learning cycles");
     ESP_LOGI(TAG, "  learndis / learnrest / learnchg - gauge learning cycle phases");
     ESP_LOGI(TAG, "  sleeptest <min> [railon] [nfcawake] [hold] - sleep current via the gauge (battery only)");
     ESP_LOGI(TAG, "  chargemon [s]     - one charger/gauge line per second");
@@ -1450,6 +1452,33 @@ static void dispatch(String command)
     // gaugeit - Impedance Track internals from IT Status 1/2/3 (bq28z610 TRM 0x0073-0x0075):
     // the true remaining/full capacity the simulation produced, the Ra scale in use, the depth
     // of discharge reference points and the Qmax update inputs. Raw bytes are printed too.
+    // gaugeimage [apply|inhibit|allow] - the learned data-flash image (GaugeGoldenImage.h):
+    // state, forced rewrite, or the NVS inhibit for a bench learning cycle (Update Status 0x04
+    // would otherwise be replayed at the next boot on USB).
+    else if (command == "gaugeimage" || command.startsWith("gaugeimage "))
+    {
+        String arg = command.length() > 10 ? command.substring(10) : String();
+        arg.trim();
+        if (arg == "inhibit" || arg == "allow")
+        {
+            BatteryManager::setGoldenImageInhibited(arg == "inhibit");
+            ESP_LOGW(TAG, "GAUGE IMAGE: replay %s on this unit", arg == "inhibit" ? "INHIBITED (NVS)" : "allowed again");
+        }
+        else if (arg == "apply")
+        {
+            const bool ok = battery.replayGaugeGoldenImage(true, true);
+            ESP_LOGI(TAG, "GAUGE IMAGE: forced replay %s", ok ? "OK" : "FAILED");
+            battery.refreshDiagnostics();
+        }
+        else
+        {
+            battery.replayGaugeGoldenImage(false, false); // classify only
+        }
+        ESP_LOGI(TAG, "GAUGE IMAGE: %s (image %s, chem 0x%04X, Qmax %u, Update Status 0x%02X; inhibited=%s)",
+                 battery.goldenImageStateName(), GaugeGoldenImage::SOURCE, GaugeGoldenImage::CHEM_ID,
+                 GaugeGoldenImage::QMAX_CELL1_MAH, GaugeGoldenImage::UPDATE_STATUS,
+                 BatteryManager::isGoldenImageInhibited() ? "yes" : "no");
+    }
     else if (command == "gaugeit")
     {
         uint8_t s1[24] = {0}, s2[24] = {0}, s3[20] = {0};
