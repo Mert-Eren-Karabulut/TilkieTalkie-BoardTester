@@ -95,6 +95,12 @@ void OtaManager::begin()
     {
         _pendingVerify = (imgState == ESP_OTA_IMG_PENDING_VERIFY);
         _bootedFromOta = _pendingVerify;
+        if (_bootedFromOta) {
+            // Right after an update the portal is asked soon (not in 90-120 s): the pack paired
+            // with the new release is only known after that check, and the hub page showed the
+            // prompt pack as "unknown" until then.
+            _nextCheckAt = _bootAt + 20000UL + (esp_random() % 10000);
+        }
     }
     ESP_LOGI(TAG, "firmware %s (code %u, %s) on %s%s", firmwareVersion(), (unsigned)firmwareVersionCode(),
                   TT_HARDWARE_REV, running ? running->label : "?", _pendingVerify ? " - pending verification" : "");
