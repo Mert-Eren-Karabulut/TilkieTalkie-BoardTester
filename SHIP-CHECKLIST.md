@@ -389,3 +389,11 @@ reset hint (hold both volume buttons 5 s) is now spoken two minutes after a boot
 network absent, then every 6 h, so a second-hand buyer learns how to pair. Portal 554fd51 sends
 the command on app/admin unbind and on a takeover; the app handoff documents it. Bench: `unbound`
 on the demo unit → 0 files (no custom tracks there), the figure's 3 stories still play.
+
+## 1.3.18 on stable, mandatory (2026-10-30)
+Contents: WiFi power save off during downloads (d4d0454), the unbind behaviour and the
+absent-network pairing hint (50aa306), loop stack 10 KB. Published straight to stable as
+mandatory on Mert's word (he watches his colleague's unit take it): release with pack #3
+paired, 2 hubs nudged, flash manifest 1.3.18 (portal ab15b6c). Mandatory means the toy
+installs after an hour on the dock even with a figure on or a story playing; the normal polite
+gate applies in that first hour. App sha e6384ff4…, USB sha b7a5158d….
