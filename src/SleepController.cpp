@@ -101,7 +101,9 @@ void SleepController::configureWakeupSources() {
     }
     const bool pogoHigh = gpio_get_level(WAKEUP_POGO_PIN);
     if (pogoHigh || !NfcController::getInstance().isReaderReady()) {
-        ESP_LOGW(TAG, "pogo pin %s - not a wake source this time", pogoHigh ? "high (figure left on, or board unplugged)" : "without a reader");
+        if (gSystemPhase == PHASE_RUNNING) { // at begin() the reader is simply not up yet
+            ESP_LOGW(TAG, "pogo pin %s - not a wake source this time", pogoHigh ? "high (figure left on, or board unplugged)" : "without a reader");
+        }
     } else {
         buttonMask |= (1ULL << WAKEUP_POGO_PIN);
     }
