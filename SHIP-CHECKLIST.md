@@ -324,3 +324,17 @@ tests (card out/in, NFC board out/in with a figure on the pins) are the acceptan
 recovery paths. Still open from the map: Armut ("not connected") is spoken for portal 4xx/5xx
 while online (a new prompt would need a new pack); a card full (303) is silent; 502-507 are never
 raised; no card-detect pin, so "card out" is noticed by the 5 s probe. Console: `fault <code>`.
+
+## 1.3.15 built with voice pack faefcbd12031, publish pending (2026-10-29 night)
+Fault feedback and recovery (the readiness pass above) plus the fruit-code prompts per failure
+category (docs/VOICE-PROMPTS.md "Error codes"): nfc_fault Çilek, battery_fault Ananas,
+account_fault Limon, portal_fault Şeftali, storage_full Erik, audio_fault Mandalina; not_linked
+says Kivi; a critical fault repeats its sentence every 10 min. Images in `releases/` (app sha
+367fc691…, USB sha 877949ed…, pack `prompts-faefcbd12031.zip`). The publish (scp + `tilkie:
+prompt-pack` + `tilkie:firmware-release`, docs/RELEASE.md step 2) is run by Mert; the demo unit's
+card needs the six new files copied in (`sdcard/sounds/tr/*.mp3` + `pack.json` over `/sounds/`)
+or a fresh card (`tools/sdcard-prepare.sh /dev/diskN releases/prompts-faefcbd12031.zip`).
+Bench: `fault 701 / 504 / 107` reach nfc_fault / battery_fault / account_fault (files missing on
+the old card, 404 reported with missing=6). The unplug tests: SD card out/in passed on batch 2;
+NFC board out turned red (the board carries the pogo pins, so "figure on a dead reader" cannot
+be tested on this hardware).
