@@ -57,7 +57,7 @@ bool FileManager::ensureDownloadBuffers() {
     persistentBufferA = (uint8_t*)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     ringBuffer = (uint8_t*)heap_caps_malloc(RING_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!persistentBufferA || !ringBuffer) {
-        ESP_LOGE(TAG, "CRITICAL: failed to allocate download buffers (32 KB internal + 4 MB PSRAM)");
+        ESP_LOGE(TAG, "CRITICAL: failed to allocate download buffers (%u KB internal + 4 MB PSRAM)", (unsigned)(DOWNLOAD_BUFFER_SIZE / 1024));
         if (persistentBufferA) { free(persistentBufferA); persistentBufferA = nullptr; }
         if (ringBuffer) { free(ringBuffer); ringBuffer = nullptr; }
         return false;

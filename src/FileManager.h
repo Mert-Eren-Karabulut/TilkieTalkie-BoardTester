@@ -53,7 +53,7 @@ private:
     static const unsigned long RETRY_DELAY_MS = 30000;          // base retry delay, doubled per consecutive failure
     static const unsigned long MAX_RETRY_DELAY_MS = 600000;     // 10 minute backoff cap
     static const unsigned long SD_WRITER_STALL_MS = 3000;       // network side waits this long for the SD writer
-    static const size_t DOWNLOAD_BUFFER_SIZE = 32768;           // 32KB internal SRAM (DMA-aligned) - 2x32KB = 64KB total
+    static const size_t DOWNLOAD_BUFFER_SIZE = 16384;           // 16 KB internal SRAM (DMA bounce for the SD writer; 32 KB left a provisioned unit under the network memory gate)
     static const unsigned long QUEUE_SAVE_INTERVAL_MS = 5000;   // retry bookkeeping is flushed at most this often
     static const unsigned long SD_SLOW_WRITE_MS = 3000;         // a single card write above this raises SD_SLOW
 

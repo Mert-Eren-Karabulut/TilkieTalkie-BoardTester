@@ -914,17 +914,37 @@ static void serviceNetworkStart()
     {
         return; // the provisioning app is still attached / BLE memory not yet released
     }
-    if (ESP.getFreeHeap() < 55000)
+    // Memory gate. 55 KB free is the comfortable start; a provisioned unit with the WiFi stack
+    // up and the download bounce buffer taken can sit a little under it for good (a unit at
+    // 43 KB free never started its network services, 2026-10-29). TLS and the sockets live in
+    // PSRAM (sdkconfig), what the start really needs internally is two 8 KB task stacks and
+    // some headroom: after 60 s on WiFi, 36 KB free with a 10 KB block is accepted and logged.
+    // Below that the toy keeps waiting and raises 803 once, so the portal sees why it is silent.
+    const uint32_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const uint32_t largestInternal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const bool comfortable = freeInternal >= 55000;
+    const bool acceptable = freeInternal >= 36000 && largestInternal >= 10240 && millis() - gWifiUpSince > 60000UL;
+    if (!comfortable && !acceptable)
     {
         static unsigned long lastLog = 0;
+        static bool reported = false;
         if (millis() - lastLog > 10000)
         {
             lastLog = millis();
-            ESP_LOGW(TAG, "NET: waiting for memory before starting the network services (%u free)", ESP.getFreeHeap());
+            ESP_LOGW(TAG, "NET: waiting for memory before starting the network services (%lu free, largest %lu)",
+                     (unsigned long)freeInternal, (unsigned long)largestInternal);
+        }
+        if (!reported && millis() - gWifiUpSince > 300000UL)
+        {
+            reported = true;
+            char d[40];
+            snprintf(d, sizeof(d), "net free=%lu largest=%lu", (unsigned long)freeInternal, (unsigned long)largestInternal);
+            Faults::raise(Fault::HEAP_LOW, d, false);
         }
         return;
     }
-    ESP_LOGI(TAG, "NET: WiFi is up - starting network services");
+    ESP_LOGI(TAG, "NET: WiFi is up - starting network services (%lu free, largest %lu%s)",
+             (unsigned long)freeInternal, (unsigned long)largestInternal, comfortable ? "" : ", below the comfortable 55 KB");
     startNetworkServices();
 }
 
