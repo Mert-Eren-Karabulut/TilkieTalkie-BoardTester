@@ -127,7 +127,9 @@ Result after the boot on the brick (06:0x, cell 3.075 V, 312 mA charging):
 - The cutoff's CUV cut did not disturb the learning: the bottom rest with the DSG FET open was
   the second OCV point the gauge needed, Qmax and Ra were committed during it.
 
-Image: docs/gauge/dumps/2026-10-29-learned-us06.dfdump.txt (gitignored; 0x4000–0x4800 via
-`gaugedump`). Next: bqStudio export over the EV2400 for the record (`gaugebus release`, then
-`gaugebus attach`), and the firmware replay of this image at bring-up so production units start
-learned (SHIP-CHECKLIST.md "Needs hardware / owner" → firmware).
+Images (all gitignored under docs/gauge/): `dumps/2026-10-29-learned-us06.dfdump.txt` (0x4000–
+0x4800 via `gaugedump`, 64 blocks, 0 errors), `2026-10-29-learned-us06.gg.csv` (bqStudio Data
+Memory export over the EV2400, 06:0x: Qmax 4443, Update Status 06, Load Select 1, Protection
+Configuration 02, the Ra table above) and `2026-10-29-learned-us06.srec` (bqStudio golden image).
+The `.bq.fs` format was not offered by this bqStudio build. Next: the firmware replay of this
+image at bring-up so production units start learned (SHIP-CHECKLIST.md).
