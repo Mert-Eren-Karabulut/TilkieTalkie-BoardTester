@@ -366,3 +366,15 @@ Stable: 1.3.17 > 1.3.14. Station trap closed on the portal (edf12f9): a flash er
 identity, so the enrollment step can no longer be skipped for a unit without keys, and the
 "known unit, erased" restore keeps the pairing code (label stays valid). TT26-00001 is being
 re-flashed and restored at the station.
+
+## Pairing, card swap and download speed on the bench (2026-10-30)
+Demo unit (TT26-00002, 1.3.17 + bench): card pulled → 307 red → a *different* (faster) card put
+in → remounted, "card pack none, 34 required files missing" → the pairing from the app went
+through (credentials, portal probe, token, WebSocket) but spoke nothing: the new card had no
+/sounds at all, not a firmware fault. The unit then staged the full pack from the portal (34
+files, ~1 min) and activated it by itself, as designed. Pairing-time heap: 37.6 KB free with BLE
+and WiFi both up, min 6.8 KB seen with BLE up during `ft begin` (thin; the station's
+intermittent BLE-test failure still needs a failing session log). Speeds on the new card: writes
+7.6 MB/s (`sdwritebench`); a 4 MB track 1.52 Mbps with WiFi modem sleep on, 2.26 Mbps with it off
+(now off while downloads run, a981…: see git), SD writes 0.7 s of the transfer. The WiFi buffer
+settings were tried smaller and reverted (no gain, and download speed is a priority).
