@@ -358,3 +358,11 @@ WiFi the gate accepts 36 KB free with a 10 KB largest block (logged); 5 min belo
 803 HEAP_LOW once. 1.3.17 (c24c4a8, app sha dfdd41af…, USB sha 2877692d…) carries it; publish,
 then re-flash TT26-00001 from the station (its card also has the old 26-file pack: the new one
 downloads by itself once the network is up).
+
+## 1.3.17 promoted to stable (2026-10-30)
+Promoted on Mert's word with the voice pack "Yelda V3 (fault codes)" paired; 1.3.16 (the build
+with the network-start gate bug) moved back to beta so nothing lands on it; 1.3.15 stays on beta.
+Stable: 1.3.17 > 1.3.14. Station trap closed on the portal (edf12f9): a flash erases the unit's
+identity, so the enrollment step can no longer be skipped for a unit without keys, and the
+"known unit, erased" restore keeps the pairing code (label stays valid). TT26-00001 is being
+re-flashed and restored at the station.
