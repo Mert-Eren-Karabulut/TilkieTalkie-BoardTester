@@ -56,7 +56,7 @@ provisioning step, at every boot:
   the write waits for a boot on USB (the reset would drop the rail under the ESP).
 - `gaugeimage inhibit` (bench console, NVS) blocks the replay on a unit that is about to run a
   learning cycle from Update Status 04; `gaugeimage allow` lifts it, `gaugeimage apply` forces a
-  rewrite, `gaugeimage` alone prints the state. `ft begin` reports it as `gauge.image`.
+  rewrite, `gaugeimage` alone prints the state. The bring-up record carries it as `gauge.image` (`ft test bringup`; `ft begin` → `bringup.record`).
 
 Verified 2026-10-29 on the demo unit (stock 0x1210, Update Status 04): replayed at the first boot
 on USB in 7 s, read-back OK, the gauge reported TrueFCC 4318 mAh right away, and a full dump
