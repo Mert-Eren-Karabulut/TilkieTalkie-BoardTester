@@ -1,4 +1,5 @@
 #include "UxScenes.h"
+#include "PromptPackManager.h"
 #include <esp_log.h>
 #include "Bringup.h"
 #include "Faults.h"
@@ -46,9 +47,9 @@ bool chargeBarAllowed()
     {
         return true;
     }
-    if (gOtaProgress >= 0 || gSystemError)
+    if (gOtaProgress >= 0 || Faults::hasActive(Severity::CRITICAL))
     {
-        return false;
+        return false; // an error owns the LEDs, docked or not
     }
     if (!WiFi.isConnected() && wifiProv.provisioningImpossible())
     {
@@ -145,7 +146,7 @@ void deriveLedScene()
         ledController.setScene(LedController::SCENE_OTA, gOtaProgress);
         return;
     }
-    if (gSystemError || Faults::hasActive(Severity::CRITICAL) ||
+    if (Faults::hasActive(Severity::CRITICAL) ||
         (!WiFi.isConnected() && wifiProv.provisioningImpossible()))
     {
         // provisioningImpossible: not provisioned and no pop to provision with (112 NOT_ENROLLED)
@@ -182,10 +183,8 @@ void deriveLedScene()
             ledController.setScene(LedController::SCENE_PROVISIONING);
         else if (millis() - gFullSystemStartedAt < Policy::WIFI_CONNECTING_WINDOW_MS)
             ledController.setScene(LedController::SCENE_WIFI_CONNECTING);
-        else if (wifiProv.quietOffline())
-            ledController.setScene(lowBattery ? LedController::SCENE_LOW_BATTERY : LedController::SCENE_OFF); // password rejected: the amber LED only around each retry
         else
-            ledController.setScene(LedController::SCENE_OFFLINE);
+            ledController.setScene(lowBattery ? LedController::SCENE_LOW_BATTERY : LedController::SCENE_OFFLINE); // dim amber, also while the password is rejected (an off toy looked healthy)
     }
     else if (lowBattery)
     {
@@ -319,12 +318,14 @@ void updateBatteryUx()
     if (battery.isVbusPresent() || battery.getChargingStatus())
     {
         lastWarnStep = 100;
+        Faults::clear(Fault::BATTERY_LOW);
         return;
     }
     const int pct = (int)battery.getBatteryPercentage();
     if (pct > 20)
     {
         lastWarnStep = 100;
+        Faults::clear(Fault::BATTERY_LOW);
         return;
     }
     const int step = pct / 5; // 20 -> 4, 15 -> 3, 10 -> 2, 5 -> 1
@@ -334,5 +335,41 @@ void updateBatteryUx()
         char d[16];
         snprintf(d, sizeof(d), "pct=%d", pct);
         Faults::raise(Fault::BATTERY_LOW, d);
+    }
+}
+
+// Peripherals that can fail or be unplugged while running: the SD card (re-mounted when it
+// comes back, 307 while it is gone; 301 from boot clears the same way) and the codec (401,
+// retried every 10 s). The NFC reader is handled inside NfcController::update().
+void updatePeripheralHealth()
+{
+    if (gSystemPhase != PHASE_RUNNING)
+    {
+        return;
+    }
+    if (fileManager.isCardMounted())
+    {
+        if (!fileManager.checkCard())
+        {
+            audioController.stop(); // the file under the decoder is gone
+            Faults::raise(Fault::SD_CARD_REMOVED);
+        }
+    }
+    else if (fileManager.tryRemount())
+    {
+        Faults::clear(Fault::SD_MOUNT_FAILED);
+        Faults::clear(Fault::SD_CARD_REMOVED);
+        PromptPackManager::getInstance().begin();  // prompts are on the card
+        requestManager.recoverPendingManifests();
+    }
+    static unsigned long lastAudioRetry = 0;
+    if (!audioController.isInitialized() && millis() - lastAudioRetry > 10000UL)
+    {
+        lastAudioRetry = millis();
+        if (audioController.begin())
+        {
+            ESP_LOGW("ux", "audio codec is back");
+            Faults::clear(Fault::AUDIO_INIT_FAILED);
+        }
     }
 }

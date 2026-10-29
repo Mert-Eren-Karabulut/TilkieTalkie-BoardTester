@@ -95,11 +95,23 @@ bool NfcController::begin()
 
 void NfcController::update()
 {
-    if (!nfcReady || simulated)
+    if (simulated)
     {
         return;
     }
+    serviceReaderHealth();
+    // The pogo switch is read even without a reader: a figure placed on a dead reader still
+    // gets the "could not read the figure" prompt after 3 s instead of silence.
     handlePogoSwitch();
+    if (!nfcReady)
+    {
+        if (pogoActive && !readTroubleChecked && millis() - pogoEngagedAt > NFC_READ_TROUBLE_MS)
+        {
+            readTroubleChecked = true;
+            readTroublePending = true;
+        }
+        return;
+    }
 
     // Only attempt NFC reading while the pogo contacts are shorted.
     if (pogoActive && !cardReadInSession)
@@ -289,6 +301,69 @@ void NfcController::handleNFCReading()
 // Reader watchdog: a figure on the pins and NFC_REINIT_AFTER_FAILURES reads without an answer
 // (wedged PN532 after an I2C glitch, or simply a figure without a readable card): run the
 // reader's init sequence again. Harmless when the reader was fine.
+bool NfcController::probeReader()
+{
+    const uint32_t versiondata = nfc.getFirmwareVersion();
+    if (versiondata)
+    {
+        nfc.SAMConfig();
+        return true;
+    }
+    return false;
+}
+
+// Reader health (docs/FAULTS.md 701): a reader that was missing at boot is tried again every
+// 10 s (nfc.begin() + firmware version + SAMConfig) and comes back without a reboot; a reader
+// that stops answering while no figure is on the pins (the read loop only runs with a figure)
+// is noticed by a firmware-version probe every 10 s, three misses in a row, one re-init, and
+// then 701 until it answers again. The fault owns the red LED while it is active.
+void NfcController::serviceReaderHealth()
+{
+    const unsigned long now = millis();
+    if (now - lastHealthProbeAt < 10000UL)
+    {
+        return;
+    }
+    lastHealthProbeAt = now;
+    if (!nfcReady)
+    {
+        nfc.begin();
+        if (probeReader())
+        {
+            nfcReady = true;
+            consecutiveFailures = 0;
+            healthProbeFailures = 0;
+            ESP_LOGW(TAG, "NFC reader is back");
+            Faults::clear(Fault::NFC_INIT_FAILED);
+        }
+        return;
+    }
+    if (pogoActive)
+    {
+        return; // the read loop is the probe while a figure is on the pins
+    }
+    if (probeReader())
+    {
+        healthProbeFailures = 0;
+        return;
+    }
+    if (++healthProbeFailures < 3)
+    {
+        return;
+    }
+    healthProbeFailures = 0;
+    nfc.begin();
+    if (probeReader())
+    {
+        ESP_LOGW(TAG, "NFC reader needed a re-init (idle probe)");
+        Faults::raise(Fault::NFC_RESET, "idle noack", false);
+        return;
+    }
+    nfcReady = false;
+    ESP_LOGE(TAG, "NFC reader stopped answering");
+    Faults::raise(Fault::NFC_INIT_FAILED, "runtime", false);
+}
+
 void NfcController::reinitReader()
 {
     nfc.begin();

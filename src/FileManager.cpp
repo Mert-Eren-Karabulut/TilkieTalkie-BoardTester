@@ -617,6 +617,56 @@ bool FileManager::createDirectory(const String& path) {
     return success;
 }
 
+bool FileManager::checkCard() {
+    if (!sdCardInitialized) {
+        return false;
+    }
+    const bool forced = ioError.exchange(false);
+    const unsigned long now = millis();
+    if (!forced && now - lastCardProbeAt < 5000UL) {
+        return true;
+    }
+    lastCardProbeAt = now;
+    // A directory read goes to the card (the FAT window is re-read); a pulled card makes the
+    // SDMMC command fail and the open returns an invalid handle.
+    bool ok = false;
+    {
+        File d = SD_MMC.open(SD_DATA_DIR);
+        ok = d && d.isDirectory();
+        if (ok) {
+            File f = d.openNextFile();
+            if (f) f.close();
+            ok = SD_MMC.cardType() != CARD_NONE;
+        }
+        if (d) d.close();
+    }
+    if (ok) {
+        return true;
+    }
+    ESP_LOGE(TAG, "SD card no longer answers%s - unmounted", forced ? " (after an I/O error)" : "");
+    SD_MMC.end();
+    sdCardInitialized = false;
+    return false;
+}
+
+bool FileManager::tryRemount() {
+    if (sdCardInitialized) {
+        return true;
+    }
+    const unsigned long now = millis();
+    if (now - lastCardProbeAt < 5000UL) {
+        return false;
+    }
+    lastCardProbeAt = now;
+    ioError.store(false);
+    SD_MMC.end();
+    if (!begin()) {
+        return false;
+    }
+    ESP_LOGW(TAG, "SD card is back");
+    return true;
+}
+
 bool FileManager::fileExists(const String& path) {
     if (!sdCardInitialized) {
         return false;

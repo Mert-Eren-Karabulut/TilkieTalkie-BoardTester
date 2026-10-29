@@ -37,6 +37,7 @@
     X(208, CONTENT_SYNC_FAILED, WARNING, "", EVENT, "Background content re-check failed", "Transient unless it repeats") \
     X(301, SD_MOUNT_FAILED, CRITICAL, "muz", ON_BOOT, "SD card missing or unreadable at boot", "Reseat or replace the card (tools/sdcard-prepare.sh)") \
     X(302, SD_WRITE_FAILED, ERROR, "muz", EVENT, "A write or rename on the card failed", "Card wearing out or corrupt: replace it") \
+    X(307, SD_CARD_REMOVED, CRITICAL, "muz", ON_BOOT, "SD card went away while running", "Put the card back, the toy picks it up by itself") \
     X(303, SD_FULL, ERROR, "muz", EVENT, "No space left for a download", "Delete stories from the hub page or use a bigger card") \
     X(304, SD_FILE_CORRUPT, WARNING, "", EVENT, "A json file on the card was unreadable and recreated", "Watch the count. Replace a card that keeps corrupting files") \
     X(305, SD_SLOW, INFO, "", EVENT, "Card write stall above 3 s", "Slow card, affects download speed only") \
@@ -63,7 +64,7 @@
     X(606, OTA_CRASH_LOOP_REVERT, CRITICAL, "", EVENT, "Crash-loop guard switched partitions", "The firmware crashes at boot, revoke the release") \
     X(607, PROMPT_PACK_FAILED, WARNING, "", EVENT, "Prompt pack could not be downloaded", "Check the pack files over port 80") \
     X(608, PROMPT_PACK_ACTIVATE_FAILED, ERROR, "", EVENT, "Staged prompt pack could not be swapped in", "Check the card. The toy retries at the next check") \
-    X(701, NFC_INIT_FAILED, ERROR, "", ON_BOOT, "NFC reader not found at boot", "Hardware fault: return the unit") \
+    X(701, NFC_INIT_FAILED, CRITICAL, "", ON_BOOT, "NFC reader not answering", "Reseat the NFC board, hardware fault if it stays") \
     X(702, NFC_READ_TROUBLE, WARNING, "", ON_PLAY, "Figure on the pins but no card read", "Reseat the figure, replace the card if it repeats") \
     X(703, NFC_RESET, INFO, "", EVENT, "NFC reader watchdog reset", "Watch the count") \
     X(801, WATCHDOG_RESET, ERROR, "", EVENT, "Task watchdog reset", "Firmware hang, report with the firmware version") \

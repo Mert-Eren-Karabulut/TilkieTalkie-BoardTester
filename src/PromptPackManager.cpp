@@ -208,6 +208,10 @@ void PromptPackManager::begin()
         snprintf(d, sizeof(d), "missing=%d", missing);
         Faults::raise(Fault::PROMPT_FILE_MISSING, d);
     }
+    else
+    {
+        Faults::clear(Fault::PROMPT_FILE_MISSING); // a complete pack is on the card again
+    }
 }
 
 void PromptPackManager::update()

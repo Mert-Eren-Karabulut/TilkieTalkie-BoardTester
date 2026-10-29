@@ -58,9 +58,9 @@ SleepController &sleepController = SleepController::getInstance();
 SystemPhase gSystemPhase = PHASE_MONITOR;
 unsigned long gFullSystemStartedAt = 0;
 unsigned long gFigureLoadingSince = 0;
-bool gSystemError = false;
 int gOtaProgress = -1;
 bool gLearnDischarge = false;
+static volatile uint8_t gWifiFaultPending = 0; // bit0 WIFI_AUTH_FAILED, bit1 CAPTIVE_PORTAL (WiFi event task -> loop)
 bool gFactoryLoadStep = false;
 bool gGaugeBusReleased = false;
 
@@ -688,22 +688,16 @@ void startFullSystem()
     ESP_LOGI(TAG, "Initializing NFC Controller...");
 
 
+    nfcController.setAfterNFCReadCallback(afterNFCRead);     // set regardless: the reader can come back later
+    nfcController.setAfterDetachNFCCallback(afterDetachNFC);
     if (nfcController.begin())
     {
         ESP_LOGI(TAG, "NFC Controller initialized successfully!");
-
-        // Set up the new NFC callbacks
-        nfcController.setAfterNFCReadCallback(afterNFCRead);
-        nfcController.setAfterDetachNFCCallback(afterDetachNFC);
-
-        ESP_LOGI(TAG, "NFC callbacks configured.");
     }
     else
     {
-        Faults::raise(Fault::NFC_INIT_FAILED);
-        ESP_LOGE(TAG, "FATAL: NFC Controller initialization failed!");
-        ESP_LOGE(TAG, "NFC functionality will not be available.");
-        gSystemError = true; // deriveLedScene() shows the steady red error scene
+        Faults::raise(Fault::NFC_INIT_FAILED, "boot", false);
+        ESP_LOGE(TAG, "NFC reader not answering at boot - red until it does (retried every 10 s)");
     }
 
     // Initialize Button Controller
@@ -804,18 +798,23 @@ void startFullSystem()
 
     ESP_LOGI(TAG, "Button Controller initialized successfully!");
 
-    // rapid pulse LED to indicate system is ready
-    ledController.flash(LedController::FX_SUCCESS);
+    // Green "ready" only when the boot really succeeded: a missing card, a dead codec or a dead
+    // NFC reader show red instead (the critical fault owns the LEDs).
+    if (!Faults::hasActive(Severity::CRITICAL))
+    {
+        ledController.flash(LedController::FX_SUCCESS);
+    }
     battery.startTask(); // ~190 ms of bit-banged I2C per poll leaves the loop
     ESP_LOGI(TAG, "Initializing WiFi...");
     wifiProv.onProvisioningEvent([](WiFiProvisioningManager::ProvEvent ev) {
         switch (ev)
         {
         case WiFiProvisioningManager::ProvEvent::CRED_RECV: prompts.say(Prompt::SETUP_CONNECTING); break;
-        case WiFiProvisioningManager::ProvEvent::CRED_FAIL: Faults::raise(Fault::WIFI_AUTH_FAILED); break;
+        // Faults is loop-task only: these two arrive on the WiFi event task and are raised from
+        // loop() (gWifiFaultPending).
+        case WiFiProvisioningManager::ProvEvent::CRED_FAIL: gWifiFaultPending |= 1; break;
         // The network wants a login page: rejected like a wrong password (speaks setup_captive).
-        // Raised from the WiFi event task like WIFI_AUTH_FAILED above.
-        case WiFiProvisioningManager::ProvEvent::CAPTIVE: Faults::raise(Fault::CAPTIVE_PORTAL, "provisioning"); break;
+        case WiFiProvisioningManager::ProvEvent::CAPTIVE: gWifiFaultPending |= 2; break;
         case WiFiProvisioningManager::ProvEvent::ENDED:
             if (WiFi.isConnected()) prompts.say(Prompt::SETUP_SUCCESS);
             break;
@@ -1109,6 +1108,13 @@ void loop()
     {
         prompts.say(Prompt::UPDATE_START);
     }
+    if (gWifiFaultPending)
+    {
+        const uint8_t pending = gWifiFaultPending;
+        gWifiFaultPending = 0;
+        if (pending & 1) Faults::raise(Fault::WIFI_AUTH_FAILED);
+        if (pending & 2) Faults::raise(Fault::CAPTIVE_PORTAL, "provisioning");
+    }
     if (OtaManager::getInstance().consumeJustFailed())
     {
         const String err = OtaManager::getInstance().lastError();
@@ -1118,10 +1124,12 @@ void loop()
         case OtaManager::Failure::SHA: f = Fault::OTA_SHA_MISMATCH; break;
         case OtaManager::Failure::FLASH: f = Fault::OTA_FLASH_FAILED; break;
         case OtaManager::Failure::PROMPTS: f = Fault::PROMPT_PACK_FAILED; break;
-        // BATTERY stays OTA_DOWNLOAD_FAILED (karpuz: "will try again later"), detail says why
         default: break;
         }
-        Faults::raise(f, err.substring(0, 39).c_str());
+        // Unplugged or under 15 % is not a failed update, it is a postponed one: logged, not
+        // spoken ("update failed" right after pulling the cable confused everyone).
+        const bool postponed = OtaManager::getInstance().lastFailure() == OtaManager::Failure::BATTERY;
+        Faults::raise(f, err.substring(0, 39).c_str(), !postponed);
     }
     if (!factory)
     {
@@ -1156,6 +1164,7 @@ void loop()
         TT_TIMED("ux", serviceUxPrompts()); // no hello, no reminders in a factory session
     }
     TT_TIMED("battux", updateBatteryUx());
+    TT_TIMED("periph", updatePeripheralHealth());
 
     // No sleeping while docked: charging is the toy's "plugged in" UX. resetActivity()
     // keeps the inactivity countdown cleared (silent no-op once clear), so after unplug

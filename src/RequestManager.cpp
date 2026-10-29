@@ -549,6 +549,7 @@ bool RequestManager::requeueIfRetrying(AsyncJob *job)
     } else {
         if (code > 0) {
             consecutive5xx = 0; // the portal answers properly again
+            Faults::clear(Fault::PORTAL_UNREACHABLE);
         }
         return false;
     }
@@ -772,6 +773,7 @@ String RequestManager::fetchDeviceTokenWithSecret()
             if (token.length() > 0 && token != "null") {
                 const long expires = doc["expires_in"] | 0L;
                 ESP_LOGI(TAG, "device token obtained (expires in %ld d)", expires / 86400L);
+                Faults::clear(Fault::TOKEN_REJECTED);
                 tokenBlockedUntil = 0;
                 lastTokenIssuedAt = millis() ? millis() : 1;
                 return token;

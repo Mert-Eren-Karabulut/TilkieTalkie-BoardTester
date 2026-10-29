@@ -246,7 +246,18 @@ void activate(int idx)
     }
     if (g_activeCount < (int)(sizeof(g_active) / sizeof(g_active[0]))) {
         g_active[g_activeCount++] = {idx, uptimeS()};
+        return;
     }
+    // Full: a more severe fault evicts the oldest less severe one (a critical fault must never
+    // be dropped on the floor because eight warnings got there first).
+    int victim = -1;
+    for (int i = 0; i < g_activeCount; ++i) {
+        if (kCatalog[g_active[i].idx].severity < kCatalog[idx].severity
+            && (victim < 0 || g_active[i].sinceS < g_active[victim].sinceS)) {
+            victim = i;
+        }
+    }
+    if (victim >= 0) g_active[victim] = {idx, uptimeS()};
 }
 
 void deactivate(int idx)
@@ -423,6 +434,12 @@ void upload()
 }
 } // namespace
 
+// A raise before begin() (the dead-cell hold, the crash-loop guard) is kept here and applied
+// once the ring is loaded: saving a ring that was never loaded wiped the stored events.
+struct PendingRaise { Fault f; char detail[DETAIL_LEN]; bool speak; };
+PendingRaise g_pending[4];
+int g_pendingCount = 0;
+
 void Faults::begin()
 {
     if (g_begun) return;
@@ -431,6 +448,10 @@ void Faults::begin()
     g_boot++;
     classifyReset();
     save();
+    for (int i = 0; i < g_pendingCount; ++i) {
+        raise(g_pending[i].f, g_pending[i].detail[0] ? g_pending[i].detail : nullptr, g_pending[i].speak);
+    }
+    g_pendingCount = 0;
     int unsent = 0;
     for (int k = 0; k < g_ring.used; ++k) if (!g_ring.e[k].sent) unsent++;
     // The catalogue string is referenced here so the linker keeps it in the image for the portal.
@@ -439,8 +460,19 @@ void Faults::begin()
     if (unsent) g_uploadAt = millis() + 30000; // once the network and token are there
 }
 
+
 void Faults::raise(Fault f, const char *detail, bool speak)
 {
+    if (!g_begun) {
+        if (g_pendingCount < (int)(sizeof(g_pending) / sizeof(g_pending[0]))) {
+            PendingRaise &p = g_pending[g_pendingCount++];
+            p.f = f;
+            p.speak = speak;
+            strncpy(p.detail, detail ? detail : "", DETAIL_LEN - 1);
+            p.detail[DETAIL_LEN - 1] = 0;
+        }
+        return;
+    }
     const int idx = indexOf((uint16_t)f);
     if (idx < 0) return;
     const FaultInfo &fi = kCatalog[idx];
@@ -455,9 +487,12 @@ void Faults::raise(Fault f, const char *detail, bool speak)
     } else {
         record(fi, detail);
         Serial.printf("Faults: %u %s (%s)%s%s\n", fi.code, fi.slug, severityName(fi.severity), detail ? " " : "", detail ? detail : "");
-        if (speak && fi.fruit[0] && g_speaker) g_speaker(f);
         if (!g_uploadAt || g_uploadAt > now + UPLOAD_DEBOUNCE_MS) g_uploadAt = now + UPLOAD_DEBOUNCE_MS;
     }
+    // The dedupe is about the event log, not the child: a repeat within 10 min is still spoken
+    // (the prompt's own minimum interval throttles it; VoicePrompts.cpp). The speaker decides
+    // which faults have a sentence; the fruit word is only the log's name for it.
+    if (speak && g_speaker) g_speaker(f);
     if (g_dirty && !repeat) save();
 }
 

@@ -36,7 +36,9 @@ feeding the loop watchdog meanwhile; any other answer or silence cancels.
 | LED | `ledon <hex> <0-255>`, `ledoff`, `pulse <hex>`, `rapid <hex> <count>` |
 | NFC | `nfcstatus`, `nfcdata`, `nfcreed` / `nfcpogo`, `nfcdiag`, `nfcsleep` |
 
-`faults` prints the active faults and the recent fault events (docs/FAULTS.md).
+`faults` prints the active faults and the recent fault events (docs/FAULTS.md). Bench build:
+`fault <code> [silent]` raises a catalogue fault as if the firmware had (LED scene, voice, event
+log, portal upload), for exercising the feedback paths.
 
 `hubid` prints the hub uuid (the efuse MAC in decimal), the MAC in the usual byte order
 (1.2.19 and older printed it reversed), whether the unit is enrolled, and the label payload

@@ -453,6 +453,7 @@ void OtaManager::onCheckResult(JsonDocument &doc, int code)
         return;
     }
     _check5xx = 0;
+    Faults::clear(Fault::OTA_CHECK_FAILED); // the check answered
     if (code == 204 || !doc["release_id"].is<uint32_t>())
     {
         nothingOffered(purpose, doc);

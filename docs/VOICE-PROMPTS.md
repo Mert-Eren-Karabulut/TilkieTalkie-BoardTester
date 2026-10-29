@@ -47,7 +47,7 @@ Until the factory writes the cards, a missing pack could also be fetched from th
 | wifi_reset_hint | Kablosuz ağın değiştiyse iki ses tuşuna birlikte beş saniye basılı tut, sonra beni uygulamadan yeniden bağla. | right after wifi_lost | |
 | wifi_reset_done | Ağ ayarlarını sildim. Şimdi beni uygulamadan yeniden bağlayabilirsin. | volume buttons released after 5 s (forget WiFi, stories stay on the card), or after the 10 s customer reset / the `factory-reset` command | blocking, then restart |
 | idle_hello | Merhaba! Bir hikâye dinlemek için figürünü üzerime koy. | provisioned boot, no figure on the pins (3 s in) | |
-| nfc_read_trouble | Figürü okuyamadım. Lütfen kaldırıp yeniden yerleştir. | figure on the pins, no card read for 3 s | |
+| nfc_read_trouble | Figürü okuyamadım. Lütfen kaldırıp yeniden yerleştir. | figure on the pins, no card read for 3 s (also with a dead reader, 701) | 10 s |
 | figure_no_content | Bu figürde henüz hikâye yok. Hata kodu: Elma. | portal: figure without stories | |
 | figure_offline | Hikâyeleri şu an alamıyorum, internete bağlı değilim. Hata kodu: Armut. | portal unreachable and nothing cached | |
 | download_start | Yeni bir figür! Hikâyelerini indiriyorum, hazır olunca sana haber vereceğim. | nothing playable yet, downloads queued | |
@@ -86,7 +86,7 @@ column + show on the hub page).
 | karpuz | firmware update failed | update_failed |
 | kivi | online, but not linked to an account (add the toy in the app) | not_linked |
 | nar | the network wants a login page (captive portal), pick another one | setup_captive |
-| muz | SD card problem (reserved; the toy cannot speak without the card) | LED red |
+| muz | SD card problem (301 at boot, 307 pulled while running; the toy cannot speak without the card) | LED red, also while docked |
 
 ## Remote update: prompt packs
 
@@ -134,3 +134,11 @@ the Firmware page and assign it to the release(s); devices pick it up at their n
 A new prompt also needs an entry in the list in `src/VoicePrompts.h` (enum, file name) and a
 policy row in `VoicePrompts.cpp`; the embedded schema then requires it, and the portal refuses
 packs that lack the file.
+
+## Faults and the voice (2026-10-29)
+A fault's prompt is spoken whenever the fault is raised with `speak` (the default), subject
+only to the prompt's own minimum interval above; the 10-minute dedupe of the fault log never
+mutes it (it used to: a second empty figure or a second wrong password within 10 minutes was
+silent, and `download_failed` was never heard because a silent track-level raise always came
+first). `battery_low` (501) and `nfc_read_trouble` (702) are reachable again. An update that
+was only postponed (toy unplugged or under 15 %) is logged, not spoken as "update failed".

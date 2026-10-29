@@ -106,8 +106,7 @@ void serviceLowBatteryCutoff()
             {
                 ESP_LOGW(TAG, "LOW BATTERY %.3fV (<= %.2fV), on battery — protecting the cell.",
                          v, Policy::LOW_BATTERY_CUTOFF_V);
-                ledController.setMaxBrightness(255);
-                ledController.simpleLed(0xFF0000, 255); // brief red = empty
+                ledController.simpleLed(0xFF0000, 255); // brief red = empty (setMaxBrightness would persist 255 to NVS)
                 delay(800);
                 ledController.turnOff();
                 // INTERIM POLICY (until the ~33mA standby phantom drain is fixed):

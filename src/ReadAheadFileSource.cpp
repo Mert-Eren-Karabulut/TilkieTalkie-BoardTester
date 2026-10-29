@@ -2,6 +2,7 @@
 #include <SD_MMC.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include "FileManager.h"
 
 ReadAheadFileSource::ReadAheadFileSource(size_t ringBytes, size_t chunkBytes)
     : ringSize(ringBytes), chunkSize(chunkBytes) {}
@@ -69,6 +70,9 @@ void ReadAheadFileSource::readerLoop() {
         }
         int n = file.read(bounce, chunkSize);
         if (n <= 0) {
+            if (n < 0 || file.position() < fileSize) {
+                FileManager::getInstance().noteIoError(); // not the end of the file: the card is gone or failing
+            }
             eof = true;
             readerState.store(READER_IDLE);
             xSemaphoreGive(dataSem);

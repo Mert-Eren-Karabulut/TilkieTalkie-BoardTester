@@ -14,6 +14,7 @@ void deriveLedScene();
 void serviceUxPrompts();
 // Battery warnings on battery power: at 20 % and every 5 % below.
 void updateBatteryUx();
+void updatePeripheralHealth(); // SD card remount / loss, codec retry (NFC does its own in NfcController)
 // startFullSystem() on an unprovisioned boot: say the setup invitation now and repeat it
 // (every 90 s, up to 5 times) while nobody pairs.
 void startSetupWelcome();

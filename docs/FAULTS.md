@@ -52,6 +52,7 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 301 | SD_MOUNT_FAILED | critical | muz | card missing or unreadable at boot |
 | 302 | SD_WRITE_FAILED | error | muz | write or rename failed |
 | 303 | SD_FULL | error | muz | no space for a download |
+| 307 | SD_CARD_REMOVED | critical | muz | card went away while running (probe every 5 s / an I/O error); clears when the card is back and mounted again |
 | 304 | SD_FILE_CORRUPT | warning | | manifest / queue / pack json unreadable (recreated) |
 | 305 | SD_SLOW | info | | write stall above 3 s |
 | 306 | CARD_FOREIGN | info | | `/.device` on the card names another toy: its story cache was wiped (detail `prev=<uuid>`) |
@@ -77,7 +78,7 @@ silent on the toy), `error` (prompt if a fruit is mapped, badge in the admin), `
 | 606 | OTA_CRASH_LOOP_REVERT | critical | | crash-loop guard switched partitions |
 | 607 | PROMPT_PACK_FAILED | warning | | pack could not be downloaded |
 | 608 | PROMPT_PACK_ACTIVATE_FAILED | error | | staging could not be swapped in |
-| 701 | NFC_INIT_FAILED | error | | reader not found at boot |
+| 701 | NFC_INIT_FAILED | critical | | reader not answering: at boot, or three idle probes in a row; retried every 10 s, clears when it answers; red LED while active |
 | 702 | NFC_READ_TROUBLE | warning | | figure on the pins, no card read |
 | 703 | NFC_RESET | info | | reader watchdog reset |
 | 801 | WATCHDOG_RESET | error | | task watchdog reset |
@@ -115,11 +116,16 @@ connection or a "network not found" ends the streak.
 
 `Faults` (src/Faults.h/.cpp):
 
-- `Faults::raise(Fault code, const char *detail = nullptr)` – records the event (uptime,
-  boot sequence, short detail such as `uid=04-1F-…` or `http=404`), updates the active set
-  for persistent faults, speaks the mapped prompt through `VoicePrompts` (its policy still
-  decides when), sets the error LED scene for `critical`, and queues the event for the
-  portal. The same code is reported at most once per 10 minutes; repeats are counted.
+- `Faults::raise(Fault code, const char *detail = nullptr, bool speak = true)` – records the
+  event (uptime, boot sequence, short detail such as `uid=04-1F-…` or `http=404`), updates the
+  active set for persistent faults, speaks the prompt the speaker in main.cpp maps to the code
+  (the prompt's own minimum interval decides when; the 10-minute dedupe below is about the
+  event log and never mutes the voice), and queues the event for the portal. The LEDs follow
+  the active set: `deriveLedScene()` shows the steady red scene while a `critical` fault is
+  active, docked or not. The same code is logged at most once per 10 minutes; repeats are
+  counted. A raise before `Faults::begin()` (the dead-cell hold, the crash-loop guard) is kept
+  and applied once the stored ring is loaded. The active set holds 8 faults; a more severe
+  fault evicts the oldest less severe one.
 - `Faults::clear(Fault code)` – ends an active fault. A clear is **not** sent as an event: the
   portal learns it from the next `active` list (device report or events upload), which no
   longer contains the code. Each code declares how it clears: `event` (a point event, never

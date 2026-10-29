@@ -902,6 +902,19 @@ static void dispatch(String command)
     {
         Faults::printStatus();
     }
+#ifdef TT_BENCH
+    // fault <code> [silent] - raise a catalogue fault as if the firmware had (LED scene, voice,
+    // event log, portal upload); for exercising the feedback paths on the bench.
+    else if (command.startsWith("fault "))
+    {
+        String arg = command.substring(6);
+        arg.trim();
+        const bool silent = arg.endsWith("silent");
+        const int code = arg.toInt();
+        Faults::raise((Fault)code, "bench", !silent);
+        ESP_LOGI(TAG, "fault %d raised%s", code, silent ? " (silent)" : "");
+    }
+#endif
     else if (command.startsWith("diag"))
     {
         String arg = command.substring(4);

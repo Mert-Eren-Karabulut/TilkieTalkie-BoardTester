@@ -260,6 +260,7 @@ private:
     float currentVoltage;
     float currentPercentage;
     bool stateOfChargeValid = false;
+    uint8_t gaugeMissedPolls = 0;
     float currentTemperatureCelsius;
     uint32_t implausibleGaugeReads = 0;  // polls rejected by the plausibility check
     uint8_t rt6160MissCount = 0;          // consecutive failed presence probes

@@ -124,6 +124,10 @@ private:
     void handlePogoSwitch();
     void handleNFCReading();
     void reinitReader();
+    bool probeReader();                 // one getFirmwareVersion() (+ SAMConfig when it answers)
+    unsigned long lastHealthProbeAt = 0;
+    uint8_t healthProbeFailures = 0;
+    void serviceReaderHealth();         // update(): re-init a missing reader, notice a dead one
     void setDockedCard(const NFCData &data);
     void invalidateDockedCard();
 };

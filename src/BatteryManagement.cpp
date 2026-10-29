@@ -513,8 +513,14 @@ void BatteryManager::refreshBatteryState() {
 
     telemetryValid = gaugeUpdated || chargerUpdated;
     // The gauge poll sets the voltage and the state of charge itself; without a gauge the
-    // charger poll supplies the voltage (its VBAT ADC) and the state of charge is unknown.
-    stateOfChargeValid = gaugeUpdated;
+    // charger poll supplies the voltage (its VBAT ADC) and the state of charge is unknown. One
+    // missed poll (a bus collision with a console read) does not count: five in a row do.
+    if (gaugeUpdated) {
+        gaugeMissedPolls = 0;
+        stateOfChargeValid = true;
+    } else if (++gaugeMissedPolls >= 5) {
+        stateOfChargeValid = false;
+    }
     if (!telemetryValid) {
         currentVoltage = 0.0f;
         isCharging = false;

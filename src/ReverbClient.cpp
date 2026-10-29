@@ -448,6 +448,7 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
         else if (strcmp(event, "pusher_internal:subscription_succeeded") == 0)
         {
             ESP_LOGI(TAG, "Successfully subscribed to private channel");
+            Faults::clear(Fault::WS_AUTH_FAILED);
             _isPrivateSubscribed = true;
             _reportDue = true;
         }

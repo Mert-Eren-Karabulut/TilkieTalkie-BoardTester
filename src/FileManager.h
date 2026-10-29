@@ -263,6 +263,8 @@ private:
     std::vector<String> tmpKeep;            // "*.tmp" of queued downloads: kept for Range resume
     void sweepOrphanedTempFiles();          // maintenance task
     void sweepTrash();                      // maintenance task: erase /.trash
+    std::atomic<bool> ioError{false};
+    unsigned long lastCardProbeAt = 0;
     void checkDeviceMarker();               // begin(): /.device holds the uuid of the toy the cache belongs to
     bool cardWasForeign = false;
     void sweepTempDir(const String &dir, int depth, int &removed);
@@ -298,6 +300,16 @@ public:
 
     // Main update method (call regularly in loop)
     void update();
+
+    // Card presence at runtime (UxScenes updatePeripheralHealth): a reader task that hit an I/O
+    // error calls noteIoError(); checkCard() probes the card (a directory read, every 5 s or at
+    // once after an I/O error) and unmounts it when it is gone; tryRemount() runs the full
+    // begin() again while the card is missing. The faults (301 / 307) and the prompt pack are
+    // handled by the caller.
+    bool isCardMounted() const { return sdCardInitialized; }
+    void noteIoError() { ioError.store(true); }
+    bool checkCard();    // true while the card answers; false once it has been unmounted
+    bool tryRemount();   // true when the card is back and begin() succeeded
 
     // File management methods
     bool deleteFile(const String &path);                            // removes the file only (not its required-file entry)
