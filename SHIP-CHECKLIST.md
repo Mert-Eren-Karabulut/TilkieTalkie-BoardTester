@@ -325,7 +325,7 @@ recovery paths. Still open from the map: Armut ("not connected") is spoken for p
 while online (a new prompt would need a new pack); a card full (303) is silent; 502-507 are never
 raised; no card-detect pin, so "card out" is noticed by the 5 s probe. Console: `fault <code>`.
 
-## 1.3.15 built with voice pack faefcbd12031, publish pending (2026-10-29 night)
+## 1.3.15 on beta with voice pack faefcbd12031, superseded by 1.3.16 (2026-10-29 night)
 Fault feedback and recovery (the readiness pass above) plus the fruit-code prompts per failure
 category (docs/VOICE-PROMPTS.md "Error codes"): nfc_fault Çilek, battery_fault Ananas,
 account_fault Limon, portal_fault Şeftali, storage_full Erik, audio_fault Mandalina; not_linked
@@ -338,3 +338,10 @@ Bench: `fault 701 / 504 / 107` reach nfc_fault / battery_fault / account_fault (
 the old card, 404 reported with missing=6). The unplug tests: SD card out/in passed on batch 2;
 NFC board out turned red (the board carries the pogo pins, so "figure on a dead reader" cannot
 be tested on this hardware).
+Mert published 1.3.15 (release 25) and pack 3 "Yelda V3 (fault codes)"; the pack was still
+converting when the release was created, so it was paired afterwards (tinker). The demo unit's
+card got the new files by copy; tests with Mert: card out → red, back → cleared; NFC board out →
+red but no sentence (701 was still raised silently at runtime); fixed in 8749de3 (spoken at once,
+first reminder after a minute, then every 10 min) and confirmed: board back → "NFC reader is
+back", red gone. 1.3.16 (4d7618f, app sha c9dbc203…, USB sha 3560af46…) carries those two fixes
+and is the one to publish and promote; 1.3.15 stays on beta behind it.
