@@ -1,5 +1,6 @@
 #include "ConfigManager.h"
 #include "FileManager.h"
+#include <WiFi.h>
 #include "Faults.h"
 #include "PsramJson.h"
 #include "RequestManager.h"
@@ -317,6 +318,24 @@ bool FileManager::checkConnectivity() {
 void FileManager::update() {
     if (!sdCardInitialized) {
         return;
+    }
+
+    // WiFi modem sleep (the Arduino default) costs most of the throughput: a 4 MB story track
+    // ran at 1.5 Mbps with it on. Off while anything is downloading or queued, back on when the
+    // queue is empty. Re-asserted every 10 s while busy because the OTA path toggles it too.
+    {
+        const bool busy = downloadInProgress || !downloadQueue.empty();
+        const unsigned long now = millis();
+        if (busy && WiFi.isConnected() && (!wifiSleepOff || now - wifiSleepReassertAt > 10000UL)) {
+            WiFi.setSleep(false);
+            if (!wifiSleepOff) ESP_LOGI(TAG, "WiFi power save off for the downloads");
+            wifiSleepOff = true;
+            wifiSleepReassertAt = now;
+        } else if (!busy && wifiSleepOff) {
+            WiFi.setSleep(true);
+            wifiSleepOff = false;
+            ESP_LOGI(TAG, "downloads done - WiFi power save back on");
+        }
     }
 
     // Completion of an in-flight download is handled here, on the loop task (owner of the

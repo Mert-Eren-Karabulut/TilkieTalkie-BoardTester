@@ -172,6 +172,8 @@ private:
     // Private members
     bool sdCardInitialized;
     bool downloadInProgress;
+    bool wifiSleepOff = false;          // WiFi modem sleep is off while downloads run (update())
+    unsigned long wifiSleepReassertAt = 0;
     AsyncDownloadState asyncState;
     std::vector<DownloadTask> downloadQueue;
     std::vector<FileEntry> requiredFiles;
