@@ -203,11 +203,16 @@ void serviceUxPrompts()
     // 10 min; the prompt policy keeps it from stacking. Card faults cannot be spoken anyway.
     {
         static unsigned long lastReminder = 0;
-        if (Faults::hasActive(Severity::CRITICAL) && millis() - lastReminder > 600000UL)
+        static bool wasCritical = false;
+        const bool critical = Faults::hasActive(Severity::CRITICAL);
+        if (critical && (!wasCritical || millis() - lastReminder > 600000UL))
         {
-            lastReminder = millis();
-            Faults::remindActive();
+            // the raise itself spoke once; the first reminder comes a minute later (in case the
+            // sentence was dropped behind a story), then every 10 min while the fault stays
+            lastReminder = wasCritical ? millis() : millis() - 540000UL;
+            if (wasCritical) Faults::remindActive();
         }
+        wasCritical = critical;
     }
     if (gSystemPhase != PHASE_RUNNING)
     {

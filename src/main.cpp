@@ -719,7 +719,7 @@ void startFullSystem()
     }
     else
     {
-        Faults::raise(Fault::NFC_INIT_FAILED, "boot", false);
+        Faults::raise(Fault::NFC_INIT_FAILED, "boot"); // spoken: nfc_fault (Çilek); audio is up by now
         ESP_LOGE(TAG, "NFC reader not answering at boot - red until it does (retried every 10 s)");
     }
 

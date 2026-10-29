@@ -362,7 +362,7 @@ void NfcController::serviceReaderHealth()
     }
     nfcReady = false;
     ESP_LOGE(TAG, "NFC reader stopped answering");
-    Faults::raise(Fault::NFC_INIT_FAILED, "runtime", false);
+    Faults::raise(Fault::NFC_INIT_FAILED, "runtime"); // spoken: nfc_fault (Çilek)
 }
 
 void NfcController::reinitReader()
