@@ -6,6 +6,8 @@
 #include "FileManager.h"
 #include "Buttons.h"
 #include "NfcController.h"
+#include "WiFiProvisioning.h"
+#include "SystemState.h"
 #include <esp_log.h>
 #include <driver/gpio.h>
 
@@ -85,13 +87,27 @@ void SleepController::end() {
 void SleepController::configureWakeupSources() {
     // Configure ext1 wake-up for multiple GPIO pins (any button press or pogo engage)
     // Use ESP_EXT1_WAKEUP_ANY_HIGH because buttons read HIGH when pressed
+    // ANY_HIGH wakes at once on a pin that is already high: a figure left on the pins, a pogo
+    // line floating because the NFC board is unplugged, or a stuck button would turn sleep into
+    // a wake / hello / sleep loop on battery. Pins that read high now stay out of the mask
+    // (the toy then wakes on the other buttons, or on USB).
     uint64_t buttonMask = 0;
-
     for (int i = 0; i < 4; i++) {
+        if (gpio_get_level(WAKEUP_BUTTON_PINS[i])) {
+            ESP_LOGW(TAG, "button on GPIO%d is high at sleep - not a wake source this time", (int)WAKEUP_BUTTON_PINS[i]);
+            continue;
+        }
         buttonMask |= (1ULL << WAKEUP_BUTTON_PINS[i]);
     }
-
-    buttonMask |= (1ULL << WAKEUP_POGO_PIN);
+    const bool pogoHigh = gpio_get_level(WAKEUP_POGO_PIN);
+    if (pogoHigh || !NfcController::getInstance().isReaderReady()) {
+        ESP_LOGW(TAG, "pogo pin %s - not a wake source this time", pogoHigh ? "high (figure left on, or board unplugged)" : "without a reader");
+    } else {
+        buttonMask |= (1ULL << WAKEUP_POGO_PIN);
+    }
+    if (buttonMask == 0) {
+        buttonMask = 1ULL << WAKEUP_BUTTON_PINS[0]; // never sleep with no wake source at all
+    }
 
     esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ANY_HIGH);
 
@@ -154,6 +170,16 @@ bool SleepController::canEnterSleep() {
         return false;
     }
     
+    // Pairing in progress (BLE provisioning advertising): a parent working through the app
+    // must not find the toy asleep after 5 min. Bounded to 20 min after the full start so an
+    // unpaired toy left on a shelf still sleeps.
+    if (WiFiProvisioningManager::getInstance().isProvisioningManagerActive()
+        && millis() - gFullSystemStartedAt < 20UL * 60UL * 1000UL) {
+        blockedReason = "pairing in progress";
+        lastCheckResult = false;
+        return false;
+    }
+
     // Check audio state (0=STOPPED, 1=PLAYING, 2=PAUSED)
     // Only prevent sleep if audio is actively playing
     if (audio.getState() == 1) { // PLAYING

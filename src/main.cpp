@@ -432,7 +432,8 @@ void setup()
         case Fault::WIFI_AUTH_FAILED: prompts.say(Prompt::SETUP_FAILED); break;
         case Fault::WIFI_NO_LINK: prompts.say(Prompt::WIFI_LOST); prompts.say(Prompt::WIFI_RESET_HINT); break;
         case Fault::FIGURE_UNKNOWN:
-        case Fault::FIGURE_NO_CONTENT: prompts.say(Prompt::FIGURE_NO_CONTENT); break;
+        case Fault::FIGURE_NO_CONTENT:
+        case Fault::MANIFEST_INVALID: prompts.say(Prompt::FIGURE_NO_CONTENT); break; // a broken manifest is "no stories" to the child
         case Fault::FIGURE_OFFLINE: prompts.say(Prompt::FIGURE_OFFLINE); break;
         case Fault::DOWNLOAD_FAILED: prompts.say(Prompt::DOWNLOAD_FAILED); break;
         case Fault::OTA_DOWNLOAD_FAILED:

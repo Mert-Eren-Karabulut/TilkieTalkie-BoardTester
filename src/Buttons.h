@@ -95,6 +95,7 @@ private:
         bool isHolding = false;
         bool singleClickPending = false;
         bool processed = false;
+        bool heldSinceBoot = false; // high at begin(): ignored until released once (stuck or held button, floating pin)
     };
 
     ButtonState buttons[MAX_BUTTONS];

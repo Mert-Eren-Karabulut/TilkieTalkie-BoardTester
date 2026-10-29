@@ -53,6 +53,7 @@ public:
     void update();
     void diagnostics();
     bool powerDown();
+    bool isReaderReady() const { return nfcReady; }
 
     // Callback setters
     void setAfterNFCReadCallback(std::function<void(const NFCData &)> cb);

@@ -18,9 +18,18 @@ void ButtonController::begin() {
         
         // Initialize button states
         buttons[i] = ButtonState();
-        buttons[i].currentState = readButtonRaw(static_cast<ButtonId>(i));
-        buttons[i].lastState = buttons[i].currentState;
-        buttons[i].debounceState = buttons[i].currentState;
+        // A button that is already high at power-up (held, stuck, or a floating pin without
+        // its board) must not count as a press, let alone as the start of the 1+4 / 2+3 combos
+        // (a held 2+3 restarted the toy in a loop, a held 1+4 ran the customer reset). It is
+        // ignored until it has been seen released once.
+        buttons[i].heldSinceBoot = readButtonRaw(static_cast<ButtonId>(i));
+        if (buttons[i].heldSinceBoot)
+        {
+            ESP_LOGW(TAG, "button %d is high at boot - ignored until released", i + 1);
+        }
+        buttons[i].currentState = false;
+        buttons[i].lastState = false;
+        buttons[i].debounceState = false;
     }
 
     // Note: Using polling instead of interrupts for better reliability across all GPIO pins
@@ -88,6 +97,14 @@ void ButtonController::updateButton(ButtonId button) {
     ButtonState& btn = buttons[button];
 
     bool currentReading = readButtonRaw(button);
+    if (btn.heldSinceBoot)
+    {
+        if (!currentReading)
+        {
+            btn.heldSinceBoot = false; // released once: a real button from now on
+        }
+        currentReading = false;
+    }
     
     // Debounce logic
     if (currentReading != btn.lastState) {
