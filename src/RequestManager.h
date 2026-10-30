@@ -129,6 +129,10 @@ public:
     LinkState linkState() const { return linkStateValue; }
     // Customer reset: POST /hubs/{uuid}/unbind with the device token, 3 s, skipped offline.
     bool unbindBestEffort();
+    // A radio reset must not pull the WiFi driver from under an HTTPS exchange (lwIP freed a packet
+    // through a dangling pointer, core 0 panic 2026-10-30): the caller holds the HTTP lock meanwhile.
+    bool lockHttp(uint32_t timeoutMs);
+    void unlockHttp();
     void forgetToken();                      // RAM copy (the caller clears NVS)
 
     void getCheckFigureTracks(const String &uid); // Method to fetch figure tracks

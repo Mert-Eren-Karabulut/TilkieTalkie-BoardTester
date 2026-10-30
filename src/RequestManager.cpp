@@ -247,6 +247,16 @@ JsonDocument RequestManager::parseResponse(const String& response)
 
 // One HTTP exchange. Serialized by httpLock: the synchronous API runs it on the caller (boot,
 // token refresh), the asynchronous API on the request worker task - never two at once.
+bool RequestManager::lockHttp(uint32_t timeoutMs)
+{
+    return httpLock && xSemaphoreTakeRecursive(httpLock, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+void RequestManager::unlockHttp()
+{
+    if (httpLock) xSemaphoreGiveRecursive(httpLock);
+}
+
 int RequestManager::performHttp(const String& endpoint, const String& method, const String* payload, String& body, String& error,
                                 const String& ifNoneMatch, int* retryAfterS)
 {

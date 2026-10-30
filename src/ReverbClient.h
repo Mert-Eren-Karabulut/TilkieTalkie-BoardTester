@@ -50,6 +50,9 @@ public:
     static void queueDeviceFiles(const String &innerJson);
     // Reports every `seconds` (2..60) for the next two minutes (the portal asks while a page is open).
     void setReportInterval(uint32_t seconds);
+    // Hold the socket task between iterations (radio reset): bounded wait, false when it is busy.
+    bool pauseSocket(uint32_t timeoutMs);
+    void resumeSocket();
 
     // Child-facing error code of the last problem (fruit names, see docs/VOICE-PROMPTS.md), sent in reports.
     static void setLastError(const char *code);

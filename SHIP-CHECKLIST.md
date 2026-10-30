@@ -422,3 +422,15 @@ free-space scan runs on sd_maint; fault saves to flash are debounced (errors at 
 story + 4 MB download at 4.4 Mbps, socket subscribed throughout, reverb section ≤ 16 ms, worst
 loop gap 250 ms (the figure tap's manifest work), reverb task 5 % CPU, 4 KB stack spare.
 Also in this build: battery current / VBUS / charger state in the report, 1 s reports on request.
+Then, during the command test with Mert (volume, seek, pause, next over the socket: "nice and
+fast"), the toy crashed: core dump = the request worker inside an HTTPS read when a radio reset
+("portal unreachable for 10 min", fired although the socket was connected) deinitialised the WiFi
+driver under it (lwIP `pbuf_free` through a dangling pointer). Fixed: the health check never
+resets while the socket is connected (and logs its numbers when it fires); `resetRadio()` first
+pauses the socket task and takes the HTTP lock (docs/RUNTIME.md "Radio reset"). 15-minute run
+after the fix: no reset, no crash, no drop, loop gaps ≤ 66 ms during playback.
+
+## 1.3.20 on beta (2026-10-30)
+The WebSocket task, the loop-side blocking fixes, the radio-reset guard, battery current / VBUS /
+charger state in the report with 1 s reports while the hub page is open. Beta first: a task
+refactor soaks on the demo unit before it goes to stable.

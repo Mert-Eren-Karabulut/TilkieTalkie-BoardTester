@@ -1,4 +1,6 @@
 #include "WiFiProvisioning.h"
+#include "RequestManager.h"
+#include "ReverbClient.h"
 #include "Faults.h"
 #include "OtaManager.h"
 #include <esp_bt.h>
@@ -600,10 +602,21 @@ bool WiFiProvisioningManager::resetRadio(const char *why) {
     }
     ESP_LOGW(TAG, "radio reset (%s)", why);
     Faults::raise(Fault::WIFI_RADIO_RESET, why);
+    // Nobody may be inside a socket read while the driver goes away: the WebSocket task between
+    // iterations, the HTTP worker between requests (its requests time out in 8 s).
+    ReverbClient &reverb = ReverbClient::getInstance();
+    const bool socketHeld = reverb.pauseSocket(3000);
+    const bool httpHeld = RequestManager::getInstance().lockHttp(12000);
+    if (!socketHeld || !httpHeld) {
+        ESP_LOGW(TAG, "radio reset: %s still busy, going ahead anyway", socketHeld ? "HTTP worker" : "WebSocket task");
+    }
+    if (socketHeld) reverb.disconnect();
     WiFi.disconnect(true, false); // radio off, credentials kept
     WiFi.mode(WIFI_OFF);
     delay(200);
     WiFi.mode(WIFI_STA);
+    if (httpHeld) RequestManager::getInstance().unlockHttp();
+    if (socketHeld) reverb.resumeSocket();
     const String ssid = config.getWiFiSSID();
     const String pass = config.getWiFiPassword();
     if (ssid.length() > 0) {

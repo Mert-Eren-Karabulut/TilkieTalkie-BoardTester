@@ -1227,6 +1227,16 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
     }
 }
 
+bool ReverbClient::pauseSocket(uint32_t timeoutMs)
+{
+    return _wsLock && xSemaphoreTakeRecursive(_wsLock, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+}
+
+void ReverbClient::resumeSocket()
+{
+    if (_wsLock) xSemaphoreGiveRecursive(_wsLock);
+}
+
 void ReverbClient::setReportInterval(uint32_t seconds)
 {
     if (seconds < 1) seconds = 1;

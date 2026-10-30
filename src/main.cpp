@@ -983,11 +983,16 @@ static void serviceNetworkHealth()
         return; // a captive network is "offline": no radio reset for it
     }
     const unsigned long now = millis();
+    if (reverb.isConnected())
+    {
+        return; // the socket is up: whatever the bookkeeping says, the portal is reachable
+    }
     const unsigned long last = reverb.lastConnectedAt();
     const unsigned long ref = last ? last : gFullSystemStartedAt;
     if (now - ref > 10UL * 60UL * 1000UL && now - lastReset > 10UL * 60UL * 1000UL)
     {
         lastReset = now;
+        ESP_LOGW(TAG, "NET: no WebSocket for %lu s (last connected at %lu s, now %lu s)", (now - ref) / 1000, last / 1000, now / 1000);
         wifiProv.resetRadio("link up but the portal has been unreachable for 10 min");
     }
 }

@@ -62,3 +62,14 @@ socket subscribed throughout, LED frame gap ≤ 60 ms.
 No `delay()` over a few ms, no synchronous HTTP/TLS, no `SD_MMC.open` in a per-pass path, no
 NVS write in a per-pass path, no `portMAX_DELAY` on a mutex another task holds across I/O. If
 it must wait, give it a task and a queue.
+
+## Radio reset
+`WiFiProvisioningManager::resetRadio()` turns the WiFi driver off and on. It must never run
+while a task is inside a socket read: the request worker crashed in `pbuf_free` through a
+dangling pointer when the driver was deinitialised under its HTTPS exchange (core dump,
+2026-10-30). The reset therefore first pauses the WebSocket task (`ReverbClient::pauseSocket`,
+3 s) and takes the request manager's HTTP lock (`lockHttp`, 12 s: a request times out in 8 s),
+disconnects the socket, and only then touches the driver. The health check in main.cpp never
+resets while the socket is connected. To read a crash: `esptool read_flash 0xfe0000 0x9000
+core.bin`, then `espcoredump.py --chip esp32s3 info_corefile -t raw -c core.bin
+.pio/build/<env>/firmware.elf` with `tool-xtensa-esp-elf-gdb/bin` on the PATH.
