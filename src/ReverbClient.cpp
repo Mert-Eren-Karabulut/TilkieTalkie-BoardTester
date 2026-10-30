@@ -578,6 +578,7 @@ void ReverbClient::sendDeviceReport(bool force)
     unsigned long now = millis();
     bool changed = (_lastReportSignature != signatureStr) ||
                    fabsf(batteryPercent - _lastReportedPercent) >= 2.0f ||
+                   abs(battery.getBatteryCurrentMilliAmps() - _lastReportedCurrentMa) >= 150 ||
                    fabsf(batteryVoltage - _lastReportedVoltage) >= 0.10f ||
                    abs(wifiRSSI - _lastReportedRssi) >= 10 ||
                    sdFreeSpace != _lastReportedSdFree;
@@ -610,7 +611,10 @@ void ReverbClient::sendDeviceReport(bool force)
                            "\"battery\":{"
                            "\"status\":\"%s\","
                            "\"percent\":%.1f,"
-                           "\"voltage\":%.2f"
+                           "\"voltage\":%.2f,"
+                           "\"current_ma\":%d,"
+                           "\"vbus_mv\":%u,"
+                           "\"charger\":\"%s\""
                            "},"
                            "\"files\":{"
                            "\"status\":\"%s\","
@@ -647,6 +651,9 @@ void ReverbClient::sendDeviceReport(bool force)
                            isCharging ? "charging" : "discharging",
                            batteryPercent,
                            batteryVoltage,
+                           battery.getBatteryCurrentMilliAmps(),
+                           (unsigned)(battery.getVbusVoltage() * 1000.0f),
+                           battery.getChargeStateName(),
                            isFileSyncing ? "syncing" : "in_sync",
                            sdFreeSpace,
                            wifiRSSI,
@@ -682,6 +689,7 @@ void ReverbClient::sendDeviceReport(bool force)
         _lastPositionReportAt = now;
         _lastReportSignature = signatureStr;
         _lastReportedPercent = batteryPercent;
+        _lastReportedCurrentMa = battery.getBatteryCurrentMilliAmps();
         _lastReportedVoltage = batteryVoltage;
         _lastReportedRssi = wifiRSSI;
         _lastReportedSdFree = sdFreeSpace;
@@ -1086,7 +1094,7 @@ void ReverbClient::executeCommand(const String &type, const String &value, bool 
 
 void ReverbClient::setReportInterval(uint32_t seconds)
 {
-    if (seconds < 2) seconds = 2;
+    if (seconds < 1) seconds = 1;
     if (seconds > 60) seconds = 60;
     _fastReportMs = seconds * 1000UL;
     _fastReportUntil = millis() + 120000UL;

@@ -90,6 +90,7 @@ private:
     String _lastReportSignature;
     unsigned long _lastConnectedAt = 0;
     float _lastReportedPercent = -100.0f;
+    int _lastReportedCurrentMa = 0;
     float _lastReportedVoltage = 0.0f;
     int _lastReportedRssi = 0;
     uint32_t _lastReportedSdFree = 0;
