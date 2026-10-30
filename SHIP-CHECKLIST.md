@@ -397,3 +397,14 @@ mandatory on Mert's word (he watches his colleague's unit take it): release with
 paired, 2 hubs nudged, flash manifest 1.3.18 (portal ab15b6c). Mandatory means the toy
 installs after an hour on the dock even with a figure on or a story playing; the normal polite
 gate applies in that first hour. App sha e6384ff4…, USB sha b7a5158d….
+
+## 1.3.19 on stable, mandatory (2026-10-30)
+TT26-00001 sat online, docked and idle on 1.3.17 ignoring the mandatory 1.3.18, the pin and the
+nudge: a station session (`ft begin`) left open after the restore (no `ft ship`) holds every
+update check and mutes the prompts for the whole boot; a restart from the hub page fixed that
+unit (then 1.3.18 in 25 s). 6ba0e32: a session with no `ft` line for 10 min, or 30 s without
+USB, ends by itself (bench: `ft begin`, idle, "ended by itself" at 10 min, checks back).
+920024e: the first check after an update boot comes 20-30 s in (the hub page showed the prompt
+pack as "unknown" until the old 90-120 s check). `ota` prints the pack state. Published
+straight to stable as mandatory on Mert's word, pack #3 paired, 2 hubs nudged, flash manifest
+1.3.19 (portal 1d92dca). App sha 6ad016cb…, USB sha 5e16b46d….
