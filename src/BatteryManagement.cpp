@@ -2370,13 +2370,47 @@ bool BatteryManager::updateChargerMeasurements(bool full) {
     }
 
     // --- Per-second: live status, faults and ADC results ---
-    bool ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_0_REGISTER, chargerStatus0);
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_1_REGISTER, chargerStatus1) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_2_REGISTER, chargerStatus2) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_3_REGISTER, chargerStatus3) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_4_REGISTER, chargerStatus4) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_STATUS_0_REGISTER, chargerFaultStatus0) && ok;
-    ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_STATUS_1_REGISTER, chargerFaultStatus1) && ok;
+    // Read into temporaries and commit only when every read succeeded: a failed bit-banged read
+    // used to leave garbage in chargerStatus0, and a VBUS_PRESENT bit read as 0 for one poll was
+    // taken for an unplug (plug/unplug tones every 10-25 min on a docked, full toy, 2026-10-30;
+    // the charger's own latched flags showed no VBUS change).
+    uint8_t s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, f0 = 0, f1 = 0;
+    bool ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_0_REGISTER, s0);
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_1_REGISTER, s1) && ok;
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_2_REGISTER, s2) && ok;
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_3_REGISTER, s3) && ok;
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_STATUS_4_REGISTER, s4) && ok;
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_STATUS_0_REGISTER, f0) && ok;
+    ok = readRegister8(BQ25792_ADDRESS, BQ25792_FAULT_STATUS_1_REGISTER, f1) && ok;
+    if (!ok) {
+        chargerPollFailures++;
+        if (chargerPollFailures <= 5 || (chargerPollFailures % 50) == 0) {
+            ESP_LOGW(TAG, "charger poll failed (#%u), previous status kept", (unsigned)chargerPollFailures);
+        }
+        return false;
+    }
+    // The VBUS bit must agree on two consecutive polls before anyone acts on it.
+    const bool vbusNow = (s0 & 0x01) != 0;
+    const bool vbusBefore = (chargerStatus0 & 0x01) != 0;
+    if (vbusNow != vbusBefore) {
+        if (!vbusEdgePending) {
+            vbusEdgePending = true;
+            ESP_LOGW(TAG, "charger VBUS_PRESENT %d -> %d (status0 0x%02X, VBUS ADC %.2f V) - waiting for the next poll to agree",
+                     vbusBefore ? 1 : 0, vbusNow ? 1 : 0, s0, currentVbusVoltage);
+            s0 = (uint8_t)((s0 & ~0x01) | (chargerStatus0 & 0x01)); // keep the old bit this poll
+        } else {
+            vbusEdgePending = false; // two polls agree: a real edge
+        }
+    } else {
+        vbusEdgePending = false;
+    }
+    chargerStatus0 = s0;
+    chargerStatus1 = s1;
+    chargerStatus2 = s2;
+    chargerStatus3 = s3;
+    chargerStatus4 = s4;
+    chargerFaultStatus0 = f0;
+    chargerFaultStatus1 = f1;
 
     if (full) {
         // --- Slow: sticky flags (clear-on-read, accumulated into *History) and config registers ---
