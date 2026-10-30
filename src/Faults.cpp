@@ -493,7 +493,9 @@ void Faults::raise(Fault f, const char *detail, bool speak)
     // (the prompt's own minimum interval throttles it; VoicePrompts.cpp). The speaker decides
     // which faults have a sentence; the fruit word is only the log's name for it.
     if (speak && g_speaker) g_speaker(f);
-    if (g_dirty && !repeat) save();
+    // Errors and worse go to flash at once (a crash right after must not lose them); the rest
+    // is saved by update() (every 30 s while dirty): an NVS write stalls both cores' caches.
+    if (g_dirty && !repeat && fi.severity >= Severity::ERROR) save();
 }
 
 void Faults::clear(Fault f)
@@ -531,7 +533,8 @@ void Faults::update()
         g_rtcMagic = RTC_MAGIC;
         g_rtcUptimeS = uptimeS();
     }
-    if (g_dirty && !g_uploading) save();
+    static unsigned long lastSave = 0;
+    if (g_dirty && !g_uploading && now - lastSave > 30000UL) { lastSave = now; save(); }
     if (g_uploadAt && !g_uploading && (long)(now - g_uploadAt) >= 0) upload();
 }
 

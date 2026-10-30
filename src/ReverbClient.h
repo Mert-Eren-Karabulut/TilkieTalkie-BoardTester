@@ -6,6 +6,9 @@
 #include <WebSocketsClient.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <atomic>
 #include <ArduinoJson.h>
 
 class ReverbClient
@@ -29,6 +32,11 @@ public:
         bool useTls = true,
         const char *apiOrigin = nullptr);
 
+    // update() runs on the loop task: it hands the commands, chat messages and fault flags the
+    // WebSocket task received over to their owners (audio, RequestManager, Faults) and builds the
+    // device report. The socket itself (frames, keepalive pings, TLS reconnects, the channel auth
+    // HTTPS) lives on its own task ("reverb", core 0), so a loop stall never drops the connection
+    // and a slow handshake never stalls the loop.
     void update();
     void cleanup();
     bool isConnected();
@@ -74,11 +82,23 @@ private:
     bool _useTls = true;
     String _apiOrigin;
     std::function<void(const String &)> _chatCb;
-    bool _isConnected = false;
-    bool _isPrivateSubscribed = false;
-    bool _initialized = false;
+    std::atomic<bool> _isConnected{false};
+    std::atomic<bool> _isPrivateSubscribed{false};
+    std::atomic<bool> _initialized{false};
     bool _wsStarted = false;
     bool _pendingSubscribe = false;
+    // ---- the WebSocket task and the hand-offs between it and the loop ----
+    TaskHandle_t _task = nullptr;
+    SemaphoreHandle_t _wsLock = nullptr;        // recursive: the task's iteration, and the loop's disconnect/cleanup
+    struct Handoff { String *type; String *value; bool hasValue; }; // a command (type) or a chat message (type == nullptr)
+    QueueHandle_t _inbox = nullptr;             // task -> loop: commands and chat messages
+    std::atomic<uint8_t> _deferredFaults{0};    // task -> loop: 1 WS_DISCONNECTED, 2 WS_AUTH_FAILED (code in _deferredAuthCode), 4 clear WS_AUTH_FAILED
+    std::atomic<int> _deferredAuthCode{0};
+    std::atomic<size_t> _reportLen{0};          // loop -> task: a report waiting in reportBuffer
+    static char *reportBuffer;
+    static void taskEntry(void *arg);
+    void taskIteration();
+    void ensureTask();
     unsigned long _subscribeRetryAt = 0;
     uint8_t _subscribeFailures = 0;
     unsigned long _reconnectDelayMs = 2000;
@@ -94,7 +114,7 @@ private:
     float _lastReportedVoltage = 0.0f;
     int _lastReportedRssi = 0;
     uint32_t _lastReportedSdFree = 0;
-    bool _reportDue = false;
+    std::atomic<bool> _reportDue{false};
     unsigned long _lastReportEvalAt = 0;     // the report state is gathered at most once a second
     unsigned long _lastOverflowLogAt = 0;
     unsigned long _fastReportMs = 0;

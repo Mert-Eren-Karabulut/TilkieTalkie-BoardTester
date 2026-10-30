@@ -55,6 +55,7 @@ static String jsonEscape(const String &in)
 
 // Define static members
 char *ReverbClient::jsonBuffer = nullptr;
+char *ReverbClient::reportBuffer = nullptr;
 char ReverbClient::urlBuffer[128];
 char ReverbClient::headerBuffer[256];
 char ReverbClient::channelBuffer[64];
@@ -100,6 +101,18 @@ void ReverbClient::begin(const char *host, uint16_t port, const char *appKey, co
             jsonBuffer = static_cast<char *>(malloc(JSON_BUFFER_LEN));
         }
     }
+    if (!reportBuffer)
+    {
+        reportBuffer = static_cast<char *>(heap_caps_malloc(JSON_BUFFER_LEN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
+    if (!_wsLock)
+    {
+        _wsLock = xSemaphoreCreateRecursiveMutex();
+    }
+    if (!_inbox)
+    {
+        _inbox = xQueueCreate(16, sizeof(Handoff));
+    }
 
     // HTTP client for /broadcasting/auth and chat: TLS or plain depending on the API origin.
     if (!_httpClient)
@@ -134,7 +147,38 @@ void ReverbClient::begin(const char *host, uint16_t port, const char *appKey, co
     // Start connection if WiFi is already available
     if (WiFi.isConnected())
     {
+        xSemaphoreTakeRecursive(_wsLock, portMAX_DELAY);
         startWebSocket();
+        xSemaphoreGiveRecursive(_wsLock);
+    }
+}
+
+void ReverbClient::taskEntry(void *arg)
+{
+    ReverbClient *self = static_cast<ReverbClient *>(arg);
+    for (;;)
+    {
+        self->taskIteration();
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void ReverbClient::ensureTask()
+{
+    if (_task || !_wsLock)
+    {
+        return;
+    }
+    // Core 0 (WiFi / lwIP live there, the audio decoder does not), above the request worker (4)
+    // so a queued HTTPS job never delays a keepalive pong. 12 KB: TLS handshakes run here.
+    if (xTaskCreatePinnedToCore(taskEntry, "reverb", 12288, this, 5, &_task, 0) != pdPASS)
+    {
+        _task = nullptr;
+        ESP_LOGE(TAG, "WebSocket task could not be created - serviced from the loop");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "WebSocket task started (core 0, prio 5)");
     }
 }
 
@@ -154,8 +198,13 @@ void ReverbClient::startWebSocket()
     }
 }
 
-void ReverbClient::update()
+void ReverbClient::taskIteration()
 {
+    if (!_initialized)
+    {
+        return;
+    }
+    xSemaphoreTakeRecursive(_wsLock, portMAX_DELAY);
     // Handle WiFi state changes
     if (!WiFi.isConnected())
     {
@@ -171,11 +220,12 @@ void ReverbClient::update()
             _pendingSubscribe = false;
             _wsStarted = false;
         }
+        xSemaphoreGiveRecursive(_wsLock);
         return;
     }
 
     // WiFi is connected - start WebSocket if not already started
-    if (!_wsStarted && _initialized)
+    if (!_wsStarted && _initialized && _ws)
     {
         ESP_LOGI(TAG, "Starting WebSocket connection");
         startWebSocket();
@@ -187,13 +237,72 @@ void ReverbClient::update()
     {
         _ws->loop();
         drainOutbox();
+        // The report the loop built: one send per iteration.
+        const size_t len = _reportLen.load();
+        if (len && _isConnected)
+        {
+            if (!_ws->sendTXT(reportBuffer, len))
+            {
+                ESP_LOGW(TAG, "device report not sent (socket busy)");
+            }
+            _reportLen = 0;
+        }
+        else if (len && !_isConnected)
+        {
+            _reportLen = 0; // stale: the loop builds a fresh one once we are back
+        }
     }
 
     serviceSubscription();
 
-    if (isConnected())
+    if (_isConnected)
     {
         _lastConnectedAt = millis();
+    }
+    xSemaphoreGiveRecursive(_wsLock);
+}
+
+void ReverbClient::update()
+{
+    ensureTask();
+    if (!_task)
+    {
+        taskIteration(); // no task (allocation failed): the old loop-driven service
+    }
+    // Hand-offs from the WebSocket task: commands touch audio / RequestManager / Faults, which
+    // belong to the loop task.
+    Handoff h;
+    while (_inbox && xQueueReceive(_inbox, &h, 0) == pdTRUE)
+    {
+        if (h.type)
+        {
+            executeCommand(*h.type, h.value ? *h.value : String(), h.hasValue);
+        }
+        else if (h.value && _chatCb)
+        {
+            ESP_LOGI(TAG, "Received chat message: %s", h.value->c_str());
+            _chatCb(*h.value);
+        }
+        delete h.type;
+        delete h.value;
+    }
+    const uint8_t deferred = _deferredFaults.exchange(0);
+    if (deferred & 1)
+    {
+        Faults::raise(Fault::WS_DISCONNECTED, nullptr, false); // a real drop, not a failed reconnect; counted by the dedupe
+    }
+    if (deferred & 2)
+    {
+        char d[16];
+        snprintf(d, sizeof(d), "http=%d", _deferredAuthCode.load());
+        Faults::raise(Fault::WS_AUTH_FAILED, d);
+    }
+    if (deferred & 4)
+    {
+        Faults::clear(Fault::WS_AUTH_FAILED);
+    }
+    if (isConnected())
+    {
         sendDeviceReport(false);
     }
 }
@@ -222,9 +331,8 @@ void ReverbClient::serviceSubscription()
     ESP_LOGW(TAG, "channel auth failed (HTTP %d), retry in %lu s", code, delayMs / 1000);
     if (code == 401 || code == 403)
     {
-        char d[16];
-        snprintf(d, sizeof(d), "http=%d", code);
-        Faults::raise(Fault::WS_AUTH_FAILED, d);
+        _deferredAuthCode = code;
+        _deferredFaults |= 2; // raised on the loop task
     }
 
     // 401/403 means the token is bad; a backend that answers 419/5xx twice in a row to the same
@@ -278,34 +386,40 @@ String ReverbClient::getConnectionStatus()
 void ReverbClient::disconnect()
 {
     ESP_LOGI(TAG, "Manual disconnect requested");
+    if (_wsLock) xSemaphoreTakeRecursive(_wsLock, portMAX_DELAY);
     if (_ws)
     {
         _ws->disconnect();
     }
     _isConnected = false;
     _wsStarted = false;
+    if (_wsLock) xSemaphoreGiveRecursive(_wsLock);
 }
 
 void ReverbClient::forceReconnect()
 {
     ESP_LOGI(TAG, "Force reconnection requested");
+    if (_wsLock) xSemaphoreTakeRecursive(_wsLock, portMAX_DELAY);
     disconnect();
 
-    if (WiFi.isConnected() && _initialized)
+    if (WiFi.isConnected() && _initialized && _ws)
     {
         ESP_LOGI(TAG, "Restarting WebSocket connection");
         startWebSocket();
         _wsStarted = true;
     }
+    if (_wsLock) xSemaphoreGiveRecursive(_wsLock);
 }
 
 void ReverbClient::cleanup()
 {
     ESP_LOGI(TAG, "Cleaning up resources");
 
+    if (_wsLock) xSemaphoreTakeRecursive(_wsLock, portMAX_DELAY);
     _initialized = false;
     _isConnected = false;
     _wsStarted = false;
+    _reportLen = 0;
 
     if (_ws)
     {
@@ -319,10 +433,12 @@ void ReverbClient::cleanup()
         if (_httpSecure) { delete static_cast<WiFiClientSecure *>(_httpClient); } else { delete _httpClient; }
         _httpClient = nullptr;
     }
+    if (_wsLock) xSemaphoreGiveRecursive(_wsLock);
 }
 
 bool ReverbClient::sendMessage(const String &text)
 {
+    struct Guard { SemaphoreHandle_t m; Guard(SemaphoreHandle_t l) : m(l) { if (m) xSemaphoreTakeRecursive(m, portMAX_DELAY); } ~Guard() { if (m) xSemaphoreGiveRecursive(m); } } guard(_wsLock);
     if (!isConnected() || !_httpClient)
     {
         ESP_LOGW(TAG, "Cannot send message - Connection status: %s",
@@ -376,7 +492,7 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
         ESP_LOGI(TAG, "WebSocket disconnected");
         if (_isConnected)
         {
-            Faults::raise(Fault::WS_DISCONNECTED, nullptr, false); // a real drop, not a failed reconnect; counted by the dedupe
+            _deferredFaults |= 1; // WS_DISCONNECTED, raised on the loop task
         }
         _isConnected = false;
         _isPrivateSubscribed = false;
@@ -449,7 +565,7 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
         else if (strcmp(event, "pusher_internal:subscription_succeeded") == 0)
         {
             ESP_LOGI(TAG, "Successfully subscribed to private channel");
-            Faults::clear(Fault::WS_AUTH_FAILED);
+            _deferredFaults |= 4; // clear WS_AUTH_FAILED on the loop task
             _isPrivateSubscribed = true;
             _reportDue = true;
         }
@@ -486,8 +602,12 @@ void ReverbClient::handleEvent(WStype_t type, uint8_t *payload, size_t length)
             }
             else
             {
-                ESP_LOGI(TAG, "Received chat message: %s", text);
-                _chatCb(String(text));
+                Handoff h{nullptr, new String(text), true};
+                if (!_inbox || xQueueSend(_inbox, &h, 0) != pdTRUE)
+                {
+                    delete h.value;
+                    ESP_LOGW(TAG, "chat message dropped (inbox full)");
+                }
             }
         }
         else
@@ -683,7 +803,15 @@ void ReverbClient::sendDeviceReport(bool force)
     }
     // An oversized report is treated like a sent one for the cadence: it is retried at the next
     // heartbeat or change, not on every loop pass.
-    if (overflow || _ws->sendTXT(jsonBuffer, written))
+    if (!overflow)
+    {
+        if (_reportLen.load() != 0)
+        {
+            return; // the previous report has not gone out yet: this one is rebuilt next pass
+        }
+        memcpy(reportBuffer, jsonBuffer, (size_t)written + 1);
+        _reportLen = (size_t)written;
+    }
     {
         _lastReportAt = now;
         _lastPositionReportAt = now;
@@ -805,9 +933,16 @@ void ReverbClient::handleDeviceCommand(JsonVariantConst data)
         hasValue = true;
     }
 
-    ESP_LOGI(TAG, "Executing command - Type: %s, Value: %s, HasValue: %s", type, commandValue.c_str(),
+    ESP_LOGI(TAG, "Command queued - Type: %s, Value: %s, HasValue: %s", type, commandValue.c_str(),
                   hasValue ? "true" : "false");
-    executeCommand(String(type), commandValue, hasValue);
+    // Executed on the loop task (audio, RequestManager and Faults are not thread-safe).
+    Handoff h{new String(type), new String(commandValue), hasValue};
+    if (!_inbox || xQueueSend(_inbox, &h, 0) != pdTRUE)
+    {
+        delete h.type;
+        delete h.value;
+        ESP_LOGW(TAG, "command '%s' dropped (inbox full)", type);
+    }
 }
 
 void ReverbClient::executeCommand(const String &type, const String &value, bool hasValue)

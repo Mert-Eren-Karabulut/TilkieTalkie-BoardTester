@@ -386,10 +386,15 @@ void AudioController::raisePendingFaults() {
     PendingFault copy[MAX_PENDING_FAULTS];
     int n = 0;
     {
-        AudioLock lock(audioMutex);
+        // Try only: the audio task holds the mutex across SD waits (seconds on a stalled card); the
+        // loop must never queue behind that just to look at an empty list.
+        if (!audioMutex || xSemaphoreTakeRecursive(audioMutex, pdMS_TO_TICKS(2)) != pdTRUE) {
+            return; // next pass
+        }
         n = pendingFaultCount;
         for (int i = 0; i < n; ++i) copy[i] = pendingFaults[i];
         pendingFaultCount = 0;
+        xSemaphoreGiveRecursive(audioMutex);
     }
     for (int i = 0; i < n; ++i) {
         Faults::raise(copy[i].fault, copy[i].detail, copy[i].speak);
@@ -733,11 +738,15 @@ int AudioController::getVolumeCeiling() const {
 // ---------------------------------------------------------------------------------------------
 
 String AudioController::getCurrentTrack() const {
-    AudioLock lock(audioMutex);
-    if (transientPlayback) {
-        return resumeAfterPrompt ? resumeTrackPath : String();
+    // Called every second by the device report on the loop task: a short try, the last answer
+    // while the audio task is busy inside an SD wait (it cannot have changed track meanwhile).
+    static String lastAnswer;
+    if (!audioMutex || xSemaphoreTakeRecursive(audioMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return lastAnswer;
     }
-    return currentTrackPath;
+    lastAnswer = transientPlayback ? (resumeAfterPrompt ? resumeTrackPath : String()) : currentTrackPath;
+    xSemaphoreGiveRecursive(audioMutex);
+    return lastAnswer;
 }
 
 String AudioController::getPlaylistFigureUid() const {

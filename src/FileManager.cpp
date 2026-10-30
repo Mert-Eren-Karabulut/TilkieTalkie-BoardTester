@@ -822,7 +822,7 @@ bool FileManager::downloadFileFromURL(const String& url, const String& localPath
     asyncState.requestPath = path;
     asyncState.startTime = millis();
     if (cachedFreeAt.load() == 0 || millis() - cachedFreeAt.load() > 60000) {
-        refreshFreeSpaceCache();
+        requestFreeSpaceRefresh(); // f_getfree walks the FAT: on the maintenance task, not here
     }
     asyncState.freeBytesAtStart = cachedFreeBytes.load();
 

@@ -408,3 +408,17 @@ USB, ends by itself (bench: `ft begin`, idle, "ended by itself" at 10 min, check
 pack as "unknown" until the old 90-120 s check). `ota` prints the pack state. Published
 straight to stable as mandatory on Mert's word, pack #3 paired, 2 hubs nudged, flash manifest
 1.3.19 (portal 1d92dca). App sha 6ad016cb…, USB sha 5e16b46d….
+
+## WebSocket on its own task; the loop no longer waits on audio (2026-10-30, towards 1.3.20)
+Mert: the WebSocket dropped during playback and the app will depend on it. Cause (code map +
+bench): the socket was serviced only from the loop, and the loop took `audioMutex` on every pass
+(pending audio faults, the report's track name) while the audio task holds it across SD waits
+(underrun up to 8 s, track change up to 5 s + the FatFs lock); one stall over 3 s cost a pong,
+two dropped the socket, and the reconnect (TLS + channel-auth HTTPS) then ran on the loop. Now
+(docs/RUNTIME.md): a "reverb" task on core 0 (prio 5, 12 KB) owns the socket; commands, chat
+and fault flags go to the loop through a queue, the loop hands the built report to the task;
+the loop only tries the audio mutex; the card probe pauses during playback/downloads; the
+free-space scan runs on sd_maint; fault saves to flash are debounced (errors at once). Bench:
+story + 4 MB download at 4.4 Mbps, socket subscribed throughout, reverb section ≤ 16 ms, worst
+loop gap 250 ms (the figure tap's manifest work), reverb task 5 % CPU, 4 KB stack spare.
+Also in this build: battery current / VBUS / charger state in the report, 1 s reports on request.

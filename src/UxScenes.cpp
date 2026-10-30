@@ -377,7 +377,10 @@ void updatePeripheralHealth()
     }
     if (fileManager.isCardMounted())
     {
-        if (!fileManager.checkCard())
+        // The probe is an SD directory read on the loop: not while the card is busy with a story
+        // or a download (the reader / writer tasks report a dead card through ioError anyway).
+        const bool cardBusy = fileManager.hasActiveDownload() || audioController.isPlaying() || audioController.isPaused();
+        if (!cardBusy && !fileManager.checkCard())
         {
             audioController.stop(); // the file under the decoder is gone
             Faults::raise(Fault::SD_CARD_REMOVED);
