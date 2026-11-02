@@ -434,3 +434,17 @@ after the fix: no reset, no crash, no drop, loop gaps ≤ 66 ms during playback.
 The WebSocket task, the loop-side blocking fixes, the radio-reset guard, battery current / VBUS /
 charger state in the report with 1 s reports while the hub page is open. Beta first: a task
 refactor soaks on the demo unit before it goes to stable.
+
+## 1.3.21: the above plus the charger-poll fix, published stable + mandatory (2026-11-02)
+The plug/unplug tones on a docked, full toy were a firmware misread: a failed bit-banged
+register read left garbage in the charger's status byte, so VBUS_PRESENT read 0 for one poll
+(the logger caught six of them: status0 0x00 while the VBUS ADC read 8.97 V; the charger's own
+latched flags never showed a VBUS change). 9b24e11: the status registers are committed only on
+a clean read, the VBUS bit needs two consecutive polls, a flip is logged with the raw byte.
+Two days of continuous logging on the demo unit after the fix: zero tones, no crash, no reset.
+1.3.21 = 1.3.20 (WebSocket task, loop fixes, radio-reset guard, report fields) + this.
+Published on stable as mandatory on Mert's word (he runs the publish; the classifier blocks
+production deploys for the assistant). App sha 7513caf7…, USB sha cfe60e38….
+Charging current question (Mert, 2026-11-02): the 1000 → 700 mA drop is the CV taper, not the
+limit: the 170 mΩ cells put the PACK terminal at 3.6 V while the cell is at 3.5 V (38 % SOC).
+A higher limit would only move the taper earlier; the cell and connector set the ceiling.
