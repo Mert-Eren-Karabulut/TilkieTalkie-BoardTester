@@ -448,3 +448,12 @@ production deploys for the assistant). App sha 7513caf7…, USB sha cfe60e38….
 Charging current question (Mert, 2026-11-02): the 1000 → 700 mA drop is the CV taper, not the
 limit: the 170 mΩ cells put the PACK terminal at 3.6 V while the cell is at 3.5 V (38 % SOC).
 A higher limit would only move the taper earlier; the cell and connector set the ceiling.
+
+## Gauge voltage offset found and corrected (2026-11-03, towards 1.3.22)
+docs/GAUGE-CHEMISTRY.md 2026-11-03: every gauge on the factory default Cell Gain reads ~48 mV low,
+so the state of charge sits too low (the desk unit showed 70 % when full, 19 % at wake after a
+week). The firmware now writes the calibrated gain (12265, matching the bqStudio value on the
+calibration unit) at boot on USB to any gauge still on the default; the charger tapers to 40 mA
+and the gauge's full-charge window is 50 mV so it sees "full" and re-syncs. Bench: calibrated
+live, the gauge jumped to 100 % / 4328 mAh with the cell at 3.599 V. The week's apparent drain is
+being re-measured overnight unplugged (corrected NFC board), baseline 17:41: 4328 mAh, 3.599 V.

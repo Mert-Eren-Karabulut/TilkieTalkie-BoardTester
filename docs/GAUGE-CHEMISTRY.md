@@ -162,3 +162,21 @@ Memory export over the EV2400, 06:0x: Qmax 4443, Update Status 06, Load Select 1
 Configuration 02, the Ra table above) and `2026-10-29-learned-us06.srec` (bqStudio golden image).
 The `.bq.fs` format was not offered by this bqStudio build. Next: the firmware replay of this
 image at bring-up so production units start learned (SHIP-CHECKLIST.md).
+
+## 2026-11-03: the gauge's cell voltage reads ~48 mV low out of the box; calibrated by firmware
+The desk unit (TT26-00002) came back from a week asleep saying 19 %, charged for three hours and
+stopped at "70 %" with the charger reporting done. Voltmeter at the cell: 3.600 V; gauge 3.552 V;
+charger VBAT ADC 3.586 V. The gauge's Cell Gain (DF 0x4000) was the factory default 12101; scaling
+it to the voltmeter gives 12265, within 0.03 % of the 12269 bqStudio found on the calibration unit
+on 2026-10-26: a systematic offset of the gauge family, not a per-unit quirk. After the write and a
+gauge reset the gauge re-evaluated itself at once: 3.599 V, 100 %, 4328 / 4328 mAh. The "70 %"
+(and the "19 %" at wake) were the uncalibrated voltage placing every rest point too low on the OCV
+curve; the cell had been full.
+Firmware (ba9c841, next commit): `calibrateCellVoltage()` + bench `gaugecalvoltage [mV]`
+(voltmeter, else the charger's VBAT ADC, which itself read 14 mV low here); `ensureGaugeCellGain()`
+runs at boot on USB after the golden-image replay and writes 12265 to a gauge still on 12101,
+never touching a gauge calibrated by hand. The charger's ITERM is 40 mA and the gauge's Charge
+Term Voltage 50 mV, so the gauge sees the end of every charge (FC) and re-syncs to 100 %.
+The production battery leads do not change the rest reading (no current at rest); under charge
+current they move the charger's taper point by the lead drop only. Re-check with the production
+pack when it arrives.

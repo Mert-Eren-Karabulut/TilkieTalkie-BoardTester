@@ -616,6 +616,9 @@ bool BatteryManager::applyPowerConfiguration(bool forceGaugeProvision) {
         // The learned image (chemistry, Ra, Qmax, Update Status 06) onto a stock gauge. Written only
         // on USB (the reset would kill the ESP on battery); classified either way for ft begin.
         replayGaugeGoldenImage(false, usb || forceGaugeProvision);
+        if (usb || forceGaugeProvision) {
+            ensureGaugeCellGain(); // after the image: the image never carries the calibration block
+        }
 
         // NOTE: CUV protection thresholds are NOT written here. The Protections-class
         // data flash silently rejects writes via the working MAC method (confirmed by
@@ -3083,6 +3086,28 @@ bool BatteryManager::writeGaugeDataFlashFloat(uint16_t address, float value) {
         delay(10);
     }
     return false;
+}
+
+bool BatteryManager::ensureGaugeCellGain() {
+    uint16_t gain = 0;
+    if (!readGaugeDataFlashWord(BQ28Z610_CELL_GAIN_ADDRESS, gain)) {
+        return false;
+    }
+    if (gain != BQ28Z610_DEFAULT_CELL_GAIN) {
+        return true; // calibrated already (by this, by bqStudio, or by hand): leave it
+    }
+    if (gaugeSealed && !unsealGauge()) {
+        return false;
+    }
+    if (!writeGaugeDataFlashWord(BQ28Z610_CELL_GAIN_ADDRESS, BQ28Z610_CALIBRATED_CELL_GAIN)) {
+        ESP_LOGW(TAG, "GAUGE: Cell Gain write did not stick");
+        return false;
+    }
+    ESP_LOGW(TAG, "GAUGE: Cell Gain %u -> %u (the default reads ~48 mV low; two units calibrated to this), gauge reset",
+             BQ28Z610_DEFAULT_CELL_GAIN, BQ28Z610_CALIBRATED_CELL_GAIN);
+    writeGaugeAltCommand(BQ28Z610_DEVICE_RESET_COMMAND); // the gain is read at init; the gauge re-evaluates SOC
+    delay(1500);
+    return true;
 }
 
 bool BatteryManager::calibrateCellVoltage(uint16_t referenceMv, uint16_t minDeltaMv, const char *source) {

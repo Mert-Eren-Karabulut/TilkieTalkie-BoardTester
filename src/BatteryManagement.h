@@ -112,7 +112,9 @@ private:
     // Data-flash addresses verified against datasheet sluua65 DF map (2026-06-26).
     // Several were previously wrong (term voltage collided with SOC Flag Config A;
     // taper current/voltage hit the Charging Voltage Hysteresis field) — corrected.
-    static const uint16_t BQ28Z610_CELL_GAIN_ADDRESS = 0x4000;     // I2, default 12101: cell voltage gain (the calibration unit needed 12269, +1.4 %, 2026-10-26)
+    static const uint16_t BQ28Z610_CELL_GAIN_ADDRESS = 0x4000;     // I2, default 12101: cell voltage gain
+    static const uint16_t BQ28Z610_DEFAULT_CELL_GAIN = 12101;      // factory default: reads ~48 mV low on this gauge family
+    static const uint16_t BQ28Z610_CALIBRATED_CELL_GAIN = 12265;   // voltmeter-calibrated on two units: 12269 (bqStudio, 2026-10-26) and 12265 (firmware, 2026-11-03)
     static const uint16_t BQ28Z610_CC_GAIN_ADDRESS = 0x4006;       // F4 (IEEE-754 LE float)
     static const uint16_t BQ28Z610_CAPACITY_GAIN_ADDRESS = 0x400A; // F4; = CC Gain * 298261.6178
     static constexpr float BQ28Z610_DEFAULT_CC_GAIN = 3.58422f;    // factory default (uncalibrated)
@@ -561,6 +563,9 @@ public:
     // (a voltmeter at the cell, or the charger's VBAT ADC at ~0 mA). Needs |current| < 30 mA,
     // a discrepancy of at least minDeltaMv, and a ratio within 5 %. Resets the gauge.
     bool calibrateCellVoltage(uint16_t referenceMv, uint16_t minDeltaMv, const char *source);
+    // A gauge still on the factory-default Cell Gain gets the family's calibrated value (the
+    // golden image leaves the calibration block alone; a unit calibrated by hand is never touched).
+    bool ensureGaugeCellGain();
     bool restartChargeCycle();
     bool clearChargerFaultHistory();
     
