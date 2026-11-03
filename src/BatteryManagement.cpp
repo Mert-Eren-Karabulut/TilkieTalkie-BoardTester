@@ -764,6 +764,7 @@ void BatteryManager::printBatteryInfo() const {
     Serial.println("Percentage: " + String(currentPercentage, 1) + "%" + (stateOfChargeValid ? "" : " (stale: gauge not answering)"));
     Serial.println("Temperature: " + String(currentTemperatureCelsius, 1) + "C");
     Serial.println("Battery Current: " + String(currentBatteryCurrentMilliAmps) + "mA");
+    Serial.println("Charger ADC: VBAT " + String(chargerVbatMilliVolts) + "mV, IBAT " + String(chargerIbatMilliAmps) + "mA");
     Serial.println("Remaining Capacity: " + String(currentRemainingCapacityMilliAmpHours) + "mAh");
     Serial.println("Full Charge Capacity: " + String(currentFullChargeCapacityMilliAmpHours) + "mAh");
     Serial.println("Gauge Design Capacity: " + String(gaugeDesignCapacityMilliAmpHours) + "mAh");
@@ -2454,6 +2455,7 @@ bool BatteryManager::updateChargerMeasurements(bool full) {
     chargerFaultFlagHistory0 |= chargerFaultFlag0;
     chargerFaultFlagHistory1 |= chargerFaultFlag1;
 
+    chargerVbatMilliVolts = vbatMillivolts;
     if (!gaugePresent && vbatMillivolts > 0) {
         currentVoltage = vbatMillivolts / 1000.0f;
     }
@@ -3081,6 +3083,58 @@ bool BatteryManager::writeGaugeDataFlashFloat(uint16_t address, float value) {
         delay(10);
     }
     return false;
+}
+
+bool BatteryManager::calibrateCellVoltage(uint16_t referenceMv, uint16_t minDeltaMv, const char *source) {
+    if (!gaugePresent || gaugeAddress != BQ28Z610_PRIMARY_ADDRESS || busReleased) {
+        ESP_LOGW(TAG, "calibrateCellVoltage: no gauge");
+        return false;
+    }
+    uint16_t gaugeMv = 0;
+    int16_t current = 0;
+    if (!readRegister16LE(gaugeAddress, BQ28Z610_VOLTAGE_REGISTER, gaugeMv) ||
+        !readRegister16LESigned(gaugeAddress, BQ28Z610_CURRENT_REGISTER, current)) {
+        ESP_LOGW(TAG, "calibrateCellVoltage: gauge read failed");
+        return false;
+    }
+    if (current > 30 || current < -30) {
+        ESP_LOGW(TAG, "calibrateCellVoltage: %d mA flowing, the reference must be taken at rest", current);
+        return false;
+    }
+    const int delta = (int)referenceMv - (int)gaugeMv;
+    ESP_LOGI(TAG, "calibrateCellVoltage: gauge %u mV, %s %u mV (delta %d mV)", gaugeMv, source, referenceMv, delta);
+    if (delta < (int)minDeltaMv && delta > -(int)minDeltaMv) {
+        ESP_LOGI(TAG, "calibrateCellVoltage: within %u mV, nothing to do", minDeltaMv);
+        return true;
+    }
+    const float ratio = (float)referenceMv / (float)gaugeMv;
+    if (ratio < 0.95f || ratio > 1.05f) {
+        ESP_LOGW(TAG, "calibrateCellVoltage: ratio %.4f out of the 5 %% window, refused", ratio);
+        return false;
+    }
+    if (gaugeSealed && !unsealGauge()) {
+        return false;
+    }
+    uint16_t gainRaw = 0;
+    if (!readGaugeDataFlashWord(BQ28Z610_CELL_GAIN_ADDRESS, gainRaw)) {
+        ESP_LOGW(TAG, "calibrateCellVoltage: Cell Gain read failed");
+        return false;
+    }
+    const int16_t gain = (int16_t)gainRaw;
+    const int16_t newGain = (int16_t)lroundf((float)gain * ratio);
+    ESP_LOGW(TAG, "calibrateCellVoltage: Cell Gain %d -> %d (x%.4f)", gain, newGain, ratio);
+    if (!writeGaugeDataFlashWord(BQ28Z610_CELL_GAIN_ADDRESS, (uint16_t)newGain)) {
+        ESP_LOGE(TAG, "calibrateCellVoltage: Cell Gain write did not stick");
+        return false;
+    }
+    writeGaugeAltCommand(BQ28Z610_DEVICE_RESET_COMMAND); // the gain is read at init
+    delay(1500);
+    uint16_t after = 0;
+    for (int i = 0; i < 10 && !readRegister16LE(gaugeAddress, BQ28Z610_VOLTAGE_REGISTER, after); ++i) {
+        delay(200);
+    }
+    ESP_LOGW(TAG, "calibrateCellVoltage: gauge now %u mV (reference %u mV)", after, referenceMv);
+    return after != 0;
 }
 
 bool BatteryManager::calibrateCurrentSense() {

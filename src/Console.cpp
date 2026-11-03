@@ -300,6 +300,7 @@ static void printHelp()
     ESP_LOGI(TAG, "  gaugecutoff       - cutoff/ship FET state on USB (DSG open, CHG closed); gaugefets restores");
     ESP_LOGI(TAG, "  gaugemac <hexcmd> [len] / gaugeit - raw MAC block / Impedance Track internals (IT Status 1-3)");
     ESP_LOGI(TAG, "  gaugedfbyte <hexaddr> [hexval] - read / write one gauge data-flash byte (e.g. 46AE Protection Configuration)");
+    ESP_LOGI(TAG, "  gaugecalvoltage [mV]           - calibrate the gauge cell voltage (voltmeter mV, or the charger VBAT ADC at rest)");
     ESP_LOGI(TAG, "  gaugeimage [apply|inhibit|allow] - learned gauge image: state / force rewrite / NVS inhibit for learning cycles");
     ESP_LOGI(TAG, "  learndis / learnrest / learnchg - gauge learning cycle phases");
     ESP_LOGI(TAG, "  sleeptest <min> [railon] [nfcawake] [hold] - sleep current via the gauge (battery only)");
@@ -1416,6 +1417,22 @@ static void dispatch(String command)
         battery.unlockBus();
         ESP_LOGI(TAG, "DF END %04x-%04x, %d read errors, %lu ms", static_cast<unsigned>(start),
                  static_cast<unsigned>(end), errors, static_cast<unsigned long>(millis() - t0));
+    }
+    // gaugecalvoltage [mV] - calibrate the gauge's cell voltage: against the voltmeter reading
+    // given in mV, or without an argument against the charger's VBAT ADC (at ~0 mA only).
+    else if (command == "gaugecalvoltage" || command.startsWith("gaugecalvoltage "))
+    {
+        String arg = command.length() > 15 ? command.substring(15) : String();
+        arg.trim();
+        uint16_t ref = (uint16_t)arg.toInt();
+        const char *source = "voltmeter";
+        if (ref == 0)
+        {
+            ref = battery.getChargerVbatMilliVolts();
+            source = "charger VBAT ADC";
+        }
+        const bool ok = battery.calibrateCellVoltage(ref, 5, source);
+        ESP_LOGI(TAG, "gauge cell voltage calibration: %s", ok ? "OK" : "FAILED");
     }
     // gaugedfbyte <hexaddr> [hexval] - read or write one data-flash byte (bench experiments)
     else if (command.startsWith("gaugedfbyte "))

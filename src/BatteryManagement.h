@@ -43,7 +43,7 @@ private:
     static const uint8_t BQ25792_INPUT_CURRENT_REGISTER = 0x06;
     static const uint8_t BQ25792_RECHARGE_CONTROL_REGISTER = 0x0A;
     static const uint8_t BQ25792_TERMINATION_CONTROL_REGISTER = 0x09; // bit6 = REG_RST (never write 1), ITERM[4:0] 40mA/LSB
-    static const uint8_t DEFAULT_TERMINATION_CURRENT_CODE = 0x03;    // 120 mA (POR 0x05 = 200 mA)
+    static const uint8_t DEFAULT_TERMINATION_CURRENT_CODE = 0x01;    // 40 mA (POR 0x05 = 200 mA): the charger tapers through the gauge's 100 mA window so the gauge sees the full charge (FC) and re-syncs to 100 %
     static const uint8_t DEFAULT_RECHARGE_THRESHOLD_CODE = 0x04;     // VREG - 250 mV (POR 0x03 = 200 mV), 50 mV/LSB
     static const uint8_t BQ25792_INPUT_VOLTAGE_REGISTER = 0x05; // VINDPM, 100mV/LSB
     static const uint8_t BQ25792_CHARGER_CONTROL_0_REGISTER = 0x0F;
@@ -112,6 +112,7 @@ private:
     // Data-flash addresses verified against datasheet sluua65 DF map (2026-06-26).
     // Several were previously wrong (term voltage collided with SOC Flag Config A;
     // taper current/voltage hit the Charging Voltage Hysteresis field) — corrected.
+    static const uint16_t BQ28Z610_CELL_GAIN_ADDRESS = 0x4000;     // I2, default 12101: cell voltage gain (the calibration unit needed 12269, +1.4 %, 2026-10-26)
     static const uint16_t BQ28Z610_CC_GAIN_ADDRESS = 0x4006;       // F4 (IEEE-754 LE float)
     static const uint16_t BQ28Z610_CAPACITY_GAIN_ADDRESS = 0x400A; // F4; = CC Gain * 298261.6178
     static constexpr float BQ28Z610_DEFAULT_CC_GAIN = 3.58422f;    // factory default (uncalibrated)
@@ -218,7 +219,7 @@ private:
     // SLUA777 §3 relationship: Taper > Dsg/Chg current threshold > Quit; Quit < C/20.
     // 4000mAh: C/10=400, C/20=200. Taper 200mA, Dsg 100, Chg 75, Quit 40.
     static const uint16_t DEFAULT_GAUGE_TAPER_CURRENT_MA = 100;    // below the charger ITERM (120 mA): the charger ends the charge, the gauge only confirms it
-    static const uint16_t DEFAULT_GAUGE_CHARGE_TERM_VOLTAGE_MV = 25;  // valid termination needs cell >= 3575 mV: the ~0.2 ohm pack path put the cell at 3.5 V while the charger sat at 3.6 V, and the gauge called that full
+    static const uint16_t DEFAULT_GAUGE_CHARGE_TERM_VOLTAGE_MV = 50;  // valid termination needs cell >= 3575 mV: the ~0.2 ohm pack path put the cell at 3.5 V while the charger sat at 3.6 V, and the gauge called that full
     static const uint16_t DEFAULT_GAUGE_VOLTAGE_RANGE_LOW_MV = 2900;
     static const uint16_t DEFAULT_GAUGE_VOLTAGE_RANGE_MED_MV = 3300;
     static const uint16_t DEFAULT_GAUGE_VOLTAGE_RANGE_HIGH_MV = 3450;
@@ -262,6 +263,7 @@ private:
     bool stateOfChargeValid = false;
     uint8_t gaugeMissedPolls = 0;
     uint32_t chargerPollFailures = 0;
+    uint16_t chargerVbatMilliVolts = 0;
     bool vbusEdgePending = false;
     float currentTemperatureCelsius;
     uint32_t implausibleGaugeReads = 0;  // polls rejected by the plausibility check
@@ -555,6 +557,10 @@ public:
     // Calibrate the gauge current sense (CC Gain) against the BQ25792's IBAT ADC.
     // Requires a steady current flowing (e.g. charging). Fixes the ~4.5x over-read.
     bool calibrateCurrentSense();
+    // Cell voltage calibration: scale the gauge's Cell Gain so Voltage() matches referenceMv
+    // (a voltmeter at the cell, or the charger's VBAT ADC at ~0 mA). Needs |current| < 30 mA,
+    // a discrepancy of at least minDeltaMv, and a ratio within 5 %. Resets the gauge.
+    bool calibrateCellVoltage(uint16_t referenceMv, uint16_t minDeltaMv, const char *source);
     bool restartChargeCycle();
     bool clearChargerFaultHistory();
     
@@ -578,6 +584,7 @@ public:
     uint8_t getChargerFaultStatus1() const { return chargerFaultStatus1; } // REG21 (live)
     const char *getChargeStateName() const { return chargerStateToString((chargerStatus1 >> 5) & 0x07); }
     int getChargerIbatMilliAmps() const { return chargerIbatMilliAmps; }    // charger IBAT ADC, + charging
+    uint16_t getChargerVbatMilliVolts() const { return chargerVbatMilliVolts; } // charger VBAT ADC (its own sense pin)
     static String describeChargerFaults(uint8_t fault0, uint8_t fault1);    // "None" or "VBUS OVP, ..."
     
     // True when the cell can actually SOURCE current into the system (and thus
