@@ -457,3 +457,15 @@ calibration unit) at boot on USB to any gauge still on the default; the charger 
 and the gauge's full-charge window is 50 mV so it sees "full" and re-syncs. Bench: calibrated
 live, the gauge jumped to 100 % / 4328 mAh with the cell at 3.599 V. The week's apparent drain is
 being re-measured overnight unplugged (corrected NFC board), baseline 17:41: 4328 mAh, 3.599 V.
+
+## Sleep drain measured; 1.3.22 built (2026-11-10)
+Desk unit, corrected NFC board, unplugged 3 Nov 17:41 at 4328 mAh / 100 %, woken by button 10 Nov
+01:28 (151.8 h): coulomb counter 4320 mAh (8 mAh, below what it can resolve), the gauge's OCV
+estimate 4113 mAh, still 100 %, 3.306 V resting. Sleep current between 0.05 and 1.4 mA: months of
+standby. Last week's "80 % in six days" was the faulty NFC board plus the gauge reading 48 mV low.
+1.3.22 (ff88ddc): Cell Gain 12265 for gauges on the factory default, ITERM 40 mA, gauge Charge
+Term Voltage 50 mV. App sha ff8c739b…, USB sha 8123240a…. Mert publishes (stable, mandatory).
+To do when the production pack with its own harness arrives: voltmeter at the cell at rest versus
+`battery`; if they differ by more than 10 mV, `gaugecalvoltage <mV>` and review the constant.
+The gain was set at rest (no current, no lead drop), and the calibration unit with production
+leads landed on 12269, so the harness is not expected to matter.
